@@ -2191,33 +2191,49 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     );
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 
-    // CONTROL A: the SAME source, with `dir/sub` a REAL destination directory,
-    // is lawful and must still succeed.
+    // CONTROL A (FLIPPED, P0): the SAME source, with `dir/sub` a REAL
+    // destination directory the source does NOT supply, is now REFUSED. The
+    // component is DESTINATION-SUPPLIED, so whether it still exists after the
+    // run is the run's own plan decision (a refused replacement, a prohibited
+    // removal); the plan-free rule refuses rather than guess even though a
+    // real directory redirects nothing. The old expectation ("a real
+    // destination directory at the traversed component is lawful") encoded
+    // the plan-dependent permission this P0 fixed.
     let dst_real = dir.path().join("dst-real");
     fs::create_dir_all(dst_real.join("dir/sub")).unwrap();
     fs::create_dir_all(dst_real.join("dir/other")).unwrap();
-    let report = owned(
+    let err = owned(
         Direction::Push,
         &src,
         &transport(&dst_real),
         &ReplaceAll,
         Keep,
     )
-    .expect("a real destination directory at the traversed component is lawful");
-    assert!(report.conflicts.is_empty(), "{report:?}");
-    assert_eq!(read(&dst_real.join("dir/keep")), b"payload");
+    .unwrap_err();
+    let msg = err.to_string();
     assert!(
-        fs::symlink_metadata(dst_real.join("dir/link"))
+        msg.contains("escaping symlink") && msg.contains("dir/sub"),
+        "a destination-supplied component is plan-dependent and must be refused, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst_real.join("dir/link")).is_err(),
+        "the link must never be materialized: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(dst_real.join("dir/sub"))
             .unwrap()
-            .file_type()
-            .is_symlink(),
-        "the in-root link is installed"
+            .is_dir(),
+        "a refused run mutates nothing: the destination directory stays"
     );
 }
 
-/// G2, control B: `Extraneous::Delete` removes the destination-only symlink at
-/// the traversed component, so the same source link no longer escapes and the
-/// sanctioned removal still runs.
+/// G2, control B. FLIPPED (P0): `dir/sub` is DESTINATION-SUPPLIED (the source
+/// holds no entry at `dir/sub`), so whether `Extraneous::Delete` removes it is
+/// the run's own plan decision (a conflict, an alias, or the residue guard can
+/// prohibit the removal). The plan-free rule refuses rather than guess, so the
+/// `Delete` run now REFUSES before any transfer and mutates nothing; the old
+/// expectation (the sanctioned deletion neutralizes the component and the link
+/// is installed dangling) is inverted.
 #[cfg(unix)]
 #[test]
 fn extraneous_delete_neutralizes_the_destination_resident_symlink_component() {
@@ -2230,24 +2246,21 @@ fn extraneous_delete_neutralizes_the_destination_resident_symlink_component() {
     fs::create_dir_all(dst.join("dir/other")).unwrap();
     std::os::unix::fs::symlink("../other", dst.join("dir/sub")).unwrap();
 
-    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
-        .expect("the sanctioned deletion removes the traversed destination symlink");
-    assert!(report.conflicts.is_empty(), "{report:?}");
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap_err();
+    let msg = err.to_string();
     assert!(
-        fs::symlink_metadata(dst.join("dir/sub")).is_err(),
-        "the destination-only symlink at the traversed component is removed: {report:?}"
-    );
-    assert_eq!(read(&dst.join("dir/keep")), b"payload");
-    assert!(
-        fs::symlink_metadata(dst.join("dir/link"))
-            .unwrap()
-            .file_type()
-            .is_symlink(),
-        "the link is installed and now dangles instead of escaping"
+        msg.contains("escaping symlink") && msg.contains("dir/sub"),
+        "a destination-supplied component is plan-dependent and must be refused, got: {msg}"
     );
     assert!(
-        fs::symlink_metadata(dst.join("dir/link/secret")).is_err(),
-        "the link must not resolve to the outside canary"
+        fs::symlink_metadata(dst.join("dir/sub"))
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false),
+        "a refused run mutates nothing: the destination symlink stays: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("dir/link")).is_err(),
+        "the link must never be materialized: {err}"
     );
 }
 
@@ -2401,10 +2414,16 @@ fn a_destination_non_residue_symlink_component_is_refused_as_control() {
 
 /// G2, the CRATE-TEMP half of the `Delete` distinction. A crate-temp shape
 /// (`.sync-aside.<name>.tmp.<pid>.<n>`) is UNADDRESSABLE but NOT residue: it
-/// holds no original, so `Extraneous::Delete` DOES remove it. The result view
-/// must therefore OMIT it under `Delete` (the run removes it), so the link is
-/// permitted and simply dangles once the temp is gone — it must not be refused
-/// for a component the run destroys.
+/// holds no original, so `Extraneous::Delete` WOULD remove it when nothing
+/// blocks the removal.
+///
+/// FLIPPED (P0): the component is DESTINATION-SUPPLIED — the source holds no
+/// entry at `temp` — so whether it still exists after the run is exactly what
+/// the run's own plan decides (`Extraneous::Delete` removes a destination-only
+/// entry only when no conflict, alias, or residue guard PROHIBITS the
+/// removal), and the plan-free rule refuses rather than guess, under `Delete`
+/// too. The assertions below are the inverse of the old "permit and remove"
+/// expectation.
 #[cfg(unix)]
 #[test]
 fn extraneous_delete_removes_a_crate_temp_symlink_component_and_permits_the_link() {
@@ -2424,22 +2443,35 @@ fn extraneous_delete_removes_a_crate_temp_symlink_component_and_permits_the_link
     fs::create_dir_all(&outside).unwrap();
     write(&outside.join("secret"), b"SECRET");
 
-    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
-        .expect("a crate-temp destination symlink is removable content, not residue");
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap_err();
+    let msg = err.to_string();
     assert!(
-        fs::symlink_metadata(dst.join(temp)).is_err(),
-        "Extraneous::Delete removes a crate temp: {report:?}"
+        msg.contains("escaping symlink") && msg.contains(temp),
+        "a destination-supplied component is plan-dependent and must be refused, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the escaping link must never be materialized: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join(temp))
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false),
+        "a refused run mutates nothing, so the crate temp is still there: {err}"
     );
     assert!(
         fs::read(dst.join("link")).is_err(),
-        "the link is installed and dangles; it must not resolve to the outside canary"
+        "the link must not have been installed, so it cannot resolve to the outside canary"
     );
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the crate-temp counterpart under `Keep`: the temp SURVIVES the run, so
-/// the walk must resolve the component to a symlink and REFUSE. This pins that
-/// crate-temp content is not specially ignored by the result view under `Keep`.
+/// G2, the crate-temp counterpart under `Keep`. FLIPPED JUSTIFICATION (P0):
+/// the run still REFUSES, but not because "the temp survives under `Keep`";
+/// it refuses because the component is DESTINATION-SUPPLIED (the source holds
+/// no entry at `temp`), so whether it survives is the run's plan decision and
+/// the plan-free rule refuses under BOTH `Keep` and `Delete`. The assertions
+/// are unchanged.
 #[cfg(unix)]
 #[test]
 fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
@@ -2465,11 +2497,13 @@ fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, NO OVER-REFUSAL: a residue entry that is a real DIRECTORY redirects
-/// nothing, so a source link whose walk passes through it is legitimate and the
-/// run must still succeed and materialize it. The result index must record the
-/// residue entry as NOT a symlink rather than dropping it or treating it as a
-/// redirect.
+/// G2. FLIPPED (P0): a destination residue entry is DESTINATION-SUPPLIED (the
+/// source holds no entry at `.sync-aside.1.2`), so whether it still exists
+/// after the run is the plan's decision (residue survives even
+/// `Extraneous::Delete`, but a conflict or an alias can also leave a removable
+/// entry behind), and the plan-free rule refuses the destination-only
+/// component rather than guess. The old expectation — install the link through
+/// the in-root residue directory — is therefore inverted.
 #[cfg(unix)]
 #[test]
 fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
@@ -2480,18 +2514,29 @@ fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
     std::os::unix::fs::symlink(".sync-aside.1.2/target", src.join("link")).unwrap();
     write(&dst.join(".sync-aside.1.2/target"), b"inside");
 
-    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
-        .expect("a residue DIRECTORY does not redirect a link and must not refuse it");
-    assert!(report.conflicts.is_empty(), "{report:?}");
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains(".sync-aside.1.2"),
+        "a destination-supplied component is plan-dependent and must be refused, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the link must never be materialized: {err}"
+    );
     assert_eq!(
-        read(&dst.join("link")),
+        read(&dst.join(".sync-aside.1.2/target")),
         b"inside",
-        "the link resolves through the in-root residue directory"
+        "a refused run mutates nothing: the residue content is intact"
     );
 }
 
-/// G2, NO OVER-REFUSAL: the same with a residue REGULAR FILE. The component is
-/// not a symlink, so it redirects nothing and the link must be installed.
+/// G2. FLIPPED (P0): the same with a residue REGULAR FILE. The component
+/// `.sync-aside.3.4` is DESTINATION-SUPPLIED (the source holds no entry
+/// there), so its post-run existence is the run's plan decision and the
+/// plan-free rule refuses rather than guess. The old "the component is not a
+/// symlink so the link must be installed" expectation encoded the
+/// plan-dependent permission this P0 fixed.
 #[cfg(unix)]
 #[test]
 fn a_destination_residue_file_does_not_break_a_legitimate_link() {
@@ -2502,8 +2547,193 @@ fn a_destination_residue_file_does_not_break_a_legitimate_link() {
     std::os::unix::fs::symlink(".sync-aside.3.4", src.join("link")).unwrap();
     write(&dst.join(".sync-aside.3.4"), b"inside");
 
-    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
-        .expect("a residue FILE does not redirect a link and must not refuse it");
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains(".sync-aside.3.4"),
+        "a destination-supplied component is plan-dependent and must be refused, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the link must never be materialized: {err}"
+    );
+    assert_eq!(
+        read(&dst.join(".sync-aside.3.4")),
+        b"inside",
+        "a refused run mutates nothing: the residue content is intact"
+    );
+}
+
+/// P0 REPRO (custom `Refuse`): a DESTINATION-SUPPLIED component the old
+/// "result view" scoped out of the walk. `dst/d` is a directory holding the
+/// ESCAPING symlink `dst/d/e -> ../../outside`; the source holds `d` as a
+/// regular FILE the policy REFUSES, plus `link -> d/e/secret`. The old index
+/// dropped `d` from the result view because the source held the path,
+/// assuming the source's file would be installed there; the `Refuse` policy
+/// leaves the destination DIRECTORY (and therefore `d/e`) in place, and
+/// `Extraneous::Delete` does not remove `d/e` because its ancestor `d` is
+/// prohibited by the conflict. The run then installed `link`, which resolved
+/// through `d/e` to the outside canary. The plan-free rule refuses `d` (source
+/// FILE vs destination DIRECTORY: a kind disagreement whose post-run kind is
+/// decided by whether the refused replacement lands) before any transfer.
+#[cfg(unix)]
+#[test]
+fn a_destination_supplied_component_under_a_refused_replacement_cannot_be_escaped_through() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("d"), b"payload");
+    std::os::unix::fs::symlink("d/e/secret", src.join("link")).unwrap();
+    fs::create_dir_all(dst.join("d")).unwrap();
+    std::os::unix::fs::symlink("../../outside", dst.join("d/e")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let refuse_d = |rel: &str, _: EntryKind| {
+        if rel == "d" {
+            EntryPolicy::Refuse
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let err = unowned(Direction::Push, &src, &transport(&dst), &refuse_d, Delete).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains("\"d\""),
+        "the run must refuse, naming the traversed component, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the escaping link must never be materialized: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("d/e"))
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false),
+        "a refused run mutates nothing: the escaping destination symlink stays: {err}"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// P0 REPRO (built-in `AppendTail`): the SAME shape with the append-only rule
+/// selected for `d`. A source FILE over a destination DIRECTORY is
+/// `ConflictReason::AppendNotAFile`, so the append leaves the directory and its
+/// `d/e` child in place exactly as `Refuse` does, and the same escape follows
+/// pre-fix. The plan-free rule refuses for the same reason.
+#[cfg(unix)]
+#[test]
+fn a_destination_supplied_component_under_an_append_refusal_cannot_be_escaped_through() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("d"), b"payload");
+    std::os::unix::fs::symlink("d/e/secret", src.join("link")).unwrap();
+    fs::create_dir_all(dst.join("d")).unwrap();
+    std::os::unix::fs::symlink("../../outside", dst.join("d/e")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let append_d = |rel: &str, _: EntryKind| {
+        if rel == "d" {
+            EntryPolicy::AppendTail
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let err = unowned(Direction::Push, &src, &transport(&dst), &append_d, Delete).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains("\"d\""),
+        "the run must refuse, naming the traversed component, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the escaping link must never be materialized: {err}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("d/e"))
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false),
+        "a refused run mutates nothing: the escaping destination symlink stays: {err}"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// P0 CONTROL: the SAME tree with `Extraneous::Keep` was already refused
+/// pre-fix (a destination-only entry is not skipped from the result view under
+/// `Keep`), which pins the hole to the index's `Delete`/source-shadow skips
+/// rather than to the walk itself. The plan-free rule refuses under `Keep`
+/// too, for the plan-free reason.
+#[cfg(unix)]
+#[test]
+fn a_destination_supplied_component_under_a_refused_replacement_is_refused_under_keep() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("d"), b"payload");
+    std::os::unix::fs::symlink("d/e/secret", src.join("link")).unwrap();
+    fs::create_dir_all(dst.join("d")).unwrap();
+    std::os::unix::fs::symlink("../../outside", dst.join("d/e")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let refuse_d = |rel: &str, _: EntryKind| {
+        if rel == "d" {
+            EntryPolicy::Refuse
+        } else {
+            EntryPolicy::Replace
+        }
+    };
+    let err = unowned(Direction::Push, &src, &transport(&dst), &refuse_d, Keep).unwrap_err();
+    assert!(
+        err.to_string().contains("escaping symlink"),
+        "the destination-supplied component is refused under Keep too: {err}"
+    );
+    assert!(fs::symlink_metadata(dst.join("link")).is_err());
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// POSITIVE: a component ONLY THE SOURCE supplies is permitted — the run
+/// installs it, so if the install is refused it stays absent and a dangling
+/// link does not escape. This pins that the plan-free rule is not merely
+/// "refuse everything".
+#[cfg(unix)]
+#[test]
+fn a_source_only_component_is_permitted_and_the_link_is_installed() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&src).unwrap();
+    std::os::unix::fs::symlink("newdir/secret", src.join("link")).unwrap();
+    write(&src.join("newdir/secret"), b"inside");
+    fs::create_dir_all(&dst).unwrap();
+
+    let report = unowned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("a source-only component is installed by the run and cannot escape");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(read(&dst.join("link")), b"inside");
+}
+
+/// POSITIVE: a component BOTH observations describe with the SAME non-symlink
+/// kind is permitted, so the rule is not merely "refuse everything".
+#[cfg(unix)]
+#[test]
+fn a_both_views_same_kind_component_is_permitted_and_the_link_is_installed() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("d/e"), b"inside");
+    std::os::unix::fs::symlink("d/e", src.join("link")).unwrap();
+    write(&dst.join("d/e"), b"inside");
+
+    let report = unowned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+        .expect("a component both observations describe with the same kind is lawful");
     assert!(report.conflicts.is_empty(), "{report:?}");
     assert_eq!(read(&dst.join("link")), b"inside");
 }

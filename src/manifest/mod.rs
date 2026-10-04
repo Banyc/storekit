@@ -486,6 +486,19 @@ pub(crate) enum SymlinkTargetRefusal {
     /// A component the walk reaches (final or intermediate) is a symlink the
     /// kernel would follow, so the spelled location is not the physical one.
     ThroughSymlink(PathBuf),
+    /// A component the walk reaches (final or intermediate) is not described
+    /// with the SAME non-symlink kind by the source manifest and the
+    /// destination observation: it is a redirector in one view, the
+    /// destination supplies it and the source does not replace it, or the two
+    /// views disagree on its kind. What the component holds ONCE THE RUN
+    /// FINISHES is then decided by the run's own plan (a refused replacement,
+    /// a removal a conflict or an alias prohibits), so the verdict cannot be
+    /// derived from the two static observations and the run refuses instead of
+    /// guessing. Produced ONLY by
+    /// [`check_relative_symlink_target_two_views`]; the canonicalizers use
+    /// [`SymlinkTargetRefusal::ThroughSymlink`], whose component really is a
+    /// symlink in their single view.
+    PlanDependent(PathBuf),
 }
 
 /// The CONTAINMENT fold for the physical walk: the full Unicode case fold
@@ -656,6 +669,51 @@ pub(crate) fn check_relative_symlink_target(
     target: &Path,
     resolve: &mut dyn FnMut(&Path) -> ComponentResolution,
 ) -> std::result::Result<(), SymlinkTargetRefusal> {
+    walk_relative_symlink_target(link_rel, target, |rel| {
+        matches!(resolve(rel), ComponentResolution::Symlink)
+    })
+    .map_err(SpelledWalkRefusal::into_through_symlink)
+}
+
+/// A refusal of the SPELLED walk before it is mapped to the
+/// [`SymlinkTargetRefusal`] variant the caller's rule implies. The walk itself
+/// is ONE implementation: a `Normal` component is offered to `refuses`, and the
+/// FIRST component it refuses ends the walk with `Component(current)`; a `..`
+/// that pops above the root ends it with `EscapesRoot`. The single-view
+/// canonicalizers map `Component` to [`SymlinkTargetRefusal::ThroughSymlink`]
+/// (their resolver answers `Symlink` exactly for a symlink component), and the
+/// applier's plan-free two-view check maps it to
+/// [`SymlinkTargetRefusal::PlanDependent`].
+enum SpelledWalkRefusal {
+    EscapesRoot,
+    Component(PathBuf),
+}
+
+impl SpelledWalkRefusal {
+    fn into_through_symlink(self) -> SymlinkTargetRefusal {
+        match self {
+            SpelledWalkRefusal::EscapesRoot => SymlinkTargetRefusal::EscapesRoot,
+            SpelledWalkRefusal::Component(component) => {
+                SymlinkTargetRefusal::ThroughSymlink(component)
+            }
+        }
+    }
+
+    fn into_plan_dependent(self) -> SymlinkTargetRefusal {
+        match self {
+            SpelledWalkRefusal::EscapesRoot => SymlinkTargetRefusal::EscapesRoot,
+            SpelledWalkRefusal::Component(component) => {
+                SymlinkTargetRefusal::PlanDependent(component)
+            }
+        }
+    }
+}
+
+fn walk_relative_symlink_target(
+    link_rel: &Path,
+    target: &Path,
+    mut refuses: impl FnMut(&Path) -> bool,
+) -> std::result::Result<(), SpelledWalkRefusal> {
     let mut current = PathBuf::new();
     if let Some(parent) = link_rel.parent() {
         for comp in parent.components() {
@@ -665,7 +723,7 @@ pub(crate) fn check_relative_symlink_target(
                 // A validated entry path has only `Normal` components; fail
                 // closed rather than reason about a spelling that cannot occur.
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(SymlinkTargetRefusal::EscapesRoot);
+                    return Err(SpelledWalkRefusal::EscapesRoot);
                 }
             }
         }
@@ -673,18 +731,18 @@ pub(crate) fn check_relative_symlink_target(
     for comp in target.components() {
         match comp {
             Component::Prefix(_) | Component::RootDir => {
-                return Err(SymlinkTargetRefusal::EscapesRoot);
+                return Err(SpelledWalkRefusal::EscapesRoot);
             }
             Component::CurDir => {}
             Component::ParentDir => {
                 if !current.pop() {
-                    return Err(SymlinkTargetRefusal::EscapesRoot);
+                    return Err(SpelledWalkRefusal::EscapesRoot);
                 }
             }
             Component::Normal(name) => {
                 current.push(name);
-                if matches!(resolve(&current), ComponentResolution::Symlink) {
-                    return Err(SymlinkTargetRefusal::ThroughSymlink(current.clone()));
+                if refuses(&current) {
+                    return Err(SpelledWalkRefusal::Component(current));
                 }
             }
         }
@@ -703,6 +761,114 @@ pub(crate) fn check_relative_symlink_target_indexed(
 ) -> std::result::Result<(), SymlinkTargetRefusal> {
     let mut resolve = |rel: &Path| index.resolve(rel);
     check_relative_symlink_target(link_rel, target, &mut resolve)
+}
+
+/// What ONE observation (a source manifest or a destination observation) holds
+/// at each spelled root-relative path, by kind. Exact spellings win; a path
+/// with no exact entry but a FOLD-EQUAL symlink entry resolves to
+/// [`EntryKind::Symlink`] for the same reason [`SymlinkContainmentIndex`] does
+/// (a case-folding host would follow it).
+struct KindIndex<'a> {
+    exact: BTreeMap<&'a str, EntryKind>,
+    folded_symlinks: BTreeSet<String>,
+}
+
+impl<'a> KindIndex<'a> {
+    fn from_entries(entries: &'a [TreeEntry]) -> Self {
+        let mut exact: BTreeMap<&'a str, EntryKind> = BTreeMap::new();
+        let mut folded_symlinks: BTreeSet<String> = BTreeSet::new();
+        for entry in entries {
+            exact.insert(entry.path.as_str(), entry.entry_type);
+            if entry.entry_type == EntryKind::Symlink {
+                folded_symlinks.insert(fold_path(&entry.path));
+            }
+        }
+        KindIndex {
+            exact,
+            folded_symlinks,
+        }
+    }
+
+    fn kind_at(&self, rel: &Path) -> Option<EntryKind> {
+        let spelled = rel_path_string(rel);
+        if let Some(&kind) = self.exact.get(spelled.as_str()) {
+            return Some(kind);
+        }
+        if self.folded_symlinks.contains(&fold_path(&spelled)) {
+            return Some(EntryKind::Symlink);
+        }
+        None
+    }
+}
+
+/// The PLAN-FREE containment view over the TWO STATIC observations: the strict
+/// SOURCE manifest and the raw DESTINATION observation. The applier's
+/// destination-aware re-check builds ONE of these and walks every source
+/// symlink's relative target through it.
+///
+/// The verdict consults NO policy and NO plan: neither [`crate::sync::Extraneous`]
+/// nor any per-entry [`crate::sync::EntryPolicy`] reaches it, so it cannot
+/// depend on whether a replacement or a removal actually lands. The rule is
+/// stated on the two static kinds at each walked component `C` (the walk
+/// INCLUDES `C`'s final component, because the kernel follows it):
+///
+/// * either view holds a `Symlink` at `C` — refuse (a redirector);
+/// * both views hold a non-symlink kind, but DIFFERENT kinds — refuse (which
+///   kind survives is decided by whether the replacement lands, which is the
+///   plan);
+/// * only the destination supplies `C` — refuse (whether it survives is the
+///   plan's `Extraneous`/conflict decision);
+/// * only the source supplies `C` — permit (it is installed; if the install is
+///   refused it stays absent, and a dangling link does not escape);
+/// * neither supplies `C` — permit (the unchanged dangling-link behaviour);
+/// * both supply the same non-symlink kind — permit.
+///
+/// The plan-dependence the previous "result view" tried to precompute is
+/// exactly what the previous rule got wrong: it assumed the source's entry is
+/// installed wherever the source holds the path, and that `Extraneous::Delete`
+/// removes every destination-only entry. A refused replacement and a removal a
+/// conflict, an alias, or the residue guard stops both leave the destination
+/// entry in place, so the walk escaped through it.
+pub(crate) struct ContainmentViews<'a> {
+    source: KindIndex<'a>,
+    destination: KindIndex<'a>,
+}
+
+impl<'a> ContainmentViews<'a> {
+    /// Build the view from the SOURCE manifest entries and the RAW destination
+    /// entries (the observation BEFORE the reserved-namespace strip).
+    pub(crate) fn new(source: &'a [TreeEntry], destination: &'a [TreeEntry]) -> Self {
+        ContainmentViews {
+            source: KindIndex::from_entries(source),
+            destination: KindIndex::from_entries(destination),
+        }
+    }
+
+    /// Whether the walk must refuse a component at `rel` under the plan-free
+    /// rule above.
+    fn refuses(&self, rel: &Path) -> bool {
+        let source_kind = self.source.kind_at(rel);
+        let destination_kind = self.destination.kind_at(rel);
+        match (source_kind, destination_kind) {
+            (Some(EntryKind::Symlink), _) | (_, Some(EntryKind::Symlink)) => true,
+            (Some(source_kind), Some(destination_kind)) => source_kind != destination_kind,
+            (None, Some(_)) => true,
+            (Some(_), None) | (None, None) => false,
+        }
+    }
+}
+
+/// Run [`check_relative_symlink_target`] for `target` against the plan-free
+/// [`ContainmentViews`] pair. This is the ONLY entry point that decides a
+/// destination-aware containment verdict; it consults ONLY the two static
+/// observations, so no policy or plan can reach it.
+pub(crate) fn check_relative_symlink_target_two_views(
+    link_rel: &Path,
+    target: &Path,
+    views: &ContainmentViews<'_>,
+) -> std::result::Result<(), SymlinkTargetRefusal> {
+    walk_relative_symlink_target(link_rel, target, |rel| views.refuses(rel))
+        .map_err(SpelledWalkRefusal::into_plan_dependent)
 }
 
 /// The canonical `/`-joined spelling of a relative path, or `None` when any
@@ -776,8 +942,11 @@ pub(crate) fn live_entry_kinds(root: &Path) -> Result<Vec<(String, bool)>> {
 }
 
 /// The refusal message for [`SymlinkTargetRefusal`], naming the offending
-/// entry and the symlink component the walk reached (when there is one). The
-/// `escaping symlink` prefix is the crate's single classification for a
+/// entry and the component the walk reached (when there is one: for
+/// [`SymlinkTargetRefusal::ThroughSymlink`] it is a symlink in the single
+/// view, and for [`SymlinkTargetRefusal::PlanDependent`] it is a component the
+/// two static observations do not describe with the same non-symlink kind).
+/// The `escaping symlink` prefix is the crate's single classification for a
 /// relative target that cannot be shown to stay inside the root.
 pub(crate) fn symlink_target_refusal_message(
     refusal: SymlinkTargetRefusal,
@@ -790,6 +959,9 @@ pub(crate) fn symlink_target_refusal_message(
         }
         SymlinkTargetRefusal::ThroughSymlink(component) => format!(
             "escaping symlink not allowed: {link_display} (target {target:?} resolves through the symlink component {component:?}, which the kernel follows, so a lexical `..` after it is not the kernel's resolution)"
+        ),
+        SymlinkTargetRefusal::PlanDependent(component) => format!(
+            "escaping symlink not allowed: {link_display} (target {target:?} walks through the component {component:?}, which the source manifest and the destination observation do not describe with the SAME non-symlink kind: it is a redirector in one view, only the destination supplies it, or the two views disagree on its kind. What the kernel would find there once the run finishes is decided by the run's own plan, so containment cannot be shown and the run refuses instead of guessing)"
         ),
     }
 }

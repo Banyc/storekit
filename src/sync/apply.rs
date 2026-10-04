@@ -949,8 +949,8 @@ use crate::atomic::ReplaceOutcome;
 use crate::error::{Error, MaterializationKind, Result, StoreKind, TransportKind};
 use crate::lock::FileLock;
 use crate::manifest::{
-    DestinationTree, SymlinkContainmentIndex, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
-    canonicalize_tree, canonicalize_tree_destination, check_relative_symlink_target_indexed,
+    ContainmentViews, DestinationTree, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
+    canonicalize_tree, canonicalize_tree_destination, check_relative_symlink_target_two_views,
     compute_tree_digest, symlink_target_refusal_message,
 };
 use crate::sync::diff::{
@@ -2396,11 +2396,18 @@ pub fn sync(
 /// acquiring constructor. Each obvious forgery below is a `compile_fail`
 /// example, so the suite proves the hole is closed rather than claiming it:
 ///
-/// A struct literal cannot name the private fields:
+/// A struct literal cannot construct the private fields (the named-field
+/// literal below fails with error `E0451` when the fields are private, and
+/// would COMPILE if a visibility change made them public — so this fence
+/// actually pins the field visibility, which a bare `LockedDestination {}`
+/// (a missing-fields `E0063` either way) would not):
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use storekit::sync::{DestinationOwnership, LockedDestination};
-/// let _forged = DestinationOwnership::Locked(LockedDestination {});
+/// let _forged = DestinationOwnership::Locked(LockedDestination {
+///     prepared: todo!(),
+///     guard: todo!(),
+/// });
 /// ```
 ///
 /// There is no `Default` (so the safe path cannot be selected without locking):
@@ -2447,11 +2454,16 @@ pub fn sync(
 /// ```
 ///
 /// The FAR-SIDE arm's [`LockedRemoteDestination`] payload is private too, so a
-/// caller cannot manufacture a held far-side session either:
+/// caller cannot manufacture a held far-side session either (the named-field
+/// literal fails with `E0451` when private and would COMPILE if public, so the
+/// fence pins the visibility rather than a missing-field `E0063`):
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use storekit::sync::{DestinationOwnership, LockedRemoteDestination};
-/// let _forged = DestinationOwnership::LockedRemote(LockedRemoteDestination {});
+/// let _forged = DestinationOwnership::LockedRemote(LockedRemoteDestination {
+///     prepared: todo!(),
+///     session: todo!(),
+/// });
 /// ```
 pub enum DestinationOwnership {
     /// The crate TAKES the destination's sibling operation lock
@@ -3619,28 +3631,42 @@ fn run(
             ))));
         }
     }
-    // CONTAINMENT IS A PROPERTY OF THE RESULT, NOT OF THE SOURCE ALONE. A source
-    // symlink's target was checked against the SOURCE tree (which is why the
-    // run may only ever install a link whose walk reaches a non-symlink there),
-    // but the destination may already hold a SYMLINK at a component that is
-    // ABSENT in the source, and under the default `Extraneous::Keep` that
-    // destination entry survives the run. The installed link then walks through
-    // it and escapes a root the crate validated. The verdict must account for
-    // what will exist at the destination AFTER the run: the source's own entry
-    // where the source will install one, otherwise the destination entry the
-    // run leaves in place. The result view is checked with the SAME rule and the
-    // SAME fold the two canonicalizers use, and the run is REFUSED rather than
-    // silently removing the destination entry (removal is the caller's
-    // `Extraneous` decision). A `Keep` run therefore refuses with a message
-    // naming the destination component; the caller can delete that entry first,
-    // use `Extraneous::Delete` when the source does not hold the path, or remove
-    // the source link, and re-run.
+    // CONTAINMENT IS A PROPERTY OF THE RESULT, AND THE RESULT IS DECIDED BY THE
+    // PLAN — so the verdict must NOT be derived from a precomputed "result
+    // view". A source symlink's target was checked against the SOURCE tree, but
+    // the destination may hold, at a component the target walks through, an
+    // entry the source does not replace: a `Refuse` policy, an `AppendTail` on
+    // a non-file ([`ConflictReason::AppendNotAFile`]), a `Diverged` or
+    // `ParentRefused` conflict, or (under `Extraneous::Delete`) an entry whose
+    // removal a conflict PROHIBITS ([`Applier::remove_extraneous`]'s
+    // `is_prohibited`), which ALIASES an installed entry (`is_aliased_dest`),
+    // or which is RESIDUE-guarded. Whether any of those "the destination entry
+    // stays in place" branches is taken is exactly what the run's LATER
+    // decisions choose, so an index built by assuming the source's entry is
+    // installed wherever the source holds the path — or that `Delete` removes a
+    // destination-only entry — was UNSOUND: the installed link walked through
+    // the surviving entry and escaped the root.
     //
-    // The result view is built from the RAW destination entries, BEFORE the
-    // residue strip. Residue is not destination-only content the run may remove:
-    // it survives `Extraneous::Delete` too, so it must constrain the walk under
-    // BOTH policies; only a destination-only entry the run actually REMOVES
-    // (removable under `Delete`, and not residue) is skipped.
+    // The rule below is PLAN-FREE by construction: it consults ONLY the two
+    // STATIC observations — the strict (reserved-stripped) SOURCE manifest and
+    // the RAW destination observation BEFORE the residue strip — and NO policy,
+    // `Extraneous` value, or derived view reaches it. For every component the
+    // target walk reaches (the FINAL one included, because the kernel follows
+    // it) it refuses unless BOTH observations describe the component with the
+    // SAME non-symlink kind. A component a redirector occupies, one only the
+    // destination supplies (its post-run existence is the plan's decision), or
+    // one the two views describe with different kinds (which kind lands is the
+    // plan's decision) is refused rather than guessed; a component only the
+    // SOURCE supplies stays permitted, because a refused install leaves it
+    // absent and a dangling link does not escape. See
+    // [`crate::manifest::ContainmentViews`] for the full table and
+    // [`crate::manifest::check_relative_symlink_target_two_views`] for the one
+    // entry point.
+    //
+    // The DESTINATION observation is the RAW entries, BEFORE the residue strip.
+    // Residue is not destination-only content the run may remove: it survives
+    // `Extraneous::Delete` too, and the plan-free rule must see it exactly as
+    // the observation reports it.
     let needs_result_containment = source_meta.entries.iter().any(|e| {
         e.entry_type == EntryKind::Symlink
             && e.symlink_target
@@ -3648,39 +3674,8 @@ fn run(
                 .is_some_and(|t| !Path::new(t).is_absolute())
     });
     if needs_result_containment {
-        let source_paths: BTreeSet<&str> = source_meta
-            .entries
-            .iter()
-            .map(|e| e.path.as_str())
-            .collect();
-        let mut result: Vec<(&str, bool)> = Vec::with_capacity(
-            destination_result_view.meta.entries.len() + source_meta.entries.len(),
-        );
-        for entry in &destination_result_view.meta.entries {
-            // The source's own entry SHADOWS the destination entry at the same
-            // path (it is installed over it, or already matches it).
-            if source_paths.contains(entry.path.as_str()) {
-                continue;
-            }
-            // A destination-only entry survives the run only under `Keep`; under
-            // `Delete` the run removes it, so it must NOT constrain the link —
-            // BUT residue is NEVER removed (not even by `Delete`: a removal
-            // that would destroy residue is refused, so the entry stays put),
-            // and it must therefore constrain even under `Delete`. The
-            // predicate is the SAME one the destination strip uses
-            // ([`crate::reserved::is_residue_path`]), so this skip means "the
-            // run actually removes it" rather than a blanket `Delete` skip: a
-            // crate-temp shape ([`crate::atomic::is_crate_temp_name`]) is
-            // removable destination content and IS removed, residue is not.
-            if extraneous == Extraneous::Delete && !crate::reserved::is_residue_path(&entry.path) {
-                continue;
-            }
-            result.push((entry.path.as_str(), entry.entry_type == EntryKind::Symlink));
-        }
-        for entry in &source_meta.entries {
-            result.push((entry.path.as_str(), entry.entry_type == EntryKind::Symlink));
-        }
-        let index = SymlinkContainmentIndex::from_pairs(result);
+        let views =
+            ContainmentViews::new(&source_meta.entries, &destination_result_view.meta.entries);
         for entry in &source_meta.entries {
             if entry.entry_type != EntryKind::Symlink {
                 continue;
@@ -3695,17 +3690,19 @@ fn run(
                 continue;
             }
             if let Err(refusal) =
-                check_relative_symlink_target_indexed(Path::new(&entry.path), target_path, &index)
+                check_relative_symlink_target_two_views(Path::new(&entry.path), target_path, &views)
             {
                 let reason = symlink_target_refusal_message(refusal, &entry.path, target);
                 return Err(SyncError::from(Error::materialization(format!(
                     "the source symlink {} cannot be shown to stay inside the destination root \
-                     once the run finishes: {reason}. The destination holds a symlink at a \
-                     component the target walks through and the source does not replace it, so \
-                     the installed link would resolve outside the root. Remedy: remove that \
+                     once the run finishes: {reason}. The source manifest and the destination \
+                     observation do not describe every component the target walks through with \
+                     the same non-symlink kind, so a redirector, a destination-only component, \
+                     or a difference between the two views could survive the run and the \
+                     installed link would resolve outside the root. Remedy: remove that \
                      destination entry first (a destination-only entry is cleared by \
-                     Extraneous::Delete; when the source holds the path, remove it by hand), or \
-                     remove the source link, and re-run.",
+                     Extraneous::Delete when the removal is sanctioned; when the source holds \
+                     the path, remove it by hand), or remove the source link, and re-run.",
                     entry.path
                 ))));
             }
