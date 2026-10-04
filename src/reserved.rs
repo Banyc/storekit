@@ -367,18 +367,19 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   itself) is not stopped.
 /// * a foreign process, or a developer writing a brand-new direct `libc::`
 ///   mutation OUTSIDE the funnel region, is not stopped by the type system.
-///   The crate carries two source audits
-///   (`atomic::guard::tests::no_libc_reference_outside_the_funnel` and
-///   `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned`) that fail on ANY
-///   new `libc` reference outside the DERIVED funnel region — the
-///   allow-bearing modules the audit derives from the module-level
-///   `#![allow(clippy::disallowed_methods)]`s, today the FOUR files
-///   `src/atomic/{mod,unix,windows,guard}.rs` (`guard.rs` is a CHILD of
-///   `atomic/mod.rs`, so its parent's allow reaches it) — a mutating symbol, a
-///   `use libc as alias` module alias, a braced self-alias, a re-export, a
-///   glob, or a call broken across a newline — and when a `std::fs`
-///   removal/replace/rename call in PRODUCTION code changes count. Their exact scope (and the holes no
-///   text audit can close) is documented at the audits themselves; the
+///   Two devices narrow the gap with different jobs: the resolved-symbol deny
+///   in `clippy.toml` REFUSES the mutation symbols the crate funnels from any
+///   module without the allow (whatever the spelling, alias, cross-module
+///   re-export, glob, macro body, or module), and two source audits NOTICE a
+///   change —
+///   `atomic::guard::tests::every_production_libc_reference_is_pinned` pins
+///   every production `libc` reference per file with the unpinned set asserted
+///   EMPTY, and
+///   `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` pins the
+///   production `std::fs` removal/replace/rename counts. Their exact scope
+///   (and the holes no text audit can close — a cross-module alias to a `libc`
+///   symbol the deny does not name, a raw `syscall(SYS_…)`, a local
+///   `extern "C"` declaration) is documented at the audits themselves; the
 ///   funnel wrappers themselves are private, so the "obvious way" to add a
 ///   mutation cannot bypass the guard.
 pub fn is_lock_record_name(name: &str) -> bool {

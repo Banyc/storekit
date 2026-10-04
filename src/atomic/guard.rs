@@ -33,23 +33,32 @@
 //!
 //! A developer who writes a brand-new direct `libc::unlinkat` /
 //! `libc::renameat` / `libc::open` / `libc::rmdir` call into a module that is
-//! not [`super::unix`] is not stopped by the type system: `libc` is an ordinary
-//! dependency and Rust cannot forbid a call to it. That is why the crate ALSO
-//! carries source audits. `no_libc_reference_outside_the_funnel` is a TEXT
-//! audit; `std_fs_name_mutation_counts_are_pinned` PARSES the crate. Their
-//! claim is exactly what they catch:
+//! not a funnel module is not stopped by the type system: `libc` is an ordinary
+//! dependency and Rust cannot forbid a call to it. Two devices narrow the gap,
+//! with DIFFERENT jobs:
 //!
-//! * `atomic::guard::tests::no_libc_reference_outside_the_funnel` scans EVERY
-//!   `.rs` file under the package directory (not only `src/`) and fails on ANY
-//!   reference to `libc` — a mutating symbol, a module alias (`use libc as c;`),
-//!   a braced self-alias, a re-export, a glob, or a call broken across a
-//!   newline — outside `src/atomic/unix.rs` or a test-only file. The crate's
-//!   audited, non-mutating `libc` surface outside the funnel is pinned by
-//!   spelling and count, so an added, removed, or renamed reference fails here
-//!   too. The funnel's own mutating-symbol counts are pinned. (A shared
-//!   textual scan cannot literally forbid a legitimate `libc::flock` or
-//!   `libc::fstatat`, so those are pinned by name and count, and the audit
-//!   independently refuses any pinned-or-new MUTATING symbol.)
+//! * the resolved-symbol deny in `clippy.toml` REFUSES a call to a denied
+//!   `libc` mutation symbol from any module not granted the allow: it matches
+//!   the symbol the compiler RESOLVED, so no alias, raw identifier, glob,
+//!   parenthesized callee, macro body, or cross-module re-export evades it. The
+//!   symbols it names are the mutation symbols THIS crate funnels (and a
+//!   reviewed set around them); it is NOT a claim to name every mutating symbol
+//!   in existence, and a symbol nobody listed is a REVIEW responsibility,
+//!   stated rather than certified.
+//! * `atomic::guard::tests::every_production_libc_reference_is_pinned` NOTICES
+//!   a change: it scans every production `.rs` file for the token `libc` and
+//!   pins the per-file, per-reference counts exactly, with the unpinned
+//!   ("outside") map asserted EMPTY. A new, removed, respelled, or re-counted
+//!   reference fails here and forces review.
+//!
+//!   THE SCAN'S LIMIT, stated: it is PER-FILE TEXT, so a `pub(crate) use libc
+//!   as c;` declared in a funnel module and reached from a non-funnel file as
+//!   `crate::…::c::chmod(…)` leaves NO `libc` token in the CALLING file and is
+//!   invisible here. That route is covered by the compiler's resolved-symbol
+//!   deny, not by this pin; a mutating symbol the deny does not name, a raw
+//!   `syscall(SYS_…)`, a local `extern "C"` declaration, a macro that emits a
+//!   call, and third-party code are REVIEW responsibilities, named as the
+//!   boundary of this contract rather than certified.
 //! * `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` PARSES every
 //!   crate `.rs` file into the crate's module graph with `syn` (after
 //!   `#[cfg(test)]` items are removed) and pins the per-file per-symbol counts
@@ -82,12 +91,16 @@
 //!   file declared BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is
 //!   PRODUCTION, because the second declaration compiles it into the lib.
 //!
-//! The COMPLETENESS device — "no mutation outside the funnel, whatever the
-//! spelling" — is a resolved-symbol clippy deny, not these audits. These audits
-//! do what a lint cannot: they notice when the funnel's OWN calls change (the
-//! per-file pinned `std::fs` counts and the funnel's pinned `libc` counts) and
-//! they resolve the enumerated import routes as a second, independent detector.
-//! Neither audit is total, and neither is offered as a spelling oracle.
+//! The COMPLETENESS device — "no call to a mutation symbol THIS CRATE FUNNELS
+//! outside the funnel, whatever the spelling" — is a resolved-symbol clippy
+//! deny, not these audits. The deny names the mutation symbols the crate
+//! funnels and a reviewed set around them; it is NOT a claim to name every
+//! mutating symbol in existence, and a symbol it does not name is a REVIEW
+//! responsibility. These audits do what a lint cannot: they notice when the
+//! crate's OWN calls change (the per-file pinned `std::fs` counts and the
+//! pinned per-file `libc` counts) and they resolve the enumerated import
+//! routes as a second, independent detector. Neither audit is total, and
+//! neither is offered as a spelling oracle.
 //!
 //! The residual holes these audits CANNOT close, and which no claim above is
 //! scoped to include: a proc macro that EMITS a mutator call (its expansion is
@@ -128,7 +141,7 @@
 //! stated rather than implied: the deny list names RESOLVED `std`/`libc`
 //! symbols, so a Windows named-pipe creator (`CreateNamedPipeW`) or a raw
 //! `CreateFileW`/`NtCreateFile` reached through `windows_sys` is outside the
-//! clippy deny (and the `libc` belt is libc-specific). Rust's stable `std`
+//! clippy deny (and the `libc` deny is libc-specific). Rust's stable `std`
 //! exposes no named-pipe creator, and the crate's own `windows_sys` uses today
 //! are non-adopting (`GetFileInformationByHandle`, `LockFileEx`/`UnlockFileEx`),
 //! so the reach is "a raw Win32 creator the crate would have to add" — the same
@@ -657,794 +670,6 @@ mod tests {
         assert!(!remote.owns(Path::new("state/OPERATION.LOCK")));
     }
 
-    /// The curated NAME-MUTATION family of `libc` syscalls: functions that can
-    /// ADOPT a directory entry, FREE or SWAP one, or change the mode /
-    /// ownership / xattrs / timestamps attached to a NAME. The `*at` forms, the
-    /// plain forms, and the descriptor-bound setters are all present.
-    ///
-    /// This list is the FAMILY half of the belt; it is NOT the belt. The belt
-    /// [`no_libc_reference_outside_the_funnel`] refuses is DERIVED by
-    /// [`mutating_libc_belt`], which unions this family with every `libc::<fn>`
-    /// CALL the tree references that is not on the reviewed
-    /// [`NON_MUTATING_LIBC_CALLS`] list. The family catches a symbol the tree
-    /// does not itself reference (a reviewer pinning `libc::mkfifo`,
-    /// `libc::mknod`, or `libc::renameat2` in the outside map); the derived
-    /// clause catches an unclassified NEW reference. The two are checked
-    /// against each other by
-    /// `every_libc_call_symbol_the_tree_references_is_classified`, so neither
-    /// the family nor the tree's references can silently lag the other.
-    ///
-    /// ROUND 11: the family is the belt's clause (a), and it is now a SUPERSET
-    /// of the independently-specified anchor [`INDEPENDENT_KNOWN_NAME_MUTATORS`]
-    /// — the set the belt oracle actually iterates. Clause (a) is the ONLY
-    /// device that refuses a symbol the tree does not reference, so an anchor
-    /// member absent here would be pinnable outside the funnel with no device
-    /// noticing; the oracle fails on exactly that. The family is also LARGER
-    /// than the hand list round 10 shipped: the POSIX IPC name API, the
-    /// template temp-name creators, the missing time setters, `fchmodat2` and
-    /// the ACL setters join it, so a pinned reference to any of them is refused
-    /// too.
-    const MUTATING_LIBC_SYSCALLS: &[&str] = &[
-        // REMOVE / REPLACE / LINK
-        "unlink",
-        "unlinkat",
-        "remove",
-        "rmdir",
-        "rename",
-        "renameat",
-        "renameat2",
-        "link",
-        "linkat",
-        "symlink",
-        "symlinkat",
-        // REMOVE a POSIX IPC name (message queue / semaphore / shared memory).
-        "mq_unlink",
-        "sem_unlink",
-        "shm_unlink",
-        // CREATE a name
-        "mkdir",
-        "mkdirat",
-        "open",
-        "openat",
-        "open64",
-        "openat64",
-        "openat2",
-        "creat",
-        "creat64",
-        "mknod",
-        "mknodat",
-        "mkfifo",
-        "mkfifoat",
-        "clonefile",
-        "clonefileat",
-        // CREATE a POSIX IPC name.
-        "mq_open",
-        "sem_open",
-        "shm_open",
-        // CREATE a name through a template (`mkstemp`/`mkdtemp` and friends
-        // both choose a spelling and ADOPT it).
-        "mkstemp",
-        "mkostemp",
-        "mkstemps",
-        "mkostemps",
-        "mkdtemp",
-        // `bind` on an `AF_UNIX` pathname socket CREATES a directory entry at
-        // the bound path (the raw-syscall twin of
-        // `std::os::unix::net::UnixListener::bind`, which `clippy.toml` denies).
-        // For an `AF_INET` bind no name is created, so the belt's refusal
-        // outside the funnel is CONSERVATIVE (it refuses the symbol, not the
-        // address family) — the safe direction, and the crate references no
-        // `libc::bind` today.
-        "bind",
-        // NAME-ATTACHED METADATA
-        "chmod",
-        "fchmod",
-        "fchmodat",
-        "fchmodat2",
-        "chown",
-        "fchown",
-        "lchown",
-        "fchownat",
-        "truncate",
-        "ftruncate",
-        "utime",
-        "utimes",
-        "futimens",
-        "utimensat",
-        "futimes",
-        "futimesat",
-        "lutimes",
-        "setxattr",
-        "lsetxattr",
-        "fsetxattr",
-        "removexattr",
-        "lremovexattr",
-        "fremovexattr",
-        "chflags",
-        "fchflags",
-        "lchflags",
-        "setattrlist",
-        "exchangedata",
-        "acl_set_file",
-        "acl_set_link_np",
-        // FILESYSTEM MOUNTS
-        "mount",
-        "umount",
-        "umount2",
-        "nmount",
-        "unmount",
-        "cygwin_umount",
-        // ROUND-12 EXTERNAL-SURFACE MEMBERS. These are `libc` name mutators the
-        // pinned crate EXPORTS that the round-11 hand family missed. The
-        // generated surface (`src/atomic/libc_name_mutation_surface.txt`)
-        // named them from the `libc` crate's own source, so they are
-        // classified here rather than left to the belt's default-deny alone.
-        "chflagsat",
-        "fsetattrlist",
-        "setattrlistat",
-        "fclonefileat",
-        "truncate64",
-        "ftruncate64",
-        "renamex_np",
-        "renameatx_np",
-        "shm_rename",
-        "wchmod",
-        "wrmdir",
-        "wutime",
-    ];
-
-    /// The NAME-MUTATION family as a LITERAL, kept in step with the belt's
-    /// clause (a) by set equality. It is deliberately NOT derived from
-    /// [`MUTATING_LIBC_SYSCALLS`] or [`NON_MUTATING_LIBC_CALLS`], so a MOVE of a
-    /// member out of the code family into the review list changes this side of
-    /// the equality.
-    ///
-    /// THIS LITERAL IS ONE HALF OF A CO-EDITABLE PAIR and is therefore NOT the
-    /// oracle. Round 10 shipped this list and [`INDEPENDENT_KNOWN_NAME_MUTATORS`]
-    /// as two hand-written literals in this file and compared them to each
-    /// other, so deleting `chown` from both and adding it to
-    /// [`NON_MUTATING_LIBC_CALLS`] disarmed the belt with every arm green
-    /// (measured; 52 of the 54 members could be moved the same way). The anchor
-    /// [`INDEPENDENT_KNOWN_NAME_MUTATORS`] is the THIRD artifact the oracle
-    /// iterates, and co-editing this pair against it now fails.
-    ///
-    /// The justification is the shared CLASS, and every member's individual
-    /// class and reason live in [`INDEPENDENT_KNOWN_NAME_MUTATORS`]: a member
-    /// can FREE or SWAP a directory entry, ADOPT/CREATE a name, create or
-    /// remove a POSIX IPC name, choose-and-adopt a temp name, or change
-    /// metadata attached to a NAME (mode/owner/time/xattr/flags/ACL), or change
-    /// the mount NAME SPACE. The descriptor-bound variants
-    /// (`fchmod`/`fchown`/`ftruncate`/`futimens`) are included because the code
-    /// family includes them; reclassifying one demands the change be stated in
-    /// the anchor with a new class and reason.
-    const KNOWN_NAME_MUTATORS: &[&str] = &[
-        // FREE or SWAP a directory entry.
-        "unlink",
-        "unlinkat",
-        "remove",
-        "rmdir",
-        "rename",
-        "renameat",
-        "renameat2",
-        // FREE a POSIX IPC name.
-        "mq_unlink",
-        "sem_unlink",
-        "shm_unlink",
-        // CREATE or replace a LINK at a name.
-        "link",
-        "linkat",
-        "symlink",
-        "symlinkat",
-        // CREATE a directory entry (directory, device node, FIFO, clone).
-        "mkdir",
-        "mkdirat",
-        "mknod",
-        "mknodat",
-        "mkfifo",
-        "mkfifoat",
-        "clonefile",
-        "clonefileat",
-        // CREATE a POSIX IPC name.
-        "mq_open",
-        "sem_open",
-        "shm_open",
-        // CREATE a name through a template.
-        "mkstemp",
-        "mkostemp",
-        "mkstemps",
-        "mkostemps",
-        "mkdtemp",
-        // ADOPT or TRUNCATE a name through an open with O_CREAT/O_TRUNC.
-        "open",
-        "openat",
-        "open64",
-        "openat64",
-        "openat2",
-        "creat",
-        "creat64",
-        // An AF_UNIX `bind` creates the bound pathname entry.
-        "bind",
-        // Change metadata attached to a NAME.
-        "chmod",
-        "fchmod",
-        "fchmodat",
-        "fchmodat2",
-        "chown",
-        "fchown",
-        "lchown",
-        "fchownat",
-        "truncate",
-        "ftruncate",
-        "utime",
-        "utimes",
-        "futimens",
-        "utimensat",
-        "futimes",
-        "futimesat",
-        "lutimes",
-        "setxattr",
-        "lsetxattr",
-        "fsetxattr",
-        "removexattr",
-        "lremovexattr",
-        "fremovexattr",
-        "chflags",
-        "fchflags",
-        "lchflags",
-        "setattrlist",
-        "exchangedata",
-        "acl_set_file",
-        "acl_set_link_np",
-        // Change the mount NAME SPACE.
-        "mount",
-        "umount",
-        "umount2",
-        "nmount",
-        "unmount",
-        "cygwin_umount",
-        // ROUND-12 EXTERNAL-SURFACE MEMBERS (see MUTATING_LIBC_SYSCALLS).
-        "chflagsat",
-        "fsetattrlist",
-        "setattrlistat",
-        "fclonefileat",
-        "truncate64",
-        "ftruncate64",
-        "renamex_np",
-        "renameatx_np",
-        "shm_rename",
-        "wchmod",
-        "wrmdir",
-        "wutime",
-    ];
-
-    /// The CLOSED set of name-mutation CLASSES an anchor entry may claim. The
-    /// anchor's class field is checked against this list, so a new member cannot
-    /// be admitted under an ad-hoc class string invented at the point of edit;
-    /// adding a class is a visible review of the CLASS axis, not just of one
-    /// symbol.
-    const KNOWN_NAME_MUTATOR_CLASSES: &[&str] = &[
-        "free-or-swap-a-directory-entry",
-        "link-at-a-name",
-        "create-a-directory-entry",
-        "adopt-or-truncate-through-an-open",
-        "bind-a-pathname-socket",
-        "create-or-remove-a-posix-ipc-name",
-        "rename-a-posix-ipc-name",
-        "create-a-name-through-a-temp-template",
-        "change-metadata-attached-to-a-name",
-        "change-the-mount-name-space",
-    ];
-
-    /// THE REVIEWED CLASS + REASON TABLE, and the belt family's justification.
-    /// Every member must (1) be on [`MUTATING_LIBC_SYSCALLS`], because clause
-    /// (a) of the derived belt is the only device that refuses a symbol the
-    /// tree does not reference, (2) be ABSENT from [`NON_MUTATING_LIBC_CALLS`],
-    /// and (3) be REFUSED by the DEFAULT-DENY half of the belt when a source
-    /// references it, so the review is not circular through the family. The set
-    /// is strictly LARGER than the 54-member family round 10 shipped:
-    /// `lutimes`, `futimes`/`futimesat`, `fchmodat2`, the POSIX IPC names
-    /// (`mq_open`/`sem_open`/`shm_open` and their `*_unlink` twins), the
-    /// template temp-name creators (`mkstemp`/`mkostemp`/`mkstemps`/
-    /// `mkostemps`/`mkdtemp`), and the ACL setters were in NEITHER hand list,
-    /// and they are named in the oracle as negative controls so the table
-    /// cannot be silently narrowed back. Round 12 added the members the DERIVED
-    /// surface ([`LIBC_NAME_MUTATION_SURFACE`]) named that the hand family
-    /// missed (`chflagsat`, `fsetattrlist`, `setattrlistat`, `fclonefileat`,
-    /// `truncate64`, `ftruncate64`, `renamex_np`, `renameatx_np`, `shm_rename`,
-    /// `wchmod`, `wrmdir`, `wutime`, `nmount`, `unmount`, `cygwin_umount`).
-    ///
-    /// THIS IS NOT THE ORACLE'S INDEPENDENT SET. It lives in this file beside
-    /// the two family literals, so all three can be edited in lockstep; the
-    /// oracle's independent anchor is the DERIVED, externally-generated
-    /// [`LIBC_NAME_MUTATION_SURFACE`]. This table's job is to justify every belt
-    /// member, and `FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY` is the only way a
-    /// belt member may lack an entry here.
-    ///
-    /// THE TABLE'S OWN BOUNDARY. It covers the POSIX.1-2017, Linux, and
-    /// BSD/macOS `libc` name-mutation surface: the remove/replace/link entry
-    /// calls, the entry creators (directory, node, FIFO, clone, template temp
-    /// names), the adopt/truncate open family, the pathname-socket bind, the
-    /// POSIX IPC name API, the name-attached metadata setters
-    /// (mode/owner/time/xattr/flags/ACL), and the mount name space. It does NOT
-    /// cover, and a mutator OUTSIDE it is a STATED RESIDUAL: (a) a raw syscall
-    /// reached by NUMBER or by a local `extern "C"` declaration
-    /// (`syscall(SYS_…)`, an `io_uring` submission, a `windows_sys` creator),
-    /// which has no `libc::<name>` symbol for the derived surface to key on —
-    /// those are refused, not enumerated, by the `libc`-reference surface pin
-    /// in [`no_libc_reference_outside_the_funnel`] and by the raw-`extern "C"`
-    /// residue named in this module's docs; and (b) a `libc` name this table
-    /// does not list, which is admitted only by ADDING it here with a class and
-    /// a reason — the act that reviews it, and now also a mutation of the
-    /// generated surface (a second, deliberate edit).
-    const INDEPENDENT_KNOWN_NAME_MUTATORS: &[(&str, &str, &str)] = &[
-        // free-or-swap-a-directory-entry
-        (
-            "unlink",
-            "free-or-swap-a-directory-entry",
-            "removes one name from its parent directory",
-        ),
-        (
-            "unlinkat",
-            "free-or-swap-a-directory-entry",
-            "the dirfd-relative twin of unlink",
-        ),
-        (
-            "remove",
-            "free-or-swap-a-directory-entry",
-            "removes a name (a file or an empty directory)",
-        ),
-        (
-            "rmdir",
-            "free-or-swap-a-directory-entry",
-            "removes an empty directory name",
-        ),
-        (
-            "rename",
-            "free-or-swap-a-directory-entry",
-            "re-links the source name and frees the target name",
-        ),
-        (
-            "renameat",
-            "free-or-swap-a-directory-entry",
-            "the dirfd-relative twin of rename",
-        ),
-        (
-            "renameat2",
-            "free-or-swap-a-directory-entry",
-            "rename with flags; can also swap two names",
-        ),
-        // link-at-a-name
-        (
-            "link",
-            "link-at-a-name",
-            "creates a second name for one inode",
-        ),
-        (
-            "linkat",
-            "link-at-a-name",
-            "the dirfd-relative twin of link",
-        ),
-        ("symlink", "link-at-a-name", "creates a symlink name"),
-        (
-            "symlinkat",
-            "link-at-a-name",
-            "the dirfd-relative twin of symlink",
-        ),
-        // create-a-directory-entry
-        (
-            "mkdir",
-            "create-a-directory-entry",
-            "creates a directory name",
-        ),
-        (
-            "mkdirat",
-            "create-a-directory-entry",
-            "the dirfd-relative twin of mkdir",
-        ),
-        (
-            "mknod",
-            "create-a-directory-entry",
-            "creates a device, socket, or FIFO name",
-        ),
-        (
-            "mknodat",
-            "create-a-directory-entry",
-            "the dirfd-relative twin of mknod",
-        ),
-        ("mkfifo", "create-a-directory-entry", "creates a FIFO name"),
-        (
-            "mkfifoat",
-            "create-a-directory-entry",
-            "the dirfd-relative twin of mkfifo",
-        ),
-        (
-            "clonefile",
-            "create-a-directory-entry",
-            "creates a new name as a copy-on-write clone",
-        ),
-        (
-            "clonefileat",
-            "create-a-directory-entry",
-            "the dirfd-relative twin of clonefile",
-        ),
-        // adopt-or-truncate-through-an-open
-        (
-            "open",
-            "adopt-or-truncate-through-an-open",
-            "adopts or truncates a name with O_CREAT/O_TRUNC",
-        ),
-        (
-            "openat",
-            "adopt-or-truncate-through-an-open",
-            "the dirfd-relative twin of open",
-        ),
-        (
-            "open64",
-            "adopt-or-truncate-through-an-open",
-            "the large-file-offset spelling of open",
-        ),
-        (
-            "openat64",
-            "adopt-or-truncate-through-an-open",
-            "the large-file-offset spelling of openat",
-        ),
-        (
-            "openat2",
-            "adopt-or-truncate-through-an-open",
-            "openat with an extensible how-struct; can adopt a name",
-        ),
-        (
-            "creat",
-            "adopt-or-truncate-through-an-open",
-            "creates or truncates a name",
-        ),
-        (
-            "creat64",
-            "adopt-or-truncate-through-an-open",
-            "the large-file-offset spelling of creat",
-        ),
-        // bind-a-pathname-socket
-        (
-            "bind",
-            "bind-a-pathname-socket",
-            "an AF_UNIX bind creates the bound pathname entry",
-        ),
-        // create-or-remove-a-posix-ipc-name
-        (
-            "mq_open",
-            "create-or-remove-a-posix-ipc-name",
-            "creates or opens a POSIX message-queue name",
-        ),
-        (
-            "mq_unlink",
-            "create-or-remove-a-posix-ipc-name",
-            "removes a POSIX message-queue name",
-        ),
-        (
-            "sem_open",
-            "create-or-remove-a-posix-ipc-name",
-            "creates or opens a POSIX named-semaphore name",
-        ),
-        (
-            "sem_unlink",
-            "create-or-remove-a-posix-ipc-name",
-            "removes a POSIX named-semaphore name",
-        ),
-        (
-            "shm_open",
-            "create-or-remove-a-posix-ipc-name",
-            "creates or opens a POSIX shared-memory name",
-        ),
-        (
-            "shm_unlink",
-            "create-or-remove-a-posix-ipc-name",
-            "removes a POSIX shared-memory name",
-        ),
-        // create-a-name-through-a-temp-template
-        (
-            "mkstemp",
-            "create-a-name-through-a-temp-template",
-            "chooses a spelling and creates the file name",
-        ),
-        (
-            "mkostemp",
-            "create-a-name-through-a-temp-template",
-            "mkstemp with extra open flags",
-        ),
-        (
-            "mkstemps",
-            "create-a-name-through-a-temp-template",
-            "mkstemp with a suffix",
-        ),
-        (
-            "mkostemps",
-            "create-a-name-through-a-temp-template",
-            "mkostemp with a suffix",
-        ),
-        (
-            "mkdtemp",
-            "create-a-name-through-a-temp-template",
-            "chooses a spelling and creates the directory name",
-        ),
-        // change-metadata-attached-to-a-name
-        (
-            "chmod",
-            "change-metadata-attached-to-a-name",
-            "sets a mode on a name",
-        ),
-        (
-            "fchmod",
-            "change-metadata-attached-to-a-name",
-            "sets a mode on a descriptor's open name",
-        ),
-        (
-            "fchmodat",
-            "change-metadata-attached-to-a-name",
-            "sets a mode on a name relative to a dirfd",
-        ),
-        (
-            "fchmodat2",
-            "change-metadata-attached-to-a-name",
-            "fchmodat with flags; can act on a symlink's own name",
-        ),
-        (
-            "chown",
-            "change-metadata-attached-to-a-name",
-            "sets an owner on a name",
-        ),
-        (
-            "fchown",
-            "change-metadata-attached-to-a-name",
-            "sets an owner on a descriptor's open name",
-        ),
-        (
-            "lchown",
-            "change-metadata-attached-to-a-name",
-            "sets an owner on a symlink's own name",
-        ),
-        (
-            "fchownat",
-            "change-metadata-attached-to-a-name",
-            "sets an owner relative to a dirfd, with symlink flags",
-        ),
-        (
-            "truncate",
-            "change-metadata-attached-to-a-name",
-            "changes a named file's length",
-        ),
-        (
-            "ftruncate",
-            "change-metadata-attached-to-a-name",
-            "changes a descriptor's open file length",
-        ),
-        (
-            "utime",
-            "change-metadata-attached-to-a-name",
-            "sets a name's access and modify times",
-        ),
-        (
-            "utimes",
-            "change-metadata-attached-to-a-name",
-            "sets a name's times with microsecond precision",
-        ),
-        (
-            "futimens",
-            "change-metadata-attached-to-a-name",
-            "sets a descriptor's open name's times with nanosecond precision",
-        ),
-        (
-            "utimensat",
-            "change-metadata-attached-to-a-name",
-            "sets a name's times relative to a dirfd",
-        ),
-        (
-            "futimes",
-            "change-metadata-attached-to-a-name",
-            "sets a descriptor's open file's times",
-        ),
-        (
-            "futimesat",
-            "change-metadata-attached-to-a-name",
-            "sets a name's times relative to a dirfd",
-        ),
-        (
-            "lutimes",
-            "change-metadata-attached-to-a-name",
-            "sets a symlink's own times",
-        ),
-        (
-            "setxattr",
-            "change-metadata-attached-to-a-name",
-            "sets an extended attribute on a name",
-        ),
-        (
-            "lsetxattr",
-            "change-metadata-attached-to-a-name",
-            "sets an extended attribute on a symlink's own name",
-        ),
-        (
-            "fsetxattr",
-            "change-metadata-attached-to-a-name",
-            "sets an extended attribute on a descriptor's open name",
-        ),
-        (
-            "removexattr",
-            "change-metadata-attached-to-a-name",
-            "removes an extended attribute from a name",
-        ),
-        (
-            "lremovexattr",
-            "change-metadata-attached-to-a-name",
-            "removes an extended attribute from a symlink's own name",
-        ),
-        (
-            "fremovexattr",
-            "change-metadata-attached-to-a-name",
-            "removes an extended attribute from a descriptor's open name",
-        ),
-        (
-            "chflags",
-            "change-metadata-attached-to-a-name",
-            "changes a name's file flags",
-        ),
-        (
-            "fchflags",
-            "change-metadata-attached-to-a-name",
-            "changes a descriptor's open name's file flags",
-        ),
-        (
-            "lchflags",
-            "change-metadata-attached-to-a-name",
-            "changes a symlink's own name's file flags",
-        ),
-        (
-            "setattrlist",
-            "change-metadata-attached-to-a-name",
-            "sets name-attached attributes in bulk (macOS)",
-        ),
-        (
-            "exchangedata",
-            "change-metadata-attached-to-a-name",
-            "swaps the contents of two names (macOS)",
-        ),
-        (
-            "acl_set_file",
-            "change-metadata-attached-to-a-name",
-            "sets an ACL on a name",
-        ),
-        (
-            "acl_set_link_np",
-            "change-metadata-attached-to-a-name",
-            "sets an ACL on a symlink's own name",
-        ),
-        // change-the-mount-name-space
-        (
-            "mount",
-            "change-the-mount-name-space",
-            "attaches a filesystem at a name",
-        ),
-        (
-            "umount",
-            "change-the-mount-name-space",
-            "detaches the filesystem at a name",
-        ),
-        (
-            "umount2",
-            "change-the-mount-name-space",
-            "the flag-taking twin of umount",
-        ),
-        (
-            "nmount",
-            "change-the-mount-name-space",
-            "the FreeBSD flag-taking mount",
-        ),
-        ("unmount", "change-the-mount-name-space", "the BSD umount"),
-        (
-            "cygwin_umount",
-            "change-the-mount-name-space",
-            "Cygwin's umount",
-        ),
-        // The members named by the DERIVED surface
-        // (`src/atomic/libc_name_mutation_surface.txt`) that the round-11 hand
-        // family missed. Each is an individual class + reason, not a bare add.
-        (
-            "chflagsat",
-            "change-metadata-attached-to-a-name",
-            "dirfd-relative chflags; changes a name's file flags",
-        ),
-        (
-            "fsetattrlist",
-            "change-metadata-attached-to-a-name",
-            "descriptor-relative setattrlist",
-        ),
-        (
-            "setattrlistat",
-            "change-metadata-attached-to-a-name",
-            "dirfd-relative setattrlist",
-        ),
-        (
-            "fclonefileat",
-            "create-a-directory-entry",
-            "dirfd-relative clonefile; creates a new name",
-        ),
-        (
-            "truncate64",
-            "change-metadata-attached-to-a-name",
-            "the large-file-offset spelling of truncate",
-        ),
-        (
-            "ftruncate64",
-            "change-metadata-attached-to-a-name",
-            "the large-file-offset spelling of ftruncate",
-        ),
-        (
-            "renamex_np",
-            "free-or-swap-a-directory-entry",
-            "rename with flags; can swap two names (macOS)",
-        ),
-        (
-            "renameatx_np",
-            "free-or-swap-a-directory-entry",
-            "the dirfd-relative twin of renamex_np",
-        ),
-        (
-            "shm_rename",
-            "rename-a-posix-ipc-name",
-            "renames a POSIX shared-memory name",
-        ),
-        (
-            "wchmod",
-            "change-metadata-attached-to-a-name",
-            "the wide-character chmod on a Windows name",
-        ),
-        (
-            "wrmdir",
-            "free-or-swap-a-directory-entry",
-            "the wide-character rmdir; removes a directory name",
-        ),
-        (
-            "wutime",
-            "change-metadata-attached-to-a-name",
-            "the wide-character utime on a Windows name",
-        ),
-    ];
-
-    /// The `libc::<fn>` CALL symbols the tree references that are REVIEWED as
-    /// unable to ADOPT, FREE, SWAP, or re-attribute a NAME: they act on an open
-    /// DESCRIPTOR, on the PROCESS, on a RESOURCE LIMIT, or only READ a name.
-    /// [`every_libc_call_symbol_the_tree_references_is_classified`] derives the
-    /// tree's `libc::<fn>(…)` call symbols and fails on any that is in neither
-    /// this list nor [`MUTATING_LIBC_SYSCALLS`], so the classification cannot
-    /// silently lag a new syscall reference.
-    const NON_MUTATING_LIBC_CALLS: &[&str] = &[
-        // READ side of a name
-        "fstatat",
-        "fstat",
-        "readlinkat",
-        "getxattr",
-        // Directory-descriptor reader
-        "readdir",
-        "fdopendir",
-        "closedir",
-        // Descriptor management / content write on an OPEN descriptor
-        "fcntl",
-        "flock",
-        "close",
-        "write",
-        "poll",
-        // Process, limit, and system control
-        "kill",
-        "killpg",
-        "signal",
-        "waitid",
-        "pipe",
-        "sysctl",
-        "getrlimit",
-        "setrlimit",
-        "getegid",
-        "getgroups",
-    ];
-
     /// The namespace-relative KEY the pin uses for a resolved CALL target, and
     /// the membership test that decides whether the pin's syntactic resolver is
     /// allowed to attribute a call to a `clippy.toml` entry at all.
@@ -1465,9 +690,9 @@ mod tests {
     ///
     /// An entry OUTSIDE these namespaces is not attributable by the syntactic
     /// resolver and is deliberately EXCLUDED from the pin. `libc::…` is the one
-    /// such family, and it has its OWN device — the per-module surface pin
-    /// [`no_libc_reference_outside_the_funnel`] plus the derived belt — so a
-    /// `libc` entry is not double-counted here.
+    /// such family, and it has its OWN devices — the per-file pin
+    /// [`every_production_libc_reference_is_pinned`] and the resolved-symbol
+    /// deny in `clippy.toml` — so a `libc` entry is not double-counted here.
     fn pin_key_for(segments: &[String]) -> Option<String> {
         let skip = match segments {
             [std, fs, ..] if std == "std" && fs == "fs" => 2,
@@ -2129,9 +1354,9 @@ mod tests {
     /// declares with its inner `#![allow(clippy::disallowed_methods)]`.
     ///
     /// DERIVED from the parsed sources and the parsed `mod` declarations, so
-    /// the libc-surface pin in [`no_libc_reference_outside_the_funnel`] follows
-    /// the allow's reach instead of a second, hardcoded file list that could
-    /// drift from the `#[allow]`s. Item-level allows that do not sit on a
+    /// the libc-surface pin in [`every_production_libc_reference_is_pinned`]
+    /// follows the allow's reach instead of a second, hardcoded file list that
+    /// could drift from the `#[allow]`s. Item-level allows that do not sit on a
     /// `mod` are covered separately by [`funnel_symbol_surface`], which walks
     /// annotated items too.
     fn funnel_modules(files: &[(String, String)], gated: &BTreeSet<String>) -> BTreeSet<String> {
@@ -3265,93 +2490,6 @@ mod tests {
         map
     }
 
-    /// The `libc::<symbol>` CALL spellings in `code`: a `libc` ident, `::`, a
-    /// symbol ident, optional whitespace, then `(`. Comments and string
-    /// literals must already be removed (callers pass [`code_only`] output), so
-    /// a mention in prose is not a call. This is the DERIVATION the libc belt
-    /// is built from and the candidate set
-    /// `every_libc_call_symbol_the_tree_references_is_classified` checks.
-    fn libc_call_symbols(code: &str) -> BTreeSet<String> {
-        let bytes = code.as_bytes();
-        let mut out = BTreeSet::new();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let Some(name) = read_ident(code, &mut i) else {
-                i += 1;
-                continue;
-            };
-            if name != "libc" {
-                continue;
-            }
-            let mut j = i;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if !(bytes.get(j) == Some(&b':') && bytes.get(j + 1) == Some(&b':')) {
-                continue;
-            }
-            j += 2;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let mut symbol_at = j;
-            let Some(symbol) = read_ident(code, &mut symbol_at) else {
-                continue;
-            };
-            let mut k = symbol_at;
-            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            if bytes.get(k) == Some(&b'(') {
-                out.insert(symbol);
-            }
-        }
-        out
-    }
-
-    /// The DERIVED `libc` name-mutation belt the OUTSIDE-the-funnel assertion
-    /// refuses: the union of
-    ///
-    /// (a) the curated [`MUTATING_LIBC_SYSCALLS`] family (POSIX/BSD/macOS name
-    ///     CREATORS, REPLACERS, REMOVERS, and name-attribute setters), and
-    /// (b) DEFAULT-DENY: every `libc::<fn>` CALL the crate's own tree
-    ///     references that is not on the reviewed [`NON_MUTATING_LIBC_CALLS`]
-    ///     list.
-    ///
-    /// Clause (b) is what makes the belt DERIVED rather than a hand-kept list:
-    /// a reference to an unclassified syscall is refused outside the funnel
-    /// even before a reviewer names it. Clause (a) is still required for a
-    /// symbol the tree does not reference at all — a reviewer can PIN
-    /// `libc::mkfifo` in the outside map without any source reference existing.
-    /// The classification test forces every referenced call symbol into (a) or
-    /// [`NON_MUTATING_LIBC_CALLS`], so the two cannot drift.
-    fn mutating_libc_belt(sources: &[(String, String)]) -> BTreeSet<String> {
-        let mut belt: BTreeSet<String> = MUTATING_LIBC_SYSCALLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        for (_, raw) in sources {
-            for symbol in libc_call_symbols(&code_only(raw)) {
-                if !NON_MUTATING_LIBC_CALLS.contains(&symbol.as_str()) {
-                    belt.insert(symbol);
-                }
-            }
-        }
-        belt
-    }
-
-    /// Whether a `libc` REFERENCE found OUTSIDE the funnel is ALLOWED by the
-    /// derived [`mutating_libc_belt`]. Extracted from the audit body so the
-    /// ORACLE
-    /// [`the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel`]
-    /// drives the SAME predicate the audit uses rather than a re-implementation:
-    /// the belt is the device cited to make a REVIEWED PIN safe, so it must be
-    /// provable that a pinned family member is refused.
-    fn libc_reference_outside_funnel_is_allowed(belt: &BTreeSet<String>, reference: &str) -> bool {
-        let symbol = reference.strip_prefix("libc::").unwrap_or("");
-        !belt.contains(symbol) && reference != "libc::*" && reference != "libc"
-    }
-
     /// Exemption follows the crate-root DIRECTORY or the GATING, never a name
     /// and never an interior component. A file under `src/**/tests.rs` or
     /// `src/**/tests/` is PRODUCTION unless EVERY `mod` declaration that names
@@ -3407,11 +2545,15 @@ mod tests {
         assert_eq!(refs.get("libc::open").copied(), Some(1));
     }
 
-    /// F3 regression: the ONE libc reference scanner sees every route the
+    /// The `libc` reference scanner sees the alias DECLARATIONS a
     /// pattern-based scan missed — a module alias, a braced self-alias, a
-    /// cross-file re-export, a glob, and a newline between the path and `(`.
+    /// cross-file re-export, a glob, and a newline between the path and `(` —
+    /// and a CROSS-MODULE alias is covered by the resolved-symbol deny, which
+    /// this test also pins. The scanner is NOT the completeness device: it is
+    /// PER-FILE TEXT and sees nothing in a calling file that spells only
+    /// `crate::…::c::chmod(…)`.
     #[test]
-    fn the_libc_reference_scanner_sees_every_alias_route() {
+    fn libc_alias_routes_are_seen_by_the_scanner_or_the_deny() {
         for (label, text, expected) in [
             (
                 "module alias",
@@ -3446,38 +2588,71 @@ mod tests {
                 "{label}: expected {expected:?} in {refs:?}"
             );
         }
+
+        // A CROSS-MODULE re-export: the DECLARING file spells `libc`, so this
+        // scanner sees the alias THERE; the CALLING file spells only
+        // `crate::funnel_alias::c::chmod`, so the scanner sees NOTHING in it.
+        // That is why the scanner (and the pin it feeds) is NOT the
+        // completeness device for the `libc` class. The resolved-symbol deny
+        // is, and it names `chmod` (and the wider reviewed set), so the
+        // compiler resolves the call through the alias whatever the spelling,
+        // alias, re-export, or module.
+        let declaring = "pub(crate) use libc as c;";
+        let declaring_refs = libc_references(&normalize_ws(&code_only(declaring)));
+        assert!(
+            declaring_refs.contains_key("libc"),
+            "the DECLARING side of a cross-module `use libc as c;` must show the alias: \
+             {declaring_refs:?}"
+        );
+        let calling =
+            "unsafe fn f(p: *const std::ffi::c_char) { crate::funnel_alias::c::chmod(p, 0); }";
+        let calling_refs = libc_references(&normalize_ws(&code_only(calling)));
+        assert!(
+            calling_refs.is_empty(),
+            "the CALLING side of a cross-module libc alias must show NO `libc` token, which is \
+             why this scanner is not the completeness device: {calling_refs:?}"
+        );
+        let denied = denied_symbols_from_clippy_toml();
+        for symbol in ["libc::chmod", "libc::renameat2", "libc::fopen"] {
+            assert!(
+                denied.contains(symbol),
+                "the deny list must name {symbol}, so a cross-module alias route to it is \
+                 refused by the compiler rather than left to the per-file scanner: {denied:?}"
+            );
+        }
     }
 
-    /// STRUCTURAL AUDIT (libc): the crate's `libc` surface is CLOSED on BOTH
-    /// sides of the funnel boundary, and each side is pinned by its EXACT
-    /// reference set.
+    /// STRUCTURAL AUDIT (libc): EVERY `libc` reference in PRODUCTION code is
+    /// PINNED, per file and per reference, and the map of production references
+    /// that are NOT pinned — the only "outside" this audit knows — is asserted
+    /// EMPTY.
     ///
-    /// * OUTSIDE the funnel modules, any reference to `libc` — a mutating
-    ///   symbol, a module alias (`use libc as c;`), a re-export, a glob, or a
-    ///   newline-separated call — must be on a pinned review list. That list
-    ///   holds only AUDITED, non-mutating uses (`libc::flock`, `libc::fstatat`,
-    ///   `libc::O_RDONLY`), and an independent assertion refuses a
-    ///   [`MUTATING_LIBC_SYSCALLS`] member even when someone pins it, so a
-    ///   reviewed pin cannot authorize a name-mutating call.
-    /// * INSIDE each funnel module, the WHOLE `libc::<symbol>` reference
-    ///   surface is pinned PER MODULE and PER REFERENCE. This is the DERIVED
-    ///   device that closes the class: a new raw syscall in the funnel changes
-    ///   this map and fails, WHATEVER the symbol — `mknod`, `mkfifo`,
-    ///   `renameat2`, `fchmod`/`fchmodat`, `remove`, `syscall`, or one not
-    ///   written yet — where the earlier per-symbol pin saw only a fixed
-    ///   14-name list and changed no count for anything else. The funnel
-    ///   modules are themselves DERIVED from the source: every production file
-    ///   carrying the module-level `#![allow(clippy::disallowed_methods)]` that
-    ///   makes the crate-root resolve-symbol deny blind inside it (see
-    ///   [`funnel_modules`]), so a new funnel module joins this pin without an
-    ///   edit.
+    /// WHAT THIS DEVICE IS, AND WHAT IT IS NOT. It is a bounded COUNT of the
+    /// crate's OWN `libc` calls, whichever module they are in: a new, removed,
+    /// respelled, or re-counted reference changes the pin and forces review.
+    /// It is NOT the completeness device for the `libc` name-mutation class.
+    /// That is the resolved-symbol deny in `clippy.toml`, which the compiler
+    /// applies to every spelling, alias, cross-module re-export, glob, macro
+    /// body, and module, and which is what refuses a mutating call outside the
+    /// funnel modules. The two devices have different jobs: the deny REFUSES,
+    /// this pin NOTICES.
     ///
-    /// The `std::fs` side has the analogous derived pin in
+    /// THE LIMIT OF A PER-FILE TEXT SCAN, named not hidden. It sees the token
+    /// `libc` in a file, so a `pub(crate) use libc as c;` declared in a funnel
+    /// module and reached from a non-funnel file as `crate::…::c::chmod(…)`
+    /// leaves NO `libc` token in the CALLING file and is invisible here. That
+    /// route is covered by the compiler's resolved-symbol deny, not by this
+    /// pin. A mutating `libc` symbol the deny does not name, a raw
+    /// `syscall(SYS_…)`, a local `extern "C"` declaration, a macro that EMITS a
+    /// call, and third-party code are REVIEW responsibilities, stated as the
+    /// boundary of this contract rather than certified by it.
+    ///
+    /// The `std::fs` side has the analogous per-production-file count pin in
     /// [`std_fs_name_mutation_counts_are_pinned`], and the cross-artifact
     /// closure (the funnel may not adopt a symbol `clippy.toml` does not deny)
     /// is [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`].
     #[test]
-    fn no_libc_reference_outside_the_funnel() {
+    fn every_production_libc_reference_is_pinned() {
         let mut files = Vec::new();
         collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
         assert!(files.len() > 10, "the audit must see the real source tree");
@@ -3504,53 +2679,62 @@ mod tests {
             );
         }
 
-        let mut funnel_surface: BTreeMap<(String, String), usize> = BTreeMap::new();
-        let mut outside: BTreeMap<(String, String), usize> = BTreeMap::new();
-        // THE BELT IS DERIVED, not enumerated: the curated name-mutation family
-        // unioned with the default-deny of every unclassified `libc::<fn>` CALL
-        // the tree references. See [`mutating_libc_belt`].
-        let belt = mutating_libc_belt(&sources);
+        let mut surface: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (rel, raw) in &sources {
-            // Order matters: strip comments/strings FIRST, then remove
-            // `#[cfg(test)]` items, so a doc comment mentioning `#[cfg(test)]`
-            // is already gone. F5: `src/atomic/guard.rs` is scanned like any
-            // other production file (its `#[cfg(test)]` audit code is removed
-            // by `production_only`).
-            let code = normalize_ws(&production_only(&code_only(raw)));
-            let refs = libc_references(&code);
-            if funnel_modules.contains(rel) {
-                // DERIVED pin: the funnel's ENTIRE `libc` reference surface,
-                // per module. ANY new syscall — whatever its name — changes
-                // this map, so the funnel's own libc use cannot drift
-                // unnoticed inside the blind spot the crate-root deny has here.
-                for (reference, count) in refs {
-                    *funnel_surface.entry((rel.clone(), reference)).or_default() += count;
-                }
-                continue;
-            }
             if is_test_only(rel, &gated) {
                 continue;
             }
-            for (reference, count) in refs {
-                assert!(
-                    libc_reference_outside_funnel_is_allowed(&belt, &reference),
-                    "{rel} references the mutating/aliased libc facility {reference:?}: a \
-                     name-mutating syscall may be issued only from the guarded funnel \
-                     ({funnel_modules:?}); a `use libc … as alias` or a re-export does not exempt it"
-                );
-                *outside.entry((rel.clone(), reference)).or_default() += count;
+            // Order matters: strip comments/strings FIRST, then remove
+            // `#[cfg(test)]` items, so a doc comment mentioning `#[cfg(test)]`
+            // is already gone.
+            let code = normalize_ws(&production_only(&code_only(raw)));
+            for (reference, count) in libc_references(&code) {
+                *surface.entry((rel.clone(), reference)).or_default() += count;
             }
         }
 
-        // The pinned production `libc` surface outside the funnel: the
-        // crate's AUDITED, non-mutating uses. Any difference in this map is a
-        // new (or removed) reference to `libc` outside the funnel and fails
-        // here. None of these is a name-mutating symbol (asserted above).
+        // THE PIN. Every production `libc` reference, per file. A change here —
+        // a new reference, a removed one, a changed count — is a deliberate,
+        // reviewed edit.
         let expected: &[(&str, &str, usize)] = &[
-            // `src/atomic/mod.rs`'s three references MOVED to the funnel surface
-            // pin below when the funnel modules became DERIVED from the
-            // module-level allow: `atomic/mod.rs` carries that allow, so its
-            // `libc` surface is the funnel's own and is pinned per module.
+            ("src/atomic/mod.rs", "libc::O_CLOEXEC", 1),
+            ("src/atomic/mod.rs", "libc::O_DIRECTORY", 1),
+            ("src/atomic/mod.rs", "libc::O_NOFOLLOW", 1),
+            ("src/atomic/unix.rs", "libc::AT_REMOVEDIR", 1),
+            ("src/atomic/unix.rs", "libc::AT_SYMLINK_NOFOLLOW", 4),
+            ("src/atomic/unix.rs", "libc::F_GETPATH", 1),
+            ("src/atomic/unix.rs", "libc::O_APPEND", 1),
+            ("src/atomic/unix.rs", "libc::O_CLOEXEC", 8),
+            ("src/atomic/unix.rs", "libc::O_CREAT", 5),
+            ("src/atomic/unix.rs", "libc::O_DIRECTORY", 18),
+            ("src/atomic/unix.rs", "libc::O_EXCL", 3),
+            ("src/atomic/unix.rs", "libc::O_NOFOLLOW", 8),
+            ("src/atomic/unix.rs", "libc::O_NONBLOCK", 2),
+            ("src/atomic/unix.rs", "libc::O_RDONLY", 29),
+            ("src/atomic/unix.rs", "libc::O_RDWR", 1),
+            ("src/atomic/unix.rs", "libc::O_TRUNC", 2),
+            ("src/atomic/unix.rs", "libc::O_WRONLY", 5),
+            ("src/atomic/unix.rs", "libc::PATH_MAX", 1),
+            ("src/atomic/unix.rs", "libc::S_IFDIR", 4),
+            ("src/atomic/unix.rs", "libc::S_IFLNK", 1),
+            ("src/atomic/unix.rs", "libc::S_IFMT", 4),
+            ("src/atomic/unix.rs", "libc::S_IFREG", 1),
+            ("src/atomic/unix.rs", "libc::c_char", 3),
+            ("src/atomic/unix.rs", "libc::closedir", 1),
+            ("src/atomic/unix.rs", "libc::fcntl", 1),
+            ("src/atomic/unix.rs", "libc::fdopendir", 1),
+            ("src/atomic/unix.rs", "libc::fstat", 3),
+            ("src/atomic/unix.rs", "libc::fstatat", 4),
+            ("src/atomic/unix.rs", "libc::linkat", 1),
+            ("src/atomic/unix.rs", "libc::mkdirat", 3),
+            ("src/atomic/unix.rs", "libc::mode_t", 2),
+            ("src/atomic/unix.rs", "libc::openat", 7),
+            ("src/atomic/unix.rs", "libc::readdir", 1),
+            ("src/atomic/unix.rs", "libc::readlinkat", 2),
+            ("src/atomic/unix.rs", "libc::renameat", 1),
+            ("src/atomic/unix.rs", "libc::stat", 8),
+            ("src/atomic/unix.rs", "libc::symlinkat", 1),
+            ("src/atomic/unix.rs", "libc::unlinkat", 3),
             ("src/lock/unix.rs", "libc::EAGAIN", 1),
             ("src/lock/unix.rs", "libc::ELOOP", 1),
             ("src/lock/unix.rs", "libc::EWOULDBLOCK", 2),
@@ -3613,768 +2797,55 @@ mod tests {
                 (((*file).to_string(), (*reference).to_string()), *count)
             })
             .collect();
-        assert_eq!(
-            outside, expected,
-            "the `libc` references outside the funnel changed: a new reference — a mutating \
-             symbol, a module alias, a re-export, or a glob — must be moved behind the funnel \
-             ({funnel_modules:?}); a NON-mutating one must be reviewed and pinned here"
-        );
 
-        // The FUNNEL side: the exact per-module, per-reference `libc` surface.
-        // A new raw syscall in a funnel module changes this map and fails, so
-        // the class is closed for EVERY symbol name rather than for an
-        // enumerated 14. A change here is a deliberate, reviewed addition.
-        let expected_funnel: &[(&str, &str, usize)] = &[
-            // src/atomic/mod.rs — the cooperative-open flags for the atomic
-            // open primitive (moved here from the outside map when the funnel
-            // modules became derived from the module-level allow).
-            ("src/atomic/mod.rs", "libc::O_CLOEXEC", 1),
-            ("src/atomic/mod.rs", "libc::O_DIRECTORY", 1),
-            ("src/atomic/mod.rs", "libc::O_NOFOLLOW", 1),
-            // src/atomic/unix.rs — the funnel's WHOLE libc surface.
-            // The name-mutating syscalls (each still individually reviewed;
-            // the point of the pin is that a NEW one changes the map):
-            ("src/atomic/unix.rs", "libc::openat", 7),
-            ("src/atomic/unix.rs", "libc::unlinkat", 3),
-            ("src/atomic/unix.rs", "libc::renameat", 1),
-            ("src/atomic/unix.rs", "libc::symlinkat", 1),
-            ("src/atomic/unix.rs", "libc::linkat", 1),
-            ("src/atomic/unix.rs", "libc::mkdirat", 3),
-            // The `openat` flag/`*at` surface (constants and flags).
-            ("src/atomic/unix.rs", "libc::AT_REMOVEDIR", 1),
-            ("src/atomic/unix.rs", "libc::AT_SYMLINK_NOFOLLOW", 4),
-            ("src/atomic/unix.rs", "libc::O_APPEND", 1),
-            ("src/atomic/unix.rs", "libc::O_CLOEXEC", 8),
-            ("src/atomic/unix.rs", "libc::O_CREAT", 5),
-            ("src/atomic/unix.rs", "libc::O_DIRECTORY", 18),
-            ("src/atomic/unix.rs", "libc::O_EXCL", 3),
-            ("src/atomic/unix.rs", "libc::O_NOFOLLOW", 8),
-            ("src/atomic/unix.rs", "libc::O_NONBLOCK", 2),
-            ("src/atomic/unix.rs", "libc::O_RDONLY", 29),
-            ("src/atomic/unix.rs", "libc::O_RDWR", 1),
-            ("src/atomic/unix.rs", "libc::O_TRUNC", 2),
-            ("src/atomic/unix.rs", "libc::O_WRONLY", 5),
-            ("src/atomic/unix.rs", "libc::PATH_MAX", 1),
-            // The mode/kind masks and the C types the syscall signatures need.
-            ("src/atomic/unix.rs", "libc::S_IFDIR", 4),
-            ("src/atomic/unix.rs", "libc::S_IFLNK", 1),
-            ("src/atomic/unix.rs", "libc::S_IFMT", 4),
-            ("src/atomic/unix.rs", "libc::S_IFREG", 1),
-            ("src/atomic/unix.rs", "libc::c_char", 3),
-            ("src/atomic/unix.rs", "libc::mode_t", 2),
-            // The READ-ONLY descriptor calls (the `stat` family and the
-            // directory-descriptor reader); none can adopt or free a name.
-            ("src/atomic/unix.rs", "libc::closedir", 1),
-            ("src/atomic/unix.rs", "libc::fcntl", 1),
-            ("src/atomic/unix.rs", "libc::fdopendir", 1),
-            ("src/atomic/unix.rs", "libc::fstat", 3),
-            ("src/atomic/unix.rs", "libc::fstatat", 4),
-            ("src/atomic/unix.rs", "libc::readdir", 1),
-            ("src/atomic/unix.rs", "libc::readlinkat", 2),
-            ("src/atomic/unix.rs", "libc::stat", 8),
-            // A macOS-only `fcntl(F_GETPATH)` read of an open descriptor.
-            ("src/atomic/unix.rs", "libc::F_GETPATH", 1),
-        ];
-        let expected_funnel: BTreeMap<(String, String), usize> = expected_funnel
+        // THE OUTSIDE MAP: production `libc` references that are not on the pin
+        // — a reference the pin does not name, OR one whose COUNT differs from
+        // the pinned count. It must be EMPTY. The funnel modules are pinned the
+        // same way as every other file (the `funnel_modules` set the deny is
+        // allowed in is asserted above), so "outside" here means "not pinned",
+        // and there is none.
+        let outside: BTreeMap<(String, String), usize> = surface
             .iter()
-            .map(|(file, reference, count)| {
-                (((*file).to_string(), (*reference).to_string()), *count)
-            })
-            .collect();
-        assert_eq!(
-            funnel_surface, expected_funnel,
-            "the guarded funnel's `libc` reference surface changed — a new raw syscall in a funnel \
-             module must be reviewed for the lock-record guard, whatever the symbol. The actual \
-             surface is on the LEFT: {funnel_surface:?}"
-        );
-    }
-
-    /// ROUND-7 REGRESSION ARM: the `libc` belt is DERIVED, not a hand-kept list
-    /// that can lag the tree. The candidate set is the `libc::<fn>` CALL symbols
-    /// the crate's own sources reference; every one must be classified as
-    /// name-mutating ([`MUTATING_LIBC_SYSCALLS`], and therefore refused as a
-    /// pinned OUTSIDE entry by [`no_libc_reference_outside_the_funnel`]) or as
-    /// reviewed non-mutating ([`NON_MUTATING_LIBC_CALLS`]).
-    ///
-    /// The reviewer's round-7 repro was a pinned `libc::mkfifo` in the OUTSIDE
-    /// map that the old 14-name list did not refuse. The tree already references
-    /// `libc::mkfifo` (test FIFO fixtures), so this derivation forces it onto
-    /// the belt; REMOVING `mkfifo` from [`MUTATING_LIBC_SYSCALLS`] fails this
-    /// test, and the belt's default-deny clause refuses it outside regardless.
-    #[test]
-    fn every_libc_call_symbol_the_tree_references_is_classified() {
-        let mut files = Vec::new();
-        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
-        let mut calls: BTreeSet<String> = BTreeSet::new();
-        for file in &files {
-            let raw = std::fs::read_to_string(file).expect("read source file");
-            calls.extend(libc_call_symbols(&code_only(&raw)));
-        }
-        assert!(
-            calls.len() > 5 && calls.contains("openat") && calls.contains("mkfifo"),
-            "the derivation must see the tree's real `libc` call surface: {calls:?}"
-        );
-
-        let mut unclassified: Vec<String> = Vec::new();
-        for symbol in &calls {
-            if !MUTATING_LIBC_SYSCALLS.contains(&symbol.as_str())
-                && !NON_MUTATING_LIBC_CALLS.contains(&symbol.as_str())
-            {
-                unclassified.push(symbol.clone());
-            }
-        }
-        assert!(
-            unclassified.is_empty(),
-            "these `libc::<fn>` CALL symbols are referenced by the crate but classified as NEITHER \
-             name-mutating (`MUTATING_LIBC_SYSCALLS`) nor reviewed non-mutating \
-             (`NON_MUTATING_LIBC_CALLS`): {unclassified:?}. A name-mutating syscall MUST go on the \
-             belt so a pinned OUTSIDE reference is refused by \
-             `no_libc_reference_outside_the_funnel`."
-        );
-
-        // The anchor of the reviewer's repro: `libc::mkfifo` creates a name,
-        // the tree references it, and the DERIVED belt (family + default-deny)
-        // refuses it outside the funnel.
-        assert!(
-            MUTATING_LIBC_SYSCALLS.contains(&"mkfifo")
-                && mutating_libc_belt(&[]).contains("mkfifo"),
-            "`libc::mkfifo` creates a name and the tree references it; it MUST be on the belt"
-        );
-    }
-
-    /// The CHECKED-IN generated `libc` name-mutation surface. Its header states
-    /// the provenance (the `libc` version `Cargo.lock` pins) and the command
-    /// that regenerates it.
-    const LIBC_NAME_MUTATION_SURFACE: &str = include_str!("libc_name_mutation_surface.txt");
-
-    /// The size [`LIBC_NAME_MUTATION_SURFACE`] must have, and an FNV-1a 64
-    /// digest over its sorted newline-joined names. Any edit to the file — an
-    /// added, removed, or reordered member — changes one of these, so a hand
-    /// edit is a deliberate second edit rather than a silent drift.
-    const LIBC_NAME_MUTATION_SURFACE_COUNT: usize = 82;
-    const LIBC_NAME_MUTATION_SURFACE_FNV1A64: u64 = 0x3fd0_9cc6_c727_3259;
-
-    /// The EXPLICIT curated allow for a `MUTATING_LIBC_SYSCALLS` member that is
-    /// deliberately absent from [`INDEPENDENT_KNOWN_NAME_MUTATORS`], with the
-    /// reason. It is empty today; the mechanism exists so the family may
-    /// DISAGREE with the hand anchor without the disagreement being silent. A
-    /// member that is neither justified in the anchor nor listed here fails the
-    /// oracle.
-    const FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY: &[(&str, &str)] = &[];
-
-    /// The NAMED NEGATIVE CONTROLS: the members that were in NEITHER round-10
-    /// hand list, so removing one is the narrowing the oracle must fail on. They
-    /// are ONE list so the two loops that use them cannot drift apart.
-    const NAMED_NEGATIVE_CONTROLS: &[&str] = &[
-        "chown",
-        "mknodat",
-        "lutimes",
-        "futimes",
-        "futimesat",
-        "fchmodat2",
-        "mq_open",
-        "mq_unlink",
-        "sem_open",
-        "sem_unlink",
-        "shm_open",
-        "shm_unlink",
-        "mkstemp",
-        "mkostemp",
-        "mkstemps",
-        "mkostemps",
-        "mkdtemp",
-        "acl_set_file",
-        "acl_set_link_np",
-    ];
-
-    /// The STATED RESIDUAL of the DERIVED surface: reviewed family members the
-    /// pinned `libc` crate declares NOWHERE, so no `libc::<name>` symbol exists
-    /// for the surface to key on. Each carries the reason it has no symbol.
-    const SURFACE_RESIDUAL: &[(&str, &str)] = &[
-        (
-            "acl_set_file",
-            "macOS ACL setter; libc 0.2.189 does not declare it",
-        ),
-        (
-            "acl_set_link_np",
-            "macOS symlink ACL setter; libc 0.2.189 does not declare it",
-        ),
-        (
-            "fchmodat2",
-            "Linux fchmodat-with-flags; reached through `syscall(SYS_fchmodat2)`, not declared",
-        ),
-        (
-            "openat2",
-            "Linux openat2; reached through `syscall(SYS_openat2)`, not declared",
-        ),
-    ];
-
-    /// The names of [`LIBC_NAME_MUTATION_SURFACE`], skipping the `#` header.
-    fn libc_name_mutation_surface() -> BTreeSet<String> {
-        LIBC_NAME_MUTATION_SURFACE
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// FNV-1a 64 over `bytes`, so the surface pin is a plain, stable checksum
-    /// that needs no digest dependency.
-    fn fnv1a_64(bytes: &[u8]) -> u64 {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
-    }
-
-    /// The digest [`LIBC_NAME_MUTATION_SURFACE_FNV1A64`] pins. Deliberately over
-    /// the SORTED, newline-joined names, so it does not depend on the file's
-    /// line ending or the order the generator happened to emit.
-    fn surface_digest(names: &BTreeSet<String>) -> u64 {
-        let joined = names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n");
-        fnv1a_64(joined.as_bytes())
-    }
-
-    /// The `pub fn` NAME in `line`, for each `pub`/`pub unsafe`/`pub unsafe
-    /// extern "C" fn` declaration on it. `pub(crate)` and `pub(super)` are not
-    /// the exported surface, so they are skipped.
-    fn pub_fn_names_in_line(line: &str) -> Vec<String> {
-        fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-                i += 1;
-            }
-            i
-        }
-        fn ident_cont(byte: Option<&u8>) -> bool {
-            byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        }
-        fn word_at(bytes: &[u8], i: usize, word: &[u8]) -> bool {
-            bytes.get(i..i + word.len()) == Some(word) && !ident_cont(bytes.get(i + word.len()))
-        }
-        let bytes = line.as_bytes();
-        let mut out = Vec::new();
-        let mut i = 0usize;
-        while i + 3 <= bytes.len() {
-            if !(bytes[i] == b'p' && bytes[i + 1] == b'u' && bytes[i + 2] == b'b')
-                || ident_cont(if i == 0 { None } else { bytes.get(i - 1) })
-            {
-                i += 1;
-                continue;
-            }
-            let mut j = skip_ws(bytes, i + 3);
-            if word_at(bytes, j, b"unsafe") {
-                j = skip_ws(bytes, j + 6);
-            }
-            if word_at(bytes, j, b"extern") {
-                j = skip_ws(bytes, j + 6);
-                if bytes.get(j) == Some(&b'"') {
-                    j += 1;
-                    while j < bytes.len() && bytes[j] != b'"' {
-                        j += 1;
-                    }
-                    j = skip_ws(bytes, j + 1);
-                }
-            }
-            if word_at(bytes, j, b"fn") {
-                j = skip_ws(bytes, j + 2);
-                let start = j;
-                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-                    j += 1;
-                }
-                if j > start
-                    && let Ok(name) = std::str::from_utf8(&bytes[start..j])
-                {
-                    out.push(name.to_string());
-                }
-            }
-            i += 3;
-        }
-        out
-    }
-
-    /// Every `pub fn` NAME declared under `root`, recursively. Lines that begin
-    /// a `//` comment are skipped, so a `pub fn` inside a doc example is not
-    /// part of the surface. This is the `libc` crate's OWN declaration surface,
-    /// read from a crate this one does not edit.
-    fn libc_pub_fn_names(root: &Path) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
-                    let Ok(text) = std::fs::read_to_string(&path) else {
-                        continue;
-                    };
-                    for line in text.lines() {
-                        let line = line.trim_start();
-                        if line.starts_with("//") {
-                            continue;
-                        }
-                        names.extend(pub_fn_names_in_line(line));
-                    }
-                }
-            }
-        }
-        names
-    }
-
-    /// The pinned `libc` crate source root (`…/registry/src/<index>/libc-<version>/src`),
-    /// or `None` when the source for the `Cargo.lock` version is not present on
-    /// this machine.
-    fn pinned_libc_source_root() -> Option<PathBuf> {
-        let lock =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
-                .ok()?;
-        let document: toml::Value = toml::from_str(&lock).ok()?;
-        let version = document
-            .get("package")?
-            .as_array()?
-            .iter()
-            .find(|package| package.get("name").and_then(toml::Value::as_str) == Some("libc"))?
-            .get("version")?
-            .as_str()?
-            .to_string();
-        let home = std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
-        for index in std::fs::read_dir(home.join("registry").join("src")).ok()? {
-            let root = index
-                .ok()?
-                .path()
-                .join(format!("libc-{version}"))
-                .join("src");
-            if root.join("lib.rs").is_file() {
-                return Some(root);
-            }
-        }
-        None
-    }
-
-    /// The reviewed family ([`INDEPENDENT_KNOWN_NAME_MUTATORS`]) intersected
-    /// with the pinned `libc` crate's own `pub fn` declaration surface. This is
-    /// the DERIVED set the belt must COVER; it is not a hand list.
-    fn libc_surface_from_source(root: &Path) -> BTreeSet<String> {
-        let declared = libc_pub_fn_names(root);
-        INDEPENDENT_KNOWN_NAME_MUTATORS
-            .iter()
-            .map(|(symbol, _, _)| *symbol)
-            .filter(|symbol| declared.contains(*symbol))
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// The generated [`LIBC_NAME_MUTATION_SURFACE`] IS the reviewed family
-    /// INTERSECTED with the pinned `libc` crate's own declaration surface. When
-    /// that source is present — the normal case, because `cargo test` built
-    /// `libc` from the registry — the set is RE-DERIVED here from the crate
-    /// this one does not edit and any drift fails. When the source is absent the
-    /// checked-in list plus the count/digest pin in
-    /// [`the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel`]
-    /// stand.
-    #[test]
-    fn the_libc_name_mutation_surface_matches_the_pinned_libc_crate() {
-        let checked_in = libc_name_mutation_surface();
-        assert_eq!(
-            checked_in.len(),
-            LIBC_NAME_MUTATION_SURFACE_COUNT,
-            "the checked-in libc surface changed size; regenerate it and update the pin"
-        );
-        assert_eq!(
-            surface_digest(&checked_in),
-            LIBC_NAME_MUTATION_SURFACE_FNV1A64,
-            "the checked-in libc surface changed content; regenerate it (see its header) and \
-             update the count and digest pins"
-        );
-        let Some(root) = pinned_libc_source_root() else {
-            eprintln!(
-                "NOTE: the pinned libc source is not present; the checked-in surface and its \
-                 count/digest pin stand unconfirmed against the live crate"
-            );
-            return;
-        };
-        let live = libc_surface_from_source(&root);
-        assert_eq!(
-            live,
-            checked_in,
-            "the checked-in libc name-mutation surface disagrees with the pinned `libc` crate's \
-             own `pub fn` declaration surface at {}. Regenerate with `cargo test --lib -- \
-             --ignored --exact \
-             atomic::guard::tests::regenerate_libc_name_mutation_surface`.",
-            root.display()
-        );
-    }
-
-    /// Regenerate [`LIBC_NAME_MUTATION_SURFACE`] from the pinned `libc` source,
-    /// preserving the prose header. `#[ignore]`d so it runs only when invoked:
-    ///
-    /// `cargo test --lib -- --ignored --exact \
-    ///  atomic::guard::tests::regenerate_libc_name_mutation_surface`
-    #[test]
-    #[ignore = "regenerates the checked-in libc name-mutation surface; run deliberately"]
-    fn regenerate_libc_name_mutation_surface() {
-        let root = pinned_libc_source_root()
-            .expect("the pinned libc source must be locatable to regenerate the surface");
-        let names = libc_surface_from_source(&root);
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/atomic/libc_name_mutation_surface.txt");
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut text: String = existing
-            .lines()
-            .take_while(|line| line.starts_with('#') || line.is_empty())
-            .map(|line| format!("{line}\n"))
-            .collect();
-        if text.is_empty() {
-            text.push_str("# GENERATED FILE - DO NOT EDIT BY HAND.\n");
-        }
-        for name in &names {
-            text.push_str(name);
-            text.push('\n');
-        }
-        std::fs::write(&path, text).expect("write the regenerated libc surface");
-        eprintln!(
-            "wrote {} names to {} (count {}, digest {:#x})",
-            names.len(),
-            path.display(),
-            names.len(),
-            surface_digest(&names)
-        );
-    }
-
-    /// ROUND-12 ANCHOR ORACLE. The `libc` belt is the device cited to make a
-    /// REVIEWED PIN outside the funnel safe, so it must REFUSE a pinned known
-    /// name-mutating syscall even if the hand-written classification lists are
-    /// edited against each other. For a symbol the lint does not deny
-    /// (`libc::chmod`) the belt is the SOLE device.
-    ///
-    /// WHAT ROUNDS 10 AND 11 GOT WRONG. [`KNOWN_NAME_MUTATORS`],
-    /// [`MUTATING_LIBC_SYSCALLS`] and [`INDEPENDENT_KNOWN_NAME_MUTATORS`] are
-    /// three hand-written artifacts IN THIS FILE, and round 11's arms compared
-    /// them to EACH OTHER — so a 3-way edit (drop the symbol from all three, add
-    /// it to [`NON_MUTATING_LIBC_CALLS`], pin a non-funnel `libc::<symbol>`
-    /// call) left every libc test and both clippy runs green. A set equality
-    /// between things you edit together is not an oracle. Only the 19 named
-    /// negative controls were outside the co-edit.
-    ///
-    /// THE FIX. [`LIBC_NAME_MUTATION_SURFACE`] is DERIVED from the pinned
-    /// `libc` crate's own `pub fn` declaration surface — a crate this one does
-    /// not edit — so it stays naming a member the hand family dropped.
-    /// [`the_libc_name_mutation_surface_matches_the_pinned_libc_crate`]
-    /// re-derives it and fails on drift.
-    ///
-    /// THIS ORACLE asserts:
-    /// (0) the reviewed anchor is non-trivial, its classes come from the CLOSED
-    ///     [`KNOWN_NAME_MUTATOR_CLASSES`] set, every entry carries a non-empty
-    ///     reason distinct from its class, and the named negative controls
-    ///     (`lutimes`, `fchmodat2`, `mq_open`, …) are still present;
-    /// (0b) the DERIVED surface is pinned by count and digest, every member is
-    ///     on [`MUTATING_LIBC_SYSCALLS`] (so dropping a member from the family
-    ///     fails HERE even when every hand artifact was edited in lockstep), and
-    ///     every member is refused by the belt and by the default-deny clause
-    ///     alone; the residual — reviewed members the pinned `libc` declares
-    ///     nowhere — is an EXPLICIT list;
-    /// (1) the two family literals name the SAME symbols, the reviewed anchor
-    ///     names every family member, and a family member WITHOUT an anchor
-    ///     entry is allowed only through the EXPLICIT
-    ///     [`FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY`] list with a reason (so the
-    ///     anchor and the family may disagree, but never silently);
-    /// (2) DISJOINTNESS from [`NON_MUTATING_LIBC_CALLS`], checked against the
-    ///     UNION of the family, the anchor, and the derived surface, so a 3-way
-    ///     MOVE into the review list fails even if every hand list was edited to
-    ///     match;
-    /// (3) every anchor member is REFUSED by the belt the audit DERIVES from a
-    ///     source that references it, via the audit's OWN predicate
-    ///     ([`libc_reference_outside_funnel_is_allowed`]);
-    /// (4) the DEFAULT-DENY clause ALONE — a belt built with no family
-    ///     contribution, so the property does not depend on
-    ///     [`MUTATING_LIBC_SYSCALLS`] at all — also refuses every anchor member:
-    ///     the anti-circular half, whose only disarm is the exclusion a MOVE into
-    ///     the non-mutating review list would add; and
-    /// (5) for EVERY anchor member the lint does NOT deny, the belt is the SOLE
-    ///     device, with a non-vacuous count, so the arm is not a hardcoded pair.
-    ///
-    /// STATED RESIDUAL. The derived surface is the `libc` crate's SYMBOL
-    /// surface, so it cannot name a mutator libc does not export
-    /// (`acl_set_file`, `acl_set_link_np`, `fchmodat2`, `openat2` — the four in
-    /// the residual above) or one reached by NUMBER (`syscall(SYS_…)`, an
-    /// `io_uring` submission, a local `extern "C"` declaration, a `windows_sys`
-    /// creator). Those are refused, where they are refused at all, by the belt's
-    /// clause (a) and the module-level residue, not by this surface.
-    #[test]
-    fn the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel() {
-        // (0) THE ANCHOR ITSELF: a closed class set, an individual reason per
-        // symbol, no duplicates, and the named negative controls that stop the
-        // anchor from being narrowed back to the round-10 family.
-        let classes: BTreeSet<&str> = KNOWN_NAME_MUTATOR_CLASSES.iter().copied().collect();
-        let mut anchor: BTreeSet<&str> = BTreeSet::new();
-        for (symbol, class, reason) in INDEPENDENT_KNOWN_NAME_MUTATORS {
-            assert!(
-                classes.contains(class),
-                "the anchor entry {symbol} claims the class {class:?}, which is not in the closed \
-                 KNOWN_NAME_MUTATOR_CLASSES set {classes:?}; add the class deliberately or fix the \
-                 spelling"
-            );
-            assert!(
-                !reason.trim().is_empty() && reason != class,
-                "the anchor entry {symbol} must carry a reason distinct from its class ({class:?})"
-            );
-            assert!(
-                anchor.insert(symbol),
-                "the anchor names {symbol} more than once; a duplicate makes the reason table \
-                 ambiguous"
-            );
-        }
-        assert!(
-            anchor.len() >= 60,
-            "the independently-specified anchor must be the reviewed family, not a stub: {}",
-            anchor.len()
-        );
-        // THE NAMED NEGATIVE CONTROLS. These were in NEITHER round-10 hand list;
-        // they are the members that make the anchor larger than that family, so
-        // removing one is the narrowing this arm exists to fail on.
-        for &symbol in NAMED_NEGATIVE_CONTROLS {
-            assert!(
-                anchor.contains(symbol),
-                "the independently-specified anchor lost the negative control {symbol}; it must \
-                 stay anchored OUTSIDE the co-editable family pair"
-            );
-        }
-
-        // (0b) THE DERIVED EXTERNAL SURFACE — THE INDEPENDENT ANCHOR. The three
-        // hand-written artifacts above all live in THIS FILE and can be edited
-        // in lockstep, so a set equality among them is not an oracle. This
-        // surface is GENERATED from the pinned `libc` crate's own `pub fn`
-        // declaration surface, a crate this one does not edit, so it DISAGREES
-        // with any shrinking of the family: it stays naming the member the
-        // family dropped. It is pinned by count and digest (so any hand edit is
-        // a deliberate second edit), every member must be on the family, and
-        // every member must be REFUSED by the belt.
-        let surface = libc_name_mutation_surface();
-        assert_eq!(
-            surface.len(),
-            LIBC_NAME_MUTATION_SURFACE_COUNT,
-            "the derived libc surface changed size: regenerate it and update the pin"
-        );
-        assert_eq!(
-            surface_digest(&surface),
-            LIBC_NAME_MUTATION_SURFACE_FNV1A64,
-            "the derived libc surface changed content: regenerate it (see its header) and update \
-             the count and digest pins"
-        );
-        let surface_not_in_family: Vec<&String> = surface
-            .iter()
-            .filter(|symbol| !MUTATING_LIBC_SYSCALLS.contains(&symbol.as_str()))
+            .filter(|(key, count)| expected.get(*key) != Some(count))
+            .map(|(key, count)| (key.clone(), *count))
             .collect();
         assert!(
-            surface_not_in_family.is_empty(),
-            "the DERIVED libc name-mutation surface names {surface_not_in_family:?}, which \
-             MUTATING_LIBC_SYSCALLS does not: the external surface is the AUTHORITY the hand \
-             family must COVER, so dropping a member from the family (or from the two literals) \
-             fails HERE even when all three hand artifacts were edited in lockstep — and the belt \
-             would otherwise AUTHORIZE a pinned call to it outside the funnel. Restore the member \
-             or regenerate the surface."
+            outside.is_empty(),
+            "these production `libc` references are NOT on the reviewed pin, or their count \
+             changed (actual count shown): {outside:?}. A new `libc` reference — mutating or not, \
+             in a funnel module or outside — must be reviewed and pinned here; a mutating one \
+             belongs behind the funnel and must ALSO be named in `clippy.toml` so the compiler \
+             refuses it outside the funnel modules. THE PIN IS WHAT NOTICES A COUNT CHANGE INSIDE \
+             A FUNNEL MODULE, where the deny is allowed and therefore blind (the closure test \
+             notices a NEW symbol, but not an extra call to a symbol already in use)."
         );
-        let justified: BTreeSet<&str> = INDEPENDENT_KNOWN_NAME_MUTATORS
-            .iter()
-            .map(|(symbol, _, _)| *symbol)
-            .collect();
-        // THE STATED RESIDUAL. A reviewed family member the pinned `libc` crate
-        // declares NOWHERE has no `libc::<name>` symbol for the derived surface
-        // to key on, so it cannot appear above. The four below are exactly that
-        // class: the crate reaches them through a raw syscall by number or does
-        // not wrap them at all. They stay on the belt's clause (a).
-        let residual: BTreeSet<&str> = justified
-            .iter()
-            .copied()
-            .filter(|symbol| !surface.contains(*symbol))
-            .collect();
-        let expected_residual: BTreeSet<&str> =
-            SURFACE_RESIDUAL.iter().map(|(name, _)| *name).collect();
-        assert_eq!(
-            residual, expected_residual,
-            "the residual — reviewed family members the pinned `libc` crate declares NOWHERE — \
-             changed. If the member is now exported, regenerate the surface; if the family gained \
-             a name with no `libc` symbol, add it to SURFACE_RESIDUAL with the reason it has no \
-             symbol."
-        );
-        for (name, reason) in SURFACE_RESIDUAL {
-            assert!(
-                !reason.trim().is_empty(),
-                "the residual {name} must carry the reason libc does not export it"
-            );
-        }
-        // The NAMED NEGATIVE CONTROLS must remain refused by the belt whether or
-        // not the pinned `libc` exports them, so each must be either on the
-        // derived surface or in the stated residual.
-        for &symbol in NAMED_NEGATIVE_CONTROLS {
-            assert!(
-                surface.contains(symbol) || residual.contains(symbol),
-                "the derived surface AND the stated residual both lost the negative control \
-                 {symbol}; the belt must keep refusing it"
-            );
-        }
-        // (3)+(4) for the DERIVED surface too: every externally-confirmed member
-        // is refused by the belt AND by the default-deny clause alone.
-        for symbol in &surface {
-            let sources = vec![(
-                "src/prod/synthetic.rs".to_string(),
-                format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
-            )];
-            let reference = format!("libc::{symbol}");
-            let belt = mutating_libc_belt(&sources);
-            assert!(
-                !libc_reference_outside_funnel_is_allowed(&belt, &reference),
-                "the DERIVED libc surface names the name mutator {reference} and the belt ALLOWED \
-                 it; the external surface is authoritative, so a pinned OUTSIDE reference would be \
-                 authorized. The belt must refuse it: {belt:?}"
-            );
-            let default_deny: BTreeSet<String> = libc_call_symbols(&code_only(&sources[0].1))
-                .into_iter()
-                .filter(|name| !NON_MUTATING_LIBC_CALLS.contains(&name.as_str()))
-                .collect();
-            assert!(
-                !libc_reference_outside_funnel_is_allowed(&default_deny, &reference),
-                "the DEFAULT-DENY clause ALONE must refuse the DERIVED {reference}; it did not, \
-                 which means the symbol sits on NON_MUTATING_LIBC_CALLS: {default_deny:?}"
-            );
-        }
-
-        // (1) THE FAMILY VS THE ANCHOR. The two family literals must agree with
-        // each other, and the anchor must name EVERY family member (the belt's
-        // clause (a) is the only device that refuses an unreferenced symbol) and
-        // NOTHING outside it.
-        let code_family: BTreeSet<&str> = MUTATING_LIBC_SYSCALLS.iter().copied().collect();
-        let literal_family: BTreeSet<&str> = KNOWN_NAME_MUTATORS.iter().copied().collect();
-        assert_eq!(
-            code_family, literal_family,
-            "the two family literals disagree: MUTATING_LIBC_SYSCALLS={code_family:?} \
-             KNOWN_NAME_MUTATORS={literal_family:?}"
-        );
-        let missing_from_family: Vec<&&str> = anchor.difference(&code_family).collect();
-        assert!(
-            missing_from_family.is_empty(),
-            "these ANCHOR name mutators are absent from MUTATING_LIBC_SYSCALLS: \
-             {missing_from_family:?}. The anchor is the artifact this oracle iterates, so \
-             co-editing BOTH family literals to drop a member (the round-10 evasion) fails \
-             here: the anchor still names it, and clause (a) of the belt no longer refuses it. \
-             Restore the family member or state the reclassification in the anchor."
-        );
-        // The OTHER direction is NO LONGER an equality. The family may be
-        // LARGER than the reviewed anchor, but only by an EXPLICIT curated entry
-        // with a reason ([`FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY`]), so a member
-        // cannot be added to the belt silently and cannot leave the anchor
-        // silently. Today that list is empty; the DERIVED surface above is a
-        // strict SUBSET of the family, so the anchor and the family already
-        // disagree, and the disagreement is visible rather than forced.
-        let unexpected_family: Vec<&&str> = code_family
-            .difference(&anchor)
-            .filter(|symbol| {
-                !FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY
-                    .iter()
-                    .any(|(name, _)| name == *symbol)
-            })
+        let removed: Vec<&(String, String)> = expected
+            .keys()
+            .filter(|key| !surface.contains_key(*key))
             .collect();
         assert!(
-            unexpected_family.is_empty(),
-            "MUTATING_LIBC_SYSCALLS names {unexpected_family:?}, which the anchor does not and \
-             which is not in FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY. Every family member needs \
-             either an individual class + reason in INDEPENDENT_KNOWN_NAME_MUTATORS or an \
-             explicit curated exemption with a reason: membership must be reviewed, not merely \
-             `it is in the list`."
+            removed.is_empty(),
+            "the pin names production `libc` references that no longer exist: {removed:?}; \
+             remove them so the pin stays a faithful count of the crate's own calls"
         );
-        for (name, reason) in FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY {
-            assert!(
-                code_family.contains(name) && !reason.trim().is_empty(),
-                "the curated family exemption {name:?} must name a real family member and carry a \
-                 non-empty reason: {reason:?}"
-            );
-        }
-
-        // (2) DISJOINTNESS, checked against the UNION of the family, the
-        // reviewed anchor, and the DERIVED surface, so a MOVE of ANY of them
-        // into the review list fails even if every hand list was edited to
-        // match the move: a family member cannot appear on the review list
-        // whether or not it is in the anchor.
-        let mut reviewed: BTreeSet<&str> = code_family.clone();
-        reviewed.extend(anchor.iter().copied());
-        reviewed.extend(surface.iter().map(String::as_str));
-        let overlap: Vec<&&str> = reviewed
-            .iter()
-            .filter(|symbol| NON_MUTATING_LIBC_CALLS.contains(symbol))
-            .collect();
+        // NON-VACUITY: the pin must cover BOTH the funnel's own mutation calls
+        // and a reviewed reference outside the funnel modules, or a scan that
+        // saw nothing would pass and this audit would silently narrow.
         assert!(
-            overlap.is_empty(),
-            "NON_MUTATING_LIBC_CALLS claims these independently-specified KNOWN name mutators, \
-             which disarms the belt by excluding them from its default-deny clause: {overlap:?}"
+            surface.contains_key(&("src/lock/unix.rs".to_string(), "libc::flock".to_string()))
+                && surface.contains_key(&(
+                    "src/atomic/unix.rs".to_string(),
+                    "libc::unlinkat".to_string()
+                )),
+            "the pin must see both a non-funnel `libc` reference and the funnel's own mutation \
+             calls: {surface:?}"
         );
-
-        // (3)+(4) Each anchor member is refused by the DERIVED belt AND by the
-        // default-deny clause ALONE. The synthetic source makes the symbol a
-        // referenced `libc::<fn>(…)` call, exactly how the real tree puts a
-        // symbol on the belt.
-        for symbol in &anchor {
-            let sources = vec![(
-                "src/prod/synthetic.rs".to_string(),
-                format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
-            )];
-            let reference = format!("libc::{symbol}");
-            let belt = mutating_libc_belt(&sources);
-            assert!(
-                !libc_reference_outside_funnel_is_allowed(&belt, &reference),
-                "a pinned OUTSIDE reference to the name mutator {reference} was ALLOWED by the \
-                 belt; the belt is DERIVED, so a non-funnel production reference must land on it: \
-                 {belt:?}"
-            );
-            let default_deny: BTreeSet<String> = libc_call_symbols(&code_only(&sources[0].1))
-                .into_iter()
-                .filter(|name| !NON_MUTATING_LIBC_CALLS.contains(&name.as_str()))
-                .collect();
-            assert!(
-                !libc_reference_outside_funnel_is_allowed(&default_deny, &reference),
-                "the DEFAULT-DENY clause ALONE (a belt with no family contribution) must refuse \
-                 {reference}; it did not, which means the symbol sits on NON_MUTATING_LIBC_CALLS: \
-                 {default_deny:?}"
-            );
-        }
-
-        // (5) For EVERY anchor member the clippy deny does NOT name, the belt is
-        // the SOLE device. Derived from the anchor rather than hardcoded to a
-        // pair, and the count must be non-vacuous, so the arm cannot pass by
-        // naming only symbols the lint already denies.
-        let denied = denied_symbols_from_clippy_toml();
-        let mut lint_omitted = 0usize;
-        for symbol in &anchor {
-            if denied.contains(&format!("libc::{symbol}")) {
-                continue;
-            }
-            lint_omitted += 1;
-            let sources = vec![(
-                "src/prod/synthetic.rs".to_string(),
-                format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
-            )];
-            let belt = mutating_libc_belt(&sources);
-            assert!(
-                !libc_reference_outside_funnel_is_allowed(&belt, &format!("libc::{symbol}")),
-                "libc::{symbol} is refused by NEITHER clippy.toml nor the belt; a non-funnel \
-                 production reference would be undefended: {belt:?}"
-            );
-        }
         assert!(
-            lint_omitted >= 5,
-            "only {lint_omitted} anchor members are outside clippy.toml's deny; this arm exists to \
-             prove the BELT refuses a symbol the lint does not, so it must not become vacuous"
+            expected
+                .keys()
+                .any(|(file, _)| !funnel_modules.contains(file)),
+            "the pin must also cover the crate's reviewed NON-funnel `libc` references, or this \
+             audit would silently narrow to the funnel: {expected:?}"
         );
     }
 
@@ -4449,7 +2920,7 @@ mod tests {
     /// `extern "C"` declaration, `extern "C" { fn unlinkat(dirfd: i32, path:
     /// *const i8, flags: i32) -> i32; }`, followed by a call: it names neither
     /// `libc` nor `std::fs`, so NEITHER this audit nor
-    /// `no_libc_reference_outside_the_funnel` sees it. An INODE-PRESERVING
+    /// `every_production_libc_reference_is_pinned` sees it. An INODE-PRESERVING
     /// content mutation on an ALREADY-EXISTING path through a call that is
     /// legal outside the funnel is not pinned: it cannot split a holder because
     /// the flock stays on the unchanged inode. The mode setter, the name
@@ -6166,11 +4637,11 @@ mod tests {
     /// entry — a name ADOPTION in the same class as `create_dir`/`symlink` — so
     /// it is denied crate-wide for both `UnixListener` and `UnixDatagram`, the
     /// surface derivation can SEE it if the funnel ever uses one, the count pin
-    /// counts it, and the raw `libc::bind` syscall is on the `libc` belt. The
-    /// Windows named-pipe creator has no stable `std` path and is stated as a
-    /// NAMED RESIDUAL in `clippy.toml` rather than left unmentioned.
+    /// counts it, and the raw `libc::bind` syscall is denied too. The Windows
+    /// named-pipe creator has no stable `std` path and is stated as a NAMED
+    /// RESIDUAL in `clippy.toml` rather than left unmentioned.
     #[test]
-    fn pathname_socket_binds_are_denied_counted_and_on_the_libc_belt() {
+    fn pathname_socket_binds_are_denied_and_counted() {
         let raw = denied_symbols_from_clippy_toml();
         for bind in [
             "std::os::unix::net::UnixListener::bind",
@@ -6202,10 +4673,12 @@ mod tests {
             Some(1),
             "the pin must count a pathname-socket bind: {counts:?}"
         );
-        // The raw syscall is on the belt, so a `libc::bind` reference outside
-        // the funnel is refused by `no_libc_reference_outside_the_funnel`.
-        assert!(MUTATING_LIBC_SYSCALLS.contains(&"bind"));
-        assert!(mutating_libc_belt(&[]).contains("bind"));
+        // The raw syscall is denied too, so a `libc::bind` reference in a
+        // module the deny is not allowed in fails `cargo clippy`.
+        assert!(
+            raw.contains("libc::bind"),
+            "clippy.toml must deny the raw `libc::bind` syscall: {raw:?}"
+        );
     }
 
     /// The surface derivation must SEE each spelling a name-ADOPTING call can

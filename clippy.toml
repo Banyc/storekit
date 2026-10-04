@@ -13,7 +13,7 @@
 #
 # DIVISION OF LABOUR. The count PIN
 # (`atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` and the
-# `libc` funnel SURFACE PIN in `no_libc_reference_outside_the_funnel`) is a
+# `libc` production-reference PIN in `every_production_libc_reference_is_pinned`) is a
 # DIFFERENT device with a DIFFERENT job: it notices when the funnel's OWN calls change —
 # i.e. inside the very modules where this lint is `#![allow]`ed and therefore
 # blind — while this lint notices a call anywhere ELSE. Neither device covers
@@ -83,14 +83,19 @@
 # a `#[cfg(test)]` module" sentence did (it missed
 # `transport::open_verify_local`, a production item-level allow).
 #
-# The `libc` set names the POSIX name-mutation syscalls the funnel owns: the
-# `*at` forms it calls, their plain (non-`*at`) forms, and the `open`/`openat`
-# pair (which adopt or truncate a name with `O_CREAT`/`O_TRUNC`). It is NOT
-# claimed to be EVERY mutating `libc` symbol: a symbol the funnel does not use
-# is not denied here, and a new `libc` REFERENCE anywhere outside the funnel is
-# caught by the exact per-module `libc` surface audit in
-# `atomic::guard::tests::no_libc_reference_outside_the_funnel` whatever this
-# list says. What this list must satisfy is the consistency property:
+# The `libc` set names the mutation symbols THIS crate funnels (and a reviewed
+# set around them). A deny is a RESOLVED symbol the compiler applies to every
+# spelling, alias, cross-module re-export, glob, macro body, and module — a
+# `pub(crate) use libc as c;` in a funnel module that a non-funnel caller
+# reaches through `crate::…::c::chmod(…)` leaves no `libc` token in the calling
+# file, so a per-file token scan cannot see it, while the deny can. It is NOT a
+# claim to name every mutating `libc` symbol in existence: a symbol nobody
+# listed here is a REVIEW responsibility, not a certified property, and the
+# per-file pin
+# (`atomic::guard::tests::every_production_libc_reference_is_pinned`) is what
+# forces that review by failing on any new or changed `libc` reference.
+#
+# The set must also satisfy the consistency property:
 # `atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`
 # derives this file's list and the funnel's resolved call targets and fails if
 # the funnel adopts a `std::fs`/`libc` call this file does not deny. That
@@ -191,7 +196,7 @@ disallowed-methods = [
   # list of RESOLVED `std`/`libc` symbols. A Windows named-pipe creator
   # (`CreateNamedPipeW`) or a raw `CreateFileW`/`NtCreateFile` reached through
   # `windows_sys` is NOT a `std` symbol, so this lint does not name it and the
-  # `libc` belt (which is libc-specific) does not either. The crate's own
+  # `libc` deny entries here (which are libc-specific) do not either. The crate's own
   # `windows_sys` uses today are non-adopting (`GetFileInformationByHandle`,
   # `LockFileEx`/`UnlockFileEx`), and Rust's stable `std` exposes no named-pipe
   # creator, so the reach is "a raw Win32 creator the crate would have to add" —
@@ -212,17 +217,113 @@ disallowed-methods = [
   { path = "libc::mkdirat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::open", reason = "name creation/truncation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::openat", reason = "name creation/truncation is funnel-owned; call the guarded atomic primitive instead" },
-  # libc — the remaining pure name CREATORS. The belt test
-  # (`every_libc_call_symbol_the_tree_references_is_classified`) derives every
-  # `libc::<fn>` call the tree references and forces a classification, so a
-  # creator the funnel does not itself use is DENIED here rather than left to
-  # the belt alone: `libc::mkfifo` in particular creates a directory entry at a
-  # name, exactly as `libc::mkdir` does. The crate's live uses of these are all
-  # `#[cfg(test)]` and carry the standard test allow; there is no production
-  # call.
+  # libc — the pure name CREATORS. `libc::mkfifo` in particular creates a
+  # directory entry at a name, exactly as `libc::mkdir` does. The crate's live
+  # uses of these are all `#[cfg(test)]` and carry the standard test allow;
+  # there is no production call.
   { path = "libc::mkfifo", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::mkfifoat", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::mknod", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::mknodat", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::creat", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  #
+  # libc — the mutation symbols the crate funnels, plus the wider reviewed set
+  # around them. Each reason below is the mutation class of the symbol. A symbol
+  # the CURRENT target does not export produces a non-fatal config-time "does
+  # not refer to a reachable function" warning (the README gives the per-target
+  # counting command); the deny still applies on the targets that do export it.
+  # These entries are what refuses a cross-module `use libc as c;` route at the
+  # compiler. They are NOT a claim to cover the whole POSIX family; a mutating
+  # symbol absent from this list is a stated REVIEW boundary (see the `libc`
+  # paragraph above).
+  #
+  # libc — class `free-or-swap-a-directory-entry`:
+  { path = "libc::remove", reason = "free-or-swap-a-directory-entry: removes a name (a file or an empty directory); the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::renameat2", reason = "free-or-swap-a-directory-entry: rename with flags; can also swap two names; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::renamex_np", reason = "free-or-swap-a-directory-entry: rename with flags; can swap two names (macOS); the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::renameatx_np", reason = "free-or-swap-a-directory-entry: the dirfd-relative twin of renamex_np; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::wrmdir", reason = "free-or-swap-a-directory-entry: the wide-character rmdir; removes a directory name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::pidfile_remove", reason = "free-or-swap-a-directory-entry: removes the pidfile name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `create-or-remove-a-posix-ipc-name`:
+  { path = "libc::mq_unlink", reason = "create-or-remove-a-posix-ipc-name: removes a POSIX message-queue name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::sem_unlink", reason = "create-or-remove-a-posix-ipc-name: removes a POSIX named-semaphore name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::shm_unlink", reason = "create-or-remove-a-posix-ipc-name: removes a POSIX shared-memory name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::mq_open", reason = "create-or-remove-a-posix-ipc-name: creates or opens a POSIX message-queue name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::sem_open", reason = "create-or-remove-a-posix-ipc-name: creates or opens a POSIX named-semaphore name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::shm_open", reason = "create-or-remove-a-posix-ipc-name: creates or opens a POSIX shared-memory name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `adopt-or-truncate-through-an-open`:
+  { path = "libc::open64", reason = "adopt-or-truncate-through-an-open: the large-file-offset spelling of open; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::openat64", reason = "adopt-or-truncate-through-an-open: the large-file-offset spelling of openat; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::openat2", reason = "adopt-or-truncate-through-an-open: openat with an extensible how-struct; can adopt a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::creat64", reason = "adopt-or-truncate-through-an-open: the large-file-offset spelling of creat; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fopen", reason = "adopt-or-truncate-through-an-open: opens a stream by name; mode `w`/`a` creates and `w` truncates a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fopen64", reason = "adopt-or-truncate-through-an-open: the large-file-offset spelling of fopen; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::freopen", reason = "adopt-or-truncate-through-an-open: reassigns a stream to a name; can create or truncate that name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::freopen64", reason = "adopt-or-truncate-through-an-open: the large-file-offset spelling of freopen; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::wopen", reason = "adopt-or-truncate-through-an-open: the wide-character Windows open; creates or truncates a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::posix_spawn_file_actions_addopen", reason = "adopt-or-truncate-through-an-open: queues an open at spawn that can create or truncate a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `create-a-directory-entry`:
+  { path = "libc::clonefile", reason = "create-a-directory-entry: creates a new name as a copy-on-write clone; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::clonefileat", reason = "create-a-directory-entry: the dirfd-relative twin of clonefile; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fclonefileat", reason = "create-a-directory-entry: dirfd-relative clonefile; creates a new name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::pidfile_open", reason = "create-a-directory-entry: creates (and locks) a pidfile name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `create-a-name-through-a-temp-template`:
+  { path = "libc::mkstemp", reason = "create-a-name-through-a-temp-template: chooses a spelling and creates the file name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::mkostemp", reason = "create-a-name-through-a-temp-template: mkstemp with extra open flags; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::mkstemps", reason = "create-a-name-through-a-temp-template: mkstemp with a suffix; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::mkostemps", reason = "create-a-name-through-a-temp-template: mkostemp with a suffix; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::mkdtemp", reason = "create-a-name-through-a-temp-template: chooses a spelling and creates the directory name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `bind-a-pathname-socket`:
+  { path = "libc::bind", reason = "bind-a-pathname-socket: an AF_UNIX bind creates the bound pathname entry; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `change-metadata-attached-to-a-name`:
+  { path = "libc::chmod", reason = "change-metadata-attached-to-a-name: sets a mode on a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fchmod", reason = "change-metadata-attached-to-a-name: sets a mode on a descriptor's open name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fchmodat", reason = "change-metadata-attached-to-a-name: sets a mode on a name relative to a dirfd; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fchmodat2", reason = "change-metadata-attached-to-a-name: fchmodat with flags; can act on a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::chown", reason = "change-metadata-attached-to-a-name: sets an owner on a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fchown", reason = "change-metadata-attached-to-a-name: sets an owner on a descriptor's open name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::lchown", reason = "change-metadata-attached-to-a-name: sets an owner on a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fchownat", reason = "change-metadata-attached-to-a-name: sets an owner relative to a dirfd, with symlink flags; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::truncate", reason = "change-metadata-attached-to-a-name: changes a named file's length; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::ftruncate", reason = "change-metadata-attached-to-a-name: changes a descriptor's open file length; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::utime", reason = "change-metadata-attached-to-a-name: sets a name's access and modify times; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::utimes", reason = "change-metadata-attached-to-a-name: sets a name's times with microsecond precision; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::futimens", reason = "change-metadata-attached-to-a-name: sets a descriptor's open name's times with nanosecond precision; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::utimensat", reason = "change-metadata-attached-to-a-name: sets a name's times relative to a dirfd; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::futimes", reason = "change-metadata-attached-to-a-name: sets a descriptor's open file's times; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::futimesat", reason = "change-metadata-attached-to-a-name: sets a name's times relative to a dirfd; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::lutimes", reason = "change-metadata-attached-to-a-name: sets a symlink's own times; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::setxattr", reason = "change-metadata-attached-to-a-name: sets an extended attribute on a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::lsetxattr", reason = "change-metadata-attached-to-a-name: sets an extended attribute on a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fsetxattr", reason = "change-metadata-attached-to-a-name: sets an extended attribute on a descriptor's open name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::removexattr", reason = "change-metadata-attached-to-a-name: removes an extended attribute from a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::lremovexattr", reason = "change-metadata-attached-to-a-name: removes an extended attribute from a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fremovexattr", reason = "change-metadata-attached-to-a-name: removes an extended attribute from a descriptor's open name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::chflags", reason = "change-metadata-attached-to-a-name: changes a name's file flags; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fchflags", reason = "change-metadata-attached-to-a-name: changes a descriptor's open name's file flags; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::lchflags", reason = "change-metadata-attached-to-a-name: changes a symlink's own name's file flags; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::setattrlist", reason = "change-metadata-attached-to-a-name: sets name-attached attributes in bulk (macOS); the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::exchangedata", reason = "change-metadata-attached-to-a-name: swaps the contents of two names (macOS); the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::acl_set_file", reason = "change-metadata-attached-to-a-name: sets an ACL on a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::acl_set_link_np", reason = "change-metadata-attached-to-a-name: sets an ACL on a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::chflagsat", reason = "change-metadata-attached-to-a-name: dirfd-relative chflags; changes a name's file flags; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::fsetattrlist", reason = "change-metadata-attached-to-a-name: descriptor-relative setattrlist; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::setattrlistat", reason = "change-metadata-attached-to-a-name: dirfd-relative setattrlist; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::truncate64", reason = "change-metadata-attached-to-a-name: the large-file-offset spelling of truncate; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::ftruncate64", reason = "change-metadata-attached-to-a-name: the large-file-offset spelling of ftruncate; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::wchmod", reason = "change-metadata-attached-to-a-name: the wide-character chmod on a Windows name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::wutime", reason = "change-metadata-attached-to-a-name: the wide-character utime on a Windows name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::extattr_set_file", reason = "change-metadata-attached-to-a-name: sets a named extended attribute on a name (FreeBSD/NetBSD); the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::extattr_set_link", reason = "change-metadata-attached-to-a-name: sets a named extended attribute on a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::extattr_delete_file", reason = "change-metadata-attached-to-a-name: removes a named extended attribute from a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::extattr_delete_link", reason = "change-metadata-attached-to-a-name: removes a named extended attribute from a symlink's own name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `change-the-mount-name-space`:
+  { path = "libc::mount", reason = "change-the-mount-name-space: attaches a filesystem at a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::umount", reason = "change-the-mount-name-space: detaches the filesystem at a name; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::umount2", reason = "change-the-mount-name-space: the flag-taking twin of umount; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::nmount", reason = "change-the-mount-name-space: the FreeBSD flag-taking mount; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::unmount", reason = "change-the-mount-name-space: the BSD umount; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  { path = "libc::cygwin_umount", reason = "change-the-mount-name-space: Cygwin's umount; the funnel owns name mutation — call the guarded atomic primitive instead" },
+  # libc — class `rename-a-posix-ipc-name`:
+  { path = "libc::shm_rename", reason = "rename-a-posix-ipc-name: renames a POSIX shared-memory name; the funnel owns name mutation — call the guarded atomic primitive instead" },
 ]

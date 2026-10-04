@@ -92,10 +92,11 @@
 //!   [`openat_no_follow_io`] run the guard at the PRIMITIVE, so a new caller
 //!   of an existing wrapper is guarded without remembering to be;
 //! * the wrappers are private and every direct name-mutating `libc` call in
-//!   the crate lives in [`unix`] (enforced by the source audits
-//!   `guard::tests::no_libc_reference_outside_the_funnel` and
-//!   `guard::tests::std_fs_name_mutation_counts_are_pinned`), so a new
-//!   primitive must either present the capability or fail an audit.
+//!   the crate lives in [`unix`] (the resolved-symbol deny in `clippy.toml`
+//!   refuses the funnel's mutation symbols everywhere else, and the source
+//!   audits `guard::tests::every_production_libc_reference_is_pinned` and
+//!   `guard::tests::std_fs_name_mutation_counts_are_pinned` notice a change),
+//!   so a new primitive must either present the capability or fail a device.
 //!
 //! The honest residual is in [`guard`]'s module docs and [`crate::reserved::is_lock_record_name`].
 //!
