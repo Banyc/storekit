@@ -88,16 +88,17 @@ Named, scoped, not pursued:
   funnel module the deny is allowed there, so nothing else refuses it either. That
   shape is outside the pin's guarantee rather than a hole in a promise, and the
   contract's clause (c) says so.
-- **The deny list's WIDER SET is not checked for resolution.** An entry outside the
-  symbols the funnel uses is what refuses a route the funnel could acquire later,
-  but nothing verifies that such an entry resolves on either supported target: a
-  typo there produces a non-fatal config-time `does not refer to a reachable
-  function` diagnostic that the gate's `-D warnings` does not cover, so it can rot
-  silently. A typo in a symbol the funnel DOES use is caught by the closure test.
-  Some wider-set entries name symbols no supported target exports at all
-  (`libc::shm_rename` is FreeBSD-only), so on both targets they are decoration;
-  they are kept as the reviewed set's record rather than pruned, and this is the
-  residual that covers them.
+- **No deny entry is checked for RESOLUTION.** `clippy.toml` is a list of resolved
+  symbols, and nothing verifies that a given entry resolves on a given target. A typo
+  there produces a non-fatal config-time `does not refer to a reachable function`
+  diagnostic that the gate's `-D warnings` does not cover, so it can rot silently; a
+  symbol the funnel DOES use is caught only by the closure test, which checks the LIST,
+  not the resolution (`cargo clippy --all-targets --target x86_64-pc-windows-msvc` exits
+  0 while naming six funnel-used `libc::…at` symbols). On Windows every `libc` entry is
+  inert in that sense — the crate uses no `libc` there and the symbols do not resolve —
+  and some wider-set entries name symbols no supported target exports at all
+  (`libc::shm_rename` is FreeBSD-only). The entries are kept as the reviewed record
+  rather than pruned, and the deny bites on each target that DOES export the symbol.
 - **The far-side root of an `SshTransport` destination is unresolvable from here.**
   When the remote is not local its root names a path on another host, so nothing this
   host can see establishes that it is disjoint from the local root — they may be a
@@ -106,10 +107,21 @@ Named, scoped, not pursued:
   one filesystem enforces disjointness itself. Stated at `src/sync/apply.rs`'s module
   docs.
 - **The count pins pin CALL COUNTS, not arguments.** A change to an argument at a
-  call site inside a reviewed allow region — adding an adoption flag to a
-  `custom_flags` call in a funnel function, say — moves no pinned count, and the
-  deny is allowed there, so no device notices it. The contract's clause (c) is
-  about a changed or ADDED call; an argument change is a review responsibility.
+  call site inside a reviewed allow region moves no `std::fs` count, and the deny is
+  allowed there. The boundary is precise, and narrower than "no device notices it": an
+  argument that introduces a NEW `libc` symbol IS noticed, because the `libc` pin counts
+  references and every funnel `custom_flags` site spells its flags as `libc::…` —
+  measured, `custom_flags(libc::O_NONBLOCK | libc::O_CREAT)` fails the pin on
+  `libc::O_CREAT`. An argument change that introduces no newly counted symbol (a
+  constant, a length, a bit already spelled) is a review responsibility. The contract's
+  clause (c) is about a changed or ADDED call.
+- **The wire reader validates SHAPES, not cross-field consistency.** The reader now
+  refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
+  version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde
+  still gets those. It does NOT check `content_sha256`/`symlink_target` (the target's
+  containment rule is relative to the entry's own path, so it cannot be a per-field
+  check), nor the digest recomputation and the duplicate/ordering rules: those live in
+  `verify_tree_metadata`, which a caller may skip.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

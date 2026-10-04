@@ -385,7 +385,10 @@ takes responsibility for exactly this, and no more.
   them (`clippy.toml`: the symbols the funnel uses, plus a reviewed set around
   them — the list is deliberately WIDER than the funnel, and naming a symbol the
   funnel never calls is how a route it could acquire later is refused in
-  advance). (b) Every production
+  advance). The deny's reach is per SYMBOL and per TARGET: a `libc` symbol does not
+  resolve on Windows at all, so those entries are inert there — the crate uses no
+  `libc` on that target, and the deny bites on every target that exports the
+  symbol. (b) Every production
   `libc` reference is either inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`)
   or NAMED in the audit's pin, by file, symbol and count; the map of references NOT on
   the pin is asserted EMPTY, so an unreviewed `libc` reference is a failing test. The
