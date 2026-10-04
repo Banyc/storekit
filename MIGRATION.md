@@ -4,7 +4,16 @@ The crate was extracted from `deploy`, so the migration is mostly deletion: swap
 `deploy`'s copies of the substrate for the crate's, keep everything that is
 domain. This file is the ordered checklist and the record of what does NOT map.
 
-`deploy` does not depend on the crate yet. Nothing below has been executed.
+**Status: the deploy-side migration is DONE, and this file is its record.**
+`deploy`'s substrate now comes from the crate (the last slice was the `id`
+newtype machinery). The checklist below is therefore a record of what was done
+and why, not a plan — the same convention as `EXTRACTION.md`. Two questions in
+it stay OPEN and are marked where they appear: whether `sync` should replace
+`deploy`'s own transfer protocol (answered NO for `materialize`, which is
+domain), and the receiver-marker adoption, which is done. An earlier version of
+this line said "deploy does not depend on the crate yet. Nothing below has been
+executed" while sixty lines below it marked steps DONE — the axis-A failure of a
+header that was written before the work and never revisited.
 
 ## What the migration is not
 
