@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use storekit::env::SysEnv;
-use storekit::error::Error;
+use storekit::error::PreflightKind;
 use storekit::sync::{DestinationOwnership, Direction, Extraneous, ReplaceAll, sync};
 use storekit::transport::{
     CreateNewVerdict, ExecOutcome, FarSideLockSession, FsBytes, Layout, LocalTransport, Remote,
@@ -288,13 +288,10 @@ fn a_remote_token_is_refused_across_endpoints_with_the_same_root() {
         token,
     )
     .expect_err("a token minted against host A must be refused for host B");
-    assert!(
-        matches!(error.error(), Error::Preflight(_)),
-        "the refusal must be a typed preflight: {error:?}"
-    );
-    assert!(
-        error.error().to_string().contains("ENDPOINT IDENTITY"),
-        "the refusal must name the ENDPOINT axis, not only the root: {error}"
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::EndpointIdentityMismatch),
+        "the refusal must be the typed ENDPOINT-identity mismatch, not only a root refusal: {error:?}"
     );
     assert!(
         !host_b.data("f").exists(),
@@ -335,13 +332,10 @@ fn a_remote_token_is_refused_across_roots_with_the_same_endpoint() {
         token,
     )
     .expect_err("a token minted for another root spelling must be refused");
-    assert!(
-        matches!(error.error(), Error::Preflight(_)),
-        "the refusal must be a typed preflight: {error:?}"
-    );
-    assert!(
-        error.error().to_string().contains("ROOT"),
-        "the refusal must name the ROOT axis: {error}"
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteRootMismatch),
+        "the refusal must be the typed ROOT-spelling mismatch: {error:?}"
     );
     assert!(!host_b.data("f").exists(), "host B must be unmutated");
 }
@@ -416,13 +410,10 @@ fn a_pull_token_is_refused_against_a_different_source_endpoint() {
         token,
     )
     .expect_err("a pull token minted against source A must be refused for source B");
-    assert!(
-        matches!(error.error(), Error::Preflight(_)),
-        "the refusal must be a typed preflight: {error:?}"
-    );
-    assert!(
-        error.error().to_string().contains("ENDPOINT IDENTITY"),
-        "the refusal must name the ENDPOINT axis: {error}"
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::EndpointIdentityMismatch),
+        "the refusal must be the typed ENDPOINT-identity mismatch: {error:?}"
     );
     assert!(
         !local_dst.join("x").exists(),
@@ -462,13 +453,10 @@ fn a_pull_token_is_refused_against_a_different_source_root() {
         token,
     )
     .expect_err("a pull token minted for another source root must be refused");
-    assert!(
-        matches!(error.error(), Error::Preflight(_)),
-        "the refusal must be a typed preflight: {error:?}"
-    );
-    assert!(
-        error.error().to_string().contains("ROOT"),
-        "the refusal must name the ROOT axis: {error}"
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteRootMismatch),
+        "the refusal must be the typed ROOT-spelling mismatch: {error:?}"
     );
     assert!(
         !local_dst.join("x").exists(),
@@ -526,18 +514,10 @@ fn a_transport_without_an_endpoint_identity_cannot_mint_a_remote_token() {
         Err(error) => error,
         Ok(_) => panic!("a transport without an endpoint identity must not mint a token"),
     };
-    assert!(
-        matches!(error, Error::Preflight(_)),
-        "the refusal must be a typed preflight: {error:?}"
-    );
-    let text = error.to_string();
-    assert!(
-        text.contains("endpoint_identity"),
-        "the refusal must name the override a transport needs: {text}"
-    );
-    assert!(
-        text.contains("DestinationOwnership::Unowned"),
-        "the refusal must name the weak path: {text}"
+    assert_eq!(
+        error.preflight_reason(),
+        Some(PreflightKind::EndpointIdentityUnavailable),
+        "the refusal must be the typed ENDPOINT-identity-unavailable condition: {error:?}"
     );
     assert_eq!(
         host.far_side_lock_calls(),
@@ -547,5 +527,69 @@ fn a_transport_without_an_endpoint_identity_cannot_mint_a_remote_token() {
     assert!(
         !host.data("f").exists(),
         "the refused mint must mutate nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mutation control: the distinguished refusals carry DISTINCT typed kinds
+// ---------------------------------------------------------------------------
+
+/// MUTATION CONTROL for the typed-preflight constraint: the two conditions a
+/// caller must tell apart — a transport that states no ENDPOINT IDENTITY, and
+/// a transport whose ROOT spelling differs from the token's — carry DIFFERENT
+/// `PreflightKind`s, and neither is `Unclassified`. Collapsing them onto one
+/// kind, or leaving the class untyped, fails here even though a test that only
+/// matched message substrings would still pass.
+#[test]
+fn the_endpoint_and_root_refusals_carry_distinct_typed_kinds() {
+    // (a) The missing-endpoint-identity refusal.
+    let f = fixture();
+    let anonymous = EndpointRemote::new(f.dir.path().join("data"), f.shared_root.clone(), None);
+    let missing_identity =
+        match DestinationOwnership::lock_remote(Direction::Push, &f.src, &anonymous) {
+            Err(error) => error,
+            Ok(_) => panic!("a transport without an endpoint identity must not mint a token"),
+        };
+    let identity_kind = missing_identity.preflight_reason();
+
+    // (b) The remote-root-mismatch refusal: mint against root A, run against
+    // root B on the SAME endpoint identity.
+    let f = fixture();
+    let host_a = EndpointRemote::new(
+        f.dir.path().join("data-a"),
+        f.shared_root.clone(),
+        Some("ssh://shared-host:22"),
+    );
+    let host_b = EndpointRemote::new(
+        f.dir.path().join("data-b"),
+        f.dir.path().join("other").join("store"),
+        Some("ssh://shared-host:22"),
+    );
+    let token = DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a)
+        .expect("mint a remote token against host A");
+    let root_mismatch = sync(
+        Direction::Push,
+        &f.src,
+        &host_b,
+        &ReplaceAll,
+        Extraneous::Keep,
+        token,
+    )
+    .expect_err("a token minted for another root spelling must be refused");
+    let root_kind = root_mismatch.error().preflight_reason();
+
+    assert_eq!(
+        identity_kind,
+        Some(PreflightKind::EndpointIdentityUnavailable)
+    );
+    assert_eq!(root_kind, Some(PreflightKind::RemoteRootMismatch));
+    assert_ne!(
+        identity_kind, root_kind,
+        "the endpoint-identity and root-spelling refusals must have DISTINCT kinds"
+    );
+    assert!(
+        identity_kind != Some(PreflightKind::Unclassified)
+            && root_kind != Some(PreflightKind::Unclassified),
+        "each distinguished condition must name its kind, never the fallback"
     );
 }

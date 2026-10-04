@@ -7033,8 +7033,13 @@ fn retire_destination_lock_fails_closed_when_presence_cannot_be_determined() {
 
     let err = retire_destination_lock(&dest).unwrap_err();
     assert!(
-        matches!(err, Error::Preflight(_)),
+        matches!(err, Error::Preflight { .. }),
         "an undeterminable presence is a typed failure, never a silent Absent: {err:?}"
+    );
+    assert_eq!(
+        err.preflight_reason(),
+        Some(PreflightKind::Unclassified),
+        "an undeterminable presence is a mechanical probe fault, so it stays the fallback: {err:?}"
     );
     assert!(
         err.reserved_kind().is_none(),
@@ -12908,10 +12913,10 @@ fn sync_refuses_a_remote_destination_and_points_at_the_unowned_value() {
          the control-socket directory and pins the verified host key; the \
          double observes the call, which is the strongest in-crate proof)"
     );
-    let text = error.to_string();
-    assert!(
-        text.contains("DestinationOwnership::Unowned"),
-        "the refusal must name the unowned value: {text}"
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteDestinationViaLocalLock),
+        "the refusal must be the typed local-constructor refusal: {error:?}"
     );
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -12942,10 +12947,10 @@ fn composed_ownership_refuses_a_remote_destination_like_the_plain_form() {
         Err(err) => err,
         Ok(_) => panic!("the composed form must refuse a destination it cannot lock"),
     };
-    assert!(matches!(err, Error::Preflight(_)), "{err:?}");
-    assert!(
-        err.to_string().contains("DestinationOwnership::Unowned"),
-        "the refusal must name the unowned value: {err}"
+    assert_eq!(
+        err.preflight_reason(),
+        Some(PreflightKind::RemoteDestinationViaLocalLock),
+        "the refusal must be the typed local-constructor refusal: {err:?}"
     );
     assert_eq!(
         remote.identity_calls(),
@@ -12986,10 +12991,10 @@ fn lock_remote_refuses_a_transport_without_far_side_locking() {
         Err(error) => error,
         Ok(_) => panic!("a transport without far-side locking must be refused"),
     };
-    assert!(matches!(error, Error::Preflight(_)), "{error:?}");
-    assert!(
-        error.to_string().contains("lock_far_side"),
-        "the refusal must name the override a transport needs: {error}"
+    assert_eq!(
+        error.preflight_reason(),
+        Some(PreflightKind::FarSideLockUnsupported),
+        "the refusal must be the typed far-side-seam refusal: {error:?}"
     );
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
@@ -13067,14 +13072,10 @@ fn a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token() {
     let err = DestinationOwnership::lock(Direction::Pull, &dst, &remote)
         .err()
         .expect("a non-local transport without an endpoint identity must not mint a token");
-    let message = err.to_string();
-    assert!(
-        message.contains("endpoint_identity") && message.contains("Unowned"),
-        "the refusal must name the override AND the weaker path: {message}"
-    );
-    assert!(
-        matches!(err, Error::Preflight(_)),
-        "the refusal must be the typed Preflight, not a message-only error: {err:?}"
+    assert_eq!(
+        err.preflight_reason(),
+        Some(PreflightKind::EndpointIdentityUnavailable),
+        "the refusal must be the typed endpoint-identity-unavailable condition: {err:?}"
     );
     // Nothing was prepared or created: no lock record, no root.
     assert_eq!(
@@ -13084,9 +13085,12 @@ fn a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token() {
     );
 }
 
-/// The `Locked` token is BOUND to the run it was taken for: a token acquired
-/// for one destination is REFUSED when handed to a run against another, so a
-/// caller cannot take the lock on a destination it will not mutate.
+/// The `Locked` token is BOUND to the transport ROOT it was taken for: a token
+/// acquired for one destination is REFUSED when handed to a run against
+/// another, so a caller cannot take the lock on a destination it will not
+/// mutate. (Both the ROOT-spelling refusal and the run-binding refusal open
+/// with "the destination ownership was taken for", which is exactly why a
+/// text match could not tell them apart; the typed kind does.)
 #[test]
 fn a_destination_ownership_token_is_bound_to_its_run() {
     let dir = fixture_tmpdir(&env()).unwrap();
@@ -13111,14 +13115,52 @@ fn a_destination_ownership_token_is_bound_to_its_run() {
         ownership,
     )
     .expect_err("a token taken for another destination must be refused");
-    assert!(
-        err.error()
-            .to_string()
-            .contains("destination ownership was taken for"),
-        "the refusal must name the mismatch: {err}"
+    assert_eq!(
+        err.error().preflight_reason(),
+        Some(PreflightKind::RemoteRootMismatch),
+        "the refusal must be the typed ROOT-spelling mismatch: {err:?}"
     );
     assert_eq!(
         canonicalize_tree(&other_dst).unwrap(),
+        before,
+        "the mismatched run must mutate nothing"
+    );
+}
+
+/// The token is bound to the LOCAL root (the source for a PUSH) as well as the
+/// remote root: a token minted for one source is REFUSED for a run from
+/// another source, with the typed RUN-BINDING mismatch — a DIFFERENT kind from
+/// the remote ROOT-spelling mismatch above, even though the two messages share
+/// their opening words.
+#[test]
+fn a_destination_ownership_token_is_bound_to_its_local_root() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src_a = dir.path().join("src-a");
+    let src_b = dir.path().join("src-b");
+    write(&src_a.join("f"), b"payload-a");
+    write(&src_b.join("f"), b"payload-b");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    let before = canonicalize_tree(&dst).unwrap();
+
+    let ownership = DestinationOwnership::lock(Direction::Push, &src_a, &transport(&dst))
+        .expect("acquiring the lock for the destination");
+    let err = sync(
+        Direction::Push,
+        &src_b,
+        &transport(&dst),
+        &ReplaceAll,
+        Keep,
+        ownership,
+    )
+    .expect_err("a token minted for another local root must be refused");
+    assert_eq!(
+        err.error().preflight_reason(),
+        Some(PreflightKind::RunBindingMismatch),
+        "the refusal must be the typed run-binding mismatch: {err:?}"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap(),
         before,
         "the mismatched run must mutate nothing"
     );

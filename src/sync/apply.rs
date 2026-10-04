@@ -946,7 +946,7 @@
 //! source".
 
 use crate::atomic::ReplaceOutcome;
-use crate::error::{Error, MaterializationKind, Result, StoreKind, TransportKind};
+use crate::error::{Error, MaterializationKind, PreflightKind, Result, StoreKind, TransportKind};
 use crate::lock::FileLock;
 use crate::manifest::{
     ContainmentViews, DestinationTree, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
@@ -1943,10 +1943,13 @@ fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
 /// then performs the acquisition.
 fn destination_lock_record(dest_is_local: bool, dest_root: &Path) -> Result<PathBuf> {
     if !dest_is_local {
-        return Err(Error::preflight(format!(
-            "refusing to sync into the REMOTE destination {} through `DestinationOwnership::lock`: that constructor takes a lock on a LOCAL record, and this destination's record is on the far side. To OWN the remote destination, acquire its far-side record with `DestinationOwnership::lock_remote` (a persistent far-side lock session, held for the whole run); if the caller holds the destination for the run, pass `DestinationOwnership::Unowned` (the explicitly weaker path); otherwise sync into a LOCAL destination.",
-            dest_root.display()
-        )));
+        return Err(Error::preflight_kind(
+            PreflightKind::RemoteDestinationViaLocalLock,
+            format!(
+                "refusing to sync into the REMOTE destination {} through `DestinationOwnership::lock`: that constructor takes a lock on a LOCAL record, and this destination's record is on the far side. To OWN the remote destination, acquire its far-side record with `DestinationOwnership::lock_remote` (a persistent far-side lock session, held for the whole run); if the caller holds the destination for the run, pass `DestinationOwnership::Unowned` (the explicitly weaker path); otherwise sync into a LOCAL destination.",
+                dest_root.display()
+            ),
+        ));
     }
     let Some(path) = destination_lock_path(dest_root) else {
         return Err(Error::preflight(format!(
@@ -2025,10 +2028,13 @@ fn lock_destination(
 /// root.
 fn require_existing_root(dest_is_local: bool, dest_root: &Path) -> Result<()> {
     if !dest_is_local {
-        return Err(Error::preflight(format!(
-            "the composed destination ownership requires a LOCAL destination, but {} names a far-side root; a far-side record cannot be held from this host",
-            dest_root.display()
-        )));
+        return Err(Error::preflight_kind(
+            PreflightKind::ComposedRequiresLocalDestination,
+            format!(
+                "the composed destination ownership requires a LOCAL destination, but {} names a far-side root; a far-side record cannot be held from this host",
+                dest_root.display()
+            ),
+        ));
     }
     // `lstat`, never `stat`/`exists`: a symlink at the root is not a directory.
     match std::fs::symlink_metadata(dest_root) {
@@ -2623,12 +2629,15 @@ impl DestinationOwnership {
         // unreachable host) leaves no far-side lock record behind.
         let prepared = prepare(direction, local_root, remote, false)?;
         if prepared.dest_is_local {
-            return Err(Error::preflight(format!(
-                "refusing to acquire a FAR-SIDE lock for {}: it names a LOCAL destination (a \
+            return Err(Error::preflight_kind(
+                PreflightKind::LocalDestinationViaRemoteLock,
+                format!(
+                    "refusing to acquire a FAR-SIDE lock for {}: it names a LOCAL destination (a \
                  PULL's destination is always local), whose record is on this host. Use \
                  `DestinationOwnership::lock` for a local destination.",
-                prepared.dest_root.display()
-            )));
+                    prepared.dest_root.display()
+                ),
+            ));
         }
         // The token MUST be bound to an ENDPOINT, not merely to a path: two
         // hosts that report the same layout path would otherwise be
@@ -2639,12 +2648,15 @@ impl DestinationOwnership {
         // ONE authority for the record's spelling: the SAME derivation the local
         // case uses, applied to the far-side root spelling.
         let Some(record) = destination_lock_path(&prepared.dest_root) else {
-            return Err(Error::preflight(format!(
-                "refusing to own the remote destination {}: no operation-lock record can be placed \
+            return Err(Error::preflight_kind(
+                PreflightKind::RemoteDestinationUnlockable,
+                format!(
+                    "refusing to own the remote destination {}: no operation-lock record can be placed \
                  as a SIBLING of that root on the far side. If the caller holds the destination for \
                  the run, pass `DestinationOwnership::Unowned`.",
-                prepared.dest_root.display()
-            )));
+                    prepared.dest_root.display()
+                ),
+            ));
         };
         let op_id = format!(
             "storekit {direction:?} of {} (client pid {})",
@@ -2786,35 +2798,44 @@ impl Prepared {
     fn matches(&self, direction: Direction, local_root: &Path, remote: &dyn Remote) -> Result<()> {
         // (1) The direction and the pinned LOCAL root.
         if self.direction != direction || normalize_root(local_root) != self.local.root_path {
-            return Err(Error::preflight(format!(
-                "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
-                self.direction,
-                self.local.root_path.display(),
-                self.dest_root.display(),
-                direction
-            )));
+            return Err(Error::preflight_kind(
+                PreflightKind::RunBindingMismatch,
+                format!(
+                    "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
+                    self.direction,
+                    self.local.root_path.display(),
+                    self.dest_root.display(),
+                    direction
+                ),
+            ));
         }
         // (2) The transport's PATH spelling, for BOTH directions.
         let remote_root = normalize_root(remote.root());
         if remote_root != self.remote_root {
-            return Err(Error::preflight(format!(
-                "the destination ownership was taken for a {:?} run against a transport rooted at {} but called against a transport whose ROOT spelling is {}: the transport's ROOT differs, so the run would mutate a different tree than the one the token was taken for; acquire ownership for the run you are about to make",
-                self.direction,
-                self.remote_root.display(),
-                remote_root.display()
-            )));
+            return Err(Error::preflight_kind(
+                PreflightKind::RemoteRootMismatch,
+                format!(
+                    "the destination ownership was taken for a {:?} run against a transport rooted at {} but called against a transport whose ROOT spelling is {}: the transport's ROOT differs, so the run would mutate a different tree than the one the token was taken for; acquire ownership for the run you are about to make",
+                    self.direction,
+                    self.remote_root.display(),
+                    remote_root.display()
+                ),
+            ));
         }
         // (3) The transport's ENDPOINT identity, for BOTH directions. This is
         // the HOST/PORT/ACCOUNT axis: the root check above cannot distinguish
         // two hosts that report the same layout path.
         let remote_identity = remote.endpoint_identity();
         if remote_identity != self.remote_identity {
-            return Err(Error::preflight(format!(
-                "the destination ownership was taken for a {:?} run against transport endpoint {} but called against transport endpoint {}: the transport's ENDPOINT IDENTITY differs, so the token would be replayed against a different host than the one it was taken for; acquire ownership for the run you are about to make",
-                self.direction,
-                describe_endpoint(&self.remote_identity),
-                describe_endpoint(&remote_identity)
-            )));
+            return Err(Error::preflight_kind(
+                PreflightKind::EndpointIdentityMismatch,
+                format!(
+                    "the destination ownership was taken for a {:?} run against transport endpoint {} but called against transport endpoint {}: the transport's ENDPOINT IDENTITY differs, so the token would be replayed against a different host than the one it was taken for; acquire ownership for the run you are about to make",
+                    self.direction,
+                    describe_endpoint(&self.remote_identity),
+                    describe_endpoint(&remote_identity)
+                ),
+            ));
         }
         // (4) The derived destination shape (a transport that flipped LOCALness
         // with the same root and identity must still be refused).
@@ -2827,13 +2848,16 @@ impl Prepared {
             Direction::Pull => true,
         };
         if dest_root != self.dest_root || dest_is_local != self.dest_is_local {
-            return Err(Error::preflight(format!(
-                "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
-                self.direction,
-                self.local.root_path.display(),
-                self.dest_root.display(),
-                direction
-            )));
+            return Err(Error::preflight_kind(
+                PreflightKind::RunBindingMismatch,
+                format!(
+                    "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
+                    self.direction,
+                    self.local.root_path.display(),
+                    self.dest_root.display(),
+                    direction
+                ),
+            ));
         }
         Ok(())
     }
@@ -2879,15 +2903,18 @@ fn require_endpoint_identity(remote: &dyn Remote) -> Result<()> {
     if remote.is_local() || remote.endpoint_identity().is_some() {
         return Ok(());
     }
-    Err(Error::preflight(format!(
-        "refusing to take ownership for {}: this transport is NOT LOCAL and cannot state an \
+    Err(Error::preflight_kind(
+        PreflightKind::EndpointIdentityUnavailable,
+        format!(
+            "refusing to take ownership for {}: this transport is NOT LOCAL and cannot state an \
          ENDPOINT IDENTITY, so a token minted here would be bound only to the PATH spelling and \
          could be replayed against a DIFFERENT host that reports the same root. Override \
          `Remote::endpoint_identity` to return a stable string identifying the transport's \
          endpoint (host/port/account), or, if the caller holds the destination for the run, pass \
          `DestinationOwnership::Unowned` (the explicitly weaker path).",
-        remote.root().display()
-    )))
+            remote.root().display()
+        ),
+    ))
 }
 
 fn prepare(

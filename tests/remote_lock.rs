@@ -36,7 +36,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use storekit::env::SysEnv;
-use storekit::error::Error;
+use storekit::error::{Error, PreflightKind};
 use storekit::sync::{
     DestinationOwnership, Direction, Extraneous, ReplaceAll, SyncResult, destination_lock_path,
     sync,
@@ -617,12 +617,9 @@ fn lock_remote_refuses_a_local_destination() {
     let err = DestinationOwnership::lock_remote(Direction::Push, &src, &t)
         .err()
         .expect("a local destination must be refused by lock_remote");
-    assert!(
-        matches!(err, Error::Preflight(_)),
-        "the refusal must be a typed preflight: {err:?}"
-    );
-    assert!(
-        err.to_string().contains("DestinationOwnership::lock"),
-        "the refusal must point at the local constructor: {err}"
+    assert_eq!(
+        err.preflight_reason(),
+        Some(PreflightKind::LocalDestinationViaRemoteLock),
+        "the refusal must be the typed local-destination refusal: {err:?}"
     );
 }

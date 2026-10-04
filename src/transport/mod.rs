@@ -81,7 +81,7 @@ pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerCo
 pub use ssh::SshTransport;
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result, TransportKind};
+use crate::error::{Error, PreflightKind, Result, TransportKind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -871,14 +871,17 @@ pub trait Remote {
     /// contract a third-party override must satisfy.
     fn lock_far_side(&self, record: &Path, op_id: &str) -> Result<Box<dyn FarSideLockSession>> {
         let _ = (record, op_id);
-        Err(Error::preflight(format!(
-            "this transport cannot hold a far-side operation lock for the remote root {}: \
+        Err(Error::preflight_kind(
+            PreflightKind::FarSideLockUnsupported,
+            format!(
+                "this transport cannot hold a far-side operation lock for the remote root {}: \
              `DestinationOwnership::lock_remote` requires a transport that overrides \
              `Remote::lock_far_side` (only `SshTransport` does). If the caller holds the \
              destination for the run, pass `DestinationOwnership::Unowned` (the explicitly \
              weaker path).",
-            self.root().display()
-        )))
+                self.root().display()
+            ),
+        ))
     }
 
     /// Atomic recover of the operation lock: remove `rel` iff it equals

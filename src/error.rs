@@ -13,7 +13,7 @@
 //! Within a class, where a caller has to DISTINGUISH one condition from
 //! another in the same class, the condition is a TYPED value carried alongside
 //! the message: [`MaterializationKind`], [`StoreKind`], [`TransportKind`],
-//! and the pre-existing [`ReservedKind`]. The message is preserved VERBATIM
+//! [`PreflightKind`], and the pre-existing [`ReservedKind`]. The message is preserved VERBATIM
 //! (the `Display` impl is byte-identical to the pre-typing one), so a caller
 //! that already matches the text keeps working; the typed value is what a
 //! caller should branch on. A class that carries no typed kind is one where
@@ -62,8 +62,15 @@ pub enum Error {
         message: String,
     },
 
-    #[error("preflight failed: {0}")]
-    Preflight(String),
+    /// A PREFLIGHT refusal: a condition checked before the run mutates
+    /// anything (an ownership binding that does not hold, a destination the
+    /// crate cannot lock, a lock record that must not be followed). The
+    /// message is preserved verbatim; a caller branches on [`PreflightKind`].
+    #[error("preflight failed: {message}")]
+    Preflight {
+        kind: PreflightKind,
+        message: String,
+    },
 
     #[error("not found: {0}")]
     NotFound(String),
@@ -284,6 +291,65 @@ pub enum TransportKind {
     Unclassified,
 }
 
+/// The TYPED reason a [`Error::Preflight`] refusal was raised.
+///
+/// These are the conditions a caller must tell apart BEFORE a run mutates
+/// anything: the ownership/token binding checks (the transport's ENDPOINT
+/// identity and ROOT spelling, the run the token was minted for), the
+/// destination-lockability checks (a remote destination handed to the local
+/// lock constructor, a local destination handed to the far-side constructor,
+/// a root with no derivable sibling record, the composed form's requirement
+/// that the destination be local), the far-side lock seam, and the two lock
+/// record path refusals whose whole point is that the caller learns the record
+/// must not be followed. Every other preflight failure is a mechanical I/O
+/// fault with no consumer-side branch and stays [`Self::Unclassified`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreflightKind {
+    /// [`crate::transport::Remote::endpoint_identity`] is `None` on a
+    /// NON-LOCAL transport, so an ownership token minted against it would be
+    /// bound only to a path spelling and could be replayed against a
+    /// different host. The remedy is to override `endpoint_identity`, or to
+    /// pass `DestinationOwnership::Unowned`.
+    EndpointIdentityUnavailable,
+    /// [`crate::sync::DestinationOwnership`]'s preflight found the transport's
+    /// ENDPOINT identity differs from the one the token was minted against:
+    /// the token would be replayed against a different host (or source).
+    EndpointIdentityMismatch,
+    /// The transport's ROOT spelling differs from the one the token was minted
+    /// against, so the run would mutate a different tree.
+    RemoteRootMismatch,
+    /// The token was minted for another DIRECTION, another pinned local root,
+    /// or another derived destination shape, so it does not describe this run.
+    RunBindingMismatch,
+    /// A REMOTE destination was handed to `DestinationOwnership::lock`, whose
+    /// record is a LOCAL sibling file; the far-side constructor
+    /// (`DestinationOwnership::lock_remote`) or `Unowned` is the remedy.
+    RemoteDestinationViaLocalLock,
+    /// A LOCAL destination was handed to `DestinationOwnership::lock_remote`,
+    /// which owns a far-side record; `DestinationOwnership::lock` is the
+    /// remedy.
+    LocalDestinationViaRemoteLock,
+    /// No operation-lock record can be placed as a SIBLING of the remote
+    /// destination root, so the far side cannot be owned from here.
+    RemoteDestinationUnlockable,
+    /// The composed ownership form requires a LOCAL destination, but the
+    /// transport names a far-side root whose in-root record cannot be held
+    /// from this host.
+    ComposedRequiresLocalDestination,
+    /// The transport did not override [`crate::transport::Remote::lock_far_side`],
+    /// whose default refuses, so it cannot hold a far-side operation lock.
+    FarSideLockUnsupported,
+    /// The lock record path is a symlink (or reparse point), so opening it
+    /// could truncate or chmod an arbitrary victim file.
+    LockRecordIsSymlink,
+    /// The lock record's PARENT directory is a symlink, so the record (and
+    /// every subsequent open) could be redirected elsewhere.
+    LockParentIsSymlink,
+    /// A condition with no distinction any caller branches on; the message is
+    /// for a human.
+    Unclassified,
+}
+
 impl Error {
     /// A TYPED reserved-spelling refusal (see [`ReservedKind`]). The message
     /// keeps the `ResidueBelow` token for textual compatibility.
@@ -352,6 +418,23 @@ impl Error {
             _ => None,
         }
     }
+
+    /// A TYPED preflight refusal (see [`PreflightKind`]). The message is
+    /// preserved verbatim.
+    pub fn preflight_kind(kind: PreflightKind, msg: impl Into<String>) -> Self {
+        Error::Preflight {
+            kind,
+            message: msg.into(),
+        }
+    }
+
+    /// The typed preflight reason, when this error is one.
+    pub fn preflight_reason(&self) -> Option<PreflightKind> {
+        match self {
+            Error::Preflight { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
 }
 
 impl Error {
@@ -380,7 +463,10 @@ impl Error {
         }
     }
     pub fn preflight(msg: impl Into<String>) -> Self {
-        Error::Preflight(msg.into())
+        Error::Preflight {
+            kind: PreflightKind::Unclassified,
+            message: msg.into(),
+        }
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
         Error::NotFound(msg.into())
@@ -431,7 +517,10 @@ impl Error {
                 kind,
                 message: format!("{message}; {context}"),
             },
-            Error::Preflight(m) => Error::Preflight(format!("{m}; {context}")),
+            Error::Preflight { kind, message } => Error::Preflight {
+                kind,
+                message: format!("{message}; {context}"),
+            },
             Error::NotFound(m) => Error::NotFound(format!("{m}; {context}")),
             Error::Ref(m) => Error::Ref(format!("{m}; {context}")),
             Error::Conflict(m) => Error::Conflict(format!("{m}; {context}")),
@@ -482,6 +571,10 @@ mod tests {
             Error::store_kind(StoreKind::CopyOverlap, "boom").to_string(),
             Error::store("boom").to_string()
         );
+        assert_eq!(
+            Error::preflight_kind(PreflightKind::EndpointIdentityUnavailable, "boom").to_string(),
+            Error::preflight("boom").to_string()
+        );
     }
 
     /// `with_context` PRESERVES the class AND the typed kind on every class
@@ -507,6 +600,14 @@ mod tests {
 
         let e = Error::reserved(ReservedKind::ResidueBelow, "boom").with_context("ctx");
         assert_eq!(e.reserved_kind(), Some(ReservedKind::ResidueBelow));
+
+        let e =
+            Error::preflight_kind(PreflightKind::RemoteRootMismatch, "boom").with_context("ctx");
+        assert_eq!(
+            e.preflight_reason(),
+            Some(PreflightKind::RemoteRootMismatch)
+        );
+        assert_eq!(e.to_string(), "preflight failed: boom; ctx");
     }
 
     /// The untyped shorthand produces the `Unclassified` kind, so a kind-aware
@@ -525,8 +626,14 @@ mod tests {
             Error::transport("t").transport_reason(),
             Some(TransportKind::Unclassified)
         );
+        assert_eq!(
+            Error::preflight("p").preflight_reason(),
+            Some(PreflightKind::Unclassified)
+        );
         // The kind accessors are None on a different class.
         assert_eq!(Error::transport("t").store_reason(), None);
         assert_eq!(Error::store("s").transport_reason(), None);
+        assert_eq!(Error::preflight("p").transport_reason(), None);
+        assert_eq!(Error::materialization("m").preflight_reason(), None);
     }
 }

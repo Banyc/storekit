@@ -71,7 +71,7 @@
 //! failure ([`crate::error::Error::Preflight`]), so a caller's retry policy
 //! reacts to the contention class instead of matching the holder message text.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PreflightKind, Result};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -164,12 +164,15 @@ impl FileLock {
             if let Ok(meta) = std::fs::symlink_metadata(parent)
                 && meta.file_type().is_symlink()
             {
-                return Err(Error::preflight(format!(
-                    "refusing to acquire the lock at {}: its parent directory {} is a symlink, \
+                return Err(Error::preflight_kind(
+                    PreflightKind::LockParentIsSymlink,
+                    format!(
+                        "refusing to acquire the lock at {}: its parent directory {} is a symlink, \
                      which would redirect the lock record (and the victim it names) elsewhere",
-                    path.display(),
-                    parent.display()
-                )));
+                        path.display(),
+                        parent.display()
+                    ),
+                ));
             }
             crate::atomic::ensure_private_dir_durable(parent)
                 .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
@@ -180,7 +183,7 @@ impl FileLock {
             // with a message that NAMES the condition rather than a raw open
             // error. The victim is never opened, truncated, or chmodded.
             if platform::is_symlink_open_error(&e) {
-                Error::preflight(format!(
+                Error::preflight_kind(PreflightKind::LockRecordIsSymlink, format!(
                     "refusing to acquire the lock at {}: the lock record path is a symlink (or is \
                      itself a reparse point), so opening it could truncate or chmod an arbitrary \
                      victim file; the record must be a regular file",
@@ -630,10 +633,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("a symlink record must be refused"),
         };
-        assert!(matches!(err, Error::Preflight(_)), "{err:?}");
-        assert!(
-            format!("{err}").contains("symlink"),
-            "the refusal names the condition: {err}"
+        assert_eq!(
+            err.preflight_reason(),
+            Some(PreflightKind::LockRecordIsSymlink),
+            "the refusal must be the typed record-symlink condition: {err:?}"
         );
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious victim data");
@@ -664,8 +667,11 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("a symlinked parent must be refused"),
         };
-        assert!(matches!(err, Error::Preflight(_)), "{err:?}");
-        assert!(format!("{err}").contains("symlink"), "{err}");
+        assert_eq!(
+            err.preflight_reason(),
+            Some(PreflightKind::LockParentIsSymlink),
+            "the refusal must be the typed parent-symlink condition: {err:?}"
+        );
         assert!(
             !victim_dir.join("operation.lock").exists(),
             "nothing is created in the victim directory"
