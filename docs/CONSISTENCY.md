@@ -899,8 +899,13 @@ a claim that no defect remains.
 
 ## The adversarial review (round 11)
 
-Nine findings, all fixed — and two of them are P1s in devices the previous round had
-just "made falsifiable", one of which is the orchestrator's own correction.
+Ten findings, all fixed — and two of them are P1s in devices the previous round had
+just "made falsifiable", one of which is the orchestrator's own correction. (This
+header said "Nine" while the table below lists ten: row 2 IS a finding — the
+orchestrator's fix asserting an artifact that did not exist — and the count had been
+written from memory rather than from the table, the same defect round 8 fixed in the
+round-1 paragraph. Totals: rounds 1–10 are 71 findings, round 11 is ten, so rounds
+1–11 are 81.)
 
 | # | finding | axis | fixed by |
 |---|---|---|---|

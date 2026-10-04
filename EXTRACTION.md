@@ -74,6 +74,7 @@ a pipe. On macOS:
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 cargo test                                  # x3
 (umask 0002; cargo test)
 (umask 0077; cargo test)
@@ -81,6 +82,14 @@ STOREKIT_FULL_TESTS=1 cargo test
 cargo test --doc
 cargo check --all-targets --target x86_64-pc-windows-msvc
 ```
+
+**TWO clippy commands, and the second is not optional** (round 6 finding 3):
+`cargo check --target …` does NOT substitute for it, because rustc does not run
+lints, so a `#[cfg(windows)]`-only module calling a denied symbol would be invisible
+without it. On Linux the same list applies (the real-`sshd` suites are part of
+`cargo test` there). An earlier version of this block listed only the host clippy,
+which was the gate as it stood before round 6 — a reader following it ran an
+incomplete completeness device.
 
 and the same set on Linux (`ssh ser`; `cargo` is on PATH only in a login shell,
 so use `ssh ser 'bash -lc "..."'`). A green gate on one platform is not evidence
