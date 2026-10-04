@@ -627,3 +627,47 @@ pointed at code deleted or replaced there since the claim was written. Axis A's
 rule about citations applies to cross-repo citations too, and had not been
 applied: a citation is a claim about a REVISION, and this crate cannot see the
 revisions that drift under it.
+
+## The adversarial review (round 5)
+
+Five findings, all fixed. This round's theme is the one the log had already named
+twice: **a LIST standing in for a RULE** — but this time the lists were the
+enforcement artifacts themselves.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The completeness device denied `libc::mkdir`/`mkdirat`/`symlink`/`symlinkat` — i.e. it ASSERTS that creating a directory or symlink at a name is funnel-owned — while the idiomatic std wrappers for exactly those operations (`std::fs::create_dir`, `std::fs::create_dir_all`, `std::os::unix::fs::symlink`, `std::os::windows::fs::symlink_file`/`symlink_dir`) were in NEITHER device. Reproduced by both reviewers on both platforms: a new production module calling them left `cargo clippy -D warnings` at 0 and both audits passing, where the funnel's own `create_dir_fd`/`symlink_fd` refuse the reserved spellings those wrappers create happily. | H, M | `lppvstnuywvx` |
+| 2 | The funnel-side pin covered a 14-name `MUTATING_LIBC_SYSCALLS` list, so `libc::mknod`, `mkfifo`, `renameat2`, `mknodat`, `mkfifoat`, `fchmod`, `fchmodat`, `remove` or a `syscall(SYS_*)` inserted INSIDE the funnel — the one place the pin's own doc says it is watching — changed no count and left every gate green. | H | `lppvstnuywvx` |
+| 3 | Constraint #7 and axis D still asserted that a destination observation "cannot be fed to `verify_tree_metadata`" and "cannot be used as a SOURCE manifest" — refuted in round 3, admitted in `src/manifest/mod.rs`'s own doc, and left standing in BOTH `.md` copies because round 3's fix touched only `src/`. | A | the round-5 docs commit |
+| 4 | The docs mis-filed the operative definition (README called "`clippy.toml`'s allow list" the funnel's membership; that file holds only the DENY side and has no allow list), and constraint #1's enumeration had missed a FIFTH member, `transport::ssh::hostkey::pin_known_hosts`'s cache-file removal. | A, M | the round-5 docs commit |
+| 5 | `platform::chmod`'s own doc claimed to be "the crate's ONE mode-bit authority ... that single `std::fs::set_permissions` call", but the FD-bound METHOD form `std::fs::File::set_permissions` is a different resolved symbol with production sites of its own. | A | `lppvstnuywvx` |
+
+**The remedy is the same one the last round used on the mechanism, applied to the
+lists: DERIVE them, and prove the derivation can fail.** The deny list can no
+longer drift from the code, because
+`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide` reads `clippy.toml`
+and scans the funnel's resolved symbol surface, then names any symbol the funnel
+USES that the deny list does not cover (measured: deleting `create_dir_all` from
+`clippy.toml` makes it fail, naming the hole). The funnel-side libc pin is no
+longer a 14-name list: it pins the funnel's WHOLE per-module `libc::<symbol>`
+reference surface (38 entries), so a new syscall there changes a count (measured:
+planting `libc::mknodat` in the funnel now fails the pin). Two consequences the
+agent reported rather than hid: `libc::open`/`openat` had to be denied too, because
+the funnel's `O_CREAT` open CAN adopt a name — the consistency property forced it;
+and the creation wrappers needed item-level allows at eight legitimate production
+sites, so the allow SET — not "the funnel modules" — is what the docs must name.
+
+**Two copies of a claim, one fix, one round of lag.** Round 3 narrowed the
+`DestinationTree` direction claim in `src/manifest/mod.rs` and left it standing in
+`API-CONSTRAINTS.md` and axis D; round 5 found the survivors. The lesson is not
+"be careful" — it is that a fix which narrows a CLAIM must cover every copy of it,
+because the crate's docs and its code are one artifact, and the review reads the
+docs.
+
+**And a sixth enumeration omission would be the signal to abandon the form.**
+Constraint #1's list has now been refuted five times (the count, the sidecar
+helper, `AdministrativeRecoveryGuard::acquire`, `Residue::discard`, the ssh hostkey
+cache). Each fix added a member. The next one should not: the population is
+derivable from the public surface, so it should be DERIVED and asserted against
+the prose, exactly as the symbol set now is — the rule is cheap to check and the
+list is not.

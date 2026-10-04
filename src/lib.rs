@@ -27,14 +27,21 @@
 //!
 //! # The name-mutation funnel is enforced by the COMPILER, not a source scan
 //!
-//! Every inode-NAME mutation (`std::fs` and `libc`) may be issued only from the
-//! guarded funnel modules, each of which carries a module-level
-//! `#![allow(clippy::disallowed_methods)]`. Everywhere else the lint is a hard
+//! Every inode-NAME mutation (`std::fs` and `libc`) may be issued only from a
+//! site annotated with `#[allow(clippy::disallowed_methods)]` — a funnel module
+//! carrying the module-level attribute, or a single reviewed function carrying the
+//! item-level one. Everywhere else the lint is a hard
 //! error: `#![deny(clippy::disallowed_methods)]` below, with the symbol list in
 //! `clippy.toml`. Because the lint matches the RESOLVED symbol, no spelling
 //! route evades it — an alias, a re-export, a raw identifier, a parenthesized
 //! or referenced callee, a `macro_rules!` body, or a `#[path]`-relocated
-//! module all resolve to the same disallowed path.
+//! module all resolve to the same disallowed path. The SET of annotated sites is
+//! the funnel's membership, and it is deliberately not enumerated here: it is
+//! whatever `rg -n 'allow\(clippy::disallowed_methods\)' src` reports, and each
+//! site carries a comment naming the rule it implements. A symbol the funnel
+//! itself calls is checked against `clippy.toml` by
+//! `atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`,
+//! so the deny list cannot drift from the code.
 //!
 //! This is a COMPLETENESS device, distinct from the count PIN in
 //! `atomic::guard.rs`: the pin notices when the funnel's OWN calls change

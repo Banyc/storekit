@@ -622,12 +622,18 @@ resolution.
 
 Together they back the rule that every name mutation goes through the ONE guarded
 funnel, and the operative definition of that membership is the set of
-`#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level in
-`src/atomic/{mod,unix,windows}.rs`, plus item-level ones for the two
-capability-gated workers in `transport`, `platform::chmod`, and one reviewed
-exception for the ssh hostkey cache. `clippy.toml` itself holds only the DENY
-side: an earlier version of this sentence called its "allow list" the operative
-definition, and there is no allow list there to read.
+`#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level
+in the funnel modules, item-level on the individual reviewed functions
+(capability-gated workers, the path-based mode authority, the cross-platform
+symlink helper, the creation helpers, and one reviewed exception for the ssh
+hostkey cache). That set is deliberately NOT listed here: it is whatever
+`rg -n 'allow\(clippy::disallowed_methods\)' src` reports, each site carrying a
+comment naming the rule it implements, and
+`atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`
+checks the SYMBOL side of the same property against `clippy.toml`. `clippy.toml`
+itself holds only the DENY side: an earlier version of this sentence called its
+"allow list" the operative definition, and there is no allow list there to read,
+while a second version enumerated the sites and went stale within one round.
 
 **Review conventions, NOT mechanical checks.** The rest of this list is enforced
 by review: in particular "fix the class, not the instance", "an oracle must be
