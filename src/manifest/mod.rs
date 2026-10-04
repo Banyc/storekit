@@ -3273,7 +3273,7 @@ mod tests {
         );
     }
 
-    /// F2 (destination tolerance, LOCAL): the strict canonicalizer still
+    /// Destination tolerance (LOCAL): the strict canonicalizer still
     /// refuses an absolute/escaping symlink and a hard link, and the
     /// DESTINATION-tolerant form records each in `unsupported` while keeping
     /// it in the manifest under its live kind — the capability a
@@ -3353,7 +3353,7 @@ mod tests {
         );
     }
 
-    /// F2 (destination tolerance, REMOTE): the same tolerance through the
+    /// Destination tolerance (REMOTE): the same tolerance through the
     /// far-side wire assembler — and the refusals it must NOT tolerate.
     // unix-only: builds symlink + FIFO fixtures (symlink(2), mkfifo(2)).
     #[cfg(unix)]

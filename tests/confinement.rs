@@ -259,7 +259,7 @@ fn root_dir_open_refuses_a_symlink_root_but_opens_the_real_directory() {
     assert_open_refusal(&err, "open root");
 }
 
-/// F-A1 (production-lib reproduction): the atomic REPLACE must consult the
+/// Production-lib reproduction: the atomic REPLACE must consult the
 /// lock-record guard, or a holder's record is swapped for a fresh inode and a
 /// second acquisition flocks the NEW inode while the first holder still holds
 /// the old one — TWO simultaneous holders. Pre-fix the PATH-BASED replace had
@@ -299,7 +299,7 @@ fn write_atomic_replace_cannot_swap_the_lock_record_inode() {
     drop(holder);
 }
 
-/// F-A2 (production-lib reproduction): `renameat_paths` guarded only the
+/// Production-lib reproduction: `renameat_paths` guarded only the
 /// endpoints' FINAL components, so renaming a directory CONTAINING the record
 /// moved the record with its inode and freed the old path; a second
 /// acquisition at the old path then created a DIFFERENT inode — TWO holders.

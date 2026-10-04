@@ -255,7 +255,7 @@ fn symlink(target: &str, link: impl AsRef<Path>) {
 }
 
 // ---------------------------------------------------------------------------
-// F1 — the far-side rename primitive.
+// The far-side rename primitive.
 //
 // Pre-fix `rename_cmd` produced `mv -T` (GNU-only). On a BSD/macOS remote
 // `mv` rejects `-T` as an illegal option and exits 64, so EVERY kind-changing
@@ -458,7 +458,7 @@ fn rename_with_metacharacters_in_the_path_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// F2 — `RemoteEntry.mode`.
+// `RemoteEntry.mode`.
 //
 // Pre-fix the list script ran `stat -c '%f'`; BSD `stat` rejects `-c`, the mode
 // column is empty, and the parser silently defaulted it to 0. The test below
@@ -546,7 +546,7 @@ fn list_frames_tab_and_newline_names_with_real_modes() {
 }
 
 // ---------------------------------------------------------------------------
-// F3 — durability.
+// Durability.
 //
 // Pre-fix `fsync_tree`/`fsync_parent`/`write_new_cmd` used `sync <operand>`,
 // which GNU coreutils >= 8.24 treats as "fsync this path" but BSD/macOS treats
@@ -619,7 +619,7 @@ fn fsync_parent_failure_propagates() {
     );
 }
 
-/// F3, the TRANSPORT-side AlreadyPresent retry: when `try_write_new` finds a
+/// The TRANSPORT-side AlreadyPresent retry: when `try_write_new` finds a
 /// byte-and-mode-identical record already installed it must still make the
 /// parent DIRECTORY durable, through the SAME portable perl primitive the
 /// script uses. The retry used to run a bare `sync <parent>`, which the perl

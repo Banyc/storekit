@@ -3797,7 +3797,7 @@ mod tests_ssh {
         assert_eq!(hidden.size, 6, "a symlink reports its OWN size");
     }
 
-    /// F2: the LITERAL `list_script` must report the REAL mode on a BSD
+    /// The LITERAL `list_script` must report the REAL mode on a BSD
     /// userland. Pre-fix it ran `stat -c '%f'`, which BSD/macOS `stat` rejects;
     /// the mode column came out empty and the parser silently defaulted every
     /// entry to 0, so this test FAILED on macOS with `left: 0` for each entry.
@@ -4401,7 +4401,7 @@ mod tests_ssh {
         );
     }
 
-    /// F1, BEHAVIOUR: `provision_layout` must create the destination ROOT, not
+    /// `provision_layout` must create the destination ROOT, not
     /// only the caller's bootstrap directories.
     ///
     /// Pre-fix the argv listed ONLY `layout.bootstrap_dirs`, so with
@@ -4598,7 +4598,7 @@ mod tests_ssh {
         );
     }
 
-    /// F4: the ControlMaster socket is keyed on the AMBIENT AUTHENTICATION
+    /// The ControlMaster socket is keyed on the AMBIENT AUTHENTICATION
     /// ENVIRONMENT. With `identity_file = None` the material used to write the
     /// single marker `identity=<ambient>`, which collapsed EVERY ambient
     /// environment to one key: two transports differing only in `HOME` (hence
@@ -4668,7 +4668,7 @@ mod tests_ssh {
         );
     }
 
-    /// F1, REGRESSION: the mux socket path must FIT the platform's
+    /// The mux socket path must FIT the platform's
     /// `sockaddr_un.sun_path` under the REAL process environment.
     ///
     /// Pre-fix the socket name was the FULL 64-hex SHA-256, so with the macOS
@@ -4738,7 +4738,7 @@ mod tests_ssh {
         );
     }
 
-    /// F1, BUDGET: the socket path is `len(mux_dir) + len("mux-") + width`, and
+    /// The socket path is `len(mux_dir) + len("mux-") + width`, and
     /// the width is `min(64, SUN_PATH_BYTES - 1 - len(mux_dir) - len("/mux-"))`.
     /// This pins the arithmetic for a SHORT temp dir (full 256-bit hash), a LONG
     /// one (truncated to the budget, path EXACTLY at the limit), and a temp dir
@@ -4851,7 +4851,7 @@ mod tests_ssh {
         assert_eq!(required, control_limit + 1);
     }
 
-    /// F1, BEHAVIOUR: the LITERAL `rename_cmd` runs under `sh` against a real
+    /// The LITERAL `rename_cmd` runs under `sh` against a real
     /// root, and a symlink-to-directory destination is REPLACED IN PLACE. This
     /// replaces the old `rename_uses_no_target_directory_flag`, which asserted
     /// `cmd.contains("mv -T")` — a shape assertion that could not tell whether
@@ -4892,7 +4892,7 @@ mod tests_ssh {
         );
     }
 
-    /// F1, GUARD: the property `-T` existed to provide — a regular file must
+    /// The property `-T` existed to provide — a regular file must
     /// not be moved INTO a directory target — must survive the portable
     /// primitive. The `rename(2)` refusal (`EISDIR`/`ENOTDIR`) is loud (nonzero)
     /// and leaves both operands untouched. This pins the guard; it passes
@@ -5956,7 +5956,7 @@ mod tests_ssh {
         );
     }
 
-    /// F3, ORDER: the remote script implements the canonical seven-step
+    /// The remote script implements the canonical seven-step
     /// sequence — the FINAL MODE is chmod'd onto the temp BEFORE the portable
     /// FILE fsync, which is before the no-clobber install, and the
     /// PARENT-DIRECTORY fsync (also the portable perl primitive) runs after the
@@ -6040,7 +6040,7 @@ mod tests_ssh {
         assert_eq!(std::fs::read(root.join(rel)).unwrap(), b"payload-data");
     }
 
-    /// F3, PROPAGATION: a FAILED parent-directory fsync is a propagated error,
+    /// A FAILED parent-directory fsync is a propagated error,
     /// never a swallowed success. The fake perl exits 9 on the
     /// [`PERL_FSYNC_DIR`] hook; the FILE fsync and the perl `link(2)` publish
     /// still run (the fake delegates them to the real perl), so the record is
@@ -6080,7 +6080,7 @@ mod tests_ssh {
         );
     }
 
-    /// F3: a far-side PARENT-DIRECTORY fsync failure AFTER the rename must be
+    /// A far-side PARENT-DIRECTORY fsync failure AFTER the rename must be
     /// reported as the SAME "the entry is visible but its durability is
     /// unconfirmed" condition the LOCAL path reports, not as an
     /// undifferentiated `ssh upload failed`. A caller then gets the same
@@ -6372,7 +6372,7 @@ mod tests_ssh {
         assert_eq!(std::fs::read(&dest).unwrap(), b"FULL-PAYLOAD".to_vec());
     }
 
-    /// F3, FAIL-CLOSED: a failure of the FILE fsync (step 4) aborts BEFORE the
+    /// A failure of the FILE fsync (step 4) aborts BEFORE the
     /// publish — the command exits [`SSH_TWRITE_PREINSTALL_EXIT`] and NOTHING is
     /// installed, because the record's bytes were never made durable.
     ///

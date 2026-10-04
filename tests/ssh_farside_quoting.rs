@@ -378,7 +378,7 @@ fn upload_leaf_names_with_metacharacters_round_trip() {
     }
 }
 
-/// F1: a destination name at the manifest's legal MAXIMUM must still upload.
+/// A destination name at the manifest's legal MAXIMUM must still upload.
 /// The manifest accepts a name up to `NAME_MAX` (255 bytes), and the far-side
 /// upload writes through a same-directory temp whose name was derived from the
 /// destination basename as `.basename.tmp.XXXXXX` — 12 bytes MORE than the

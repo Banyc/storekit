@@ -468,7 +468,7 @@ fn filesystem_folds(written: &str, lookup: &str) -> bool {
 /// This is a PURE predicate: it prints NOTHING. The two caller classes need
 /// OPPOSITE skip reasons (a case-insensitive-only reproduction skips when this
 /// is `false`; a case-sensitive-only one skips when this is `true`), so a
-/// message baked in here is necessarily a lie for one of them — defect F2. Each
+/// message baked in here is necessarily a lie for one of them. Each
 /// caller announces its OWN truthful reason via
 /// [`announce_skip`].
 #[cfg(unix)]
@@ -1075,11 +1075,11 @@ struct RecordingRemote {
     set_mode_calls: AtomicUsize,
     exec_failure: Option<ExecOutcome>,
     /// `prepare_identity` calls seen, and the remote-request counter at the
-    /// moment of each call: the F1 ordering instrument. A call that ran after
+    /// moment of each call: the ordering instrument. A call that ran after
     /// the first remote request records a non-zero index.
     identity_calls: AtomicUsize,
     identity_op_index: Mutex<Vec<usize>>,
-    /// A message to fail `prepare_identity` with: the F1 failure instrument.
+    /// A message to fail `prepare_identity` with: the failure instrument.
     identity_failure: Option<String>,
     /// Every remote request (ANY trait operation, read or mutating), in order.
     /// `prepare_identity` is NOT a remote request: it PREPARES the transport.
@@ -1170,11 +1170,11 @@ struct RecordingRemote {
     first_op_fired: AtomicBool,
     ops: AtomicUsize,
     writes: AtomicUsize,
-    /// `list` calls seen: the LISTING-COUNT instrument for the F2 bound. A
+    /// `list` calls seen: the LISTING-COUNT instrument for the width bound. A
     /// directory with N entries must cost O(1) listings, so this counts the
     /// delegation to the destination listing seam.
     list_calls: AtomicUsize,
-    /// `metadata`/`metadata_opt` calls seen: the F1 instrument. `Side::kind_opt`
+    /// `metadata`/`metadata_opt` calls seen: the ancestry instrument. `Side::kind_opt`
     /// and `Side::mode`/`mode_opt` on a `Side::Remote` destination both route
     /// through this one call, one per probed PATH, so a depth-D ancestry walk
     /// that re-probes every prefix per ancestor shows up here as O(D^2) while
@@ -4038,7 +4038,7 @@ fn syncing_two_empty_directories_is_a_no_op() {
 }
 
 // ---------------------------------------------------------------------------
-// F1: OVERLAPPING ROOTS. `sync` used to relate the two roots nowhere, so a
+// OVERLAPPING ROOTS. `sync` used to relate the two roots nowhere, so a
 // destination nested inside the source (or vice versa) put the run on both
 // sides of an overlap: a self-copy that grew without bound, and — with
 // `delete_extraneous` — the destruction of the SOURCE. The refusal reuses
@@ -4264,7 +4264,7 @@ fn an_absent_root_with_only_the_filesystem_root_as_ancestor_still_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// F2: SUPERLINEAR DIRECTORY ENUMERATION. Three per-entry sites re-listed the
+// SUPERLINEAR DIRECTORY ENUMERATION. Three per-entry sites re-listed the
 // parent directory with no cache, so a wide directory cost O(N) listings (and
 // O(N^2) time). The ONE run-scoped listing cache makes a directory cost O(1)
 // listings per verify pass, and this test BOUNDS the count: it is what makes
@@ -4376,7 +4376,7 @@ fn measure_deep_chain_sync(depth: usize) -> (usize, usize) {
     (remote.metadata_probes(), remote.lists())
 }
 
-/// F1 DEPTH BOUND: a depth-D chain with ONE change must cost O(D) ancestry
+/// DEPTH BOUND: a depth-D chain with ONE change must cost O(D) ancestry
 /// probes, not O(D^2) (and not O(D^3) `openat`: a probe resolves a path
 /// component-wise, so D probes of a depth-D prefix is D^2 `openat` and a
 /// per-ancestor re-walk of every prefix is D of those). This fixture uses a
@@ -4465,7 +4465,7 @@ fn measure_wide_delete(n: usize, policy: Extraneous) -> (usize, usize) {
     (consumed, remote.lists())
 }
 
-/// F2 WIDTH BOUND: the REMOVAL pass must consume a parent directory's listing
+/// WIDTH BOUND: the REMOVAL pass must consume a parent directory's listing
 /// O(1) times, not once per extraneous entry. This mirrors
 /// [`enumerating_a_wide_directory_costs_a_constant_number_of_listings`], which
 /// pins the SKIPPED path; this pins the REMOVAL path. The `Keep` run is the
@@ -5658,7 +5658,7 @@ fn an_append_write_that_races_a_concurrent_appender_conflicts_and_preserves_it()
     assert_report_lists_disjoint(report);
 }
 
-/// F1: a concurrent DELETION of the append target. The writer unlinks `f`
+/// A concurrent DELETION of the append target. The writer unlinks `f`
 /// immediately after the append's destination read, so the compare-and-append's
 /// re-read finds the entry GONE. The documented contract: a live entry the
 /// caller read but that is now ABSENT is a MISMATCH, never an error — the retry
@@ -5714,7 +5714,7 @@ fn an_append_whose_target_is_deleted_during_the_compare_creates_it() {
     assert_report_lists_disjoint(&report);
 }
 
-/// F3: a concurrent DELETION between the LIVE-KIND read and the BYTE read.
+/// A concurrent DELETION between the LIVE-KIND read and the BYTE read.
 /// The writer unlinks `f` IMMEDIATELY BEFORE the append's own `Remote::read` of
 /// `f` (the first read of that path), so the read itself fails with ENOENT.
 /// The documented contract is the SAME one the compare's re-read follows: an
@@ -5772,7 +5772,7 @@ fn an_append_whose_target_is_deleted_before_the_byte_read_is_created() {
     assert_report_lists_disjoint(&report);
 }
 
-/// F3 (the adjacent window): a concurrent DELETION between the append's byte
+/// The adjacent window: a concurrent DELETION between the append's byte
 /// read and the `append_settle_mode` kind re-read. Here NO byte write is due
 /// (the source `a\n` is a PREFIX of the destination `a\nb\n`), so the settle
 /// path runs — and the destination vanished in the window.
@@ -5884,7 +5884,7 @@ fn a_parent_sync_never_destroys_a_held_nested_lock_record() {
     drop(held);
 }
 
-/// F1: the crate's own `sync` must not carry the lock record over a live
+/// The crate's own `sync` must not carry the lock record over a live
 /// holder's inode. Pre-fix `is_unaddressable_path` consulted only the byte-exact
 /// reserved spellings, which do NOT include the application lock record
 /// `operation.lock`, so a source entry `state/operation.lock` was neither
@@ -5949,7 +5949,7 @@ fn a_push_cannot_carry_the_lock_record_over_a_live_holder() {
     drop(held);
 }
 
-/// F1, ALIAS form: every spelling that can ALIAS the record is stripped too.
+/// The ALIAS form: every spelling that can ALIAS the record is stripped too.
 /// A source entry whose final component is a case alias of `operation.lock`
 /// (`.STATE/OPERATION.LOCK`) is a collision and is never transferred.
 #[cfg(unix)]
@@ -5979,11 +5979,11 @@ fn a_push_strips_a_case_alias_of_the_lock_record() {
     );
 }
 
-/// F6: a bare destination `operation.lock` is RESIDUE, not a failed deletion.
+/// A bare destination `operation.lock` is RESIDUE, not a failed deletion.
 /// Pre-fix `Extraneous::Delete` over the record hard-errored with a transport
 /// conflict and `indeterminate=["state/operation.lock"]` (or `["operation.lock"]`
 /// for the root-level spelling); the record is now recognized as residue (the
-/// same authority gap as F1), left in place, and named in the report so a
+/// same authority gap), left in place, and named in the report so a
 /// caller learns it is there. Both the in-root `state/operation.lock` and the
 /// bare root-level `operation.lock` are covered.
 #[cfg(unix)]
@@ -6100,7 +6100,7 @@ fn extraneous_delete_spares_a_case_alias_of_a_reserved_spelling() {
     );
 }
 
-/// F5: the derived lock-record name is BOUNDED to `NAME_MAX`. Pre-fix
+/// The derived lock-record name is BOUNDED to `NAME_MAX`. Pre-fix
 /// `destination_lock_path` built `.` + the full destination component +
 /// `.operation.lock`, so a 240-byte component produced a 256-byte record name
 /// and `FileLock::acquire` failed `ENAMETOOLONG`. The embedded component is
@@ -6139,7 +6139,7 @@ fn the_derived_lock_record_name_is_bounded_to_name_max() {
     drop(held);
 }
 
-/// F-C: two DISTINCT sibling destinations must derive DISTINCT lock records.
+/// Two DISTINCT sibling destinations must derive DISTINCT lock records.
 /// Pre-fix `bounded_temp_trunk` returned a name VERBATIM whenever it merely
 /// fit, so a 240-byte destination derived a 239-byte hash-truncated trunk and a
 /// destination NAMED that trunk then returned it verbatim — `trunk(trunk(B))
@@ -7124,7 +7124,7 @@ fn residue_nested_under_an_extraneous_directory_is_never_deleted() {
     assert_residue_present(&report, &[&dst]);
 }
 
-/// F2: a STALE TEMP whose destination name begins `sync-aside.` inherits the
+/// A STALE TEMP whose destination name begins `sync-aside.` inherits the
 /// reserved `.sync-aside.` prefix, so the applier used to classify it as
 /// RESERVED residue — contradicting the report doc, which promises a stale temp
 /// is reported as `extraneous` and that recovery is a removal of each
@@ -7230,7 +7230,7 @@ fn a_stale_temp_in_the_aside_namespace_is_extraneous_not_residue() {
     assert_residue_present(&report, &[&dst]);
 }
 
-/// F3: the REMOTE live-kind classifier must agree with the LOCAL one. Both map
+/// The REMOTE live-kind classifier must agree with the LOCAL one. Both map
 /// `is_dir`/`is_symlink`/`is_file` explicitly and REFUSE anything else
 /// (fifo/socket/device), instead of the remote side mapping "not dir, not
 /// symlink" to `File` while the local side returned `Err`. The two transports
@@ -7301,7 +7301,7 @@ fn the_remote_and_local_live_kind_classifiers_agree_on_a_fifo() {
     assert_eq!(remote_side.kind_opt(&missing).unwrap(), None);
 }
 
-/// F2 (cont.): the same distinction inside the CLAIMED-subtree removal walk. A
+/// The same distinction inside the CLAIMED-subtree removal walk. A
 /// kind-changing replacement claims the stale directory aside and removes it
 /// deepest-first; a reserved-namespaced TEMP inside it is a leftover, not a
 /// held-aside, so the walk must take it and NOT stop and name it residue
@@ -10108,7 +10108,7 @@ fn delete_extraneous_never_destroys_a_nested_case_aliased_transfer() {
 // `exists`-but-not-in-listing gate), never a bigger fold table.
 // ---------------------------------------------------------------------------
 
-/// F1: a fold `to_lowercase` does not model (`ß`/`ss`) must never overwrite the
+/// A fold `to_lowercase` does not model (`ß`/`ss`) must never overwrite the
 /// destination entry it folds onto. The two spellings carry DIFFERING content —
 /// the earlier fixture used identical content, which is exactly why it missed
 /// this — so a destroyed victim is observable as changed BYTES, not merely a
@@ -10198,7 +10198,7 @@ fn a_unicode_case_fold_never_overwrites_a_destination_entry() {
     assert_eq!(read(&dst.join("other.txt")), b"CCCC");
 }
 
-/// F1 with `delete_extraneous=true`: the destination-only spelling the fold
+/// With `delete_extraneous=true`: the destination-only spelling the fold
 /// would land through is sanctioned for REMOVAL, but it must not be destroyed
 /// by the fold (its bytes are the only content that exists) and the report must
 /// not claim the run left it alone while replacing its content.
@@ -10263,7 +10263,7 @@ fn delete_extraneous_never_destroys_a_unicode_case_aliased_transfer() {
     );
 }
 
-/// F1 in a SUBDIRECTORY: the fold and the touched-directory check must be keyed
+/// In a SUBDIRECTORY: the fold and the touched-directory check must be keyed
 /// on the full manifest path, not a bare file name. `d/other.txt` forces a real
 /// install into `d`, so the per-directory listing and untouched-content checks
 /// run against `d`.
@@ -10835,7 +10835,7 @@ fn a_failed_verification_read_is_an_infrastructure_error_not_a_content_mismatch(
 // every report-named path, and the faithful destination listing.
 // ---------------------------------------------------------------------------
 
-/// F3: a MODE-ONLY `Replace` mutates the destination (the chmod) but
+/// A MODE-ONLY `Replace` mutates the destination (the chmod) but
 /// used to push no `VerifyItem`, so its CONTENT was never re-read. A writer that
 /// changed the bytes in the window between the chmod and verification was
 /// reported `applied` — a path whose destination content was wrong. Every
@@ -10891,7 +10891,7 @@ fn a_mode_only_transfer_is_content_verified() {
     assert_eq!(read(&dst.join("f")), b"MUTATED");
 }
 
-/// F3, `AppendTail`: the append rule wrote no bytes (the destination
+/// The `AppendTail` case: the append rule wrote no bytes (the destination
 /// already held the same stream) but applied a differing mode. That mode-only
 /// `Transferred` outcome pushed no `VerifyItem` either, so its content was never
 /// re-read. It is now verified against the bytes the append rule observed.
@@ -10937,7 +10937,7 @@ fn an_append_mode_only_transfer_is_content_verified() {
     assert_eq!(read(&dst.join("f")), b"MUTATED");
 }
 
-/// F4: no check verified a directory's KIND. `verify_claimed_untouched`
+/// No check verified a directory's KIND. `verify_claimed_untouched`
 /// returned `intact = true` for `EntryKind::Dir`, and the name checks compare
 /// names only, so a `Same` directory a writer replaced with a regular file (the
 /// name stays present) was reported `skipped`. Every path the report names now
@@ -10973,7 +10973,7 @@ fn a_same_directory_replaced_by_a_file_is_not_reported_skipped() {
     );
 }
 
-/// F1: the destination LISTING view was lossy on the `Remote` path,
+/// The destination LISTING view was lossy on the `Remote` path,
 /// so a raw-`0xFF` name and an intended `U+FFFD` name both rendered as
 /// `U+FFFD`; the run then reported `Ok` over a destination it could not address.
 /// With a faithful-or-error listing, the raw name is a name NO manifest spelling
@@ -11031,7 +11031,7 @@ fn an_unplanned_raw_non_utf8_destination_name_is_an_error_not_a_silent_ok() {
     );
 }
 
-/// F1, DESTRUCTION variant: with `delete_extraneous=true` the run
+/// The DESTRUCTION variant: with `delete_extraneous=true` the run
 /// must still fail closed on a destination directory it cannot enumerate, and
 /// it must not remove ANY entry from that directory. The root holds the
 /// unaddressable raw `0xFF` entry AND an ordinary destination-only entry
@@ -11092,7 +11092,7 @@ fn a_non_utf8_destination_directory_is_never_removed_from_and_fails_closed() {
     );
 }
 
-/// F1, DESTRUCTION variant that reaches the REMOVAL pass: the raw
+/// The DESTRUCTION variant that reaches the REMOVAL pass: the raw
 /// `0xFF` name lives inside a destination-only subtree (`d`) the sanctioned
 /// `delete_extraneous` pass would recursively remove. `d` is not a directory the
 /// run installed into, so the verification pass never lists it; ONLY
@@ -11140,7 +11140,7 @@ fn delete_extraneous_never_removes_from_a_directory_it_cannot_enumerate() {
     assert!(dst.join("d").is_dir(), "the subtree survives whole");
 }
 
-/// F4, APPLIED entry: a directory this run CREATED is replaced by a
+/// The APPLIED entry: a directory this run CREATED is replaced by a
 /// regular file by the writer. The name stays present, so only the KIND check on
 /// the `Transferred` entry's `VerifyItem` catches it; without that check the run
 /// reports the directory `applied`.
@@ -11217,7 +11217,7 @@ fn find_named(root: &Path, name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// F1: an extraneous REMOVAL must never follow a symlink a writer
+/// An extraneous REMOVAL must never follow a symlink a writer
 /// planted at a destination DIRECTORY position. `dst/d/y` is in the destination
 /// manifest (extraneous) and `dst/d` was a directory when the manifest was
 /// read; a writer replaces `dst/d` with a symlink to an OUTSIDE directory
@@ -11254,7 +11254,7 @@ fn an_extraneous_removal_never_follows_a_swapped_directory_symlink() {
     assert_report_lists_disjoint(&report);
 }
 
-/// F2: an INSTALL must never follow a symlink a writer planted at a
+/// An INSTALL must never follow a symlink a writer planted at a
 /// destination DIRECTORY position. `src/d/x` is installed under a `d` the
 /// destination manifest described as an empty directory; a writer replaces
 /// `dst/d` with a symlink to an empty OUTSIDE directory before the install.
@@ -11289,7 +11289,7 @@ fn an_install_never_follows_a_swapped_directory_symlink() {
     assert_report_lists_disjoint(&report);
 }
 
-/// NON-RACY F1: the destination manifest DESCRIBES `d` as a directory with an
+/// NON-RACY: the destination manifest DESCRIBES `d` as a directory with an
 /// extraneous `d/y`, but the live destination already holds a SYMLINK at `d`.
 /// No concurrent writer is needed: a crafted far-side manifest is exactly the
 /// manifest the remote verification script emits for a directory, and it must
@@ -11332,7 +11332,7 @@ fn a_preexisting_directory_symlink_is_refused_for_extraneous_removal() {
     }
 }
 
-/// NON-RACY F2: the destination manifest DESCRIBES `d` as a directory, but the
+/// NON-RACY: the destination manifest DESCRIBES `d` as a directory, but the
 /// live destination already holds a SYMLINK there. No concurrent writer. The
 /// install under `d` must be refused, not written through the link.
 #[cfg(unix)]
@@ -13039,7 +13039,7 @@ fn an_unowned_run_reaches_a_remote_destination_and_still_verifies() {
 }
 
 // ---------------------------------------------------------------------------
-// F1: the sync entry points prepare the transport's host identity.
+// The sync entry points prepare the transport's host identity.
 // ---------------------------------------------------------------------------
 
 /// NO token may be minted against a NON-LOCAL transport that cannot state an
@@ -13366,7 +13366,7 @@ fn a_destination_ownership_token_refuses_a_derived_destination_shape_swap() {
     );
 }
 
-/// F1: every sync entry point that reaches the transport runs
+/// Every sync entry point that reaches the transport runs
 /// [`Remote::prepare_identity`] BEFORE its first remote request.
 ///
 /// A real `sshd` is not available to the suite, so this pins the CONTRACT with
@@ -13448,7 +13448,7 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
     assert!(unowned_recorder.remote_requests() > 0);
 }
 
-/// F1: a failure from the transport's identity preparation surfaces as THAT
+/// A failure from the transport's identity preparation surfaces as THAT
 /// failure and leaves no mutation, no residue, and no held lock.
 ///
 /// Preparation runs before the destination lock record is created, so a
@@ -13505,7 +13505,7 @@ fn a_transport_preparation_failure_leaves_nothing_behind() {
     );
 }
 
-/// F2: the sibling destination record and the in-root `Layout::lock` are
+/// The sibling destination record and the in-root `Layout::lock` are
 /// DIFFERENT files and do NOT exclude each other. A caller holding a
 /// [`crate::lock::FileLock`] on `<dst>/state/operation.lock` (the
 /// `Layout::lock` path) does not stop an owned `sync` from running against
@@ -13559,7 +13559,7 @@ fn the_sibling_record_does_not_compose_with_the_in_root_layout_lock() {
     assert!(report.applied.contains(&"g".to_string()), "{report:?}");
 }
 
-/// F2 CROSS-CHECK: the record `destination_lock_path` derives must ALWAYS be a
+/// CROSS-CHECK: the record `destination_lock_path` derives must ALWAYS be a
 /// spelling [`crate::reserved::is_reserved_name`] calls reserved. The two are
 /// separate authorities over the same file name — the derivation owns what the
 /// record is CALLED, and `reserved` owns whether a parent sync must LEAVE IT
@@ -13839,7 +13839,7 @@ fn taking_the_destination_lock_does_not_narrow_a_missing_parent_to_store_private
     );
 }
 
-/// A-F2 REGRESSION: a run that REMOVES a nested destination-only subtree must
+/// REGRESSION: a run that REMOVES a nested destination-only subtree must
 /// not then fail re-listing a directory it correctly removed.
 ///
 /// `remove_extraneous` inserts each removed entry's PARENT into `touched_dirs`,
@@ -14008,7 +14008,7 @@ fn the_ancestry_memo_is_off_for_a_path_based_destination_on_this_platform() {
     }
 }
 
-/// F1 REGRESSION: a PUSH to a destination root that does not exist yet must
+/// REGRESSION: a PUSH to a destination root that does not exist yet must
 /// create and use it, exactly as the local `provision_layout` already did.
 ///
 /// Pre-fix `run` read the destination manifest BEFORE anything created the
@@ -14059,7 +14059,7 @@ fn push_unowned_to_a_fresh_destination_root_creates_it() {
     assert_eq!(report.transfers, 1, "{report:?}");
 }
 
-/// F1 `Layout::empty()` usability, end to end: a layout with no bootstrap
+/// `Layout::empty()` usability, end to end: a layout with no bootstrap
 /// directories and no receiver marker is enough to provision a fresh
 /// destination. (`transport` builds exactly `Layout::empty()`.)
 #[test]
@@ -14084,7 +14084,7 @@ fn push_to_a_fresh_destination_works_with_an_empty_layout() {
     assert_eq!(read(&dst_root.join("nested/ok")), b"payload");
 }
 
-/// F2 REGRESSION (absolute symlink): a destination-only entry the manifest
+/// REGRESSION (absolute symlink): a destination-only entry the manifest
 /// model refuses must not block the WHOLE run, including its own sanctioned
 /// deletion.
 ///
@@ -14131,7 +14131,7 @@ fn sanctioned_delete_clears_an_absolute_symlink_destination_entry() {
     assert!(report.verify_failures.is_empty(), "{report:?}");
 }
 
-/// F2 REGRESSION (escaping symlink): the second refusal, same capability.
+/// REGRESSION (escaping symlink): the second refusal, same capability.
 ///
 /// Pre-fix: `materialization error: escaping symlink not allowed: <dst>/esc`.
 #[cfg(unix)]
@@ -14164,7 +14164,7 @@ fn sanctioned_delete_clears_an_escaping_symlink_destination_entry() {
     assert!(report.conflicts.is_empty(), "{report:?}");
 }
 
-/// F2 REGRESSION (hard link): the third refusal, same capability — and the
+/// REGRESSION (hard link): the third refusal, same capability — and the
 /// removal unlinks ONE name without destroying the other.
 ///
 /// Pre-fix: `materialization error: hard links not allowed: <dst>/hard`.
@@ -14227,7 +14227,7 @@ fn sanctioned_delete_clears_a_hard_link_destination_entry_without_touching_its_t
     assert_report_lists_disjoint(&report);
 }
 
-/// F2 (LOCAL destination, PULL direction): the same tolerance on the local
+/// LOCAL destination, PULL direction: the same tolerance on the local
 /// destination manifest, so the capability does not depend on the direction.
 #[cfg(unix)]
 #[test]
@@ -14265,7 +14265,7 @@ fn sanctioned_delete_clears_an_absolute_symlink_in_a_local_pull_destination() {
     assert!(report.conflicts.is_empty(), "{report:?}");
 }
 
-/// F2, `Extraneous::Keep`: `keep` must report the unsupported destination entry
+/// `Extraneous::Keep`: `keep` must report the unsupported destination entry
 /// instead of dying, so a consumer can at least list what differs.
 #[cfg(unix)]
 #[test]
@@ -14349,7 +14349,7 @@ fn the_report_explains_a_tolerated_hard_link_destination_entry() {
     assert_report_lists_disjoint(&report);
 }
 
-/// F2 SOUNDNESS GATE: an unsupported destination entry may be DELETED under a
+/// SOUNDNESS GATE: an unsupported destination entry may be DELETED under a
 /// sanction, but the run must NEVER write a source entry over it. The refusal
 /// names the path, the reason, and the remedy, and it fires BEFORE any
 /// transfer.

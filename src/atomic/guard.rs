@@ -574,7 +574,7 @@ mod tests {
         }
     }
 
-    /// F1/F2, at the authority: the owned-record grant is decided by IDENTITY,
+    /// The owned-record grant is decided by IDENTITY,
     /// not by a spelling fold, and the authority is built from the transport's
     /// own `Layout` (a candidate path cannot be its own authority — the guard's
     /// second parameter is an [`OwnedLockRecord`], not a `Path`, so the old
@@ -1599,7 +1599,7 @@ mod tests {
                     }
                 }
             }
-            // P2-C: local non-generic `type` aliases are bindings too.
+            // Local non-generic `type` aliases are bindings too.
             // A `type ZZBuilder = std::fs::OpenOptions;` inside a funnel module
             // must resolve to the same canonical builder owner as the direct
             // spelling, or `ZZBuilder::new()…create_new(…)` is invisible to both
@@ -2137,7 +2137,7 @@ mod tests {
     }
 
     /// Strip comments AND string-literal CONTENTS, leaving only code
-    /// positions; a raw string becomes `r""` and a plain string `""`. F7: a
+    /// positions; a raw string becomes `r""` and a plain string `""`. A
     /// `#[doc = "libc::open("]` or a `const` holding that text must not trip a
     /// text audit, and a doc comment that merely MENTIONS a symbol must not
     /// either. Raw strings (`r"…"`, `r#"…"#`) are handled. A char literal is
@@ -2269,7 +2269,7 @@ mod tests {
     }
 
     /// Remove every `#[cfg(test)]`-gated item/statement from already
-    /// comment/string-stripped code, leaving PRODUCTION code. F4: counting test
+    /// comment/string-stripped code, leaving PRODUCTION code. Counting test
     /// occurrences as production is what made six pin entries advertise a
     /// production call that did not exist. An ATTRIBUTE RUN is buffered whole,
     /// so a `#[cfg(unix)]` that PRECEDES the `#[cfg(test)]` of the same item is
@@ -2528,7 +2528,7 @@ mod tests {
         assert!(is_test_only("src/test_support.rs", &gated));
     }
 
-    /// F7 regression: string-literal and comment contents are removed before an
+    /// String-literal and comment contents are removed before an
     /// audit matches, so a `#[doc = "libc::open("]` or a `const` holding the
     /// text does not fail the gate, while a real call still does.
     #[test]
@@ -3020,7 +3020,7 @@ mod tests {
             ("src/transport/mod.rs", "create_dir_all", 5),
             ("src/transport/ssh/hostkey.rs", "create_dir_all", 1),
             ("src/transport/ssh/mod.rs", "create_dir_all", 1),
-            // --- The ADOPTION family the pin MISSED (P1-A).
+            // --- The ADOPTION family the pin MISSED.
             // These symbols were on `clippy.toml`'s deny list but NOT in the
             // hand-kept pin table, so a call to one INSIDE a funnel module —
             // where the module-level `#[allow]` blinds the lint — left the count
@@ -3054,7 +3054,7 @@ mod tests {
             // `O_DIRECTORY`/`FILE_FLAG_OPEN_REPARSE_POINT`/
             // `FILE_FLAG_BACKUP_SEMANTICS`) — the same reviewed sites that carry
             // the item-level allow for the crate-wide deny. The ADOPTING
-            // `custom_flags(O_CREAT)` form is what P1-B proved was
+            // `custom_flags(O_CREAT)` form is what was
             // reachable with every gate green.
             ("src/atomic/guard.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
@@ -3082,7 +3082,7 @@ mod tests {
         );
     }
 
-    /// P1-A REGRESSION: the count pin's symbol set is DERIVED from
+    /// The count pin's symbol set is DERIVED from
     /// `clippy.toml`, so every ADOPTING symbol the lint denies is counted even
     /// inside a funnel module, where the module-level `#[allow]` blinds the
     /// lint. Before this arm, seven adopting symbols were denied by the lint but
@@ -3971,7 +3971,7 @@ mod tests {
         }
         // The pathname-socket bind: a `net` creator that ADOPTS a directory
         // entry, so the closure MUST be able to see it if the funnel ever
-        // spells one (P2-A).
+        // spells one.
         if canonical.len() == 6
             && canonical[0] == "std"
             && canonical[1] == "os"
@@ -4496,7 +4496,7 @@ mod tests {
     /// which the arms above see; this residual is a real reach INSIDE the
     /// funnel, not a hole the lint closes.
     ///
-    /// P2-C CLOSED ONE SPELLING: a `type` ALIAS of the builder type
+    /// A `type` ALIAS of the builder type
     /// used to be a hole in BOTH devices — inside a funnel module,
     /// `type ZZBuilder = std::fs::OpenOptions;` followed by
     /// `ZZBuilder::new().write(true).create_new(true).open(p)?` left clippy,
@@ -4576,7 +4576,7 @@ mod tests {
         }
     }
 
-    /// P1-B RECONCILIATION. `OpenOptionsExt::custom_flags` forwards
+    /// `OpenOptionsExt::custom_flags` forwards
     /// ARBITRARY bits to `open(2)`, and `O_CREAT` through it ADOPTS a name. The
     /// lint must name the RESOLVED trait path
     /// (`std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`); the surface
@@ -4633,7 +4633,7 @@ mod tests {
         );
     }
 
-    /// P2-A REGRESSION: a pathname-socket `bind` CREATES a directory
+    /// A pathname-socket `bind` CREATES a directory
     /// entry — a name ADOPTION in the same class as `create_dir`/`symlink` — so
     /// it is denied crate-wide for both `UnixListener` and `UnixDatagram`, the
     /// surface derivation can SEE it if the funnel ever uses one, the count pin
@@ -4725,7 +4725,7 @@ fn split_local() {
     opts.append(true);
 }
 
-// P2-C: a local non-generic `type` alias of the builder type. The
+// A local non-generic `type` alias of the builder type. The
 // resolver used to key the owner on the literal last-segment name, so this
 // spelling recorded NOTHING and the closure + count pin were both blind to it;
 // a `use … as` alias WAS resolved.
@@ -4771,7 +4771,7 @@ fn not_attributed(p: &std::path::Path) {
             "std::fs::DirBuilder::default",
             "std::fs::OpenOptions::create",
             "std::fs::OpenOptions::read",
-            // P2-C: the builder reached through a local non-generic
+            // The builder reached through a local non-generic
             // `type` ALIAS. `mode`/`recursive` are spelled ONLY through the
             // aliases here, so their presence pins the alias resolution rather
             // than the direct spelling beside it.
@@ -4904,7 +4904,7 @@ impl S {
         );
     }
 
-    /// P3-D REGRESSION ARM. `funnel_modules` / `funnel_symbol_surface`
+    /// `funnel_modules` / `funnel_symbol_surface`
     /// treat a CHILD FILE of an allow-bearing parent module as inside the region
     /// by an ANCESTOR-OR-SELF prefix test ([`module_is_in_funnel_region`]), the
     /// exact reach of Rust's attribute inheritance. That derivation shipped with
@@ -5375,7 +5375,7 @@ impl S {
         ),
     ];
 
-    /// P2-B / P3-B BOUNDARY. The pair-less derivation is
+    /// The pair-less derivation is
     /// SYNTACTIC on the parameter type, and its class is exactly
     /// `Path`/`PathBuf`, the same nested through a PATH-BEARING CONTAINER
     /// (`Option`/`Box`/`Cow`/`Rc`/`Arc`/`Vec`/`Result`, a slice/array, or a
@@ -5499,7 +5499,7 @@ impl S {
             );
         }
         // OUT OF CLASS: a LOCAL non-generic `type` ALIAS of `Path`/`PathBuf`
-        // (P2-E/P3-E). Like `use … as`, the predicate matches the
+        // Like `use … as`, the predicate matches the
         // last-segment NAME, so `type ZP = std::path::Path;` leaves `&ZP`
         // outside the class BY CONSTRUCTION. The FsIndex-backed derivations DO
         // resolve `type` aliases; this syntactic derivation deliberately does
@@ -5642,7 +5642,7 @@ impl S {
                 break;
             };
             k += 1;
-            // P2-B: skip a `<…>` GENERIC-PARAMETER group after the
+            // Skip a `<…>` GENERIC-PARAMETER group after the
             // name. An earlier scan expected `(` IMMEDIATELY, so
             // `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
             // skipped entirely — a real public raw-path mutator with the
@@ -5667,7 +5667,7 @@ impl S {
                     continue;
                 }
             };
-            // P2-B: an earlier scan stopped at the parameter list,
+            // An earlier scan stopped at the parameter list,
             // so `pub fn f<T>(p: T) where T: AsRef<Path> {}` was invisible too.
             // Extend the scanned range across a trailing `where` clause, up to
             // the body opener or the declaration terminator.
@@ -5695,7 +5695,7 @@ impl S {
         out
     }
 
-    /// P3-A TRIPWIRE. `collect_audited_fns` walks the `syn` item
+    /// `collect_audited_fns` walks the `syn` item
     /// graph, and `syn` does NOT descend into a macro's token stream (its
     /// `visit_token_stream` hook is a no-op), so a `macro_rules!` body that
     /// emits a `pub fn` taking a raw path is NOT derived: the walk sees the
@@ -5733,14 +5733,14 @@ impl S {
     /// behind a `<…>` generic-parameter group is refused), so it cannot pass by
     /// accident.
     ///
-    /// P2-B: an earlier scan required `(` IMMEDIATELY after the fn
+    /// An earlier scan required `(` IMMEDIATELY after the fn
     /// name, so `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
     /// skipped, and it stopped at the parameter-list close, so a
     /// `where T: AsRef<Path>` bound was invisible too. Both are now scanned and
     /// both are pinned as test arms below.
     #[test]
     fn production_macro_bodies_emitting_public_path_fns_are_refused() {
-        // P2-B ARMS: the token scan must see a `pub fn` whose name is
+        // The token scan must see a `pub fn` whose name is
         // followed by a `<…>` generic-parameter group and/or a `where` clause.
         // Before the fix these returned EMPTY, which is why a generic
         // `pub fn zz<T>(_p: &Path)` planted in a production `macro_rules!` body

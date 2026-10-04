@@ -384,7 +384,7 @@ pub(crate) const MAX_ANCESTRY: usize = 1 << 16;
 /// can shorten a 4-byte character), while the verbatim branch is taken only
 /// when the trunk fits in `NAME_MAX - overhead - SLACK`; with `SLACK = 4` the
 /// two length ranges are DISJOINT, so no verbatim name can ever equal a
-/// truncated one (F-C).
+/// truncated one.
 const BOUNDED_TRUNK_BRANCH_SLACK: usize = 4;
 
 /// Derive the BOUNDED trunk of a temp name from a destination `name`, so
@@ -399,7 +399,7 @@ const BOUNDED_TRUNK_BRANCH_SLACK: usize = 4;
 /// truncation alone could collapse them). Truncation stops on a UTF-8
 /// boundary — the names the crate carries are the manifest's UTF-8 names.
 ///
-/// The derivation is INJECTIVE by construction (F-C): the verbatim branch is
+/// The derivation is INJECTIVE by construction: the verbatim branch is
 /// restricted to trunks of at most `NAME_MAX - overhead - SLACK` bytes, while
 /// the truncated branch always emits at least `NAME_MAX - overhead - 3`
 /// bytes, so a name returned verbatim can never be the truncation of a
@@ -526,7 +526,7 @@ fn is_crate_temp_tail(marker: &str, trunk: &str, tail: &str) -> bool {
 /// [`is_crate_temp_name`] AND consulted by the id/name rule
 /// ([`crate::id::valid_name`], via
 /// [`crate::reserved::is_unaddressable_name`]), so an id the crate accepts can
-/// never look like one of its own temps (F-B: the documented recovery sweep
+/// never look like one of its own temps (the documented recovery sweep
 /// that removes every [`is_crate_temp_name`] match is safe BY CONSTRUCTION —
 /// no addressable content can match).
 ///
@@ -1016,7 +1016,7 @@ mod tests {
             assert!(!is_crate_temp_name(other), "{other:?} is NOT a crate temp");
         }
 
-        // F4 NEAR-MISS: the crate's temps ALWAYS begin with `.`, so a dotless
+        // NEAR-MISS: the crate's temps ALWAYS begin with `.`, so a dotless
         // name the id rule ACCEPTS must NOT be offered to the recovery sweep.
         // Pre-fix the suffix-only match made every one of these `true`.
         for near_miss in [
@@ -1036,7 +1036,7 @@ mod tests {
         }
     }
 
-    /// F-B PROPERTY: the recovery recognizer and the id rule can NEVER both
+    /// The recovery recognizer and the id rule can NEVER both
     /// accept a name. `is_crate_temp_name` is documented as the predicate a
     /// consumer's recovery sweep REMOVES every match of, so a name the id rule
     /// also accepts would let the documented sweep DELETE addressable content.
@@ -1082,7 +1082,7 @@ mod tests {
         ];
 
         // Dotted near-misses: the recognizer matches them, so the id rule must
-        // refuse them (F-B).
+        // refuse them.
         let dotted = [
             ".notes.tmp.1.0",
             ".a.tmp.1.0",
@@ -1139,7 +1139,7 @@ mod tests {
         }
     }
 
-    /// F-C: `bounded_temp_trunk` must be INJECTIVE. Pre-fix it returned the
+    /// `bounded_temp_trunk` must be INJECTIVE. Pre-fix it returned the
     /// name VERBATIM whenever it merely fit, so `trunk(trunk(B)) == trunk(B)`
     /// for a long `B`: a 240-byte name forces the hash branch and its 239-byte
     /// trunk then fit verbatim, so two DISTINCT sibling destinations shared one
@@ -1152,7 +1152,7 @@ mod tests {
     #[test]
     fn bounded_temp_trunk_is_injective() {
         let suffix = ".operation.lock"; // 15 bytes; `.` + suffix = overhead 16
-        // The F-C collision: a 240-byte name forces the hash branch; its trunk
+        // The injectivity collision: a 240-byte name forces the hash branch; its trunk
         // is then tested again and must not be returned verbatim.
         let long = "b".repeat(240);
         let trunk_long = bounded_temp_trunk(&long, suffix);

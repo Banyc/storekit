@@ -52,7 +52,7 @@
 //! manifest-path model consults its path form ([`is_unaddressable_path`]), so
 //! a spelling the crate refuses as an id is EXACTLY a spelling a whole-store
 //! sync refuses to transfer or destroy. It refuses the crate's own TEMP shapes
-//! (and their case aliases, F6) as well as the reserved/lock spellings, so the
+//! (and their case aliases) as well as the reserved/lock spellings, so the
 //! documented recovery sweep ([`crate::atomic::is_crate_temp_name`]) can never
 //! delete addressable content. The crate's mutating primitives consult
 //! the lock-record subset ([`is_lock_record_name`]) through the ONE guard
@@ -185,11 +185,11 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 /// ([`crate::atomic::is_crate_temp_name`]) is documented to REMOVE. The crate
 /// owns the temp namespace, and an id that looked like its temp would be a
 /// trap the consumer cannot see; refusing the shape at this ONE boundary makes
-/// the documented sweep safe by construction (F-B). (While
+/// the documented sweep safe by construction. (While
 /// [`is_reserved_name`] / [`is_reserved_path`] stay byte-exact for the sync's
 /// reserved stripping.)
 ///
-/// F6: the temp half is checked in CASE-FOLDED form too
+/// The temp half is checked in CASE-FOLDED form too
 /// ([`is_crate_temp_case_alias`]). The byte-exact recognizer
 /// [`crate::atomic::is_crate_temp_name`] cannot see that `.FOO.TMP.1.0`
 /// aliases `.foo.tmp.1.0` on a case-insensitive filesystem (macOS APFS,

@@ -716,7 +716,7 @@ mod tests {
     }
 }
 
-/// F5: the bounded drain must consult its deadline on EVERY arm and bound the
+/// The bounded drain must consult its deadline on EVERY arm and bound the
 /// buffered growth.
 #[cfg(all(test, unix))]
 mod drain_tests {

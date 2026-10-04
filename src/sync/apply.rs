@@ -3427,7 +3427,7 @@ type DirListing = Vec<(Vec<u8>, EntryKind)>;
 /// `Vec` clone per consultation. `Clone` on this type is the DEEP clone that
 /// the pre-fix consultation ran per call; it exists so a consumer that really
 /// needs an owned listing can ask for one, and it is TEST-ONLY instrumented
-/// ([`listing_elements`]) so the F2 bound measures the WORK a cached
+/// ([`listing_elements`]) so this bound measures the WORK a cached
 /// consultation does, not only the number of calls it makes.
 #[derive(Debug)]
 struct Listing(DirListing);
@@ -3481,7 +3481,7 @@ pub(crate) mod listing_elements {
 /// TEST-ONLY instrumentation: the number of times the CURRENT thread's applier
 /// obtains a directory listing through [`Applier::listing`] (a cache read OR the
 /// single raw fetch). A thread-local, so the parallel libtest threads do not
-/// share a count. The F2 bound uses it because the destination-level
+/// share a count. This bound uses it because the destination-level
 /// `Remote::list` count cannot see the defect: the run-scoped cache already
 /// makes the number of RAW fetches O(1) per directory, while pre-fix
 /// `remove_extraneous` still CONSUMED (cloned and scanned) the parent listing
@@ -3706,7 +3706,7 @@ fn run(
     let (source_meta, destination) = apply_manifests(&source_meta, &destination);
     let dest_unsupported = destination.unsupported.clone();
     let diff = diff_source_and_destination(&source_meta, &destination);
-    // F2: an unsupported DESTINATION entry may be DELETED under a sanction
+    // An unsupported DESTINATION entry may be DELETED under a sanction
     // (`Extraneous::Delete`, when the source does not hold that path), but the
     // run must never WRITE a source entry over one. The diff cannot express
     // "present but not replaceable", so the refusal is a PREFLIGHT here, before

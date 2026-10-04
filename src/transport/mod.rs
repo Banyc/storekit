@@ -4434,7 +4434,7 @@ mod tests {
         drop(holder);
     }
 
-    /// F1 — ownership is granted by IDENTITY, not by a fold. For each lock-record
+    /// Ownership is granted by IDENTITY, not by a fold. For each lock-record
     /// alias that is a DISTINCT on-disk entry on this filesystem, make it a live
     /// second holder, then assert `remove_file_if` is REFUSED and neither entry's
     /// inode moves. For an alias that resolves to the owned record's OWN inode

@@ -162,7 +162,7 @@ fn push_mid_write_failure_leaves_previous_content_intact_child() {
     );
 }
 
-/// F2: a local PUSH must transfer a destination name at the manifest's legal
+/// A local PUSH must transfer a destination name at the manifest's legal
 /// MAXIMUM. Change 1 routed the local push through the atomic replace, whose
 /// temp was `.{name}.tmp.{pid}.{counter}` — the embedded name made the temp
 /// 10–12 bytes longer than the destination, so the longest legal names failed

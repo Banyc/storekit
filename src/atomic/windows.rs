@@ -85,7 +85,7 @@ pub fn write_atomic_replace(
     bytes: &[u8],
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<ReplaceOutcome> {
-    // F-A1: the PATH-BASED replace removes the target entry before the rename
+    // The PATH-BASED replace removes the target entry before the rename
     // (Windows `rename` does not overwrite), so it DESTROYS the target's inode
     // exactly like the Unix port; consult the ONE guard authority and the FULL
     // path (see [`refuse_reserved_mutation`]). Type-checked only here (this
@@ -1270,7 +1270,7 @@ pub(crate) fn rename_residue_paths(
 fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'_>) -> Result<()> {
     let from = rel_join(root, from.as_path())?;
     let to = rel_join(root, to.as_path())?;
-    // F-A2: renaming a directory that CONTAINS the record moves the record's
+    // Renaming a directory that CONTAINS the record moves the record's
     // inode and frees the old path. Windows delegates the walk to the same
     // tree guard the recursive removal uses (type-checked only here).
     refuse_lock_record_in_tree(&from)?;

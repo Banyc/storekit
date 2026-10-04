@@ -164,11 +164,10 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// fold of a trailing `.`/` ` (on Windows `.dest.operation.lock.` and
 /// `operation.lock.` ARE a lock record), and any of the crate's own TEMP shapes
 /// ([`crate::atomic::is_crate_temp_name`]) or a CASE ALIAS of a temp shape
-/// (`.FOO.TMP.1.0`, F6). The temp shapes are refused because
+/// (`.FOO.TMP.1.0`). The temp shapes are refused because
 /// the crate owns that namespace: a consumer's documented recovery sweep
 /// REMOVES every [`crate::atomic::is_crate_temp_name`] match, so an id that
-/// looked like a temp would be addressable content the sweep silently deletes
-/// (F-B).
+/// looked like a temp would be addressable content the sweep silently deletes.
 ///
 /// A name becomes a directory/file component UNCHANGED (the store stores
 /// validated names VERBATIM), so the rule must make the valid set INJECTIVE
@@ -556,7 +555,7 @@ mod tests {
         }
     }
 
-    /// F6: a CASE ALIAS of a crate TEMP shape is refused. On a
+    /// A CASE ALIAS of a crate TEMP shape is refused. On a
     /// case-insensitive filesystem (macOS APFS, Windows) `.FOO.TMP.1.0` and
     /// `.foo.tmp.1.0` are the SAME directory entry, so accepting the alias
     /// would make the id rule's stated purpose ("an accepted id can never
@@ -600,7 +599,7 @@ mod tests {
         );
     }
 
-    /// The on-disk half of F6: on a CASE-INSENSITIVE filesystem the two
+    /// The on-disk half of the case-alias rule: on a CASE-INSENSITIVE filesystem the two
     /// spellings are one inode. Linux cannot exhibit the alias (its native
     /// filesystems are case-sensitive), so the test SKIPS there with an
     /// announced reason rather than asserting a property the platform cannot

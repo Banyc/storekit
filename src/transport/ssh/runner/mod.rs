@@ -1227,7 +1227,7 @@ mod runner_property_tests {
         assert_pair(kind, stall, deadline, &state, outcome);
     }
 
-    /// F3: `prepare_identity` creates the transport's OUTSIDE-THE-ROOT residue
+    /// `prepare_identity` creates the transport's OUTSIDE-THE-ROOT residue
     /// and leaves it behind — the third residue the `sync` module doc omitted.
     /// With a hermetic `TMPDIR` and the fake runner's keyscan seam, this
     /// measures exactly what a run BLOCKED on the destination lock (or failing
@@ -1768,7 +1768,7 @@ mod runner_property_tests {
     /// hermetically, so the regression is caught without an sshd on either
     /// platform.
     ///
-    /// F2 FLIP REMOVAL: the same command is run under a SHORT (200 ms) and a
+    /// FLIP REMOVAL: the same command is run under a SHORT (200 ms) and a
     /// LONG (5 s) deadline. Because the direct child exits before either
     /// deadline, the deadline only outlasts the bounded post-exit drain, and
     /// the outcome must be the SAME at both deadlines — the pipe-holding
@@ -2006,7 +2006,7 @@ mod runner_property_tests {
         assert!(!still_exists, "reaped child {pid} must be gone");
     }
 
-    /// F4: the SSH runner's Unix seam reuses the LOCAL runner's
+    /// The SSH runner's Unix seam reuses the LOCAL runner's
     /// [`crate::transport::runner::OwnedChild`] drop backstop (ONE authority
     /// for "every error path leaves no uncollected child"). If a
     /// `drain_available`/`try_wait` error makes the wait closure return while

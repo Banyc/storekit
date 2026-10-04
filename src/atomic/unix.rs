@@ -180,7 +180,7 @@ pub fn write_atomic_replace(
 ) -> Result<ReplaceOutcome> {
     // The PATH-BASED replace DESTROYS the target entry's inode (the temp is
     // renamed OVER it), so it belongs on the guarded list exactly like the
-    // `_fd` replace (F-A1): replacing the lock record would swap its inode
+    // `_fd` replace: replacing the lock record would swap its inode
     // and let a later acquisition flock a fresh inode while a live holder
     // still holds the old one. The guard consults the ONE authority and the
     // FULL path (see [`refuse_reserved_mutation`]).
@@ -1788,7 +1788,7 @@ pub fn set_private_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
 /// lock-record entry: walk the subtree rooted at `root`/`rel` — descriptor-
 /// relative, classifying each entry with `fstatat(AT_SYMLINK_NOFOLLOW)` so a
 /// symlink is never followed — and refuse if ANY entry's name is a lock-record
-/// spelling (F-A2).
+/// spelling.
 ///
 /// [`refuse_reserved_mutation`] guards the path the caller NAMES; it cannot
 /// see a record UNDER a directory the caller moves or removes. A `renameat` of
@@ -1912,7 +1912,7 @@ fn renameat_paths_guarded(
 ) -> Result<()> {
     let from = from.as_path();
     let to = to.as_path();
-    // F-A2: the endpoints' names are not enough. A rename MOVES the source
+    // The endpoints' names are not enough. A rename MOVES the source
     // entry, so if `from` is a directory CONTAINING the record (directly or at
     // any depth) the record's inode moves with it and the old path is freed.
     // Walk the source subtree (the moved tree) and refuse. `to` needs no walk:
@@ -4647,7 +4647,7 @@ mod tests {
         assert!(matches!(alias_err, Error::Conflict(_)), "{alias_err:?}");
     }
 
-    /// F2: the atomic REPLACE must consult the same guard as removal. Pre-fix
+    /// The atomic REPLACE must consult the same guard as removal. Pre-fix
     /// `replace_core` renamed a fresh inode over the record: A held
     /// `operation.lock`, a replace swapped the inode, and C then acquired the
     /// NEW inode while A still held the old one — two simultaneous holders.
@@ -4689,7 +4689,7 @@ mod tests {
         drop(holder);
     }
 
-    /// F3: removing an ANCESTOR of the record must not unlink it. Pre-fix the
+    /// Removing an ANCESTOR of the record must not unlink it. Pre-fix the
     /// guard checked only the ENTRY path's final component, so
     /// `remove_dir_all_fd(root, "state")` walked into `state` and unlinked
     /// `state/operation.lock`; a second acquisition then succeeded. The walk
@@ -4729,7 +4729,7 @@ mod tests {
         drop(holder);
     }
 
-    /// F-A1: the PATH-BASED `write_atomic_replace` had NO lock-record guard.
+    /// The PATH-BASED `write_atomic_replace` had NO lock-record guard.
     /// Pre-fix it renamed a fresh inode over the record: A held
     /// `operation.lock`, a path-based replace swapped the inode, and C then
     /// acquired the NEW inode while A still held the old one — two simultaneous
@@ -4764,7 +4764,7 @@ mod tests {
         drop(holder);
     }
 
-    /// F-A2: renaming an ANCESTOR of the lock record MOVES the record with its
+    /// Renaming an ANCESTOR of the lock record MOVES the record with its
     /// directory (the inode follows), freeing the old path. Pre-fix the guard
     /// checked only the endpoints' final components, so
     /// `renameat_paths(root, "state", "state2")` succeeded and a second
@@ -4807,7 +4807,7 @@ mod tests {
         drop(holder);
     }
 
-    /// F-A2 control: renaming a directory that holds NO lock record (and whose
+    /// Control: renaming a directory that holds NO lock record (and whose
     /// siblings are ordinary) is still allowed, so the subtree guard does not
     /// refuse every directory rename.
     #[test]
@@ -4821,7 +4821,7 @@ mod tests {
         assert!(!dir.path().join("state").exists());
     }
 
-    /// F7: `set_private_fd` used to admit a DIRECTORY (`O_RDONLY` on a
+    /// `set_private_fd` used to admit a DIRECTORY (`O_RDONLY` on a
     /// directory succeeds) and chmod it to 0o600, stripping its execute bit.
     /// The opened inode is classified now, so a directory is refused and its
     /// mode is untouched, while a regular file is still chmodded.

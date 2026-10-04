@@ -1300,7 +1300,7 @@ mod tests {
         );
     }
 
-    /// F4: `perl`'s `die` exits 255 when `$! == 0` (perl's documented rule),
+    /// `perl`'s `die` exits 255 when `$! == 0` (perl's documented rule),
     /// and the crate's OWN far-side script reaches that arm for a NON-NFC name
     /// and for a root that EXISTS but is not a directory. Exit 255 therefore
     /// establishes no layer: with the script's own stderr the failure must
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F4: the classifier pinned to the REAL script's own emissions.
+    // The classifier pinned to the REAL script's own emissions.
     // -----------------------------------------------------------------------
 
     /// Whether `perl` can run at all (the real-script probes need it).
@@ -1815,7 +1815,7 @@ mod tests {
         );
     }
 
-    /// F4: the classifier is pinned to the [status, stderr] the REAL far-side
+    /// The classifier is pinned to the [status, stderr] the REAL far-side
     /// script emits, measured identically on macOS perl 5.34.1 and Linux perl
     /// 5.40.1 under the crate's own `perl -e <script> <root>` invocation:
     ///
