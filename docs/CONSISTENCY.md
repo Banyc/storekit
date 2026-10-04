@@ -896,3 +896,68 @@ no test notices. The runtime itself has now survived several rounds of attack,
 including a reviewer's algebraic audit of every `matches` axis; that is evidence,
 but it is evidence about the SHAPE of the remaining risk (self-audit overreach), not
 a claim that no defect remains.
+
+## The adversarial review (round 11)
+
+Nine findings, all fixed — and two of them are P1s in devices the previous round had
+just "made falsifiable", one of which is the orchestrator's own correction.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The belt "oracle" was a CONSISTENCY CHECK BETWEEN TWO CO-EDITABLE LITERALS: `KNOWN_NAME_MUTATORS` and `MUTATING_LIBC_SYSCALLS` are both hand-written in the same file and every arm compared them to each other (arm 5 anchored only `chmod`/`renameat2`), so deleting a member from BOTH and adding it to the review list disarmed the belt — 52 of the 54 members — with all six libc tests green. | H | `mywyuvnnmsqx` |
+| 2 | THE ORCHESTRATOR'S OWN FIX: the round-10 paragraph was corrected to say the axis-to-test table and a "PUSH twin" were "recorded in the round-11 entry below" — a section that had not been written, asserting a test that did not exist. An earlier version of the same sentence had claimed that table lived in this log at all. Both were claims about content that was not there; the second was written while correcting the first. | A | `kutvqmmryruq`, then this entry |
+| 3 | The round-10 macro tripwire was evaded by a GENERIC `pub fn` (it expected `(` immediately after the name; a generic writes `<`), so a real public raw-path mutator shipped with the tripwire and the derivation both green. | H | `mywyuvnnmsqx` |
+| 4 | A local `type` ALIAS of the builder type (`type ZZBuilder = std::fs::OpenOptions`) left the funnel closure AND the count pin blind inside a funnel module — a `use … as` alias was resolved, a `type` alias was not. | H | `mywyuvnnmsqx` |
+| 5 | `platform::symlink` — a public, path-based name CREATOR — never ran the reserved-name guard while its `_fd` twin did: a consumer could create `operation.lock` and `.sync-aside.…` names through it. Constraint #1's "Removes from the impl" column claims that class was removed. | A, M | `oxmkqtnktvrz` |
+| 6 | The ownership LOCALNESS axis was compared for both directions in code but test-pinned only for `Pull`: gating step 4 on `Pull` left the entire suite green. Corroborated by both reviewers. | H | `oxmkqtnktvrz` |
+| 7 | The round-10 transitive funnel-region derivation had NO failing test: replacing the ancestor-or-self test with an exact-module match left all 690 tests green. | H | `mywyuvnnmsqx` |
+| 8 | The pair-less boundary named `use … as` aliases but omitted local `type` aliases of `Path`/`PathBuf`. | A | `mywyuvnnmsqx` |
+| 9 | The belt's literal boundary was UNSTATED: a real name mutator in NEITHER list (`lutimes`, `futimes`, `fchmodat2`, `mq_open`, `sem_open`, `shm_open`, …) could be moved into the review list with nothing failing. | H | `mywyuvnnmsqx` |
+| 10 | Three claims of the orchestrator's: the mode-delta prose said "six" spellings where its own table lists EIGHT; the round-10 sentence claimed a table that existed only in a fix agent's report; and the README stated an `iff` between `valid_name` and `is_unaddressable_name` that the identifier rule does not satisfy (`Ünïcode` is refused and is not unaddressable). | A | the round-11 docs commits |
+
+**The belt's oracle is now anchored OUTSIDE the co-editable pair.** A third table,
+`INDEPENDENT_KNOWN_NAME_MUTATORS` — 71 entries, each with a CLASS and a REASON,
+covering the POSIX/Linux/BSD name-mutation surface and including **17 symbols that
+were in neither round-10 list** — is what the oracle iterates: every anchor member
+must be refused by the derived belt AND by the default-deny belt alone, must not
+appear in the review list, and the non-vacuity count must be real. Co-editing both
+family literals for `chown` now FAILS ("these ANCHOR name mutators are absent from
+`MUTATING_LIBC_SYSCALLS`"), and moving the new control `lutimes` into the review
+list FAILS too. The anchor is itself a list, so its own boundary is STATED (a raw
+syscall by number or a local `extern "C"` declaration is not keyable) rather than
+implied.
+
+**`platform::symlink` is guarded, and the choice was made on CONSUMER evidence.**
+The brief's preferred option (demote the function to `pub(crate)`) was REFUTED by
+measurement: `~/code/deploy` re-exports the whole module (`pub(crate) use
+storekit::platform::*;`) and calls `platform::symlink` in three places, so demotion
+would break a real consumer. The fix instead runs `refuse_reserved_mutation` at the
+public entry (returning the crate's `Result`, the same type as its `_fd` twin) and
+moves the unguarded std calls into a NAMED `pub(crate) symlink_verbatim`, which is
+what `copy_tree_verbatim` uses — with that primitive's reserved-name carrying left
+byte-identical and its test STRENGTHENED to include a reserved-named symlink.
+
+**The axis-to-test table this log twice claimed, now real.** Each comparison was
+removed in a scratch copy; these are the tests that fail:
+
+| axis | comparison removed | tests that fail |
+|---|---|---|
+| direction | `self.direction != direction` | `a_destination_ownership_token_is_bound_to_its_direction`, `..._refuses_a_derived_destination_shape_swap` |
+| pinned local root | `normalize_root(local_root) != self.local.root_path` | `a_destination_ownership_token_is_bound_to_its_local_root` |
+| remote root | `normalize_root(remote.root()) != self.remote_root` | `..._is_bound_to_its_run`, `a_remote_token_is_refused_across_roots_with_the_same_endpoint`, `a_pull_token_is_refused_against_a_different_source_root`, `the_endpoint_and_root_refusals_carry_distinct_typed_kinds` |
+| endpoint identity | `remote.endpoint_identity() != self.remote_identity` | `a_remote_token_is_refused_across_endpoints_with_the_same_root`, `a_pull_token_is_refused_against_a_different_source_endpoint` |
+| remote localness | `remote.is_local() != self.remote_is_local` | `a_pull_token_is_refused_when_{the_source_flips_from_local_to_non_local,equal_content_hides_the_local_to_non_local_flip}` and `a_push_token_is_refused_when_{the_destination_flips_from_local_to_non_local,equal_content_hides_the_local_to_non_local_flip}` |
+
+The localness row is the one round 10 could not fill: it had a PULL test and no PUSH
+twin, so gating that comparison on `Pull` was invisible — and the PUSH twin now
+reproduces round 9's P1 in the other direction (a token minted against a LOCAL
+destination replayed against a non-local one that states the same root and no
+identity mutated the non-local destination, and returned `Ok` when the content
+matched).
+
+**My own documentation defects are now the largest single category in this round**
+(items 2 and 10): four claims across three commits, all of a kind — an artifact I
+asserted was there and was not, and a number I wrote without counting. The remedy is
+in the text rather than in a resolution: the round-10 paragraph now states the
+COVERAGE GAP it has (localness pinned for PULL only), and this entry carries the
+filled gap. A claim about content is a measurement like any other.
