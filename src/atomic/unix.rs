@@ -142,14 +142,15 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// the two commit points.
 ///
 /// THE NAME STATES THE WEAKNESS (API constraint #8, verdict N; API constraint
-/// #1's ONE tolerated name): this PATH-BASED replace takes a raw `&Path`
-/// rather than the crate's validated [`crate::RootedRelativePath`], and it
-/// resolves every component by that path, so an intermediate symlink is
-/// FOLLOWED — it is NOT component-confined. It is the ONE mutation that does
-/// NOT take a `(&RootDir, &RootedRelativePath)` pair, so it is the form to
-/// AVOID whenever the confined [`write_atomic_replace_fd`] can name the
-/// destination; [`crate::atomic::COMPONENT_CONFINED`] describes the platform
-/// split. It is PUBLIC because it is part of the interface this crate was
+/// #1 enumerates this as one of the pair-less mutations): this PATH-BASED
+/// replace takes a raw `&Path` rather than the crate's validated
+/// [`crate::RootedRelativePath`], and it resolves every component by that
+/// path, so an intermediate symlink is FOLLOWED — it is NOT component-confined.
+/// It is the UNCONFINED replace — the pair-less mutation to AVOID whenever the
+/// confined [`write_atomic_replace_fd`] can name the destination, alongside the
+/// other pair-less mutations API constraint #1 enumerates;
+/// [`crate::atomic::COMPONENT_CONFINED`] describes the platform split.
+/// It is PUBLIC because it is part of the interface this crate was
 /// extracted from — a consumer's port calls the path-based replace (see
 /// `docs/CONSISTENCY.md`, axis M) — and a public-API name is justified by a
 /// consumer's need, never by this crate's own tests. The Windows port keeps

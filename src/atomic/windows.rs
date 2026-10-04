@@ -53,11 +53,12 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// platform-independent).
 ///
 /// THE NAME STATES THE WEAKNESS (API constraint #8, verdict N; API constraint
-/// #1's ONE tolerated name): this PATH-BASED replace takes a raw `&Path`
-/// rather than the crate's validated [`crate::RootedRelativePath`], and it is
-/// the ONE mutation that does NOT take a `(&RootDir, &RootedRelativePath)`
-/// pair, so it is the form to AVOID whenever a confined form can name the
-/// destination. It is PUBLIC because it is part of the interface this crate
+/// #1 enumerates this as one of the pair-less mutations): this PATH-BASED
+/// replace takes a raw `&Path` rather than the crate's validated
+/// [`crate::RootedRelativePath`], and it is the UNCONFINED replace — the
+/// pair-less mutation to AVOID whenever a confined form can name the
+/// destination, alongside the other pair-less mutations API constraint #1
+/// enumerates. It is PUBLIC because it is part of the interface this crate
 /// was extracted from — and on this port it IS the body of the fd surface
 /// ([`write_atomic_replace_fd`]), which is path-based throughout.
 pub fn write_atomic_replace(

@@ -13085,6 +13085,66 @@ fn a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token() {
     );
 }
 
+/// The COMPOSED mint path enforces the SAME endpoint-identity rule as `lock`
+/// and `lock_remote`: a NON-LOCAL source that states NO endpoint identity
+/// cannot mint a `LockedWithInRoot` token either. All three minting paths go
+/// through ONE authority, [`require_endpoint_identity`], because the token
+/// binds the transport's endpoint — for a PULL the remote is the SOURCE whose
+/// manifest the token carries as the plan the run applies. Without this test
+/// the call in [`DestinationOwnership::lock_with_in_root_lock`] could be
+/// removed with the whole suite still green, leaving that path's guard
+/// unregressible.
+///
+/// The destination root is created BEFORE the mint because the composed form
+/// requires an existing root: that separates the refusal under test from the
+/// distinct pre-existing-root refusal, so a pass here can only come from the
+/// endpoint-identity guard. The refusal is TYPED and precedes BOTH record
+/// acquisitions, so neither the sibling record nor the in-root record is
+/// created.
+#[cfg(unix)]
+#[test]
+fn a_composed_mint_refuses_a_non_local_source_without_an_endpoint_identity() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    // The destination root PRE-EXISTS: the composed form takes the caller's
+    // in-root lock, so an absent root has its own refusal, which must not be
+    // what this test measures.
+    fs::create_dir_all(&dst).unwrap();
+    let in_root_lock = RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap();
+    // A NON-LOCAL source (a third-party remote) that states NO endpoint.
+    let remote = RecordingRemote::over(transport(&src), false).without_endpoint_identity();
+
+    let err = DestinationOwnership::lock_with_in_root_lock(
+        Direction::Pull,
+        &dst,
+        &remote,
+        &in_root_lock,
+    )
+    .err()
+    .expect(
+        "a composed mint against a non-local source without an endpoint identity must not mint \
+         a token",
+    );
+    assert_eq!(
+        err.preflight_reason(),
+        Some(PreflightKind::EndpointIdentityUnavailable),
+        "the composed refusal must be the typed endpoint-identity-unavailable condition: {err:?}"
+    );
+    // Nothing was created: the refusal precedes the sibling record AND the
+    // in-root record, so neither the record nor its parent chain exists.
+    assert!(
+        !dst.join("state/operation.lock").exists(),
+        "a refused composed mint must not create the in-root lock record"
+    );
+    assert_eq!(
+        fs::read_dir(&dst).unwrap().count(),
+        0,
+        "a refused composed mint must leave the destination untouched"
+    );
+}
+
 /// The `Locked` token is BOUND to the transport ROOT it was taken for: a token
 /// acquired for one destination is REFUSED when handed to a run against
 /// another, so a caller cannot take the lock on a destination it will not

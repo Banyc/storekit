@@ -1266,20 +1266,27 @@ pub struct UnsupportedEntry {
 /// The result of canonicalizing a DESTINATION tree: the destination's own
 /// observation plus the entries the strict rules would have refused.
 ///
-/// The observation is a DESTINATION-ROLE value, not a canonical tree object,
-/// and the type now says so. An entry named in [`Self::unsupported`] may not
-/// be one the strict canonicalizer would emit (its symlink target may be
-/// absolute, or it may be a hard link recorded as an ordinary file). The
-/// canonical metadata is therefore `pub(crate)`: the ONLY way to obtain a
-/// [`TreeMetadata`] here is inside the crate, so a consumer cannot serialize a
-/// destination observation as a `tree.json`, cannot feed it to
-/// [`verify_tree_metadata`], and cannot use it as a SOURCE manifest — the
-/// directions API constraint #7 keeps apart. A consumer that needs the
-/// destination's entries or digest uses the role-named accessors
+/// The observation is a DESTINATION-ROLE value, not a canonical tree object:
+/// an entry named in [`Self::unsupported`] may not be one the strict
+/// canonicalizer would emit (its symlink target may be absolute, or it may be
+/// a hard link recorded as an ordinary file). What the crate ENFORCES and
+/// proves is narrower than "this value cannot become a source manifest": the
+/// wrong direction does not TYPECHECK at the ENTRY POINTS — a
+/// `DestinationTree` is not a [`TreeMetadata`] and has no `Deref`, so it
+/// cannot be passed where the canonical source type is required — and that is
+/// pinned by the two `compile_fail,E0308` doctests below. The crate does NOT
+/// seal [`TreeMetadata`]: its fields are `pub` by design, so a consumer can
+/// construct one, and a caller who REBUILDS a [`TreeMetadata`] from this
+/// observation's public accessors is therefore not stopped by the type system.
+/// Sealing [`TreeMetadata`] is the only way to make the broad claim true, and
+/// it is not done here because it is a breaking public-API change with a
+/// consumer cost, not a narrowing the crate makes on its own. A consumer that
+/// needs the destination's entries or digest uses the role-named accessors
 /// ([`Self::entries`], [`Self::tree_sha256`]) or, to build the engine's own
 /// diff, `crate::sync::diff::diff_source_and_destination`.
 ///
-/// Compile-checked: each wrong direction below is a `compile_fail` example.
+/// Compile-checked: the wrong-direction ENTRY POINTS below are `compile_fail`
+/// examples; the residual above is what they do NOT cover.
 ///
 /// A destination observation is not a source manifest:
 ///
