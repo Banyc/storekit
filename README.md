@@ -624,7 +624,7 @@ nine config-time "does not refer to a reachable function" warnings for entries
 whose Unix libc symbols do not exist on that target; they are correct for the host
 and do not fail the run. `cargo test` alone exercises neither clippy command.
 * The **two source audits** in `atomic::guard::tests` run under `cargo test`, i.e.
-always, and under BOTH targets' `cargo check`: `no_libc_reference_outside_the_funnel`
+always: `no_libc_reference_outside_the_funnel`
 fails when a `libc` reference appears outside the funnel or when the funnel's own
 per-module `libc` reference surface changes, and
 `std_fs_name_mutation_counts_are_pinned` fails when a production name-mutating call

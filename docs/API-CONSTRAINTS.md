@@ -10,7 +10,7 @@ sentences disappear from `src/`.
 
 | # | Constraint | Removes from the impl | Status |
 |---|---|---|---|
-| 1 | **A mutation OF A NAME INSIDE A ROOT is named one way: `(&RootDir, &RootedRelativePath)`.** The path is parsed once, at the boundary, into a validated type, and that type is the only input a ROOT-RELATIVE mutating primitive accepts. The mutations that do NOT take the pair are enumerated below and each is named for its reach (see #8): `atomic::write_atomic_replace` (the UNCONFINED replace), the copy primitives `atomic::copy_tree_verbatim` and `atomic::copy_dir_recursive_fd`, `sync::retire_destination_lock`, `sync::Residue::recover_to`, `lock::FileLock::acquire`, `platform::chmod` and `platform::symlink`, `lock::AdministrativeRecoveryGuard::acquire` (a lock record created or truncated at a caller-supplied path — the THIRD member this enumeration missed, after round 1 found the count wrong and round 2 found the sidecar helper absent), `transport::ssh::hostkey::pin_known_hosts`'s cache-file `std::fs::remove_file` (a drop of a stale or unreadable pinned host key under the transport's OWN private `cache_dir`, whose path is never derived from a caller's store-relative name and so cannot name a lock record — the FIFTH member this enumeration missed, found by round 5 after `Residue::discard` was the fourth), the `Remote` trait's path-taking seam `lock_far_side`, and `transport::with_operation_lock_sidecar` (a raw `base: &Path` plus a CALLER-CHOSEN `sidecar` spelling: it creates the sidecar and its parent chain, and that spelling is now refused by the same reserved-mutation authority every other path uses). An earlier version of this row claimed "ONE tolerated exception": its population was the crate's own root-relative primitives, not the whole public surface (axis M) — and the NEXT version still missed the sidecar helper, which is the same error twice, and is why the rule is stated as a rule about ROOT-RELATIVE mutation with its exceptions ENUMERATED rather than as a count. | the private `validate_rel` guard (its looser rule was re-derived at every `_fd` primitive and at the Windows port's `rel_join`); the "which spelling did the caller use" branches; the public path-based `set_private`, `sync_parent_dir`, `ensure_private_dir(_durable)` and `remove_dir_all_path` spellings; and the *class* where a path-based primitive shipped missing the guard its `_fd` twin had. | **done** |
+| 1 | **A mutation OF A NAME INSIDE A ROOT is named one way: `(&RootDir, &RootedRelativePath)`.** The path is parsed once, at the boundary, into a validated type, and that type is the only input a ROOT-RELATIVE mutating primitive accepts. The mutations that do NOT take the pair are enumerated ONCE, in the MACHINE-CHECKED `PAIR-LESS-MUTATIONS` block below (search that marker), and that block — not this row and not the constraint-8 bullet — is the list: a test derives the public raw-path surface and fails unless every member is named there or carries a stated exemption, so a SEVENTH omission is a failing test rather than a reviewer's find (six were found by hand, across rounds 1, 2, 3, 5, 6 and 7). An earlier version of this row claimed "ONE tolerated exception": its population was the crate's own root-relative primitives, not the whole public surface (axis M) — and the NEXT version still missed the sidecar helper, which is the same error twice, and is why the rule is stated as a rule about ROOT-RELATIVE mutation with its exceptions ENUMERATED rather than as a count. | the private `validate_rel` guard (its looser rule was re-derived at every `_fd` primitive and at the Windows port's `rel_join`); the "which spelling did the caller use" branches; the public path-based `set_private`, `sync_parent_dir`, `ensure_private_dir(_durable)` and `remove_dir_all_path` spellings; and the *class* where a path-based primitive shipped missing the guard its `_fd` twin had. | **done** |
 | 2 | **Ownership is one axis, not six entry points.** `sync`/`push`/`pull` × owned/unowned × local/remote collapse to one function taking an `Ownership` value that only the lock-taking paths can construct. The lock records a run holds are part of the SAME axis, not a parallel API: `DestinationOwnership::Locked` (LOCAL sibling record), `DestinationOwnership::LockedWithInRoot` (sibling record + the caller's in-root `Layout::lock`), and `DestinationOwnership::LockedRemote` (a persistent FAR-SIDE lock session) are three unforgeable values of the one enum, produced by `DestinationOwnership::lock`, `DestinationOwnership::lock_with_in_root_lock`, and `DestinationOwnership::lock_remote`. | five near-duplicate entry bodies; the "call the right one" prose; a documented limitation that exists only because the weak path is a separate function; a `bool` parameter on the acquiring constructor (the composition and the remote/local choice are named enum values, never flags). | **done** (`DestinationOwnership`; `DestinationOwnership::lock` is the unforgeable acquiring constructor; `lock_with_in_root_lock` is the composed one; `lock_remote` is the far-side one) |
 | 3 | **Containment has one authority and it consumes kinds, not resolutions.** A caller supplies an entry-kind view; it never supplies a resolution function. | three hand-rolled resolvers, one of which projected from the live source tree and accepted an escape while the other two refused it. Verified: all three views build `SymlinkContainmentIndex` from `live_entry_kinds`, the rule and the index are `pub(crate)`, and no API accepts a resolver. | **done** |
 | 4 | **Every condition a caller must branch on is a typed value.** Each class whose conditions a caller must tell apart carries a public kind enum and every error variant names it: `ReservedKind` (reserved-spelling refusals), `MaterializationKind` (address-fidelity and wire refusals, plus `RootsOverlap`/`ParentNotClosed`), `StoreKind` (the tree copy's source-audit refusals, the residue gate, and visible-but-unconfirmed durability), `TransportKind` (the manifest-failure LAYERS — unreachable host vs far-side script vs missing `perl` vs output-drain vs undetermined — the receiver-marker conditions, a non-directory root, and remote durability), and `PreflightKind` (the RUN-BINDING conditions: an endpoint identity unavailable vs mismatched, a remote root mismatch, a run-binding mismatch, a remote destination through the local lock and a local one through the far-side lock, an unlockable remote destination, the composed form's local-only requirement, far-side locking unsupported, and a lock record or its parent being a symlink). The message is preserved VERBATIM so a text-matching caller keeps working; `with_context` preserves the kind. Of these five enums, the FOUR that split a heterogeneous class — `MaterializationKind`, `StoreKind`, `TransportKind`, `PreflightKind` — carry an explicit `Unclassified` fallback for the conditions no caller branches on, and their accessors follow the `*_reason()` convention (`materialization_reason`, `store_reason`, `transport_reason`, `preflight_reason`); `ReservedKind` is a CLOSED set of three conditions (`ResidueBelow`, `NotResidue`, `RecoverTargetOccupied`) with no fallback needed and the accessor `reserved_kind()`. An earlier version of this sentence said "each enum carries an explicit `Unclassified` fallback" and named the `*_reason()` convention without exception, which is false for `ReservedKind`. | string matching in callers (the manifest-failure layer tests, the copy-source-audit tests, the roots-overlap test, the receiver-marker tests and — until this row was completed — every endpoint/root/run-binding refusal had to match message substrings to tell two conditions apart), and the mutation where two layers collapsed onto one kind stayed green under message assertions but is caught by the kind assertions. **This row was marked done while the FIFTH class had no kind at all**: `PreflightKind` did not exist, and the crate's own newest tests were telling its conditions apart by substring — the constraint's stated product (no text matching in callers) was violated by the crate itself. Typing it EXPOSED a mis-specified test: `a_destination_ownership_token_is_bound_to_its_run` matched `"destination ownership was taken for"`, an opening BOTH the root and the run-binding refusals share, so it had been asserting the ROOT refusal while claiming to assert the run binding; it now asserts `RemoteRootMismatch`, and a new test covers `RunBindingMismatch`. The class is a **breaking change to a consumer**: `deploy`'s bridge destructured the tuple variant and needed `{ message, .. }`. | **done** (`ReservedKind`, `MaterializationKind`, `StoreKind`, `TransportKind`, `PreflightKind`) |
@@ -18,6 +18,38 @@ sentences disappear from `src/`.
 | 6 | **Every bound is a constant with its reason stated**, and no derived value feeds a length-limited resource unbounded. | ad-hoc length arithmetic at each site. | **done** |
 | 7 | **One direction of data flow per type**: a type that is read is not the same type that is written. | mode/kind re-reads, and the checks that exist only to catch a caller passing the wrong one. | **done** (see "What constraint 7 closed" below) |
 | 8 | **The crate's own contract is not reachable by accident**: the weak, unverified or unenforced path is reachable only through a name that states it. | the "documented but not enforced" bullets. | **done** (see "What constraint 8 closed" below; one stated residual remains by decision) |
+
+## The pair-less mutations
+
+`
+<!-- PAIR-LESS-MUTATIONS:BEGIN -->
+- `atomic::write_atomic_replace` — the UNCONFINED, absolute-path replace
+- `atomic::copy_tree_verbatim` — a tolerant verbatim copy whose SOURCE may be out of root
+- `atomic::copy_dir_recursive_fd` — the same copy, descriptor-confined on the destination
+- `sync::retire_destination_lock` — a lock-record removal with its own spelling and identity checks
+- `sync::Residue::recover_to` — takes a raw target path, validated at the boundary before use
+- `sync::Residue::discard` — takes NO path argument; the validated pair lives inside `Residue`
+- `lock::FileLock::acquire` — the record path the lock protocol computes
+- `lock::AdministrativeRecoveryGuard::acquire` — a record created or truncated at a caller-supplied path
+- `platform::chmod` — the ONE path-based mode authority (FD-bound `File::set_permissions` is the permitted second form)
+- `platform::symlink` — the cross-platform symlink helper
+- `Remote::lock_far_side` — the far-side ownership seam (a trait method)
+- `Remote::provision_layout` — the layout and bootstrap-`create_dir_all` seam (a trait method)
+- `transport::with_operation_lock_sidecar` — a raw `base` plus a caller-chosen `sidecar` spelling, refused by the reserved-mutation authority if it names the crate's bookkeeping
+- `transport::ssh::hostkey::pin_known_hosts` — the drop of a stale pinned host key under the transport's OWN private `cache_dir`
+<!-- PAIR-LESS-MUTATIONS:END -->
+`
+
+This block is the ONE enumeration of the mutations that do NOT take
+`(&RootDir, &RootedRelativePath)`, and it is MACHINE-CHECKED: a test in
+`atomic::guard::tests` finds exactly one such block, resolves every name in it to
+a real item, and separately derives the public raw-path surface so that a member
+missing from the block is a FAILING TEST. The read-only primitives that also take
+a `&Path` (`platform::file_mode`, `atomic::path_state`, `sync::diff::local_manifest`,
+`manifest::canonicalize_tree(_destination)`, `manifest::verify_tree_metadata`,
+`RootDir::open`, `OwnedRoot::parse`, `atomic::temp_name_for`) are exempt in that
+test, each with its reason, because they neither mutate a name nor escape the
+confined primitives.
 
 ## What constraint 8 closed
 
@@ -90,32 +122,17 @@ named AT the item with its reach).
   `flock` session (`DestinationOwnership::lock_remote`).
 * **N — the enumerated path-based mutators.** Constraint #1's rule is about
   ROOT-RELATIVE mutations; the mutations that take a raw `&Path` are legitimate
-  for what they do, and each is a NAMED weak path rather than an unnamed one:
-  `atomic::write_atomic_replace` (the unconfined replace), `atomic::copy_tree_verbatim`
-  and `atomic::copy_dir_recursive_fd` (copy primitives whose role includes an
-  out-of-root source), `sync::retire_destination_lock` (a lock-record removal
-  with its own spelling and identity checks), `sync::Residue::recover_to` AND
-  `sync::Residue::discard` (the sweep's target and the discard; each holds a
-  validated `(&RootDir, &RootedRelativePath)` pair INSIDE `Residue`, so they meet
-  the rule's SPIRIT — the validated type is the input — and they are listed
-  because this enumeration is about the SIGNATURE, and NEITHER takes that pair as
-  an ARGUMENT. They differ in one way an earlier version of this paragraph got
-  wrong: `recover_to` DOES take a caller-supplied path
-  (`target: impl AsRef<Path>`), which it validates at the boundary before use,
-  while `discard` takes no path argument at all; the sentence once said "a
-  proof-carrying method takes no path argument at all" of BOTH, which is false for
-  `recover_to`. `discard` is the FOURTH member this enumeration missed), `lock::FileLock::acquire` (the record path the lock
-  protocol computes), `platform::chmod` / `platform::symlink` (the platform
-  primitives), and the `Remote` trait's path-taking seam `lock_far_side`. The
-  READ-ONLY primitives that also take a `&Path` (`platform::file_mode`,
-  `atomic::path_state`, `sync::diff::local_manifest`,
+  for what they do, and each is a NAMED weak path rather than an unnamed one. The
+  list exists ONCE — the machine-checked `PAIR-LESS-MUTATIONS` block above — and
+  this bullet deliberately does not restate it: an earlier version did, and the
+  two copies diverged within one round (each omitted members the other listed),
+  which is the same "a list standing in for a rule" error that had already cost
+  six hand-found omissions. The READ-ONLY primitives that also take a `&Path`
+  (`platform::file_mode`, `atomic::path_state`, `sync::diff::local_manifest`,
   `manifest::canonicalize_tree(_destination)`, `manifest::verify_tree_metadata`,
-  `RootDir::open`, `OwnedRoot::parse`, `atomic::temp_name_for`) are not
-  mutations and are not exceptions to this rule. The list is the audited
-  population at the revision that wrote it; the class error recorded at axis M
-  is exactly an audit that surveyed the wrong population, which is why the rule
-  is stated as a RULE (`of a name inside a root`) with its exceptions
-  enumerated, not as a count.
+  `RootDir::open`, `OwnedRoot::parse`, `atomic::temp_name_for`) are not mutations
+  and are not exceptions to this rule; the derived test exempts each with a stated
+  reason.
 * **R — `Remote::exec`.** The raw command seam: it runs a caller-built
   command, bypassing the operation lock, path confinement and the crate's own
   operation protocol. It cannot be closed without removing the seam every
