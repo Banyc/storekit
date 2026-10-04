@@ -412,14 +412,17 @@ one: a guard is a guard only if a test notices its removal, and a coverage claim
 spanning several call sites must name a test for EACH, never one test for the set. A non-local `RecordingRemote` now states an endpoint at
 construction, the way a real remote transport must.
 
-**Eight of the twelve are axis A**, "a doc claim ↔ the code", and they are not
-eight unrelated slips: they are one habit, a claim ASSERTED in the confident
-register rather than MEASURED. The sharpest instance is finding 3 — its paragraph
-was titled "**The delta, measured**" and was not measured; it described a
-strictness the code did not have, and the crate's own rule ("prove the delta")
-would have caught it had the delta actually been produced. Findings 3, 5, 6, 7,
-10 and 12 all share the shape: a sentence that reads as verified with nothing
-behind it.
+**Six of the twelve are axis A** (rows 3, 7, 8, 9, 10 and 12), "a doc claim ↔
+the code", and they are not six unrelated slips: they are one habit, a claim
+ASSERTED in the confident register rather than MEASURED. The sharpest instance is
+finding 3 — its paragraph was titled "**The delta, measured**" and was not measured;
+it described a strictness the code did not have, and the crate's own rule ("prove
+the delta") would have caught it had the delta actually been produced. The other
+five axis-A rows share that shape: a sentence that reads as verified with nothing
+behind it. (An earlier version of this paragraph said "EIGHT of the twelve" and
+named rows 5 and 6 among them — a count that contradicted its own table directly
+above it, written while diagnosing exactly that habit. Round 8 measured it: the
+table gives six.)
 
 Two axes gained a meaning they did not have. **C** now covers "a view prepared
 for ONE purpose reused for another": the destination stripped for the diff is not
