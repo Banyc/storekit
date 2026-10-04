@@ -376,9 +376,18 @@ transport author read the doc is not a check.** One authority,
 transport in EITHER role, because for a PULL the remote is the source whose
 manifest the token carries as the plan. The refusal is a typed `Preflight`
 naming both the override and the weaker `Unowned` path, and it does not touch an
-UNOWNED run, which holds no token to bind. Evidence: the new test fails when the
-three calls are removed and passes with them, so the constraint is load-bearing
-rather than decorative. A non-local `RecordingRemote` now states an endpoint at
+UNOWNED run, which holds no token to bind. Evidence, PER PATH — because an
+earlier version of this sentence claimed one test covered all three, and the
+round-3 review showed that was false by REMOVING the third call and watching the
+whole suite stay green (659 + 2 lib, every integration suite, 11 doc-tests):
+`lock` is covered by
+`a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token`,
+`lock_remote` by `a_transport_without_an_endpoint_identity_cannot_mint_a_remote_token`,
+and `lock_with_in_root_lock` by a test added in round 3 for exactly this reason.
+The guard was present on all three from the start; on the third it was
+UNREGRESSIBLE, which is one step from absent. The lesson is this file's usual
+one: a guard is a guard only if a test notices its removal, and a coverage claim
+spanning several call sites must name a test for EACH, never one test for the set. A non-local `RecordingRemote` now states an endpoint at
 construction, the way a real remote transport must.
 
 **Eight of the twelve are axis A**, "a doc claim ↔ the code", and they are not
