@@ -6675,8 +6675,8 @@ mod fingerprint_ssh_tests {
             // reference command. The recording block reads no stdin, so the
             // piped payload flows through this shim untouched into the remote
             // `cat > "$tmp"` (the shell execs the command with stdin intact).
-            std::fs::write(
-                bin.join("ssh"),
+            crate::test_support::write_executable(
+                &bin.join("ssh"),
                 format!(
                     r##"#!/bin/sh
 # Fake `ssh` for tests: emulates a remote host whose filesystem is a local
@@ -6708,14 +6708,13 @@ remapped=$(printf '%s' "$cmd" | awk -v old="$REMOTE_PREFIX" -v new="$FAKE_ROOT$R
 exec sh -c "$remapped"
 "##,
                     argv_log = argv_log.display(),
-                ),
-            )
-            .unwrap();
+                ).as_bytes(),
+            );
 
             // Fake ssh-keyscan: record every invocation (so tests can prove the
             // cached pin is reused) and answer with the generated host key.
-            std::fs::write(
-                bin.join("ssh-keyscan"),
+            crate::test_support::write_executable(
+                &bin.join("ssh-keyscan"),
                 format!(
                     r#"#!/bin/sh
 printf 'keyscan\n' >> '{log}'
@@ -6735,9 +6734,9 @@ printf '%s %s\n' "$host" '{pubkey}'
                     log = keyscan_log.display(),
                     address = address,
                     pubkey = pubkey,
-                ),
-            )
-            .unwrap();
+                )
+                .as_bytes(),
+            );
 
             // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it):
             // the transport's list script uses `stat -c '%f'` (raw mode in
@@ -6748,8 +6747,8 @@ printf '%s %s\n' "$host" '{pubkey}'
             // fixture faithful for any caller that still formats through
             // `stat`. `/usr/bin/perl` (absolute) is used so an injected fake
             // `perl` in the test bin dir never shadows the shim's interpreter.
-            std::fs::write(
-                bin.join("stat"),
+            crate::test_support::write_executable(
+                &bin.join("stat"),
                 r#"#!/bin/sh
 fmt=""
 while [ $# -gt 0 ]; do
@@ -6771,9 +6770,8 @@ case "$fmt" in
     exec /usr/bin/stat "$@"
     ;;
 esac
-"#,
-            )
-            .unwrap();
+"#.as_bytes(),
+            );
 
             // Fake `mv` emulating GNU coreutils `mv -T` (no-target-directory):
             // macOS BSD mv lacks `-T` and, like GNU mv without `-T`, treats a
@@ -6781,8 +6779,8 @@ esac
             // itself and moves the source INTO it. The deploy tool's `current`
             // swap depends on GNU `-T` semantics, so strip the flag and remove
             // any existing destination first.
-            std::fs::write(
-                bin.join("mv"),
+            crate::test_support::write_executable(
+                &bin.join("mv"),
                 r#"#!/bin/sh
 if [ "$1" = "-T" ]; then
   shift
@@ -6793,17 +6791,11 @@ if [ "$1" = "-T" ]; then
   exec /bin/mv -- "$src" "$dst"
 fi
 exec /bin/mv "$@"
-"#,
-            )
-            .unwrap();
+"#
+                .as_bytes(),
+            );
 
-            use std::os::unix::fs::PermissionsExt;
-            for name in ["ssh", "ssh-keyscan", "stat", "mv"] {
-                let p = bin.join(name);
-                let mut perms = std::fs::metadata(&p).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&p, perms).unwrap();
-            }
+            // The shims are installed 0o755 by `write_executable`'s helper.
 
             FakeSsh {
                 bin,
