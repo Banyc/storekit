@@ -340,6 +340,25 @@ finding.**
 | 11 | `the_table_covers_the_unicode_17_additions` named 28 mappings and asserted 6, so corrupting an unsampled one left all five casefold tests green (the table itself was correct, verified against the UCD). | H | `ruylovrpvvvs` |
 | 12 | Constraint #5 claimed `Sanction`/`GuardedRel` were "unforgeable outside the crate" while both are `pub(crate)` — the row described no public surface at all. | A | `kvyywnmrxnyn` |
 
+**Finding 2's fix left a residual, and the round closed it rather than shipping it.**
+The token agent reported it plainly: `DestinationOwnership::lock_remote` refused a
+`None` endpoint identity, but `DestinationOwnership::lock` did not — so a PULL
+whose SOURCE was a third-party `Remote` that did not override
+`endpoint_identity` still minted a token bound to nothing but a path spelling,
+and the run would apply one host's plan to another host's data. The reach was
+third-party only (`SshTransport` always states one), which is exactly why it was
+closed rather than documented: **a check that holds only because every
+transport author read the doc is not a check.** One authority,
+`require_endpoint_identity`, is now called by all three minting paths —
+`lock`, `lock_remote` and `lock_with_in_root_lock` — and refuses a NON-LOCAL
+transport in EITHER role, because for a PULL the remote is the source whose
+manifest the token carries as the plan. The refusal is a typed `Preflight`
+naming both the override and the weaker `Unowned` path, and it does not touch an
+UNOWNED run, which holds no token to bind. Evidence: the new test fails when the
+three calls are removed and passes with them, so the constraint is load-bearing
+rather than decorative. A non-local `RecordingRemote` now states an endpoint at
+construction, the way a real remote transport must.
+
 **Eight of the twelve are axis A**, "a doc claim ↔ the code", and they are not
 eight unrelated slips: they are one habit, a claim ASSERTED in the confident
 register rather than MEASURED. The sharpest instance is finding 3 — its paragraph
