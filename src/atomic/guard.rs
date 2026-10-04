@@ -2979,7 +2979,7 @@ mod tests {
             // authority on the whole path/tree before the call, so neither can
             // name the record; the count is raised deliberately, not silently.
             ("src/atomic/windows.rs", "remove_dir_all", 2),
-            // SEVEN production `remove_file` calls: the pre-A1 five plus the two
+            // SEVEN production `remove_file` calls: the pre-existing five plus the two
             // sanctioned claim-aside walk primitives (`remove_claim_file_fd`
             // and the discard `remove_residue_file_fd`), whose paths include
             // the claim root and therefore permit residues.

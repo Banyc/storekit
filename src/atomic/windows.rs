@@ -1485,7 +1485,7 @@ pub fn read_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Vec<DirEn
     read_dir_entries(entries)
 }
 
-/// Read the entries of the OWNED ROOT itself (see the Unix port for the B1
+/// Read the entries of the OWNED ROOT itself (see the Unix port for the
 /// rationale).
 pub fn read_root_dir_fd(root: &RootDir) -> Result<Vec<DirEntry>> {
     let entries = std::fs::read_dir(root.path())

@@ -2666,7 +2666,7 @@ impl Remote for SshTransport {
     }
 
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        // A3: the remote recursive removal carries the SAME residue refusal the
+        // The remote recursive removal carries the SAME residue refusal the
         // local primitive does. The strand's NAME is known locally, so the gate
         // runs before the `rm -rf` command is built — a consumer naming a
         // PARENT directory of a strand is refused, never allowed to destroy the
@@ -3410,7 +3410,7 @@ mod tests_ssh {
         .unwrap()
     }
 
-    /// A3: the SSH recursive and file removals carry the SAME residue refusal
+    /// The SSH recursive and file removals carry the SAME residue refusal
     /// as the local substrate, and run it BEFORE any remote command is built.
     /// The refusal is returned with no far side reachable, which is exactly the
     /// property: a consumer naming a strand on a remote destination cannot
@@ -3642,7 +3642,7 @@ mod tests_ssh {
         assert!(!msg.contains("DEPLOY_SSH_MIN_RATE_BYTES_PER_SEC="));
     }
 
-    /// D1: the READ deadline is the SAME size-aware rule the upload path uses
+    /// The READ deadline is the SAME size-aware rule the upload path uses
     /// ([`transfer_deadline`]), so a large read is bounded by
     /// `max(command deadline, bytes / min_rate)` and a slow link is not killed
     /// by the fixed 60 s. `download_bytes` computes it from the entry's framed
@@ -3665,7 +3665,7 @@ mod tests_ssh {
         assert!(transfer_deadline(mb400, 64 * 1024, base) > base);
     }
 
-    /// D1: a read timeout is diagnosed as a DOWNLOAD, names the file and its
+    /// A read timeout is diagnosed as a DOWNLOAD, names the file and its
     /// size, and points at the rate override for a slow link — distinct from a
     /// stalled remote (which the base-deadline branch names instead).
     #[test]
@@ -6152,7 +6152,7 @@ mod tests_ssh {
         );
     }
 
-    /// F-1: a mid-transfer connection loss makes the remote `cat` see a CLEAN,
+    /// A mid-transfer connection loss makes the remote `cat` see a CLEAN,
     /// SHORT EOF (sshd closes the remote stdin; the write "succeeds" with fewer
     /// bytes). The far side must REFUSE TO PUBLISH: the previous content stays
     /// and the error names the truncation.
@@ -6226,7 +6226,7 @@ mod tests_ssh {
         );
     }
 
-    /// F-1 (`try_write_new`): the SAME truncation on a FRESH immutable record.
+    /// The `try_write_new` case: the SAME truncation on a FRESH immutable record.
     /// The far side must refuse to publish and leave the slot FREE, so a re-run
     /// still succeeds. Pre-fix the truncated record was `link(2)`-published and
     /// the re-run returned `Conflict(ContentMismatch)` — the slot was
@@ -6286,7 +6286,7 @@ mod tests_ssh {
         );
     }
 
-    /// D1/D2 (ssh half): the SAME ONE guard/scope authority governs the remote
+    /// The ssh half: the SAME ONE guard/scope authority governs the remote
     /// ownership-token protocol AND the remote substrate mutations. A foreign
     /// lock-record spelling is refused BEFORE any remote command is built (so
     /// no ssh is attempted), and the substrate methods (`write`, `remove_file`,
@@ -6323,7 +6323,7 @@ mod tests_ssh {
         }
     }
 
-    /// F-1 (`try_write_new_sidecar_cmd`): the operation-lock path reads its
+    /// The `try_write_new_sidecar_cmd` case: the operation-lock path reads its
     /// payload with perl's `do { local $/; <STDIN> }`, so a mid-transfer
     /// connection loss yields a clean, short read too. The perl helper must
     /// refuse BEFORE creating the temp, leaving the lock slot replaceable.

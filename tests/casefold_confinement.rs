@@ -1,4 +1,4 @@
-//! H1 and the fold-ORDER fix through the public API: a case-insensitive
+//! The widened case fold and the fold-ORDER fix through the public API: a case-insensitive
 //! DESTINATION must not be able to resolve a source link's target component
 //! onto a destination symlink the source view never saw.
 //!
@@ -213,25 +213,25 @@ fn source_escape_refused_by_all_views(on_disk: &str, spelled: &str) {
     );
 }
 
-/// H1, `ß`/`SS` through the destination preflight and `push`.
+/// The widened fold, `ß`/`SS` through the destination preflight and `push`.
 #[test]
 fn push_refuses_a_sharp_s_destination_only_fold_escape() {
     push_refuses_a_destination_only_fold_escape("stra\u{df}e", "STRASSE");
 }
 
-/// H1, the `ﬁ`/`FI` ligature through the destination preflight and `push`.
+/// The widened fold, the `ﬁ`/`FI` ligature through the destination preflight and `push`.
 #[test]
 fn push_refuses_a_ligature_destination_only_fold_escape() {
     push_refuses_a_destination_only_fold_escape("\u{fb01}le", "FILE");
 }
 
-/// H1, final sigma through the destination preflight and `push`.
+/// The widened fold, final sigma through the destination preflight and `push`.
 #[test]
 fn push_refuses_a_final_sigma_destination_only_fold_escape() {
     push_refuses_a_destination_only_fold_escape("\u{3c2}", "\u{3a3}");
 }
 
-/// H1, the SOURCE side through the public API: when the source itself holds
+/// The widened fold on the SOURCE side through the public API: when the source itself holds
 /// the symlink component, the strict source manifest refuses and `push` returns
 /// `Err`; the destination is untouched and the canary stays unreachable.
 #[test]

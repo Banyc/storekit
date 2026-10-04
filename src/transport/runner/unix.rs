@@ -756,7 +756,7 @@ mod drain_tests {
         }
     }
 
-    /// D1: ONE `drain_available` call must drain the WHOLE readable backlog,
+    /// ONE `drain_available` call must drain the WHOLE readable backlog,
     /// not a single 8192-byte chunk. Pre-fix the wait loop appended one chunk
     /// per call and slept 1 ms between passes, capping every remote read at
     /// ~8 MiB/s regardless of the link; the fix loops until the pipe reports

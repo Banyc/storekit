@@ -1357,7 +1357,7 @@ mod runner_property_tests {
         );
     }
 
-    /// D3: a FRESH transport whose ControlMaster socket directory does not
+    /// A FRESH transport whose ControlMaster socket directory does not
     /// exist must SELF-PREPARE before its first remote request. The request
     /// entry points ([`SshTransport::run_remote`], [`SshTransport::upload_bytes`],
     /// [`Remote::exec`]) prepare at their ONE boundary, so a consumer that calls
@@ -1463,7 +1463,7 @@ mod runner_property_tests {
                             format!("timed out after {deadline:?}"),
                             "timeout exec stderr must keep the existing shape"
                         );
-                        // W1: the PRODUCER mapping is pinned, not inferred: a
+                        // The PRODUCER mapping is pinned, not inferred: a
                         // deadline that killed a RUNNING child must carry the
                         // CommandStillRunning cause — never the drain one.
                         assert_eq!(
@@ -2251,7 +2251,7 @@ mod runner_property_tests {
         run_one_pair(OpKind::Upload, Stall::WaitError);
     }
 
-    /// W1 — the SSH PRODUCER mapping for the deadline-kill cause, PINNED. A
+    /// The SSH PRODUCER mapping for the deadline-kill cause, PINNED. A
     /// real `RunError::Timeout` from the runner (driven through the fake seam
     /// injected into the REAL [`SshTransport::with_runner`] entry point) must
     /// become `ExecOutcome { exit_code: -1, timeout_cause:
@@ -2263,7 +2263,7 @@ mod runner_property_tests {
         run_one_pair(OpKind::Exec, Stall::Hang);
     }
 
-    /// W1 — the SSH PRODUCER mapping for the DRAIN cause, PINNED. A real
+    /// The SSH PRODUCER mapping for the DRAIN cause, PINNED. A real
     /// `RunError::Background` (the command exited and was reaped; only its
     /// bounded post-exit drain gave up while a pipe-holding process outlived
     /// it) must become `ExecOutcome { exit_code: -1, timeout_cause:

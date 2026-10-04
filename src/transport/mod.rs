@@ -3228,7 +3228,7 @@ impl LocalTransport {
     /// every lock-record spelling EXCEPT the single layout lock the protocol
     /// OWNS, decided by IDENTITY (the layout lock's resolved device/inode) and
     /// not by a spelling fold, so a future `*_if`-style primitive cannot
-    /// repeat the D1 hole: it either mints a capability (which runs the guard)
+    /// repeat the same hole: it either mints a capability (which runs the guard)
     /// or cannot call a mutation worker, whose argument is that capability.
     fn guarded_mutation_target<'a>(
         &self,
@@ -3411,7 +3411,7 @@ mod tests {
             .expect("an ordinary test path is not a lock record")
     }
 
-    /// W1 — the LOCAL producer of the typed timeout cause, PINNED. A real child
+    /// The LOCAL producer of the typed timeout cause, PINNED. A real child
     /// that outlives its deadline is killed and reaped by [`ChildRunner`], and
     /// [`Exec for ChildRunner`] (driven here through the REAL
     /// [`LocalTransport::exec`] entry point, i.e. the production
@@ -4252,7 +4252,7 @@ mod tests {
         );
     }
 
-    /// D1 — the sanctioned lock protocol may break EXACTLY the record it OWNS.
+    /// The sanctioned lock protocol may break EXACTLY the record it OWNS.
     /// `remove_file_if` used to route through the sidecar only for the
     /// byte-exact layout lock and to fall back to the claim-by-rename path for
     /// every other spelling, so a caller could claim away `operation.lock` or
@@ -4310,7 +4310,7 @@ mod tests {
         }
     }
 
-    /// D1's sibling primitive: `try_write_new` shares the same guard gate, so it
+    /// The sibling primitive: `try_write_new` shares the same guard gate, so it
     /// also refuses a lock record the layout does not own. Pre-fix it went
     /// straight to `durable_create_new`; the refusal keeps the protocol's reach
     /// at ONE record.
@@ -4345,7 +4345,7 @@ mod tests {
         );
     }
 
-    /// D2 (identity) — the owned-record selection is decided by IDENTITY, not
+    /// The owned-record selection is decided by IDENTITY, not
     /// by a spelling fold. Runs on macOS AND Linux with NO skip.
     ///
     /// * Where `state/OPERATION.LOCK` resolves to the SAME inode as
@@ -4538,7 +4538,7 @@ mod tests {
         }
     }
 
-    /// D1/D2 — the LEGITIMATE case, on both platforms: the ONE record the
+    /// The LEGITIMATE case, on both platforms: the ONE record the
     /// layout OWNS is still breakable through the sidecar. A mismatch is a
     /// Mismatch (the record untouched) and a match is Removed (the sanctioned
     /// break). This is the behaviour the residual must preserve: guarding the

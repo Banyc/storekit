@@ -558,7 +558,7 @@ mod tests {
     /// A name that is not byte-identical to a reserved spelling but CASE-FOLDS
     /// onto one is the SAME directory entry on a case-insensitive filesystem,
     /// so the id/name rule refuses the alias while the byte-exact reserved
-    /// MATCH leaves it alone. This is the A3 aliasing rule: matching is
+    /// MATCH leaves it alone. This is the aliasing rule: matching is
     /// byte-exact, ALIASING is folded.
     #[test]
     fn case_aliases_of_reserved_spellings_are_unaddressable_but_not_byte_reserved() {
@@ -605,7 +605,7 @@ mod tests {
         }
     }
 
-    /// K3: all three DENIAL folds must be the FULL case fold, not
+    /// All three DENIAL folds must be the FULL case fold, not
     /// `str::to_lowercase`. A full-fold-only character (`ſ`, U+017F, folds to
     /// `s`; `to_lowercase` leaves it unchanged) is an ALIAS of a reserved or
     /// crate-temp spelling on a case-folding host, so narrowing a fold would
@@ -709,7 +709,7 @@ mod tests {
         }
     }
 
-    /// G5: a trailing dot or space is stripped by Win32 from the final
+    /// A trailing dot or space is stripped by Win32 from the final
     /// component of a short absolute drive path, so `operation.lock.` and
     /// `operation.lock` are the SAME entry on Windows and the predicate must
     /// fold the trailing dot/space (harmless on macOS/Linux, where a trailing
@@ -745,7 +745,7 @@ mod tests {
         }
     }
 
-    /// B5: the Win32 trailing-dot/space fold the LOCK-RECORD DENIAL already
+    /// The Win32 trailing-dot/space fold the LOCK-RECORD DENIAL already
     /// applies is ALSO extended to the id rule's authority, so a name that
     /// ALIASES a lock record is unaddressable and refused as an identity.
     /// Pre-fix `is_unaddressable_name(".dest.operation.lock.")` was `false`
@@ -861,7 +861,7 @@ mod tests {
         }
     }
 
-    /// The ON-DISK half of the A3 aliasing rule: on a case-insensitive
+    /// The ON-DISK half of the aliasing rule: on a case-insensitive
     /// filesystem `.SYNC-ASIDE.1` and `.sync-aside.1` are the SAME directory
     /// entry, so a name the id rule accepted would collide with the crate's
     /// claim-aside machinery. The pure rule is pinned everywhere by

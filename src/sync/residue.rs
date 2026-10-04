@@ -500,7 +500,7 @@ mod tests {
         assert!(root.join(".dest.operation.lock").is_file());
     }
 
-    /// A4: `recover_to` HOLDS the destination operation lock (the SAME
+    /// `recover_to` HOLDS the destination operation lock (the SAME
     /// `FileLock` authority a sync run holds) for its duration. PRE-FIX it took
     /// no lock at all, so a cooperating writer could install the target inside
     /// the check-then-rename window and be silently replaced by the rename.
@@ -530,7 +530,7 @@ mod tests {
         );
     }
 
-    /// A4b: `discard` HOLDS the destination operation lock (the SAME
+    /// `discard` HOLDS the destination operation lock (the SAME
     /// `FileLock` authority a sync run holds) for its duration, exactly like
     /// `recover_to`. PRE-FIX it opened the root and unlinked the aside with NO
     /// lock, so a cooperating second process could remove the claim-aside a
@@ -559,7 +559,7 @@ mod tests {
         assert!(fs::symlink_metadata(root.join(".sync-aside.999.0")).is_err());
     }
 
-    /// A6: a consumer can tell DESTROYING A STRAND (`ResidueBelow`) from an
+    /// A consumer can tell DESTROYING A STRAND (`ResidueBelow`) from an
     /// OCCUPIED recovery target (`RecoverTargetOccupied`) via the TYPED reason,
     /// without string-matching; and a SYMLINK occupant is that same typed
     /// conflict, not a raw `Store("openat ... ELOOP")`.
@@ -589,7 +589,7 @@ mod tests {
         assert!(strand.is_err());
     }
 
-    /// A1/A6: the substrate refusal itself carries the typed reason, and the
+    /// The substrate refusal itself carries the typed reason, and the
     /// message keeps the historical `ResidueBelow` token.
     #[test]
     fn the_substrate_refusal_carries_a_typed_residue_reason() {

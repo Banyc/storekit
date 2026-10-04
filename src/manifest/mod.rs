@@ -2771,7 +2771,7 @@ mod tests {
         );
         assert!(validate_entry_path("a\tb").is_err(), "tab must be refused");
 
-        // B5: the NAME_MAX bound is ENFORCED at the wire/local boundary, not
+        // The NAME_MAX bound is ENFORCED at the wire/local boundary, not
         // merely asserted in prose. A component at the bound is accepted; one
         // byte over is refused with a clear error (the store would otherwise
         // refuse it later with `ENAMETOOLONG`).
@@ -3434,7 +3434,7 @@ mod tests {
         );
     }
 
-    /// B1: a RELATIVE symlink target is resolved against the directory
+    /// A RELATIVE symlink target is resolved against the directory
     /// CONTAINING the link (its own parent), per POSIX, not against the tree
     /// root. `dir/up -> ../other` resolves to `<root>/other` and is ACCEPTED by
     /// BOTH canonicalizers, as is a multi-separator `..` target that walks up
@@ -3493,7 +3493,7 @@ mod tests {
         assert_eq!(remote.tree_sha256, local.tree_sha256);
     }
 
-    /// B1, the refusal half: after resolving relative targets from the link's
+    /// The refusal half: after resolving relative targets from the link's
     /// own directory, an ABSOLUTE target and a target that genuinely leaves the
     /// root stay refused by BOTH canonicalizers. `dir/escape -> ../../outside`
     /// resolves to `<root>/../outside`, which is outside `<root>`.
@@ -3535,7 +3535,7 @@ mod tests {
         );
     }
 
-    /// B1, the base's own resolution: when the ROOT is reached through a
+    /// The base's own resolution: when the ROOT is reached through a
     /// symlink, a target that stays inside the root (`../other` from `dir`) is
     /// accepted, and a target that escapes it is refused. The local walk's
     /// `lstat` base is the CANONICALIZED root, so it sees the live tree the
@@ -3836,7 +3836,7 @@ mod tests {
         std::os::unix::fs::symlink("", dir.path().join("empty-target-probe")).is_ok()
     }
 
-    /// G1: an exact-string lookup is NOT the kernel's resolution on a
+    /// An exact-string lookup is NOT the kernel's resolution on a
     /// case-folding filesystem. `R/dir/sub -> ../other` and `R/dir/link ->
     /// Sub/../../outside`: the kernel resolves the spelled `Sub` onto the
     /// on-disk `sub` (a symlink), so the walk reaches a symlink and the target
@@ -3890,7 +3890,7 @@ mod tests {
         );
     }
 
-    /// G1, the normalization half: an NFD target spelling must reach the NFC
+    /// The normalization half: an NFD target spelling must reach the NFC
     /// on-disk symlink through the same fold, on BOTH views. `dir/caf\u{e9}` is
     /// the on-disk (NFC) symlink and `dir/link -> cafe\u{301}/../../outside`
     /// spells it decomposed, so an exact-string lookup misses while the kernel
@@ -3935,7 +3935,7 @@ mod tests {
         );
     }
 
-    /// G1, the ACCEPT direction: a fold-equal component that is NOT a symlink
+    /// The ACCEPT direction: a fold-equal component that is NOT a symlink
     /// must still be accepted, and the two views must produce byte-identical
     /// manifests. `link -> Sub/file` with the on-disk `sub` a real directory:
     /// the fold resolves `Sub` to `sub`, which is not a symlink, so the target
@@ -3977,7 +3977,7 @@ mod tests {
         );
     }
 
-    /// G1, the legitimate case the fold must NOT break: on a
+    /// The legitimate case the fold must NOT break: on a
     /// case-SENSITIVE filesystem two case-distinct entries (`Sub` a directory,
     /// `sub` a symlink) can legitimately coexist, and a target naming the
     /// non-symlink `Sub` must be ACCEPTED by both views. The EXACT entry wins
@@ -4073,7 +4073,7 @@ mod tests {
         );
     }
 
-    /// H1, `ß`/`SS`: `str::to_lowercase` maps NEITHER `ß` to `ss` NOR `SS` to
+    /// The widened fold, `ß`/`SS`: `str::to_lowercase` maps NEITHER `ß` to `ss` NOR `SS` to
     /// `ß`, so the old fold answered `Absent` for a spelled `SS`/`STRASSE`
     /// component the kernel resolves onto the `ß` symlink and accepted the
     /// escape. The full Unicode case fold matches them, so BOTH views refuse.
@@ -4092,7 +4092,7 @@ mod tests {
         );
     }
 
-    /// H1, the `ﬁ`/`FI` ligature: `to_lowercase` leaves U+FB01 alone, so a
+    /// The widened fold, the `ﬁ`/`FI` ligature: `to_lowercase` leaves U+FB01 alone, so a
     /// spelled `FILE` component was answered `Absent` and accepted although the
     /// host resolves it onto the `ﬁle` symlink. The full case fold maps the
     /// ligature to `fi`, so both views refuse. PRE-FIX this FAILED on both
@@ -4108,7 +4108,7 @@ mod tests {
         );
     }
 
-    /// H1, final sigma: `to_lowercase` keeps U+03C2 (final sigma) distinct from
+    /// The widened fold, final sigma: `to_lowercase` keeps U+03C2 (final sigma) distinct from
     /// U+03C3/U+03A3, so a spelled `Σ` component was answered `Absent` and
     /// accepted although APFS resolves final sigma onto sigma. The full case
     /// fold maps `ς`/`Σ` to `σ`, so both views refuse. PRE-FIX this FAILED on
@@ -4298,7 +4298,7 @@ mod tests {
         assert_ne!(fold_component("\u{130}"), fold_component("i"));
     }
 
-    /// H1, the ACCEPT direction that must survive the widened fold: an
+    /// The ACCEPT direction that must survive the widened fold: an
     /// ordinary in-root `../other` target (a DIRECTORY, not a symlink) is still
     /// accepted by both views and stored verbatim, and a target naming an exact
     /// non-symlink component is accepted even on a case-sensitive host. This is
@@ -4333,7 +4333,7 @@ mod tests {
         );
     }
 
-    /// G3: an EMPTY symlink target is refused by BOTH views. Before the fix
+    /// An EMPTY symlink target is refused by BOTH views. Before the fix
     /// the local walk ACCEPTED `""` (its component walk over an empty path
     /// reaches nothing) while the wire assembler refused it, so a macOS source
     /// (where APFS stores an empty-target link) was accepted by one view and

@@ -286,7 +286,7 @@ mod real_seam_tests {
         )
     }
 
-    /// D1: the running-phase drain must not be capped at one 8192-byte chunk
+    /// The running-phase drain must not be capped at one 8192-byte chunk
     /// per 1 ms wait-loop pass. Pre-fix that capped every remote read at
     /// ~8 MiB/s, so this 64 MiB read outlived the tiny 3 s command deadline
     /// and was KILLED (`RunError::Timeout`); post-fix the same tiny deadline
@@ -312,7 +312,7 @@ mod real_seam_tests {
         assert!(out.status.success());
     }
 
-    /// D2: a failed stdin write (the far side stopped reading / exited) must
+    /// A failed stdin write (the far side stopped reading / exited) must
     /// carry the far side's OWN stderr, so a full disk is not reported as a
     /// bare `Broken pipe`. Pre-fix the message was only
     /// `stdin write: Broken pipe (os error 32)` and the far-side

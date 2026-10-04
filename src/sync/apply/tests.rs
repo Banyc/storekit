@@ -869,7 +869,7 @@ enum AfterWrite {
     Overwrite(String, Vec<u8>),
     /// APPEND `bytes` to the regular file at `rel`: a writer that adds a line
     /// between a compare-and-append's read of the destination and its write
-    /// (the A2 window). The bytes are appended, never replacing what is there.
+    /// (the append's read→write window). The bytes are appended, never replacing what is there.
     Append(String, Vec<u8>),
     /// DELETE the regular file at `rel`: a writer that removes the append
     /// target between the append's destination read and its compare. The
@@ -1125,7 +1125,7 @@ struct RecordingRemote {
     /// tree it planned against moved underneath it and fail closed, naming the
     /// path that changed.
     source_writer: Option<(usize, PathBuf, AfterWrite)>,
-    /// The A2 WINDOW WRITER: after the Nth (1-based) successful read OF THE
+    /// The APPEND-WINDOW WRITER: after the Nth (1-based) successful read OF THE
     /// PATH named in `.0` lands, apply the `AfterWrite` to the stored
     /// destination root. Positioned by (path, count-within-that-path) because
     /// the destination manifest's own hash read of the same path comes FIRST —
@@ -1152,7 +1152,7 @@ struct RecordingRemote {
     /// read failure on the confined-local path, where there is no destination
     /// write seam, so a claim rollback runs.
     fail_nth_read: Option<usize>,
-    /// Fail every `read` of a SPECIFIC manifest path. Used by the D1(b)
+    /// Fail every `read` of a SPECIFIC manifest path. Used by the
     /// verification-read test to fail the `verify_claimed_untouched` re-read
     /// of one left-alone entry while the run's other reads succeed.
     fail_read_for: Option<String>,
@@ -1601,7 +1601,7 @@ impl Remote for RecordingRemote {
         {
             action.apply(root);
         }
-        // The A2 window writer: count reads of THIS path and fire on the
+        // The append-window writer: count reads of THIS path and fire on the
         // requested one. The destination manifest hash read is the first read
         // of a file, so the append's own destination read is a later count.
         if let Some((path, target, action)) = &self.dest_read_writer {
@@ -2030,7 +2030,7 @@ fn pull_makes_local_equal_to_remote() {
     );
 }
 
-/// B1 end to end: a source holding `dir/link -> ../other` (an in-root relative
+/// End to end: a source holding `dir/link -> ../other` (an in-root relative
 /// target that walks up out of the link's directory) is snapshotted and
 /// round-trips through a PUSH and a PULL, and the destination holds the link as
 /// a RELATIVE link with the SAME target, resolving to the copied `other`.
@@ -2154,7 +2154,7 @@ fn an_escaping_symlink_target_is_refused_by_push_and_pull() {
     );
 }
 
-/// G2: the containment answer must be a property of the RESULT, not of the
+/// The containment answer must be a property of the RESULT, not of the
 /// SOURCE alone. The source here holds `dir/link -> sub/../../outside` with NO
 /// `dir/sub` (so the SOURCE rule lawfully accepts it: the walk reaches no
 /// symlink and never pops above the root), while the DESTINATION already holds
@@ -2194,7 +2194,7 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     );
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 
-    // CONTROL A (FLIPPED, P0): the SAME source, with `dir/sub` a REAL
+    // CONTROL A (FLIPPED): the SAME source, with `dir/sub` a REAL
     // destination directory the source does NOT supply, is now REFUSED. The
     // component is DESTINATION-SUPPLIED, and the rule is POLICY-INDEPENDENT BY
     // CONSTRUCTION: it does not consult the `Extraneous` value, because the
@@ -2205,7 +2205,7 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     // so the refusal is the sanctioned over-refusal rather than a removal
     // decision — even though a real directory redirects nothing. The old
     // expectation ("a real destination directory at the traversed component is
-    // lawful") encoded the plan-dependent permission this P0 fixed.
+    // lawful") encoded the plan-dependent permission this change fixed.
     let dst_real = dir.path().join("dst-real");
     fs::create_dir_all(dst_real.join("dir/sub")).unwrap();
     fs::create_dir_all(dst_real.join("dir/other")).unwrap();
@@ -2234,7 +2234,7 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     );
 }
 
-/// G2, control B. FLIPPED: `dir/sub` is DESTINATION-SUPPLIED (the source
+/// Control B. FLIPPED: `dir/sub` is DESTINATION-SUPPLIED (the source
 /// holds no entry at `dir/sub`), so whether `Extraneous::Delete` removes it is
 /// the run's own plan decision (a conflict, an alias, or the residue guard can
 /// prohibit the removal). The plan-free rule refuses rather than guess, so the
@@ -2271,7 +2271,7 @@ fn extraneous_delete_neutralizes_the_destination_resident_symlink_component() {
     );
 }
 
-/// G2, the UNSUPPORTED variant: the destination holds `dir/sub ->
+/// The UNSUPPORTED variant: the destination holds `dir/sub ->
 /// ../../outside` (an escaping symlink, so it is listed in
 /// `unsupported_destination`) and the source does not hold `dir/sub`. Pre-fix
 /// the report named the entry as unsupported yet the sync SUCCEEDED and the
@@ -2307,7 +2307,7 @@ fn an_unsupported_destination_symlink_component_cannot_be_escaped_through() {
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the RESIDUE blind spot. The destination supplies the traversed component
+/// The RESIDUE blind spot. The destination supplies the traversed component
 /// `.sync-aside.1.2` as a symlink that points OUTSIDE the root, and `.sync-aside.`
 /// is a genuine claim-aside (residue, not a crate temp), so the destination
 /// strip removes it before the diff AND from the result-containment index. The
@@ -2350,7 +2350,7 @@ fn a_destination_residue_symlink_component_cannot_be_escaped_through_under_keep(
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the residue blind spot under `Extraneous::Delete`. Residue is NEVER
+/// The residue blind spot under `Extraneous::Delete`. Residue is NEVER
 /// removed by a run, so the `Delete` skip of destination-only entries (which is
 /// sound only for entries the run actually removes) must NOT skip it. The
 /// destination residue symlink survives `Delete` and still redirects the
@@ -2391,7 +2391,7 @@ fn a_destination_residue_symlink_component_cannot_be_escaped_through_under_delet
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2 CONTROL: the SAME shape with the destination component spelled OUTSIDE
+/// CONTROL: the SAME shape with the destination component spelled OUTSIDE
 /// the residue namespace (`sub`, ordinary content) is refused today, proving the
 /// result-containment check runs and that residue is the specific blind spot.
 #[cfg(unix)]
@@ -2419,7 +2419,7 @@ fn a_destination_non_residue_symlink_component_is_refused_as_control() {
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the CRATE-TEMP half of the `Delete` distinction. A crate-temp shape
+/// The CRATE-TEMP half of the `Delete` distinction. A crate-temp shape
 /// (`.sync-aside.<name>.tmp.<pid>.<n>`) is UNADDRESSABLE but NOT residue: it
 /// holds no original, so `Extraneous::Delete` WOULD remove it when nothing
 /// blocks the removal.
@@ -2473,7 +2473,7 @@ fn extraneous_delete_removes_a_crate_temp_symlink_component_and_permits_the_link
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the crate-temp counterpart under `Keep`. JUSTIFICATION CORRECTED:
+/// The crate-temp counterpart under `Keep`. JUSTIFICATION CORRECTED:
 /// the run REFUSES because the component is DESTINATION-SUPPLIED (the source
 /// holds no entry at `temp`). The rule is POLICY-INDEPENDENT BY CONSTRUCTION:
 /// it does not consult the `Extraneous` value at all, because the applier's
@@ -2508,7 +2508,7 @@ fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2. FLIPPED: a destination residue entry is DESTINATION-SUPPLIED (the
+/// FLIPPED: a destination residue entry is DESTINATION-SUPPLIED (the
 /// source holds no entry at `.sync-aside.1.2`), and the rule is
 /// POLICY-INDEPENDENT BY CONSTRUCTION: it does not consult the `Extraneous`
 /// value, because the applier's post-run set is not a function of it. See
@@ -2545,7 +2545,7 @@ fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
     );
 }
 
-/// G2. FLIPPED: the same with a residue REGULAR FILE. The component
+/// FLIPPED: the same with a residue REGULAR FILE. The component
 /// `.sync-aside.3.4` is DESTINATION-SUPPLIED (the source holds no entry
 /// there), and the rule is POLICY-INDEPENDENT BY CONSTRUCTION: it does not
 /// consult the `Extraneous` value, because the applier's post-run set is not a
@@ -2554,7 +2554,7 @@ fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
 /// `remove_extraneous` is never called and the residue would in fact have been
 /// left untouched, so the refusal is the sanctioned over-refusal. The old "the
 /// component is not a symlink so the link must be installed" expectation
-/// encoded the plan-dependent permission this P0 fixed.
+/// encoded the plan-dependent permission this change fixed.
 #[cfg(unix)]
 #[test]
 fn a_destination_residue_file_does_not_break_a_legitimate_link() {
@@ -2582,7 +2582,7 @@ fn a_destination_residue_file_does_not_break_a_legitimate_link() {
     );
 }
 
-/// P0 REPRO (custom `Refuse`): a DESTINATION-SUPPLIED component the old
+/// The REPRO (custom `Refuse`): a DESTINATION-SUPPLIED component the old
 /// "result view" scoped out of the walk. `dst/d` is a directory holding the
 /// ESCAPING symlink `dst/d/e -> ../../outside`; the source holds `d` as a
 /// regular FILE the policy REFUSES, plus `link -> d/e/secret`. The old index
@@ -2635,7 +2635,7 @@ fn a_destination_supplied_component_under_a_refused_replacement_cannot_be_escape
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// P0 REPRO (built-in `AppendTail`): the SAME shape with the append-only rule
+/// The REPRO (built-in `AppendTail`): the SAME shape with the append-only rule
 /// selected for `d`. A source FILE over a destination DIRECTORY is
 /// `ConflictReason::AppendNotAFile`, so the append leaves the directory and its
 /// `d/e` child in place exactly as `Refuse` does, and the same escape follows
@@ -2681,7 +2681,7 @@ fn a_destination_supplied_component_under_an_append_refusal_cannot_be_escaped_th
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// P0 CONTROL: the SAME tree with `Extraneous::Keep` was already refused
+/// The CONTROL: the SAME tree with `Extraneous::Keep` was already refused
 /// pre-fix (a destination-only entry is not skipped from the result view under
 /// `Keep`), which pins the hole to the index's `Delete`/source-shadow skips
 /// rather than to the walk itself. The plan-free rule refuses under `Keep`
@@ -5597,7 +5597,7 @@ fn a_no_write_append_under_a_refused_read_only_parent_is_not_parent_refused() {
     assert_eq!(read(&dst2.join("d/f")), b"abc", "unchanged");
 }
 
-/// A2: the append's read→write window. A concurrent writer APPENDS to the
+/// The append's read→write window. A concurrent writer APPENDS to the
 /// destination between the append's destination read and its write. Pre-fix
 /// the append wrote the WHOLE source unconditionally, so the writer's bytes
 /// were overwritten, the post-transfer hash matched the source, and the run
@@ -5823,7 +5823,7 @@ fn an_append_settle_whose_target_is_deleted_after_the_byte_read_is_created() {
     assert_report_lists_disjoint(&report);
 }
 
-/// A4: a parent sync must NEVER destroy a held nested lock record. The nested
+/// A parent sync must NEVER destroy a held nested lock record. The nested
 /// store's record is `destination_lock_path(snapshots/001)` =
 /// `snapshots/.001.operation.lock`, which lies INSIDE the parent store's judged
 /// tree. Before the fix it was an ordinary destination-only entry and a
@@ -6022,7 +6022,7 @@ fn extraneous_delete_spares_and_names_the_lock_record() {
     );
 }
 
-/// G1: a far-side `mktemp` temp is a CRATE TEMP, not a held-aside, so
+/// A far-side `mktemp` temp is a CRATE TEMP, not a held-aside, so
 /// `Extraneous::Delete` removes it. Pre-fix `is_crate_temp_name` required an
 /// all-digit `<pid>.<counter>` tail, so `.sync-aside.foo.tmp.aB3xY9` (the
 /// far-side six-alphanumeric tail) was classified as residue, was never
@@ -6054,7 +6054,7 @@ fn a_farside_mktemp_temp_is_extraneous_not_residue() {
     assert!(!temp.exists(), "a sanctioned deletion removes the temp");
 }
 
-/// G3: on a case-insensitive filesystem a CASE ALIAS of a reserved spelling is
+/// On a case-insensitive filesystem a CASE ALIAS of a reserved spelling is
 /// the SAME INODE, so `Extraneous::Delete` must not destroy it — matching the
 /// README's "a reserved spelling is never destroyed by `Extraneous::Delete`".
 /// The destination residue classifier consults the SAME unaddressable
@@ -6173,7 +6173,7 @@ fn distinct_destinations_never_share_a_lock_record() {
     );
 }
 
-/// B2: a run REFUSED for an unrepresentable SOURCE must create NOTHING. The
+/// A run REFUSED for an unrepresentable SOURCE must create NOTHING. The
 /// pre-fix order provisioned the destination (creating the root) and took the
 /// destination lock (creating the sibling record) BEFORE the source manifest
 /// was read, so a push of a source containing a hard link left a destination
@@ -7016,7 +7016,7 @@ fn retiring_an_obsolete_snapshot_lock_record_is_explicit_and_refuses_a_held_one(
     assert!(!held_path.exists());
 }
 
-/// A5: `retire_destination_lock` FAILS CLOSED when it cannot DETERMINE whether
+/// `retire_destination_lock` FAILS CLOSED when it cannot DETERMINE whether
 /// the destination or the record exists. PRE-FIX any `symlink_metadata` error
 /// (an EACCES on a `000` parent) read as "gone"/"no record" (`Absent`), which
 /// contradicts the crate's fail-closed doctrine. A genuinely-absent path still
@@ -10780,7 +10780,7 @@ fn a_claimed_untouched_entry_changed_by_a_writer_is_not_reported_skipped() {
     );
 }
 
-/// D1(b): a FAILED verification READ is an INFRASTRUCTURE error, never a
+/// A FAILED verification READ is an INFRASTRUCTURE error, never a
 /// content-mismatch claim. An entry the run left alone has its bytes re-read to
 /// confirm the no-mutation claim; when that read FAILS (here injected for one
 /// path), the run must surface the read failure. The pre-fix
@@ -11456,7 +11456,7 @@ fn local_and_remote_destinations_agree_a_swapped_symlink_is_not_followed() {
     );
 }
 
-/// F-1 REGRESSION (destination-component confinement). On a PATH-BASED
+/// REGRESSION (destination-component confinement). On a PATH-BASED
 /// destination the preflight is the ONLY confinement, so a directory the run
 /// confirmed once must still be probed LIVE on every later operation. Here the
 /// first transfer of `a/1` confirms `a`, a writer then replaces `a` with a
@@ -13403,7 +13403,7 @@ fn sync_prepares_the_transport_identity_before_the_first_remote_request() {
         "got {err:?}"
     );
     // The entry point prepares the transport identity, and the source
-    // manifest primitive now SELF-PREPARES too (the D3 fix), so a PULL records
+    // manifest primitive now SELF-PREPARES too, so a PULL records
     // exactly two preparations. What matters is unchanged: EVERY prepare call
     // runs before the FIRST remote request (op index 0).
     assert_eq!(
@@ -13661,7 +13661,7 @@ fn a_source_that_changes_after_the_plan_fails_closed_and_names_the_path() {
 }
 
 // ---------------------------------------------------------------------------
-// F-2 / F-3: the lock record's sibling location.
+// The lock record's sibling location.
 // ---------------------------------------------------------------------------
 
 /// Env var that turns the test binary into the CHILD that runs the owned entry
@@ -13675,7 +13675,7 @@ const RELATIVE_ROOT_SRC: &str = "STOREKIT_RELATIVE_ROOT_SRC";
 #[cfg(unix)]
 const RELATIVE_ROOT_RESULT: &str = "STOREKIT_RELATIVE_ROOT_RESULT";
 
-/// The CHILD side of the F-3 test: `chdir` into the work directory (the child
+/// The CHILD side of the sibling-location test: `chdir` into the work directory (the child
 /// owns its process, so the process-global cwd change cannot race other tests)
 /// and run the OWNED `sync` against a single-component RELATIVE destination
 /// root. The outcome is written to the result file so the parent reads it, and
@@ -13703,7 +13703,7 @@ fn destination_lock_relative_root_child() {
     write(&result, outcome.as_bytes());
 }
 
-/// F-3 REGRESSION: a single-component RELATIVE destination root through the
+/// REGRESSION: a single-component RELATIVE destination root through the
 /// OWNED entry point. `destination_lock_path("local")` derived a record whose
 /// `Path::parent` is `""`, so the lock helper ran `mkdir ""` (ENOENT) and the
 /// run failed with a message that did not name the real problem. The record
@@ -13748,7 +13748,7 @@ fn the_owned_entry_point_accepts_a_single_component_relative_destination_root() 
     );
 }
 
-/// F-2 REGRESSION: taking the destination's operation lock must NOT narrow a
+/// REGRESSION: taking the destination's operation lock must NOT narrow a
 /// directory OUTSIDE the destination root to the store-private `0o700`.
 ///
 /// The lock record is a SIBLING of the root, so a destination whose parent
@@ -14214,7 +14214,7 @@ fn sanctioned_delete_clears_a_hard_link_destination_entry_without_touching_its_t
     );
     assert_eq!(read(&dst.join("ok")), b"payload");
     assert!(report.conflicts.is_empty(), "{report:?}");
-    // W4: the annotation survives the sanctioned removal (the entry was
+    // The annotation survives the sanctioned removal (the entry was
     // observed as unsupported even though `Delete` removed it), and `hard` is
     // still named by `extraneous`.
     for name in ["hard", "kept"] {
@@ -14289,7 +14289,7 @@ fn keep_reports_an_unsupported_destination_entry_without_failing_the_run() {
         report.extraneous.contains(&"current".to_string()),
         "the unsupported entry is reported extraneous: {report:?}"
     );
-    // W4: the OUTCOME alone left the caller unable to learn WHY the entry was
+    // The OUTCOME alone left the caller unable to learn WHY the entry was
     // tolerated, so the report must also carry the strict rule's reason. The
     // annotation is attached to the path `extraneous` already names.
     assert_eq!(
@@ -14303,7 +14303,7 @@ fn keep_reports_an_unsupported_destination_entry_without_failing_the_run() {
     assert_report_lists_disjoint(&report);
 }
 
-/// W4 (hard link): a destination hard-link pair whose content matches the
+/// The hard-link case: a destination hard-link pair whose content matches the
 /// source is `skipped` — the run correctly mutates nothing — and before the
 /// annotation the caller had NO signal that the two names are aliased. The
 /// report must name the skipped twin with the hard-link refusal so a consumer

@@ -994,7 +994,7 @@ mod tests {
         assert_eq!(decision.classify("f"), Some(EntryDiff::Same));
     }
 
-    /// D3: `remote_manifest` and `remote_destination_manifest` PREPARE the
+    /// `remote_manifest` and `remote_destination_manifest` PREPARE the
     /// transport's host identity before their first remote request, exactly as
     /// the sync entry points do. Pre-fix they did not, so a fresh
     /// `SshTransport` failed a status-only read with
@@ -2142,7 +2142,7 @@ mod tests {
             "the drain case must not assert the transport-before-command layer: {msg}"
         );
         assert!(!msg.contains("is perl installed"), "{msg}");
-        // W3: the drain bound is NOT the caller's deadline, and the exit status
+        // The drain bound is NOT the caller's deadline, and the exit status
         // WAS collected by the reap (then discarded by the `Background` error),
         // so the message must not claim either the opposite.
         assert!(

@@ -1758,7 +1758,7 @@ pub fn sync_parent_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()
 /// and only [`PathKind::File`] is accepted.
 pub fn set_private_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
     let rel = rel.as_path();
-    // G4: the PATH-BASED `set_private` already consults the guard; this
+    // The PATH-BASED `set_private` already consults the guard; this
     // descriptor-relative twin must too, so the two cannot disagree about the
     // record's spelling. A chmod preserves the inode (no holder split), but
     // consistency at the ONE authority is the point.
@@ -4465,10 +4465,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // A1: the durable ordering the replace claims
+    // The durable ordering the replace claims
     // -----------------------------------------------------------------
 
-    /// The ORDERING PROOF for A1: replacing a path whose parent chain is
+    /// The ORDERING PROOF: replacing a path whose parent chain is
     /// MISSING commits every CREATED directory's own entry into its parent
     /// BEFORE the rename, so `ReplacedDurable` is true for the whole chain.
     /// The pre-fix code created the chain with the non-durable helper and
@@ -4541,7 +4541,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // B1: the owned root is enumerable
+    // The owned root is enumerable
     // -----------------------------------------------------------------
 
     /// Residue sitting DIRECTLY at the store root used to be unreachable: the
@@ -4571,7 +4571,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // B2: the crate's OWN crash-temp recognizer is public
+    // The crate's OWN crash-temp recognizer is public
     // -----------------------------------------------------------------
 
     /// A crashed atomic replace (SIGKILL mid-protocol) leaves its temp behind;
@@ -4606,7 +4606,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // A5: the stable-inode guarantee is structural
+    // The stable-inode guarantee is structural
     // -----------------------------------------------------------------
 
     /// The two-holder reproduction: while A holds the record, B used to UNLINK
@@ -4859,7 +4859,7 @@ mod tests {
         assert_eq!(file_mode, 0o600, "a regular file is narrowed to 0o600");
     }
 
-    /// G4: the descriptor-relative `set_private_fd` consults the SAME guard as
+    /// The descriptor-relative `set_private_fd` consults the SAME guard as
     /// the path-based `set_private`. A chmod preserves the inode, so this is
     /// not a holder split, but the two spellings of the primitive must not
     /// disagree about the record. Pre-fix `set_private_fd` chmodded the record
@@ -5142,7 +5142,7 @@ mod tests {
         assert!(dir.path().join("ordinary").exists());
     }
 
-    /// A1: EVERY name-mutating primitive that could touch a strand FILE refuses
+    /// EVERY name-mutating primitive that could touch a strand FILE refuses
     /// it with the TYPED `ResidueBelow` reason, and the strand's bytes AND mode
     /// are intact. PRE-FIX: each of these returned `Ok` (or clobbered/replaced)
     /// and destroyed the caller's only copy.
@@ -6048,7 +6048,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // H2: the copy uses the SAME index as the two manifest views.
+    // The copy uses the SAME index as the two manifest views.
     // ------------------------------------------------------------------
 
     /// A CASE-SENSITIVE source directory, with the platform resource that
@@ -6169,7 +6169,7 @@ mod tests {
         }
     }
 
-    /// H2a: on a CASE-SENSITIVE source the old live `symlink_metadata` probe
+    /// On a CASE-SENSITIVE source the old live `symlink_metadata` probe
     /// missed a component the crate's full case fold matches, so the copy
     /// LANDED an escaping link that `canonicalize_tree(dst)` then refused. The
     /// copy now uses the manifest's index and refuses before landing it.
@@ -6212,7 +6212,7 @@ mod tests {
         );
     }
 
-    /// H2b: a destination-only symlink INSIDE `dst_rel` is part of the
+    /// A destination-only symlink INSIDE `dst_rel` is part of the
     /// post-copy view. The old probe answered from the SOURCE, so it was
     /// invisible and `src/link -> evil/secret` landed on top of a pre-existing
     /// `dst/evil -> ../../outside` and escaped. The copy now consults the
@@ -6242,7 +6242,7 @@ mod tests {
         );
     }
 
-    /// H2c: with NO host folding, the copy and `canonicalize_tree` must reach
+    /// With NO host folding, the copy and `canonicalize_tree` must reach
     /// the SAME verdict on a fold-equal symlink component. The old live probe
     /// (case-sensitive source) missed `Sub`, accepted the tree, and
     /// contradicted the manifest. The copy now uses the manifest's index, so
@@ -6279,8 +6279,8 @@ mod tests {
         assert!(!base.path().join("root/dst/dir/link").exists());
     }
 
-    /// H2d: on a host that folds `STRASSE` onto `straße`, the old copy's LIVE
-    /// probe REFUSED a tree the manifest (narrow fold) ACCEPTED. After H1+H2
+    /// On a host that folds `STRASSE` onto `straße`, the old copy's LIVE
+    /// probe REFUSED a tree the manifest (narrow fold) ACCEPTED. After both fixes
     /// both views refuse, so they AGREE. PRE-FIX this test FAILED: the manifest
     /// accepted the tree (the narrow fold missed the pair).
     #[test]
@@ -6350,7 +6350,7 @@ mod tests {
         }
     }
 
-    /// H3: the copy no longer collapses a filesystem error to "no symlink
+    /// The copy no longer collapses a filesystem error to "no symlink
     /// here". An unreadable destination subtree makes the enumeration fail, and
     /// the copy fails CLOSED rather than guessing the escaped component is
     /// absent. (Reproducible only where a mode-0000 directory really refuses

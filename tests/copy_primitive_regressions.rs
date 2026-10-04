@@ -8,20 +8,20 @@
 //! a fresh staging destination, then the caller's own canonicalize + digest
 //! + fsync + rename:
 //!
-//! * I1 — the overlap refusal was decided by PATH SPELLING, so a bind-mount
+//! * The overlap refusal was decided by PATH SPELLING, so a bind-mount
 //!   (Linux) or firmlink (macOS) alias of the root evaded it and the walk
 //!   recursed without bound. The fix decides overlap by directory IDENTITY.
-//! * I2 — a case-fold-equal `dst_rel` on a folding filesystem (macOS APFS)
+//! * A case-fold-equal `dst_rel` on a folding filesystem (macOS APFS)
 //!   was not seen as overlap, and the copy MUTATED ITS OWN SOURCE's mode. The
 //!   fix refuses by identity and restores every mode it changes on failure.
-//! * I3 — a mid-walk failure left a destination directory the crate's own
+//! * A mid-walk failure left a destination directory the crate's own
 //!   `remove_dir_all_fd` could not remove (a `0o200` directory). The fix
 //!   restores the modes it changed on failure.
-//! * I4 — a copied symlink UNLINKED and REPLACED a live destination file and
+//! * A copied symlink UNLINKED and REPLACED a live destination file and
 //!   returned `Ok`. The fix refuses, all-or-nothing like the file/dir rules.
-//! * I5 — a trailing-slash symlink source was FOLLOWED while the error text
+//! * A trailing-slash symlink source was FOLLOWED while the error text
 //!   claimed it was not. The fix normalizes the source spelling first.
-//! * I6(a) — the copy had no `RLIMIT_NOFILE` subprocess regression.
+//! * The copy had no `RLIMIT_NOFILE` subprocess regression.
 #![cfg(unix)]
 // Test-only fixtures drive the same name-mutating primitives the funnel guards;
 // the production name-mutation rule does not apply to this test crate.
@@ -84,7 +84,7 @@ fn host_folds_ascii_case(base: &Path) -> bool {
 }
 
 // ----------------------------------------------------------------------
-// I5 — a symlink source is refused regardless of a trailing separator.
+// A symlink source is refused regardless of a trailing separator.
 // ----------------------------------------------------------------------
 
 #[test]
@@ -141,7 +141,7 @@ fn a_genuine_directory_source_with_a_trailing_separator_still_copies() {
 }
 
 // ----------------------------------------------------------------------
-// I1 (ordinary overlap) and I2 (fold-equal, source mutation).
+// The ordinary overlap refusal and the fold-equal destination (source mutation).
 // ----------------------------------------------------------------------
 
 #[test]
@@ -180,7 +180,7 @@ fn a_non_overlapping_source_still_copies() {
     assert_eq!(std::fs::read(base.path().join("copy/f")).unwrap(), b"f");
 }
 
-/// I2: on a host that folds ASCII case, `dst_rel = "TREE"` resolves to the
+/// On a host that folds ASCII case, `dst_rel = "TREE"` resolves to the
 /// SOURCE directory `tree`. PRE-FIX the path comparison saw two spellings and
 /// did not refuse; `ensure_private_dir_fd` reused the existing (fold-equal)
 /// directory, chmodded it, and the two-phase widening left the SOURCE at
@@ -217,7 +217,7 @@ fn a_fold_equal_destination_is_refused_by_identity_and_never_mutates_the_source(
 }
 
 // ----------------------------------------------------------------------
-// I3 — a failed copy leaves a destination the crate can remove itself.
+// A failed copy leaves a destination the crate can remove itself.
 // ----------------------------------------------------------------------
 
 #[test]
@@ -302,7 +302,7 @@ fn a_failed_nested_copy_restores_modes_and_keeps_the_created_ancestors_removable
     set_mode(&src.join("keep"), 0o755);
 }
 
-/// CHARACTERIZATION for the reviewer's exact I3 repro: at THIS revision a
+/// CHARACTERIZATION for the reviewer's exact repro: at THIS revision a
 /// `src/bad` directory of mode `0o000` is caught by the FAIL-CLOSED containment
 /// enumeration before any destination mutation, so nothing is created. (The
 /// reviewer's run left `dst/bad` at `0o200`; that pre-dated the enumeration
@@ -335,7 +335,7 @@ fn a_mode_0000_source_directory_fails_closed_before_creating_anything() {
 }
 
 // ----------------------------------------------------------------------
-// I4 — a copied symlink never replaces a live destination entry.
+// A copied symlink never replaces a live destination entry.
 // ----------------------------------------------------------------------
 
 #[test]
@@ -451,7 +451,7 @@ fn every_kind_pair_refuses_to_replace_a_live_destination_entry() {
 }
 
 // ----------------------------------------------------------------------
-// I1 (macOS) — a firmlink alias of the root is refused by identity.
+// On macOS, a firmlink alias of the root is refused by identity.
 // ----------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -495,7 +495,7 @@ fn a_firmlink_alias_of_the_root_is_refused_by_identity() {
 }
 
 // ----------------------------------------------------------------------
-// I1 (Linux) — a bind-mount alias of the root is refused by identity.
+// On Linux, a bind-mount alias of the root is refused by identity.
 // ----------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -590,7 +590,7 @@ fn bind_mount_child() {
 }
 
 // ----------------------------------------------------------------------
-// I6(a) — the copy surfaces a clean descriptor exhaustion, never an abort.
+// The copy surfaces a clean descriptor exhaustion, never an abort.
 // ----------------------------------------------------------------------
 
 const MODE_ENV: &str = "STOREKIT_COPY_EMFILE_MODE";

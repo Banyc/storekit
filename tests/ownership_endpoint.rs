@@ -11,8 +11,8 @@
 //! minted against host A was therefore accepted for a run against host B
 //! whenever both reported the same `root()` spelling — and for
 //! `Direction::Pull`, where the remote is the SOURCE, `matches` ignored the
-//! remote entirely, so a plan read from source R1 was applied against a live
-//! source R2.
+//! remote entirely, so a plan read from source A was applied against a live
+//! source B.
 //!
 //! # The double
 //!
@@ -378,9 +378,9 @@ fn the_transport_that_minted_a_push_token_is_accepted() {
 // PULL: the token binds the SOURCE (the remote is the source)
 // ---------------------------------------------------------------------------
 
-/// THE PULL REPRO. A token minted against source R1 is accepted pre-fix for a
-/// run whose live source is R2 (the same root spelling, a different endpoint),
-/// so the plan read from R1 is applied against R2. Post-fix it is REFUSED.
+/// THE PULL REPRO. A token minted against source A is accepted pre-fix for a
+/// run whose live source is B (the same root spelling, a different endpoint),
+/// so the plan read from A is applied against B. Post-fix it is REFUSED.
 #[test]
 fn a_pull_token_is_refused_against_a_different_source_endpoint() {
     let f = fixture();

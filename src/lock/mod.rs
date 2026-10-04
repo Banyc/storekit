@@ -683,7 +683,7 @@ mod tests {
         Ok(())
     }
 
-    /// A2: a SYMLINK at the lock-record path must not be followed. PRE-FIX the
+    /// A SYMLINK at the lock-record path must not be followed. PRE-FIX the
     /// `create(true).truncate(false)` open plus `set_permissions`/`set_len(0)`/
     /// write opened THROUGH the link: the victim was truncated to the op id and
     /// chmodded 0600. Now the open fails closed (`O_NOFOLLOW` -> ELOOP) with a
@@ -722,7 +722,7 @@ mod tests {
         );
     }
 
-    /// A2 (parent): a SYMLINK at the record's OWN PARENT must be refused before
+    /// A SYMLINK at the record's OWN PARENT must be refused before
     /// anything is created, so the record cannot be redirected into a victim
     /// directory.
     #[test]
