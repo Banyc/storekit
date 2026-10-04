@@ -21,7 +21,7 @@
 //! * [`GuardedRel`] is an unforgeable proof that the guard ran, carrying the
 //!   [`GuardScope`] the guard authorized. Its fields are private to THIS
 //!   module, so no other module — not [`super`] itself, not [`super::unix`] /
-//!   [`super::windows`], not `transport` / `sync` — can build one except
+//!   `super::windows`, not `transport` / `sync` — can build one except
 //!   through the THREE minting constructors [`GuardedRel::new`],
 //!   [`GuardedRel::new_for_owned_lock_record`], and
 //!   [`GuardedRel::new_for_residue`], each of which runs the ONE reserved-
@@ -449,7 +449,7 @@ impl<'a> GuardedRel<'a> {
     ///
     /// COMPILE-LEVEL ARGUMENT: the fields are private to this module, so a
     /// struct-literal construction (`GuardedRel { rel, scope }`) anywhere else
-    /// — including in [`super::unix`] / [`super::windows`] — is `E0451`
+    /// — including in [`super::unix`] / `super::windows` — is `E0451`
     /// ("field is private"), and no `unsafe`/`transmute` route exists in safe
     /// code. This constructor is one of the THREE minting constructors (with
     /// [`Self::new_for_owned_lock_record`] and [`Self::new_for_residue`]), the

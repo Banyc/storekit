@@ -251,7 +251,7 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 /// [`Remote::is_local`] and the same failure classification, but the manifest
 /// is built TOLERANT of the address-fidelity refusals a destination may
 /// legitimately hold (see [`canonicalize_tree_destination`] and
-/// [`canonicalize_remote_entries_destination`]). The tolerated entries are
+/// [`canonicalize_remote_entries_destination_checked`]). The tolerated entries are
 /// returned in [`DestinationTree::unsupported`] so the sync can classify them
 /// as destination-only and let a caller-sanctioned
 /// [`crate::sync::Extraneous::Delete`] remove them, and can REFUSE to write a

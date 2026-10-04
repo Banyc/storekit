@@ -81,7 +81,7 @@
 //! wait loop (`waitid` WNOWAIT peek vs `try_wait` poll), termination
 //! (`killpg` vs `Child::kill`), the foreground-only check (group enumeration
 //! vs none), and the pipe drain (`poll`/`fcntl` non-blocking vs reader
-//! threads) — lives in the [`unix`] / [`windows`] submodules, selected by
+//! threads) — lives in the [`unix`] / `windows` submodules, selected by
 //! the TWO `mod` declarations below. The rest of the crate calls the
 //! re-exported surface and never sees the switch.
 //!
@@ -440,7 +440,7 @@ impl ChildRunner {
     /// result (a pipe-holding leftover is [`RunError::Background`], never a
     /// deadline flip). The platform-specific lifecycle (process groups, the
     /// foreground-only check, the pipe drain) lives in the [`unix`] /
-    /// [`windows`] submodules.
+    /// `windows` submodules.
     pub fn exec(
         &self,
         argv: &[String],

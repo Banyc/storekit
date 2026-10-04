@@ -1493,7 +1493,7 @@ pub fn write_atomic_if_match_fd(
 }
 
 /// The descriptor-relative create-or-compare CAS: the same protocol as
-/// [`write_atomic_cas`], but every path resolves COMPONENT-WISE relative to
+/// [`write_atomic_cas_fd`], but every path resolves COMPONENT-WISE relative to
 /// `root` with `openat(O_NOFOLLOW)`. A symlink injected at the final
 /// component is REFUSED (ELOOP) — never followed, never compared against
 /// its target.
@@ -2404,7 +2404,8 @@ fn mode_of_opened_dir(fd: &OwnedFd) -> Result<u32> {
 
 /// The on-disk identity `(st_dev, st_ino)` of an OPENED directory (`fstat`),
 /// through the crate's ONE identity type
-/// ([`crate::atomic::guard::EntryIdentity`], the same pair [`entry_identity`]
+/// ([`crate::atomic::guard::EntryIdentity`], the same pair
+/// [`entry_identity`](crate::atomic::guard::entry_identity)
 /// resolves for a path). Resolving an fd avoids re-resolving a spelling, so the
 /// copy's overlap decision cannot be raced by a spelling swap between the probe
 /// and the walk. Implemented HERE (not in `guard`) because `libc` may only be
@@ -3542,7 +3543,7 @@ pub fn read_link_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<PathBuf>
 }
 
 /// [`read_fd`] + JSON deserialization (the descriptor-relative mirror of
-/// [`read_json`] for the store's own record reads).
+/// `read_json` for the store's own record reads).
 pub fn read_json_fd<T: serde::de::DeserializeOwned>(
     root: &RootDir,
     rel: &RootedRelativePath,
@@ -3591,7 +3592,7 @@ pub fn path_state_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
 /// ABSENCE (`Ok(None)`); every other filesystem error is a real failure →
 /// [`Error::store`].
 ///
-/// [`parent_fd_of`]: super::parent_fd_of
+/// [`parent_fd_of`]: parent_fd_of
 pub fn path_kind_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Option<PathKind>> {
     path_kind_fd_path(root, rel.as_path())
 }

@@ -104,7 +104,7 @@
 //!
 //! The platform-dependent primitives — private permissions, the atomic
 //! replace's rename/fsync semantics, and the owned-root confinement — live
-//! in the [`unix`] / [`windows`] submodules, selected by the TWO `mod`
+//! in the [`unix`] / `windows` submodules, selected by the TWO `mod`
 //! declarations below (the single cfg switch point). [`unix`] provides the
 //! descriptor-relative `_fd` implementation (`openat`/`renameat`/`linkat`/
 //! `unlinkat`/`mkdirat` with `O_NOFOLLOW` — on that `_fd` surface every
@@ -118,7 +118,7 @@
 //! `ensure_private_dir_durable`, `copy_tree_verbatim`)
 //! take an ordinary path and are NOT covered — see [`unix`]'s module docs for
 //! the exact split.
-//! [`windows`] is the path-based implementation with documented weaker
+//! `windows` is the path-based implementation with documented weaker
 //! guarantees: no directory descriptors (the root is a path), no
 //! parent-directory fsync durability, a non-atomic replace (Windows
 //! `rename` does not overwrite), and no Unix mode bits. The rest of the
@@ -625,7 +625,7 @@ pub(crate) fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
 ///
 /// The PATH-BASED replace's cleanup, used in PRODUCTION on every port now that
 /// [`write_atomic_replace`] is public and production on Unix too. The
-/// descriptor-relative twin is [`atomic::unix::discard_temp_fd`].
+/// descriptor-relative twin is `atomic::unix::discard_temp_fd`.
 fn discard_temp(original: Error, tmp: &Path) -> Error {
     match std::fs::remove_file(tmp) {
         Ok(()) => original,

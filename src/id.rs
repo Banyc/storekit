@@ -5,12 +5,12 @@
 //! be injective into the filesystem — on the case-sensitive,
 //! trailing-dot-preserving addressing the crate canonicalizes against. The
 //! folding-host residual is stated at [`valid_name`]. The
-//! [`id_newtype!`] macro wraps such a validated string in a newtype whose
+//! [`crate::id_newtype!`] macro wraps such a validated string in a newtype whose
 //! construction validates the invariant, so an invalid value cannot exist.
 //!
 //! The composition here is deliberately small and domain-free:
 //!
-//! * [`id_newtype!`] — the validated newtype, with
+//! * [`crate::id_newtype!`] — the validated newtype, with
 //!   `parse`/`FromStr`/`TryFrom` and a serde `Deserialize` that routes every
 //!   wire string through the same validation (fail closed). There is
 //!   deliberately NO `Default` and no unchecked production constructor: an
@@ -28,11 +28,11 @@
 //! * [`valid_hex_digest`] — the exactly-64-lowercase-hex sha256 rule;
 //! * [`Identifier`] — the worked example newtype built from [`valid_name`].
 
-/// The validated identity newtype: construction goes through [`parse`]
+/// The validated identity newtype: construction goes through `parse`
 /// (or `FromStr`/`TryFrom`), which enforces the type's format rule, and the
 /// serde `Deserialize` routes every wire string through the same validation
 /// (an invalid wire identity fails deserialization — fail closed). The
-/// UNCHECKED [`new`] constructor is `#[cfg(test)]` only: test fixtures may
+/// UNCHECKED `new` constructor is `#[cfg(test)]` only: test fixtures may
 /// build arbitrary ids, production never can.
 ///
 /// `$validator` is a `fn(&str) -> bool` implementing the type's format rule.

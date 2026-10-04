@@ -17,7 +17,7 @@
 //!   that describes a tree by content hash so two hosts can agree on what
 //!   differs without shipping the bytes ([`sync`]).
 //!
-//! [`env`], [`digest`], [`platform`], and [`trace`] are the small shared
+//! [`mod@env`], [`digest`], [`platform`], and [`trace`] are the small shared
 //! helpers the rest of the crate is built on.
 //!
 //! The crate is deliberately free of any application's domain model: no

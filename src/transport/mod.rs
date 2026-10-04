@@ -1272,8 +1272,8 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(
 /// public CREATE path that reaches the filesystem without the crate's
 /// reserved-spelling gate: a caller could name the crate's own bookkeeping
 /// (`operation.lock`, a `.sync-aside.*` residue, or the sibling record
-/// `.<name>.operation.lock`) and create it. So [`refuse_reserved_mutation`]
-/// runs with [`Sanction::None`] BEFORE the depth check and before anything is
+/// `.<name>.operation.lock`) and create it. So [`crate::atomic::refuse_reserved_mutation`]
+/// runs with [`crate::atomic::Sanction::None`] BEFORE the depth check and before anything is
 /// created: a lock-record or residue spelling is refused TYPED ([`Error::Conflict`]
 /// / [`Error::Reserved`]`{ResidueBelow}`) exactly as every guarded primitive
 /// refuses it, and no parent chain or record is created. The crate's own
@@ -1667,7 +1667,7 @@ pub(crate) struct CreateNewOptions<'a> {
 /// convergent path still returns with a durable entry.
 ///
 /// This is a GUARDED mutation worker: its `guarded: GuardedRel<'_>` argument is
-/// the unforgeable capability [`crate::atomic::guard`] mints only after the
+/// the unforgeable capability `crate::atomic::guard` mints only after the
 /// reserved-spelling check passes, so the `std::fs` calls below are the
 /// funnel's own. The crate-root deny is relaxed for exactly this function; the
 /// count pin watches its call counts change.

@@ -362,7 +362,7 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   pre-existing one is refused), so it cannot free or swap the record's
 ///   inode and cannot split a holder; and its destination is documented NOT to
 ///   be a store root. The NAME states the weakness (API constraint #8,
-///   verdict N), while the strict, root-confined [`copy_dir_recursive_fd`]
+///   verdict N), while the strict, root-confined [`crate::atomic::copy_dir_recursive_fd`]
 ///   still refuses every unaddressable name. The
 ///   lock's assumption section already states that a caller acting outside
 ///   the substrate (a foreign process, a raw `std::fs` call the caller writes

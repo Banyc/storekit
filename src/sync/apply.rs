@@ -761,7 +761,7 @@
 //! caller entry. Second, the sync's own residue cleanup is likewise a sanctioned
 //! removal and can fail the same way. This is a deliberate, DOCUMENTED
 //! limitation: correcting it would require a root-mode operation on the
-//! [`Remote`](crate::transport::Remote) transport, and `Remote::root()` is
+//! [`Remote`] transport, and `Remote::root()` is
 //! documented to name an entry on a REMOTE
 //! host for an [`SshTransport`](crate::transport::SshTransport), so the root
 //! cannot be chmodded portably from this module. Widening only the LOCAL
@@ -1423,8 +1423,8 @@ pub struct SyncReport {
     /// and [`Residue::discard`](crate::sync::Residue::discard) removes it as the
     /// caller's explicit decision. The implicit recursive-removal primitives
     /// REFUSE a residue ([`crate::atomic::remove_file_fd`], and the transport's
-    /// [`Remote::remove_file`](crate::transport::Remote::remove_file) /
-    /// [`Remote::remove_dir_all`](crate::transport::Remote::remove_dir_all) all
+    /// [`Remote::remove_file`] /
+    /// [`Remote::remove_dir_all`] all
     /// carry the refusal — the remote `remove_dir_all` checks the strand's
     /// locally-knowable name before it builds its command), so the old
     /// `remove_dir_all` recipe is no longer a silent way to destroy the
@@ -1440,7 +1440,7 @@ pub struct SyncReport {
     /// **Which root the spelling is relative to.** Every path in this list —
     /// and in [`SyncReport::indeterminate`], [`SyncReport::extraneous`], and
     /// every other list — is spelled relative to THE RUN'S DESTINATION ROOT:
-    /// [`Remote::root`](crate::transport::Remote::root) when the destination
+    /// [`Remote::root`] when the destination
     /// was a [`crate::transport::Remote`] (a push), the local root for a pull.
     /// A per-subtree transport (one whose root names a single snapshot
     /// directory) therefore reports paths relative to THAT subtree, so a caller
@@ -1905,7 +1905,7 @@ pub fn retire_destination_lock(dest_root: &Path) -> Result<RetireOutcome> {
 /// the caller-visible `<missing>` created AND narrowed to `0o700` — on a run
 /// that refuses every entry, to boot. Pre-creating the chain here with the
 /// platform default (`create_dir_all`, exactly the mode
-/// [`Applier::root_for_mutation`] gives a destination root's missing ancestors)
+/// [`LocalSide::root_for_mutation`] gives a destination root's missing ancestors)
 /// leaves [`crate::atomic::ensure_private_dir_durable`] nothing to create or
 /// chmod.
 ///
@@ -3427,7 +3427,7 @@ type DirListing = Vec<(Vec<u8>, EntryKind)>;
 /// `Vec` clone per consultation. `Clone` on this type is the DEEP clone that
 /// the pre-fix consultation ran per call; it exists so a consumer that really
 /// needs an owned listing can ask for one, and it is TEST-ONLY instrumented
-/// ([`listing_elements`]) so this bound measures the WORK a cached
+/// (`listing_elements`) so this bound measures the WORK a cached
 /// consultation does, not only the number of calls it makes.
 #[derive(Debug)]
 struct Listing(DirListing);

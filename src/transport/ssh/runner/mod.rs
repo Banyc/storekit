@@ -45,7 +45,7 @@ pub(crate) const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub(crate) const SSH_COMMAND_TIMEOUT_SECS: u64 = 60;
 
 /// The assumed MINIMUM transfer rate (bytes/sec) used to scale the deadline
-/// of a size-known upload ([`SshTransport::upload_bytes`]): the deadline is
+/// of a size-known upload ([`SshTransport::upload_bytes`](crate::transport::ssh::SshTransport::upload_bytes)): the deadline is
 /// `max(SSH_COMMAND_TIMEOUT_SECS, bytes / MIN_RATE)`, so a large upload over
 /// a slow link is never killed mid-transfer (the fixed 60s command deadline
 /// would truncate a 24MB binary at ~0.2MB/s and the truncated object would
@@ -69,7 +69,7 @@ pub(crate) enum OpKind {
     /// `run_remote_ok`: a remote shell command that must exit 0.
     RemoteOk,
     /// The stdin-payload path: `ssh` with a payload piped to the remote
-    /// `cat` — used by the raw [`SshTransport::upload_bytes`] write AND by
+    /// `cat` — used by the raw [`SshTransport::upload_bytes`](crate::transport::ssh::SshTransport::upload_bytes) write AND by
     /// `try_write_new`'s no-clobber install. Both ship their bytes on STDIN
     /// (never embedded in the command string), so arbitrary `Vec<u8>`
     /// round-trips exactly; a remote that stops reading stdin is covered by
@@ -103,7 +103,7 @@ pub(crate) enum RunError {
     /// ALREADY EXITED (its exit status was collected by the reap, then
     /// discarded here), at ANY deadline: the deadline never flips a completed
     /// command's outcome to a timeout (see [`SshRunner::run`]). The drain's
-    /// bound is the runner's POST-EXIT DRAIN bound ([`KILL_REAP_BOUND`]),
+    /// bound is the runner's POST-EXIT DRAIN bound ([`crate::transport::runner::KILL_REAP_BOUND`]),
     /// which is INDEPENDENT of the caller's deadline — a command that exits
     /// early and leaves a pipe holder reaches this variant without any
     /// deadline having been outlasted — so this variant is the typed carrier
@@ -237,7 +237,7 @@ pub(crate) struct SshRunner {
     /// PARENT at spawn time (called synchronously right after a successful
     /// spawn, before the deadline clock starts). Production installs nothing;
     /// a test installs a recording closure via
-    /// [`SshRunner::with_spawn_observer`] and afterwards asserts the recorded
+    /// `SshRunner::with_spawn_observer` and afterwards asserts the recorded
     /// pid is gone — the parent-side replacement for a child-written pidfile,
     /// which races the deadline kill (the child can be killed before it
     /// writes its own pid).
@@ -307,9 +307,9 @@ impl SshRunner {
     /// THE BOUND IS ADDITIVE, NOT `deadline`. After the deadline fires the
     /// runner still
     ///
-    /// * sends the group SIGTERM, sleeps [`TERM_TO_KILL_GRACE`] (200 ms), and
+    /// * sends the group SIGTERM, sleeps [`crate::transport::runner::TERM_TO_KILL_GRACE`] (200 ms), and
     ///   sends SIGKILL (plus the owned-handle escalation), and
-    /// * lets the bounded post-exit drain finish ([`KILL_REAP_BOUND`], 2 s per
+    /// * lets the bounded post-exit drain finish ([`crate::transport::runner::KILL_REAP_BOUND`], 2 s per
     ///   pipe; the two pipes are drained sequentially).
     ///
     /// so a call may return up to about `deadline + TERM_TO_KILL_GRACE +

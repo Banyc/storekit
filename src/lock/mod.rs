@@ -2,7 +2,7 @@
 //!
 //! `FileLock` is an advisory lock held by an open file descriptor — `flock`
 //! on Unix, `LockFileEx` on Windows (the platform split lives in the
-//! [`unix`] / [`windows`] submodules behind ONE cfg switch at the module
+//! [`unix`] / `windows` submodules behind ONE cfg switch at the module
 //! boundary).
 //! While the guard is alive the kernel prevents any other process from
 //! acquiring the same lock, and the lock is released automatically if the

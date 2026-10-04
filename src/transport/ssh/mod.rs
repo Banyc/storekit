@@ -1911,9 +1911,9 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// single quotes span newlines).
     ///
     /// Test-only swap injection is via a `#[cfg(test)]` Rust VALUE seam
-    /// ([`SshTransport::test_verify_swap`] set through
-    /// [`SshTransport::set_test_verify_swap`]): the
-    /// [`VerifySwap`](crate::transport::VerifySwap) is passed as a Rust value
+    /// (`SshTransport::test_verify_swap` set through
+    /// `SshTransport::set_test_verify_swap`): the
+    /// `VerifySwap` is passed as a Rust value
     /// and, when present, is embedded into the helper as literal
     /// `my $swap = "..."` / `my $boundary = "..."` assignments — never via
     /// environment variables. Production builds contain no swap logic at all.
@@ -2032,7 +2032,7 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
         }
     }
 
-    /// The [`NotRegularFileKind`] of a [`RemoteMeta`] (directory / symlink /
+    /// The [`crate::transport::NotRegularFileKind`] of a [`RemoteMeta`] (directory / symlink /
     /// other) — the verify-open parser's type classification.
     fn kind_of(meta: &RemoteMeta) -> crate::transport::NotRegularFileKind {
         use crate::transport::NotRegularFileKind;
