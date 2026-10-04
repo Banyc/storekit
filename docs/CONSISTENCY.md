@@ -749,3 +749,46 @@ name to a real item, and derives the 41-item public raw-path surface so each ite
 must be either listed or exempted — 26 exemptions, each with a stated reason, and
 a stale exemption fails the test. A planted new public raw-path mutator fails it,
 which is the property six hand-found omissions never had.
+
+## The adversarial review (round 8)
+
+Eight findings, all fixed — the largest round since round 1, and the first in which
+the ORCHESTRATOR's errors outnumber the code's.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The funnel-side count pin's symbol table (`NAME_MUTATION_SYMBOLS`) omitted the name-ADOPTING symbols the DENY list names (`File::create`, `File::create_new`, `OpenOptions::create`/`create_new`, `DirBuilder::create`, `std::fs::copy`, `std::fs::write`). Inside a funnel module the clippy deny is allowed, so the pin is the only device left — and it did not count them: planting `std::fs::write` or `File::create` in `src/atomic/mod.rs` left `cargo test`, host clippy AND Windows clippy green, while the identical call outside the funnel was exit 101. | M, H | `oklvktzqonoy` |
+| 2 | `OpenOptions::custom_flags` forwards ARBITRARY bits to `open(2)`, so `O_CREAT` through it adopts a name — and `FUNNEL_SYMBOLS_NOT_DENIED` excused it with the comment "these are not and **cannot adopt**". A production call adopted any absent name with clippy and all four derived audits green. | M, H | `oklvktzqonoy` |
+| 3 | `std::os::unix::net::{UnixListener,UnixDatagram}::bind` creates a directory entry and was in NO device (not denied, not counted, and outside `funnel_symbol`'s domain), so a production module could bind a socket at `state/operation.lock` with every gate green. | M | `oklvktzqonoy` |
+| 4 | The pair-less derivation could not see a `&str`-spelled public raw-path mutator (`pub fn f(name: &str)` then `Path::new(name)`), so "a SEVENTH omission is a failing test" was false for that class. | A, H | `oklvktzqonoy`, class STATED |
+| 5 | `Residue::discard` was NOT serialized by the destination operation lock, unlike its sibling `recover_to`: a cooperating second process could `detect` a live run's claim-aside and `discard` it, destroying the run's only copy of the pre-replace original before its rollback. | C | `vnxwyvyvtlxw` |
+| 6 | The real-`sshd` harness had a PORT TOCTOU: `free_port` released the port before `sshd` bound it, `wait_for_port` accepted a FOREIGN listener, and the client then failed to authenticate against the wrong `AuthorizedKeysFile`. **The Linux gate was nondeterministic — measured 2 failures in 240 runs (0.83%) under load** — so every "the Linux gate is green" claim in this log is weaker than it read. | L | `vnxwyvyvtlxw` |
+| 7 | `atomic`'s doc claimed a failed replace "leaves the directory exactly as it found it"; when the target's PARENT CHAIN was missing, the durable parents created before the failure remain. The existing test pre-created the destination directory, so it could not express the case. | A | `vnxwyvyvtlxw` |
+| 8 | THIS LOG's round-1 paragraph said "Eight of the twelve are axis A" while its own table gave six (3, 7, 8, 9, 10, 12), and the follow-up sentence named rows 5 and 6, which are `M` and `H`. | A | the round-8 docs commits |
+
+**The strongest medicine was applied to the last hand list.** The pin's symbol
+set is no longer a const: it is DERIVED from `clippy.toml`'s deny entries (with a
+synthetic builder mapping so a denied trait path and the syntax a caller writes
+name the same key), so the deny and the pin cannot drift apart again — the exact
+failure of finding 1, where round 7 added the adopting symbols to one device and
+not the other. Measured: all seven adopting symbols planted in a funnel module now
+change a pinned count, with a read-only control unchanged.
+
+**And a gate that can fail for reasons unrelated to the code is a finding about
+the ARTIFACT, not about the test.** Finding 6 was measured before and after
+(2/240 → 0/240 under identical load), the harness now serializes port-pick/spawn/
+verify, polls its own child, and verifies the presented host key — so a taken port
+now says "taken by a NON-SSH listener" or "a FOREIGN listener presenting a
+different ed25519 key" instead of surfacing as an authentication failure against
+the wrong sshd.
+
+**The orchestrator's own defect rate is now the story.** Finding 8 and the two
+counts corrected in `b5a6f2d0` ("nine" Windows warnings for thirteen; "25
+exemptions" for 26) are FOUR wrong numbers from me in three rounds, all of the same
+shape: a figure transcribed from an agent's report instead of measured — the habit
+this log exists to diagnose. They were caught only because independent reviewers
+re-derive instead of trusting, which is the argument for the re-run step restated
+once more. The rule is now mechanical: a count, and any claim that a change closed
+a finding, is measured or diffed before it enters a document — and where a number
+was already wrong, the document says so rather than presenting a silently edited
+digit.

@@ -651,8 +651,13 @@ funnel, and the operative definition of that membership is the set of
 in the funnel modules, item-level on the individual reviewed functions
 (capability-gated workers, the path-based mode authority, the cross-platform
 symlink helper, the creation helpers, and one reviewed exception for the ssh
-hostkey cache). That set is deliberately NOT listed here: it is whatever
-`rg -n 'allow\(clippy::disallowed_methods\)' src` reports, each site carrying a
+hostkey cache). A module-level attribute is INHERITED by that module's child
+modules, so the EFFECTIVE set is the annotated modules AND their descendants —
+`atomic::guard`, for instance, is inside the funnel by inheritance rather than by
+an attribute of its own, which is why the rule is stated as "annotated item or
+module" rather than enumerated. That set is deliberately NOT listed here: it is
+whatever `rg -n 'allow\(clippy::disallowed_methods\)' src` reports plus the modules
+those attributes cover, each site carrying a
 comment naming the rule it implements, and
 `atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`
 checks the SYMBOL side of the same property against `clippy.toml`. `clippy.toml`
