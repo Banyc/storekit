@@ -49,8 +49,13 @@ named AT the item with its reach).
   `pub(crate)`) on the ground that no production body needed it — but that
   ground covered THIS CRATE's production, not the CONSUMER's interface. The
   reason C was wrong, in one line: **the justification covered the crate's own
-  production, not the consumer's interface** (deploy's Windows port calls the
-  path-based `write_atomic_replace` in its own `store::atomic::windows`). It is
+  production, not the consumer's interface** (deploy's Windows port called the
+  path-based `write_atomic_replace` — at the revision this was measured, in its
+  own `store::atomic::windows`; that module has since been replaced by a
+  re-export, so a reader checking the citation at deploy's HEAD will not find it.
+  The SUBSTANTIVE evidence is the CALL SHAPE, and a cross-repo citation must be
+  read at the revision it names: axis A's rule about citations applies across
+  repositories too, and this one drifted for reasons this crate never saw). It is
   PUBLIC again, and its NAME states the weakness: the UNCONFINED,
   absolute-path form, the one to avoid when the confined
   `write_atomic_replace_fd` can name the destination. `docs/CONSISTENCY.md`
@@ -60,9 +65,13 @@ named AT the item with its reach).
   **C** (deleted from the trait) on the ground that the crate's own production
   and tests never needed it — the same population error: **the justification
   covered the crate's own production, not the consumer's interface.** deploy's
-  own transport trait DECLARES `exists` as a REQUIRED method and its production
-  calls
-  it. It is a DEFAULT method again, delegating to `metadata_opt` (so no
+  own transport trait DECLARED `exists` as a REQUIRED method when this was
+  measured and its production calls it; at deploy's current HEAD that trait is
+  itself a re-export of `storekit::transport::Remote`, so the citation moved
+  under the claim, and the evidence that still holds is the CALL SITES (267
+  `.exists(` occurrences, with `fn exists` defined in its `impl Remote` blocks,
+  which would not compile if the name left the trait). It is a DEFAULT method
+  again, delegating to `metadata_opt` (so no
   implementor is forced to write it, and an implementor may override with a
   cheaper probe), and its doc states EXACTLY what it discards — a `false`
   conflates *absent* with *the probe could not tell* — pointing a caller that
@@ -85,8 +94,13 @@ named AT the item with its reach).
   `atomic::write_atomic_replace` (the unconfined replace), `atomic::copy_tree_verbatim`
   and `atomic::copy_dir_recursive_fd` (copy primitives whose role includes an
   out-of-root source), `sync::retire_destination_lock` (a lock-record removal
-  with its own spelling and identity checks), `sync::Residue::recover_to` (the
-  residue sweep's target), `lock::FileLock::acquire` (the record path the lock
+  with its own spelling and identity checks), `sync::Residue::recover_to` AND
+  `sync::Residue::discard` (the sweep's target and the discard; both hold a
+  validated `(&RootDir, &RootedRelativePath)` pair INSIDE `Residue`, so they meet
+  the rule's SPIRIT — the validated type is the input — and are listed only
+  because this enumeration is about the SIGNATURE, and a proof-carrying method
+  takes no path argument at all; `discard` is the FOURTH member this enumeration
+  missed), `lock::FileLock::acquire` (the record path the lock
   protocol computes), `platform::chmod` / `platform::symlink` (the platform
   primitives), and the `Remote` trait's path-taking seam `lock_far_side`. The
   READ-ONLY primitives that also take a `&Path` (`platform::file_mode`,

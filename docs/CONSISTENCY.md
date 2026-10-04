@@ -146,9 +146,16 @@ population the earlier fix had already emptied (the `pub use …::*` free-functi
 sets) instead of asking each surviving `pub` item whether it exists on both
 ports. The second sweep asked a better question — does any CONSUMER need it —
 and, with `~/code/deploy` the only dependent and zero hits for all three, demoted
-them to `pub(crate)`. Measured with rustdoc JSON on both targets, the public sets
-are now IDENTICAL: 191 items each crate-wide and 11 in `atomic`, with 0 unix-only
-and 0 windows-only names.
+them to `pub(crate)`. Measured with rustdoc JSON on both targets — and the COUNTS that stood here
+(191 items crate-wide, 11 in `atomic`) are REMOVED, because a bare count without
+its counting RULE is a label rather than a measurement (README's rule), and a
+round-4 reviewer applying a stated but different rule (public, `crate_id == 0`,
+excluding modules, `use` re-exports, struct fields and variants) counted 173 and
+37. Both instruments agree on the PROPERTY, which is the claim; they disagree on
+the number, which was never the claim. The property: the accessible public NAME
+SETS are identical on `aarch64-apple-darwin` and `x86_64-pc-windows-msvc` — 0
+unix-only and 0 windows-only names — reproduced independently by two reviewers
+with their own instruments.
 
 What REMAINS platform-dependent is on BOTH ports and states its MEANING rather
 than its presence, so the next sweep checks the right property:
