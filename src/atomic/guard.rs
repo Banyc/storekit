@@ -131,7 +131,7 @@
 //! writes itself, is outside the crate entirely and is not stopped by any of
 //! this.
 //!
-//! TWO name-ADOPTING forms joined the deny list in round 8 and are NOT residue:
+//! TWO name-ADOPTING forms joined the deny list and are NOT residue:
 //! `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags` (on Unix it
 //! forwards ARBITRARY `open(2)` bits and `O_CREAT` through it creates a name;
 //! on Windows it forwards `dwFlagsAndAttributes`, where the creation
@@ -1459,8 +1459,8 @@ mod tests {
     /// `impl` block — carries `#[allow(clippy::disallowed_methods)]`. The
     /// `syn::Item` arm above CANNOT see these: an `impl`'s children are
     /// `ImplItem`s, not `Item`s, so before this arm existed an `#[allow]` on a
-    /// METHOD was invisible to the surface derivation (round 6 claimed the arm;
-    /// it did not exist).
+    /// METHOD was invisible to the surface derivation (an earlier draft of this
+    /// audit claimed the arm existed; it did not).
     fn impl_item_allows_disallowed(item: &syn::ImplItem) -> bool {
         let attrs = match item {
             syn::ImplItem::Const(item) => &item.attrs,
@@ -2891,10 +2891,10 @@ mod tests {
     /// adding such a call does not change a count.
     ///
     /// SYMBOL SET: DERIVED from `clippy.toml` ([`name_mutation_symbols`]), not
-    /// hand-kept — the round-8 finding was seven ADOPTING symbols the lint
+    /// hand-kept — the finding was seven ADOPTING symbols the lint
     /// denied but a hand-kept table did not count, so a funnel-module call to
     /// one left this pin green. A new deny entry now changes this pin
-    /// automatically. The pinned VALUES changed in round 8 for exactly that
+    /// automatically. The pinned VALUES changed for exactly that
     /// reason (`create_new`, `create`, `custom_flags`, and `write` calls that
     /// were always there are now counted); each new value is a deliberate,
     /// reviewed entry recorded at the pin with its reason.
@@ -2989,7 +2989,7 @@ mod tests {
             ("src/transport/mod.rs", "rename", 1),
             ("src/transport/mod.rs", "hard_link", 1),
             ("src/transport/ssh/hostkey.rs", "remove_file", 1),
-            // --- The CREATION wrappers (round 5): `std::fs::create_dir*` and
+            // --- The CREATION wrappers: `std::fs::create_dir*` and
             // the platform symlink creators ADOPT a name, so they are on
             // `clippy.toml`'s deny list and this pin tracks their production
             // call counts too. Every site below is either a funnel module
@@ -3020,7 +3020,7 @@ mod tests {
             ("src/transport/mod.rs", "create_dir_all", 5),
             ("src/transport/ssh/hostkey.rs", "create_dir_all", 1),
             ("src/transport/ssh/mod.rs", "create_dir_all", 1),
-            // --- The ADOPTION family the pin MISSED before round 8 (P1-A).
+            // --- The ADOPTION family the pin MISSED (P1-A).
             // These symbols were on `clippy.toml`'s deny list but NOT in the
             // hand-kept pin table, so a call to one INSIDE a funnel module —
             // where the module-level `#[allow]` blinds the lint — left the count
@@ -3054,7 +3054,7 @@ mod tests {
             // `O_DIRECTORY`/`FILE_FLAG_OPEN_REPARSE_POINT`/
             // `FILE_FLAG_BACKUP_SEMANTICS`) — the same reviewed sites that carry
             // the item-level allow for the crate-wide deny. The ADOPTING
-            // `custom_flags(O_CREAT)` form is what round 8 (P1-B) proved was
+            // `custom_flags(O_CREAT)` form is what P1-B proved was
             // reachable with every gate green.
             ("src/atomic/guard.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
@@ -3897,7 +3897,7 @@ mod tests {
     /// forwards ARBITRARY bits to `open(2)`/`CreateFile`, and `O_CREAT` through
     /// it ADOPTS a name, so it is DENIED crate-wide as the resolved trait
     /// methods `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`. The
-    /// round-8 finding was that this list carried the synthetic spelling with a
+    /// finding was that this list carried the synthetic spelling with a
     /// comment claiming the method "cannot adopt": both the entry and the
     /// reason were false. Reviewed non-adopting sites now carry an item-level
     /// `#[allow]` instead, exactly as `set_permissions` does.
@@ -3971,7 +3971,7 @@ mod tests {
         }
         // The pathname-socket bind: a `net` creator that ADOPTS a directory
         // entry, so the closure MUST be able to see it if the funnel ever
-        // spells one (round 8, P2-A).
+        // spells one (P2-A).
         if canonical.len() == 6
             && canonical[0] == "std"
             && canonical[1] == "os"
@@ -4357,9 +4357,9 @@ mod tests {
     /// (`line.strip_prefix("{ path = \"")`) silently DROPPED a reformatted
     /// entry, which made the derived pin table and the crate-wide deny
     /// DISAGREE: clippy still refused a non-funnel call (exit 101) while the
-    /// derived table lacked the symbol, so the count pin lost it (round 8's
-    /// exact failure mode) and the closure reported a FALSE "undefended"
-    /// symbol.
+    /// derived table lacked the symbol, so the count pin lost it — two views of
+    /// the same fact disagreeing silently — and the closure reported a FALSE
+    /// "undefended" symbol.
     ///
     /// The CROSS-CHECK below compares the parse against
     /// [`raw_denied_path_strings`]: every path-shaped string in the array must
@@ -4417,9 +4417,9 @@ mod tests {
     /// what the compiler resolves; the surface derivation and the count pin
     /// see the SYNTACTIC builder method (`std::fs::OpenOptions::custom_flags`),
     /// because `syn` has no type information. Mapping one to the other keeps
-    /// the closure test and the deny from silently disagreeing — the round-8
-    /// finding where the closure's review list carried a symbol the deny list
-    /// did not name.
+    /// the closure test and the deny from silently disagreeing — the failure mode
+    /// where the closure's review list carried a symbol the deny list did not
+    /// name.
     fn synthetic_builder_spelling(path: &str) -> Option<String> {
         let segments: Vec<&str> = path.split("::").collect();
         let [std, os, unix_or_windows, fs, owner, method] = segments.as_slice() else {
@@ -4687,7 +4687,7 @@ mod tests {
     /// (including through a `use … as` alias) — or `clippy.toml`'s list could
     /// drift from the code without
     /// [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`]
-    /// noticing. This is the round-6 finding's regression guard: the old
+    /// noticing. This is the regression guard for that: the old
     /// three-segment filter and path-callee-only visitor saw NEITHER the
     /// inherent nor the builder form.
     #[test]
@@ -5271,13 +5271,10 @@ impl S {
     /// raw-path item, so this list is the residue a reviewer checks one entry
     /// at a time.
     const PAIR_LESS_EXEMPTIONS: &[(&str, &str)] = &[
-        (
-            "atomic::path_state",
-            "lstat-style state read; no mutation (round 3)",
-        ),
+        ("atomic::path_state", "lstat-style state read; no mutation"),
         (
             "atomic::temp_name_for",
-            "derives a temp SPELLING; issues no syscall (round 3)",
+            "derives a temp SPELLING; issues no syscall",
         ),
         (
             "RootDir::open",
@@ -5308,10 +5305,7 @@ impl S {
             "manifest::verify_tree_metadata",
             "read-only verification of a stored manifest",
         ),
-        (
-            "platform::file_mode",
-            "reads an entry's mode; no mutation (round 3)",
-        ),
+        ("platform::file_mode", "reads an entry's mode; no mutation"),
         (
             "relpath::RootedRelativePath::parse",
             "parses a spelling into the validated type; issues no syscall",
@@ -5330,7 +5324,7 @@ impl S {
         ),
         (
             "sync::diff::local_manifest",
-            "read-only walk/hash of a source root (round 3)",
+            "read-only walk/hash of a source root",
         ),
         (
             "sync::Residue::detect",
@@ -5403,7 +5397,7 @@ impl S {
     /// containers, the strings-in-containers, and the alias case — so the
     /// statement cannot rot into a false claim about the code.
     ///
-    /// The CONTAINER extension (round 10) is the fix for a measured hole: a
+    /// The CONTAINER extension is the fix for a measured hole: a
     /// `pub fn f(paths: &[PathBuf])`, `(PathBuf,)`, or `Result<PathBuf>` was
     /// neither in the stated in-class set nor the out-of-class set, and the
     /// derivation passed for all three while the `&Path` control failed. A
@@ -5505,7 +5499,7 @@ impl S {
             );
         }
         // OUT OF CLASS: a LOCAL non-generic `type` ALIAS of `Path`/`PathBuf`
-        // (round 11 P2-E/P3-E). Like `use … as`, the predicate matches the
+        // (P2-E/P3-E). Like `use … as`, the predicate matches the
         // last-segment NAME, so `type ZP = std::path::Path;` leaves `&ZP`
         // outside the class BY CONSTRUCTION. The FsIndex-backed derivations DO
         // resolve `type` aliases; this syntactic derivation deliberately does
@@ -5615,7 +5609,7 @@ impl S {
     /// it deliberately scans TOKENS rather than parsing items, so it still sees
     /// a `pub fn $name(p: &Path)` whose metavariable would make an item parse
     /// fail. It is conservative: a `Path` token anywhere in a `pub fn`
-    /// parameter list, a trailing `where` clause, or (round 11) behind a
+    /// parameter list, a trailing `where` clause, or behind a
     /// `<…>` GENERIC-PARAMETER group is enough, so it cannot pass by accident.
     fn macro_body_public_path_fns(tokens: impl std::fmt::Display) -> Vec<String> {
         let list = macro_token_list(tokens);
@@ -5673,7 +5667,7 @@ impl S {
                     continue;
                 }
             };
-            // ROUND-11 P2-B: the round-10 scan stopped at the parameter list,
+            // P2-B: an earlier scan stopped at the parameter list,
             // so `pub fn f<T>(p: T) where T: AsRef<Path> {}` was invisible too.
             // Extend the scanned range across a trailing `where` clause, up to
             // the body opener or the declaration terminator.
@@ -5739,7 +5733,7 @@ impl S {
     /// behind a `<…>` generic-parameter group is refused), so it cannot pass by
     /// accident.
     ///
-    /// ROUND 11 P2-B: the round-10 scan required `(` IMMEDIATELY after the fn
+    /// P2-B: an earlier scan required `(` IMMEDIATELY after the fn
     /// name, so `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
     /// skipped, and it stopped at the parameter-list close, so a
     /// `where T: AsRef<Path>` bound was invisible too. Both are now scanned and

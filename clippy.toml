@@ -192,7 +192,7 @@ disallowed-methods = [
   { path = "std::os::unix::net::UnixListener::bind", reason = "a pathname-socket bind creates a directory entry; call the guarded atomic primitive instead" },
   { path = "std::os::unix::net::UnixDatagram::bind", reason = "a pathname-socket bind creates a directory entry; call the guarded atomic primitive instead" },
   #
-  # NAMED RESIDUAL OF THE COMPLETENESS CLAIM (round 8, P2-A): the deny list is a
+  # NAMED RESIDUAL OF THE COMPLETENESS CLAIM: the deny list is a
   # list of RESOLVED `std`/`libc` symbols. A Windows named-pipe creator
   # (`CreateNamedPipeW`) or a raw `CreateFileW`/`NtCreateFile` reached through
   # `windows_sys` is NOT a `std` symbol, so this lint does not name it and the
