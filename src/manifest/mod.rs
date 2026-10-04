@@ -391,6 +391,12 @@ pub struct TreeEntry {
     /// host-independent: nested entries are `a/b` on every platform. A
     /// literal `\` inside one component is an ordinary name character (legal
     /// on Unix) and is preserved verbatim, so readers must split on `/` only.
+    ///
+    /// The wire READER enforces every one of these rules, through the same
+    /// [`validate_entry_path`] authority the canonicalizers use, so a path the
+    /// canonicalizers would refuse cannot deserialize into a `TreeEntry` at
+    /// all.
+    #[serde(deserialize_with = "path_wire::deserialize")]
     pub path: String,
     /// `file`, `dir`, or `symlink`, as the VALIDATED [`EntryKind`].
     #[serde(rename = "type")]
@@ -409,11 +415,17 @@ pub struct TreeEntry {
 }
 
 /// Canonical tree metadata (the `tree.json` payload). `tree_schema_version`
-/// is `TREE_SCHEMA_VERSION`; readers refuse any other value.
+/// is `TREE_SCHEMA_VERSION` and `hash_algorithm` is `HASH_ALGORITHM`; the wire
+/// reader refuses any other value for either, and refuses a `tree_sha256`
+/// that is not a well-formed digest, so a malformed record cannot deserialize
+/// into a `TreeMetadata` at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeMetadata {
+    #[serde(deserialize_with = "schema_version_wire::deserialize")]
     pub tree_schema_version: u32,
+    #[serde(deserialize_with = "hash_algorithm_wire::deserialize")]
     pub hash_algorithm: String,
+    #[serde(deserialize_with = "tree_sha256_wire::deserialize")]
     pub tree_sha256: String,
     pub entries: Vec<TreeEntry>,
 }
@@ -421,6 +433,12 @@ pub struct TreeMetadata {
 /// [`canonicalize_tree`] emits exactly this value and every reader of a tree
 /// record refuses any other version (fail closed).
 pub const TREE_SCHEMA_VERSION: u32 = 1;
+
+/// The ONE `hash_algorithm` spelling a manifest record may carry: the string
+/// [`build_metadata`] emits. The wire reader refuses every other value, so a
+/// record naming an algorithm the crate does not implement cannot deserialize
+/// into a [`TreeMetadata`].
+pub const HASH_ALGORITHM: &str = "sha256";
 
 /// The low twelve permission bits of a platform mode, the only bits the
 /// manifest carries.
@@ -467,6 +485,89 @@ mod mode_octal {
                 "invalid manifest mode {spelling:?}"
             )))
         }
+    }
+}
+
+/// Serde for [`TreeMetadata::tree_schema_version`]: the wire reader accepts
+/// EXACTLY the crate's current [`TREE_SCHEMA_VERSION`] and refuses every other
+/// value fail-closed, so a record under an unrecognized schema cannot
+/// deserialize into a [`TreeMetadata`]. The emitted form is unchanged.
+mod schema_version_wire {
+    use serde::{Deserialize, Deserializer};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<u32, D::Error> {
+        let version = u32::deserialize(deserializer)?;
+        if version == super::TREE_SCHEMA_VERSION {
+            Ok(version)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unsupported manifest tree_schema_version {version}: this reader accepts only {}",
+                super::TREE_SCHEMA_VERSION
+            )))
+        }
+    }
+}
+
+/// Serde for [`TreeMetadata::hash_algorithm`]: the wire reader accepts EXACTLY
+/// the crate's algorithm spelling ([`HASH_ALGORITHM`]) and refuses every other
+/// value, so a record naming an algorithm the crate does not implement cannot
+/// deserialize into a [`TreeMetadata`]. The emitted form is unchanged.
+mod hash_algorithm_wire {
+    use serde::{Deserialize, Deserializer};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<String, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        if spelling == super::HASH_ALGORITHM {
+            Ok(spelling)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "unsupported manifest hash_algorithm {spelling:?}: this reader accepts only {:?}",
+                super::HASH_ALGORITHM
+            )))
+        }
+    }
+}
+
+/// Serde for [`TreeMetadata::tree_sha256`]: the wire reader accepts EXACTLY
+/// the shape [`crate::id::valid_hex_digest`] admits — 64 lowercase hex
+/// characters, the form [`crate::digest::sha256_bytes`] produces — and refuses
+/// every other spelling. Whether the digest MATCHES the entry set is a
+/// whole-record property, decided by [`verify_tree_metadata`], not here.
+mod tree_sha256_wire {
+    use serde::{Deserialize, Deserializer};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<String, D::Error> {
+        let digest = String::deserialize(deserializer)?;
+        if crate::id::valid_hex_digest(&digest) {
+            Ok(digest)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "invalid manifest tree_sha256 {digest:?}: expected 64 lowercase hex characters"
+            )))
+        }
+    }
+}
+
+/// Serde for [`TreeEntry::path`]: the wire reader applies the SAME name/path
+/// rules the canonicalizers apply, through the SAME authority
+/// ([`validate_entry_path`]), so a path the canonicalizers would refuse — a
+/// NUL/LF/CR/TAB character, an absolute spelling, an empty or traversal
+/// component, a component past the filesystem name bound, or a non-NFC
+/// spelling — cannot deserialize into a [`TreeEntry`] at all.
+mod path_wire {
+    use serde::{Deserialize, Deserializer};
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<String, D::Error> {
+        let path = String::deserialize(deserializer)?;
+        super::validate_entry_path(&path).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1433,7 +1534,7 @@ fn build_metadata(mut entries: Vec<TreeEntry>) -> TreeMetadata {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut meta = TreeMetadata {
         tree_schema_version: TREE_SCHEMA_VERSION,
-        hash_algorithm: "sha256".to_string(),
+        hash_algorithm: HASH_ALGORITHM.to_string(),
         tree_sha256: String::new(),
         entries,
     };
@@ -2591,6 +2692,148 @@ mod tests {
         assert_eq!(
             reparsed, meta,
             "the canonical wire record must parse back to the exact canonical record"
+        );
+    }
+
+    /// Build a canonical `tree.json` record with the crate's own serializer
+    /// and return the record and its wire bytes, so the per-field refusal
+    /// tests mutate exactly the bytes a real record carries.
+    fn canonical_record_and_wire() -> (TreeMetadata, String) {
+        let meta = build_metadata(vec![TreeEntry {
+            path: "sub/file.txt".to_string(),
+            entry_type: EntryKind::File,
+            mode: 0o644,
+            content_sha256: Some("ab".repeat(32)),
+            symlink_target: None,
+        }]);
+        let wire = serde_json::to_string(&meta).unwrap();
+        (meta, wire)
+    }
+
+    /// POSITIVE CONTROL shared by the per-field refusal tests: the record the
+    /// crate's own serializer emits still loads back unchanged through the
+    /// validating reader.
+    #[test]
+    fn wire_reader_still_accepts_a_canonical_record() {
+        let (meta, wire) = canonical_record_and_wire();
+        let back: TreeMetadata = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            back, meta,
+            "a canonical record must round-trip through the validating reader"
+        );
+    }
+
+    /// A `tree_schema_version` other than the crate's current one is refused
+    /// fail-closed at the wire reader, so a record under an unrecognized
+    /// schema cannot deserialize into a `TreeMetadata`.
+    #[test]
+    fn wire_reader_refuses_a_foreign_schema_version() {
+        let (_meta, wire) = canonical_record_and_wire();
+        serde_json::from_str::<TreeMetadata>(&wire)
+            .expect("the positive control must load before the mutation");
+        let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(value["tree_schema_version"], TREE_SCHEMA_VERSION);
+        value["tree_schema_version"] = serde_json::json!(999);
+        let err = serde_json::from_value::<TreeMetadata>(value)
+            .expect_err("a foreign tree_schema_version must be refused");
+        assert!(
+            err.to_string()
+                .contains("unsupported manifest tree_schema_version 999"),
+            "unexpected refusal for a foreign schema version: {err}"
+        );
+    }
+
+    /// A `hash_algorithm` the crate does not implement is refused at the wire
+    /// reader, so a record naming one cannot deserialize into a
+    /// `TreeMetadata`.
+    #[test]
+    fn wire_reader_refuses_a_foreign_hash_algorithm() {
+        let (_meta, wire) = canonical_record_and_wire();
+        serde_json::from_str::<TreeMetadata>(&wire)
+            .expect("the positive control must load before the mutation");
+        let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        value["hash_algorithm"] = serde_json::json!("md5");
+        let err = serde_json::from_value::<TreeMetadata>(value)
+            .expect_err("a hash_algorithm the crate does not implement must be refused");
+        assert!(
+            err.to_string()
+                .contains("unsupported manifest hash_algorithm \"md5\""),
+            "unexpected refusal for a foreign hash algorithm: {err}"
+        );
+    }
+
+    /// A `tree_sha256` that is not a well-formed digest — empty, short, long,
+    /// uppercase, or non-hex — is refused at the wire reader. Whether it
+    /// MATCHES the entry set stays a `verify_tree_metadata` check.
+    #[test]
+    fn wire_reader_refuses_a_malformed_tree_sha256() {
+        let (_meta, wire) = canonical_record_and_wire();
+        serde_json::from_str::<TreeMetadata>(&wire)
+            .expect("the positive control must load before the mutation");
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        let uppercase = "A".repeat(64);
+        let non_hex = "g".repeat(64);
+        for bad in [
+            "nope",
+            "",
+            short.as_str(),
+            long.as_str(),
+            uppercase.as_str(),
+            non_hex.as_str(),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            value["tree_sha256"] = serde_json::json!(bad);
+            let err = serde_json::from_value::<TreeMetadata>(value)
+                .expect_err(&format!("a malformed tree_sha256 {bad:?} must be refused"));
+            assert!(
+                err.to_string().contains("invalid manifest tree_sha256"),
+                "unexpected refusal for tree_sha256 {bad:?}: {err}"
+            );
+        }
+    }
+
+    /// The wire reader must refuse every `TreeEntry.path` the canonicalizers
+    /// refuse, through the SAME `validate_entry_path` authority, so an
+    /// escaping, absolute, control-character-bearing, empty, or non-NFC path
+    /// cannot deserialize into a `TreeEntry`/`TreeMetadata` at all.
+    #[test]
+    fn wire_reader_refuses_a_malformed_entry_path() {
+        let (_meta, wire) = canonical_record_and_wire();
+        serde_json::from_str::<TreeMetadata>(&wire)
+            .expect("the positive control must load before the mutation");
+        for bad in [
+            "../escape",
+            "/abs",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a\0b",
+            "e\u{301}",
+            "",
+            "a//b",
+            "./a",
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            value["entries"][0]["path"] = serde_json::json!(bad);
+            let err = serde_json::from_value::<TreeMetadata>(value)
+                .expect_err(&format!("a malformed entry path {bad:?} must be refused"));
+            let expected = validate_entry_path(bad)
+                .expect_err("the authority must refuse this spelling")
+                .to_string();
+            assert!(
+                err.to_string().contains(&expected),
+                "the refusal for {bad:?} must be the canonicalizer's {expected:?}, got {err}"
+            );
+        }
+        // The same field is refused on a BARE `TreeEntry`, since the rule sits
+        // on the field itself rather than on the enclosing record.
+        let entry_wire = r#"{"path":"../escape","type":"file","mode":"0644"}"#;
+        let err = serde_json::from_str::<TreeEntry>(entry_wire)
+            .expect_err("a bare TreeEntry with an escaping path must be refused");
+        assert!(
+            err.to_string().contains("traversal"),
+            "unexpected refusal for a bare escaping TreeEntry: {err}"
         );
     }
 
