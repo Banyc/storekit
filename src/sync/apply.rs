@@ -2553,6 +2553,7 @@ impl DestinationOwnership {
         remote: &dyn Remote,
     ) -> Result<DestinationOwnership> {
         let prepared = prepare(direction, local_root, remote, true)?;
+        require_endpoint_identity(remote)?;
         let guard = lock_destination(direction, prepared.dest_is_local, &prepared.dest_root)?;
         Ok(DestinationOwnership::Locked(LockedDestination {
             prepared,
@@ -2620,21 +2621,9 @@ impl DestinationOwnership {
         // The token MUST be bound to an ENDPOINT, not merely to a path: two
         // hosts that report the same layout path would otherwise be
         // interchangeable, and the token could be replayed against the wrong
-        // one. Fail closed exactly as the `lock_far_side` default does — a
-        // remote ownership token that is not bound to an endpoint is not
-        // ownership.
-        if remote.endpoint_identity().is_none() {
-            return Err(Error::preflight(format!(
-                "refusing to own the remote destination {}: this transport cannot state an \
-                 ENDPOINT IDENTITY, so a token minted here would be bound only to the PATH \
-                 spelling and could be replayed against a DIFFERENT host that reports the same \
-                 root. Override `Remote::endpoint_identity` to return a stable string \
-                 identifying the transport's endpoint (host/port/account), or, if the caller \
-                 holds the destination for the run, pass `DestinationOwnership::Unowned` (the \
-                 explicitly weaker path).",
-                prepared.dest_root.display()
-            )));
-        }
+        // one. ONE authority does this for every minting path — see
+        // [`require_endpoint_identity`].
+        require_endpoint_identity(remote)?;
         // ONE authority for the record's spelling: the SAME derivation the local
         // case uses, applied to the far-side root spelling.
         let Some(record) = destination_lock_path(&prepared.dest_root) else {
@@ -2727,6 +2716,7 @@ impl DestinationOwnership {
         in_root_lock: &RootedRelativePath,
     ) -> Result<DestinationOwnership> {
         let prepared = prepare(direction, local_root, remote, true)?;
+        require_endpoint_identity(remote)?;
         // The composed form never creates the destination ROOT: refuse a root
         // that is absent (or not a directory) BEFORE the sibling record is
         // created, so the refusal leaves no residue. This is also what keeps a
@@ -2853,6 +2843,41 @@ fn describe_endpoint(identity: &Option<String>) -> String {
 /// record is created or the destination is provisioned, so a refusal leaves no
 /// residue. The result is carried into [`sync`] so the run uses exactly the
 /// tree the plan was made against.
+/// ONE authority for the ownership token's TRANSPORT binding, called by EVERY
+/// minting path ([`DestinationOwnership::lock`],
+/// [`DestinationOwnership::lock_remote`],
+/// [`DestinationOwnership::lock_with_in_root_lock`]).
+///
+/// A token records the remote's ROOT spelling and its ENDPOINT IDENTITY, and
+/// [`Prepared::matches`] compares both. A LOCAL remote is fully identified by
+/// its root spelling — it is a path on this host — so it needs nothing more. A
+/// NON-LOCAL one is not: two hosts can report the same layout path, so the
+/// PATH alone cannot tell them apart and a token minted against one would be
+/// replayed against the other. That applies in EITHER role, which is why this
+/// check is on the TRANSPORT and not on "the destination": for a PULL the
+/// remote is the SOURCE, and the token carries that source's manifest as the
+/// plan the run applies, so an unbound PULL token applies one host's plan to
+/// another host's data. Fail closed, exactly as the `lock_far_side` default
+/// does — a token that is not bound to an endpoint is not ownership.
+///
+/// This does NOT apply to an UNOWNED run (`DestinationOwnership::Unowned`),
+/// which holds no token to bind and is the explicitly weaker path the refusal
+/// below points at.
+fn require_endpoint_identity(remote: &dyn Remote) -> Result<()> {
+    if remote.is_local() || remote.endpoint_identity().is_some() {
+        return Ok(());
+    }
+    Err(Error::preflight(format!(
+        "refusing to take ownership for {}: this transport is NOT LOCAL and cannot state an \
+         ENDPOINT IDENTITY, so a token minted here would be bound only to the PATH spelling and \
+         could be replayed against a DIFFERENT host that reports the same root. Override \
+         `Remote::endpoint_identity` to return a stable string identifying the transport's \
+         endpoint (host/port/account), or, if the caller holds the destination for the run, pass \
+         `DestinationOwnership::Unowned` (the explicitly weaker path).",
+        remote.root().display()
+    )))
+}
+
 fn prepare(
     direction: Direction,
     local_root: &Path,

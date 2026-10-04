@@ -1186,7 +1186,16 @@ impl RecordingRemote {
         RecordingRemote {
             inner,
             is_local,
-            endpoint_identity: None,
+            // A NON-LOCAL double states an endpoint identity, because a real
+            // remote transport must (`SshTransport` returns `ssh://target:port`)
+            // and a token minted against one is refused without it. A LOCAL one
+            // states none, exactly as `LocalTransport` does — a path on this
+            // host needs no endpoint, and the root spelling identifies it.
+            endpoint_identity: if is_local {
+                None
+            } else {
+                Some("test://recording-remote".to_string())
+            },
             fail_writes: false,
             fail_nth_write: None,
             fail_write_after_write: false,
@@ -1256,6 +1265,16 @@ impl RecordingRemote {
     /// ownership token (see [`Remote::endpoint_identity`]).
     fn with_endpoint_identity(mut self, identity: &str) -> RecordingRemote {
         self.endpoint_identity = Some(identity.to_string());
+        self
+    }
+
+    /// Test-only: state NO endpoint identity on a NON-LOCAL double, which is the
+    /// shape the ownership binding must refuse. [`RecordingRemote::over`]
+    /// states one for a non-local double (as a real remote transport must), so
+    /// only a test that is ABOUT the missing-identity refusal clears it.
+    #[cfg(test)]
+    fn without_endpoint_identity(mut self) -> RecordingRemote {
+        self.endpoint_identity = None;
         self
     }
 
@@ -12766,6 +12785,56 @@ fn an_unowned_run_reaches_a_remote_destination_and_still_verifies() {
 // ---------------------------------------------------------------------------
 // F1: the sync entry points prepare the transport's host identity.
 // ---------------------------------------------------------------------------
+
+/// NO token may be minted against a NON-LOCAL transport that cannot state an
+/// ENDPOINT IDENTITY — in EITHER role. The `Locked` token carries the remote's
+/// root spelling AND its endpoint identity, and for a PULL the remote is the
+/// SOURCE whose manifest the token carries as the plan the run applies. A
+/// non-local transport that states no endpoint is therefore identified only by
+/// a path spelling, which two different hosts can share, so a token minted
+/// against one could be handed to a run against the other.
+///
+/// The concrete reach this closes: before the check, `lock` refused a
+/// `None` identity only for a remote DESTINATION (`lock_remote`), so a PULL
+/// from a third-party `Remote` source that did not override
+/// `Remote::endpoint_identity` minted an unbound token and the run applied one
+/// host's plan to another host's data. The crate's own `SshTransport` always
+/// states one, so this is the third-party contract, which is exactly why it is
+/// enforced rather than documented: the check must not depend on a transport
+/// author reading the doc.
+///
+/// The refusal is TYPED and names both the override and the weaker alternative,
+/// and it leaves the destination untouched (no lock record, no root).
+#[cfg(unix)]
+#[test]
+fn a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(&dst).unwrap();
+    // A NON-LOCAL source (a third-party remote) that states NO endpoint.
+    let remote = RecordingRemote::over(transport(&src), false).without_endpoint_identity();
+
+    let err = DestinationOwnership::lock(Direction::Pull, &dst, &remote)
+        .err()
+        .expect("a non-local transport without an endpoint identity must not mint a token");
+    let message = err.to_string();
+    assert!(
+        message.contains("endpoint_identity") && message.contains("Unowned"),
+        "the refusal must name the override AND the weaker path: {message}"
+    );
+    assert!(
+        matches!(err, Error::Preflight(_)),
+        "the refusal must be the typed Preflight, not a message-only error: {err:?}"
+    );
+    // Nothing was prepared or created: no lock record, no root.
+    assert_eq!(
+        fs::read_dir(&dst).unwrap().count(),
+        0,
+        "a refused mint must leave the destination untouched"
+    );
+}
 
 /// The `Locked` token is BOUND to the run it was taken for: a token acquired
 /// for one destination is REFUSED when handed to a run against another, so a
