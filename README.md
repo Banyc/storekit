@@ -26,9 +26,14 @@ caller.
    answer; the crate refuses rather than guess where the follow ends. A
    component counts as a symlink component when its EXACT entry is one, or —
    when no exact entry exists — when it folds onto a symlink entry under the
-   crate's platform-independent name fold (NFC, Unicode lowercase, trailing
-   `.`/space), so a case- or normalization-folding spelling cannot be missed by
-   one view and accepted by another. Nothing is normalized or substituted.
+   crate's containment name fold: NFD, then the FULL Unicode case fold (the `C`
+   and `F` mappings, so `ß` folds to `ss` and the `ﬁ` ligature to `fi`), then
+   NFC, with trailing `.` and spaces removed. This is deliberately NOT
+   `str::to_lowercase`, which is a different mapping: a case-insensitive host
+   folds the full way, so on APFS `STRASSE`, `strasse` and `straße` are ONE
+   entry, and a lowercase-only fold would miss that. So a case- or
+   normalization-folding spelling cannot be missed by one view and accepted by
+   another. Nothing is normalized or substituted.
 4. **A view is faithful, or the check does not run.** No lossy decode, no
    trimming, no defaulted field, on any path that decides something. A listing
    carries the live kind of each entry beside its name.

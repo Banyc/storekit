@@ -1240,6 +1240,7 @@ mod tests {
     #[test]
     fn exhaustive_stage_sweep() {
         if !slow_tests_enabled() {
+            eprintln!("skipped: slow test — set STOREKIT_FULL_TESTS=1 to run");
             return;
         }
         for stage in [

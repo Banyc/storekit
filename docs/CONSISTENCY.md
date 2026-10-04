@@ -88,6 +88,12 @@ Named, scoped, not pursued:
   funnel module the deny is allowed there, so nothing else refuses it either. That
   shape is outside the pin's guarantee rather than a hole in a promise, and the
   contract's clause (c) says so.
+- **The deny list's WIDER SET is not checked for resolution.** An entry outside the
+  symbols the funnel uses is what refuses a route the funnel could acquire later,
+  but nothing verifies that such an entry resolves on either supported target: a
+  typo there produces a non-fatal config-time `does not refer to a reachable
+  function` diagnostic that the gate's `-D warnings` does not cover, so it can rot
+  silently. A typo in a symbol the funnel DOES use is caught by the closure test.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

@@ -125,8 +125,9 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// advisory lock [`crate::lock::FileLock`] holds (`<root>/operation.lock`).
 ///
 /// This spelling is deliberately NOT one of the two byte-exact reserved
-/// families above — [`is_reserved_name`] stays byte-exact, so the sync's
-/// reserved stripping is unchanged — but it IS unaddressable as an identity:
+/// families above — [`is_reserved_name`] stays byte-exact, and the sync's
+/// stripping consults the BROAD [`is_unaddressable_name`] instead — but it IS
+/// unaddressable as an identity:
 /// accepting it would let consumer content share a name with the crate's own
 /// lock record, which [`crate::lock::FileLock::acquire`] rewrites (adopting an
 /// entry only when it is empty or already a record this crate wrote), and
@@ -186,8 +187,9 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 /// owns the temp namespace, and an id that looked like its temp would be a
 /// trap the consumer cannot see; refusing the shape at this ONE boundary makes
 /// the documented sweep safe by construction. (While
-/// [`is_reserved_name`] / [`is_reserved_path`] stay byte-exact for the sync's
-/// reserved stripping.)
+/// [`is_reserved_name`] / [`is_reserved_path`] stay byte-exact for a caller that
+/// needs that question; the sync strips with the BROAD
+/// [`is_unaddressable_path`] and [`is_residue_path`].)
 ///
 /// The temp half is checked in CASE-FOLDED form too
 /// ([`is_crate_temp_case_alias`]). The byte-exact recognizer

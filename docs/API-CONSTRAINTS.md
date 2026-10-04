@@ -14,7 +14,7 @@ made possible.
 | 5 | **The reserved spellings a break may touch are a value, unforgeable outside the crate.** | the residual list as prose. | **done** (INTERNAL: `Sanction` and `GuardedRel` are `pub(crate)`, so no caller can name them and no public signature takes or returns one — this constraint shapes the implementation, not the public surface) |
 | 6 | **Every bound is a constant with its reason stated**, and no derived value feeds a length-limited resource unbounded. | ad-hoc length arithmetic at each site. | **done** |
 | 7 | **One direction of data flow per type**: a type that is read is not the same type that is written. | mode/kind re-reads, and the checks that exist only to catch a caller passing the wrong one. | **done** (see below) |
-| 8 | **The crate's own contract is not reachable by accident**: the weak, unverified or unenforced path is reachable only through a name that states it. | the "documented but not enforced" bullets. | **done** (see below; one stated residual remains by decision) |
+| 8 | **The crate's own contract is not reachable by accident**: the weak, unverified or unenforced path is reachable only through a name that states it. | the "documented but not enforced" bullets. | **done** (see below; FIVE residuals remain by decision, each named at its item) |
 
 ## The pair-less mutations
 

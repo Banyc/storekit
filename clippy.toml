@@ -230,8 +230,9 @@ disallowed-methods = [
   # libc — the mutation symbols the crate funnels, plus the wider reviewed set
   # around them. Each reason below is the mutation class of the symbol. A symbol
   # the CURRENT target does not export produces a non-fatal config-time "does
-  # not refer to a reachable function" warning (the README gives the per-target
-  # counting command); the deny still applies on the targets that do export it.
+  # not refer to a reachable function" warning; `cargo clippy --lib -- -D warnings`
+  # still exits 0 and prints `generated N warnings` for it, and the deny applies
+  # on every target that DOES export the symbol.
   # These entries are what refuses a cross-module `use libc as c;` route at the
   # compiler. They are NOT a claim to cover the whole POSIX family; a mutating
   # symbol absent from this list is a stated REVIEW boundary (see the `libc`
