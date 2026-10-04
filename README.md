@@ -443,15 +443,20 @@ that has drifted: the `-A` allows module docs to link PRIVATE items, which this 
 does deliberately for its maintainers, while an UNRESOLVED link — a renamed item, a
 misspelled path — stays a hard error.
 
-`STOREKIT_FULL_TESTS=1` does not add test names: FOUR tests consult it. Three
-return early with a printed skip
-reason — the atomic replace's sweep over EVERY pre-rename stage, the
-concurrent-controller ssh case, and the every-boundary swap case — and one
-widens its own exhaustive sweep instead
-(`valid_name_agrees_with_the_independent_characterization`). The default run
-covers sampled shapes; the widened run covers all of them. (The search
-`rg -n slow_tests_enabled src` returns SIX hits: those four, the definition, and
-one `use`.)
+`STOREKIT_FULL_TESTS=1` does not add test names: it WIDENS the suite in place, and
+two wrappers read the variable.
+
+* `slow_tests_enabled()` — FOUR tests consult it. Three return early with a
+  printed skip reason: the atomic replace's sweep over EVERY pre-rename stage, the
+  concurrent-controller ssh case, and the every-boundary swap case. One widens its
+  own exhaustive sweep instead
+  (`valid_name_agrees_with_the_independent_characterization`). The default run
+  covers sampled shapes; the widened run covers all of them. (The search
+  `rg -n slow_tests_enabled src` returns SIX hits: those four, the definition, and
+  one `use`.)
+* `proptest_cases(..)` — every property test that sizes its case count through it
+  widens under the same variable, so the widened run also covers more generated
+  cases, not more test names.
 
 TWO clippy commands, and the second is not optional: `--all-targets` compiles the HOST
 only, and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module is

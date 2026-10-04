@@ -58,11 +58,7 @@
 //! the lock-record subset ([`is_lock_record_name`]) through the ONE guard
 //! authority (`crate::atomic::guard`), so the record's stable inode cannot be
 //! unlinked, replaced, truncated, or renamed through the substrate's
-//! name-mutating funnel. The crate's mutating
-//! primitives consult the lock-record subset ([`is_lock_record_name`]) through
-//! the ONE gate authority (`crate::atomic::guard`), so the record's stable
-//! inode cannot be unlinked, replaced, truncated, or renamed through the
-//! substrate's name-mutating funnel. The SAME gate consults the RESIDUE subset
+//! name-mutating funnel. The SAME guard consults the RESIDUE subset
 //! ([`is_residue_name`]) on every component, so a mutating primitive can no
 //! longer destroy a stranded aside that HOLDS an original; the sanctioned
 //! breaks are the explicit [`crate::sync::Residue::discard`], the engine's own
