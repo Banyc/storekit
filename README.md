@@ -603,18 +603,27 @@ the other, and the gate must run both.
 
 * The **resolved-symbol deny** (`clippy.toml` + `#![deny(clippy::disallowed_methods)]`
 at the crate root) makes the compiler refuse a call to any listed name-mutating
-symbol (`std::fs::{remove_file,remove_dir,remove_dir_all,rename,hard_link,set_permissions}`
-and the `libc` syscalls the funnel wraps) from any module not granted the allow.
-This is the **completeness** device: it matches the symbol the compiler RESOLVED,
+symbol — the free-function removal/replace/rename family, the name-CREATING std
+wrappers, the mode authority, and the `libc` syscalls the funnel wraps — from any
+module not granted the allow. The list itself is the authority and is deliberately
+not repeated here: an earlier version of this bullet enumerated it and went stale
+within one round. This is the **completeness** device: it matches the symbol the
+compiler RESOLVED,
 so no alias, raw identifier, cross-module re-export, glob, parenthesized or
 referenced callee, macro body, or `#[path]`-relocated module evades it — all eight
-shapes were measured against it. It runs only under `cargo clippy`, so
-`cargo clippy --all-targets -- -D warnings` is part of the gate and `cargo test`
-alone does not exercise it.
+shapes were measured against it. It runs only under `cargo clippy`, on the HOST
+target, so `cargo clippy --all-targets -- -D warnings` is part of the gate and
+`cargo test` alone does not exercise it — and a `#[cfg(windows)]`-only module needs
+`cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings`, which
+`cargo check --target …` does NOT substitute for (rustc does not run lints).
 * The **two source audits** in `atomic::guard::tests` run under `cargo test`, i.e.
-always: `no_libc_reference_outside_the_funnel` fails on a new `libc` reference
-outside the funnel, and `std_fs_name_mutation_counts_are_pinned` fails when a
-production `std::fs` removal/replace/rename call count changes. Their job is what
+always, and under BOTH targets' `cargo check`: `no_libc_reference_outside_the_funnel`
+fails when a `libc` reference appears outside the funnel or when the funnel's own
+per-module `libc` reference surface changes, and
+`std_fs_name_mutation_counts_are_pinned` fails when a production name-mutating call
+count changes (removal, replacement, creation or mode). The funnel's membership is
+DERIVED from the source (the modules carrying the module-level allow), so neither
+audit's prose restates it. Their job is what
 the lint cannot do — notice when the funnel's OWN calls change, inside the modules
 where the deny is allowed and therefore blind — and they resolve the enumerated
 import routes by PARSING the sources, independently of the lint's symbol
