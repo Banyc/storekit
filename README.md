@@ -621,8 +621,13 @@ import routes by PARSING the sources, independently of the lint's symbol
 resolution.
 
 Together they back the rule that every name mutation goes through the ONE guarded
-funnel, and `clippy.toml`'s allow list (whose comments name the rule each module
-implements) IS the operative definition of the funnel's membership.
+funnel, and the operative definition of that membership is the set of
+`#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level in
+`src/atomic/{mod,unix,windows}.rs`, plus item-level ones for the two
+capability-gated workers in `transport`, `platform::chmod`, and one reviewed
+exception for the ssh hostkey cache. `clippy.toml` itself holds only the DENY
+side: an earlier version of this sentence called its "allow list" the operative
+definition, and there is no allow list there to read.
 
 **Review conventions, NOT mechanical checks.** The rest of this list is enforced
 by review: in particular "fix the class, not the instance", "an oracle must be

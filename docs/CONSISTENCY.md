@@ -329,7 +329,19 @@ three and NO runtime check existed to catch any of them (the count of such
 guards was zero, which is why the fix is a TYPE, not a branch deletion, at
 that edge). `DestinationTree`'s payload is now `pub(crate)` and the diff/apply
 entry points are direction-typed. Proof: two `compile_fail` doctests, each
-`E0308` (`expected &TreeMetadata, found &DestinationTree`). The one branch
+`E0308` (`expected &TreeMetadata, found &DestinationTree`).
+
+What that fix CLOSES and what it does NOT, because this entry once listed all
+three as closed: the `pub(crate)` payload closes SERIALIZATION, and the
+direction-typed entry points close PASSING a destination where a source is
+required — both proven by the `E0308` doctests. It does NOT close the REBUILD
+route: `TreeMetadata`'s fields are `pub` by design, so a caller can construct one
+from the destination's public accessors and `verify_tree_metadata` accepts it
+(round 3 found exactly that, `src/manifest/mod.rs`'s doc states it, and the
+CONSTRAINT doc's copy of the broad claim had to be corrected in round 5 because
+the round-3 fix touched only `src/`). Closing it would require SEALING
+`TreeMetadata`, a breaking change to a consumer that the crate does not make.
+The one branch
 class the split DID delete is the walk's runtime policy mode
 (`UnsupportedPolicy` plus the deferred `unsupported_reason: Option<...>`),
 now a `UnsupportedSink` type.
