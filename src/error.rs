@@ -78,12 +78,21 @@ pub enum Error {
     #[error("invalid reference: {0}")]
     Ref(String),
 
+    /// A refusal to break the crate's own bookkeeping. The reserved-spelling
+    /// authority raises it for a LOCK-record spelling: the public, PATH-BASED
+    /// [`crate::platform::symlink`] runs that authority before any syscall, so
+    /// a caller cannot create `operation.lock` / `.<name>.operation.lock` (or
+    /// a case / trailing-dot alias) through it; the descriptor-confined twin
+    /// [`crate::atomic::symlink_fd`] raises the same variant.
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// A TYPED reserved-spelling / residue refusal from the substrate's ONE gate
+    /// A TYPED reserved-spelling / residue refusal from the crate's ONE gate
     /// (or a residue recovery). A consumer branches on [`ReservedKind`] instead
-    /// of string-matching the message. The message KEEPS the historical
+    /// of string-matching the message. The public [`crate::platform::symlink`]
+    /// raises it for a `.sync-aside.…` residue spelling, and the
+    /// descriptor-confined mutators raise it for a residue on any component.
+    /// The message KEEPS the historical
     /// `ResidueBelow` token, so a caller that already matches the text is
     /// unaffected.
     #[error("reserved spelling: {reason:?}: {message}")]

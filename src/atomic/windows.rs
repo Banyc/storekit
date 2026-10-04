@@ -235,9 +235,10 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
 /// Windows port carries its documented weaker guarantees:
 ///
 /// * no Unix mode bits (nothing is chmodded);
-/// * a symlink is recreated best-effort through [`crate::platform::symlink`]
-///   (Windows symlinks need admin/developer mode; a failure is a propagated
-///   `Err`, never a silent materialization);
+/// * a symlink is recreated best-effort through the UNGUARDED
+///   `crate::platform::symlink_verbatim` (Windows symlinks need
+///   admin/developer mode; a failure is a propagated `Err`, never a silent
+///   materialization);
 /// * HARD LINKS ARE NOT DETECTED, so a hard-linked source file is duplicated
 ///   into an independent regular file (Unix refuses them);
 /// * the shared overlap refusal and the all-or-nothing create-new landing
@@ -338,7 +339,10 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
         } else if ft.is_symlink() {
             let link = std::fs::read_link(&from)
                 .map_err(|e| Error::store(format!("readlink {}: {e}", from.display())))?;
-            crate::platform::symlink(&link, &to).map_err(|e| {
+            // The UNGUARDED creator is deliberate: this copy must CARRY
+            // reserved/temp spellings into its destination. The name states
+            // the weakness (API constraint #8).
+            crate::platform::symlink_verbatim(&link, &to).map_err(|e| {
                 Error::store(format!(
                     "copy_tree_verbatim: refusing to replace the existing destination entry {} \
                      with a symlink ({e})",

@@ -478,8 +478,8 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
 ///
 /// The Windows twin copies the same fields but carries the port's documented
 /// weaker guarantees: no Unix mode bits are applied, a symlink is recreated
-/// best-effort through [`crate::platform::symlink`] (which needs
-/// admin/developer mode), and HARD LINKS ARE NOT DETECTED, so a hard-linked
+/// best-effort through the UNGUARDED `crate::platform::symlink_verbatim` (which
+/// needs admin/developer mode), and HARD LINKS ARE NOT DETECTED, so a hard-linked
 /// source file is duplicated into an independent regular file. The overlap
 /// refusal is shared.
 pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
@@ -618,7 +618,10 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
         } else if ft.is_symlink() {
             let link = std::fs::read_link(&from)
                 .map_err(|e| Error::store(format!("readlink {}: {e}", from.display())))?;
-            crate::platform::symlink(&link, &to).map_err(|e| {
+            // The UNGUARDED creator is deliberate: this copy must CARRY
+            // reserved/temp spellings into its destination. The name states
+            // the weakness (API constraint #8).
+            crate::platform::symlink_verbatim(&link, &to).map_err(|e| {
                 Error::store(format!(
                     "copy_tree_verbatim: refusing to replace the existing destination entry {} \
                      with a symlink ({e})",
@@ -5622,6 +5625,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(src.join("sub/inner"), b"INNER").unwrap();
+        // A RESERVED-named SYMLINK: the copy must carry the reserved spelling
+        // through its UNGUARDED creator (`symlink_verbatim`). This is what
+        // pins the tolerance against a future edit that routes the copy back
+        // through the guarded `platform::symlink`.
+        std::os::unix::fs::symlink("aside-target", src.join(".sync-aside.link")).unwrap();
         // An ABSOLUTE symlink target: the strict copy refuses it, the verbatim
         // copy reproduces the link DATA exactly.
         std::os::unix::fs::symlink("/verbatim/absolute/target", src.join("abs-link")).unwrap();
@@ -5662,6 +5670,21 @@ mod tests {
             std::fs::read_link(dst.join("abs-link")).unwrap(),
             Path::new("/verbatim/absolute/target"),
             "the link DATA is reproduced verbatim, absolute target included"
+        );
+        assert!(
+            crate::reserved::is_residue_name(".sync-aside.link"),
+            "premise: the carried symlink name really is a reserved residue spelling"
+        );
+        let aside_link = std::fs::symlink_metadata(dst.join(".sync-aside.link"))
+            .expect("the reserved-named symlink is carried into the destination");
+        assert!(
+            aside_link.file_type().is_symlink(),
+            "the reserved-named entry stays a symlink"
+        );
+        assert_eq!(
+            std::fs::read_link(dst.join(".sync-aside.link")).unwrap(),
+            Path::new("aside-target"),
+            "the reserved-named symlink's target is reproduced verbatim"
         );
     }
 

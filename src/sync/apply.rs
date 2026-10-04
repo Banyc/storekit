@@ -2876,11 +2876,28 @@ impl Prepared {
         // (4) The transport's LOCALNESS, for BOTH directions. The identity
         // check above cannot see this when BOTH transports state `None`, so
         // this is the ONE axis that keeps a token minted against a LOCAL
-        // source distinct from a NON-LOCAL source that reports the same root
-        // and no identity. This is the token's
+        // source/destination distinct from a NON-LOCAL one that reports the
+        // same root and no identity. This is the token's
         // authority for the binding; the mint-time [`require_endpoint_identity`]
         // stays the authority for "a NON-LOCAL transport must state an identity
         // to MINT at all", so no second check is needed on the run paths.
+        //
+        // REMOVE-AND-TEST: each DIRECTION is pinned by its OWN test in
+        // `tests/ownership_endpoint.rs`, because the two directions flip the
+        // role the remote plays and a single-direction test cannot catch a
+        // direction gate here. PULL (the remote is the SOURCE):
+        // `a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local`
+        // and its equal-content twin
+        // `a_pull_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip`.
+        // PUSH (the remote is the DESTINATION):
+        // `a_push_token_is_refused_when_the_destination_flips_from_local_to_non_local`
+        // and its equal-content twin
+        // `a_push_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip`.
+        // Gating this comparison on `direction == Direction::Pull` leaves every
+        // PULL test green and turns the PUSH twins RED; gating it on
+        // `Direction::Push` turns the PULL tests RED. Before the PUSH twins
+        // existed the Pull gate left the WHOLE suite green — only the PULL
+        // direction was pinned.
         let remote_is_local = remote.is_local();
         if remote_is_local != self.remote_is_local {
             return Err(Error::preflight_kind(

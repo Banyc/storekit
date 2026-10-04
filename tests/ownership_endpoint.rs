@@ -706,3 +706,157 @@ fn a_pull_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip(
         "the local destination must be unmutated by the refused pull"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PUSH: the token binds the DESTINATION's LOCALNESS (the other direction of
+// the same `None`-identity hole)
+// ---------------------------------------------------------------------------
+
+/// The sorted entry names directly under `dir`, for an UNMUTATED comparison.
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read the destination directory")
+        .map(|entry| {
+            entry
+                .expect("read a destination entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// THE PUSH TWIN of
+/// [`a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local`].
+///
+/// `Prepared::matches` step 4 compares the remote's LOCALNESS for BOTH
+/// directions, but before this test only the PULL direction was pinned: gating
+/// step 4 on `direction == Direction::Pull` left the ENTIRE suite green, so a
+/// future edit could re-open the PUSH half of round 9's P1. A token minted
+/// against a LOCAL destination — `DestinationOwnership::lock(Direction::Push,
+/// src, &LocalTransport over P)` records `remote_is_local == true` and states
+/// no endpoint identity — is replayed against a NON-LOCAL third-party `Remote`
+/// that states the SAME root spelling and NO identity. Direction, local root,
+/// remote root and identity (`None == None`) therefore all match, and ONLY the
+/// localness axis can refuse.
+///
+/// Before the fix this run MUTATES the non-local destination (the token's
+/// lock was taken on a different, local tree). The refusal now precedes
+/// `run`, so the non-local destination is byte-for-byte unmutated.
+#[test]
+fn a_push_token_is_refused_when_the_destination_flips_from_local_to_non_local() {
+    let f = fixture();
+    // The LOCAL destination the token is minted against. Its root spelling is
+    // the SHARED layout spelling, so LOCALNESS is the only axis that
+    // distinguishes it from the non-local destination below.
+    std::fs::create_dir_all(&f.shared_root).expect("create the shared root");
+    std::fs::write(f.shared_root.join("sentinel"), b"local-only")
+        .expect("seed the local destination");
+    let local_dest = LocalTransport::new(
+        &SysEnv::from_process(),
+        f.shared_root.clone(),
+        Layout::empty(),
+    )
+    .expect("a LocalTransport over the shared root");
+
+    let token = DestinationOwnership::lock(Direction::Push, &f.src, &local_dest)
+        .expect("mint a push token against the LOCAL destination");
+
+    // The non-local destination the run is handed: the SAME root spelling, NO
+    // endpoint identity, and DIFFERENT content.
+    let non_local_dest =
+        EndpointRemote::new(f.dir.path().join("dst-b"), f.shared_root.clone(), None);
+    std::fs::write(non_local_dest.data("sentinel"), b"non-local-bytes")
+        .expect("seed the non-local destination");
+    let before = entry_names(&non_local_dest.data_root);
+
+    let error = sync(
+        Direction::Push,
+        &f.src,
+        &non_local_dest,
+        &ReplaceAll,
+        Extraneous::Keep,
+        token,
+    )
+    .expect_err(
+        "a push token minted against a LOCAL destination must be refused for a non-local one",
+    );
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteLocalnessMismatch),
+        "the refusal must be the typed LOCALNESS mismatch, not a post-transfer verification \
+         failure or a silent success: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(non_local_dest.data("sentinel")).expect("the non-local sentinel"),
+        b"non-local-bytes",
+        "the non-local destination must be UNMUTATED by the refused push"
+    );
+    assert_eq!(
+        entry_names(&non_local_dest.data_root),
+        before,
+        "the non-local destination's entry set must be unchanged by the refused push"
+    );
+    assert!(
+        !non_local_dest.data("f").exists(),
+        "the refused push must not copy the source entry into the non-local destination"
+    );
+}
+
+/// The EQUAL-CONTENT variant of the PUSH hole: when the non-local destination
+/// already holds byte-identical content, the run has nothing left to write, so
+/// before the fix `sync` would verify cleanly and return **`Ok`** — the token
+/// minted for a LOCAL destination applied to a non-local one with nothing to
+/// catch it. The localness axis is what makes this run refusable at all.
+#[test]
+fn a_push_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip() {
+    let f = fixture();
+    std::fs::create_dir_all(&f.shared_root).expect("create the shared root");
+    // The local destination holds exactly the source content.
+    std::fs::write(f.shared_root.join("f"), b"payload").expect("seed the local destination");
+    let local_dest = LocalTransport::new(
+        &SysEnv::from_process(),
+        f.shared_root.clone(),
+        Layout::empty(),
+    )
+    .expect("a LocalTransport over the shared root");
+
+    let token = DestinationOwnership::lock(Direction::Push, &f.src, &local_dest)
+        .expect("mint a push token against the LOCAL destination");
+
+    let non_local_dest =
+        EndpointRemote::new(f.dir.path().join("dst-b"), f.shared_root.clone(), None);
+    std::fs::write(non_local_dest.data("f"), b"payload")
+        .expect("seed the non-local destination with equal content");
+    let before = entry_names(&non_local_dest.data_root);
+
+    let error = sync(
+        Direction::Push,
+        &f.src,
+        &non_local_dest,
+        &ReplaceAll,
+        Extraneous::Keep,
+        token,
+    )
+    .expect_err(
+        "even EQUAL content must not hide a local->non-local destination flip: returning `Ok` \
+         here means the token minted for a local destination was applied to a non-local one",
+    );
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteLocalnessMismatch),
+        "the refusal must be the typed LOCALNESS mismatch: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(non_local_dest.data("f")).expect("the non-local content"),
+        b"payload",
+        "the non-local destination must be UNMUTATED by the refused push"
+    );
+    assert_eq!(
+        entry_names(&non_local_dest.data_root),
+        before,
+        "the non-local destination's entry set must be unchanged by the refused push"
+    );
+}

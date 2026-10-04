@@ -92,13 +92,45 @@ pub fn metadata_mode(m: &std::fs::Metadata) -> u32 {
 /// (which requires admin/developer mode; a failure propagates). Documented
 /// weaker guarantee of the Windows port.
 ///
+/// # The reserved-spelling guard
+///
+/// This public, PATH-BASED creation runs the crate's ONE reserved-spelling
+/// authority (`crate::atomic::refuse_reserved_mutation`) on `link` BEFORE any
+/// syscall, exactly as the descriptor-confined `crate::atomic::symlink_fd`
+/// does. A caller therefore cannot use it to create the crate's own
+/// bookkeeping names — the application lock record, a `.<name>.operation.lock`
+/// sibling, or a `.sync-aside.…` residue — and the refusal is TYPED
+/// ([`crate::Error::Conflict`] for a lock-record spelling,
+/// [`crate::error::ReservedKind::ResidueBelow`] for a residue) rather than a
+/// bare `EEXIST`. A LEGITIMATE name is created exactly as before.
+///
+/// The ONE deliberately UNGUARDED symlink creator is the `pub(crate)`
+/// `symlink_verbatim`, which `crate::atomic::copy_tree_verbatim` uses because a
+/// verbatim copy must CARRY reserved and temp spellings into its destination.
+/// Its name states the weakness (API constraint #8); a caller outside the
+/// crate always reaches the guarded form below.
+pub fn symlink(target: &Path, link: &Path) -> crate::Result<()> {
+    crate::atomic::refuse_reserved_mutation(link, crate::atomic::Sanction::None)?;
+    symlink_verbatim(target, link).map_err(crate::Error::from)
+}
+
+/// Create a symlink WITHOUT the reserved-spelling guard — the SANCTIONED weak
+/// path, named as such (API constraint #8).
+///
+/// `crate::atomic::copy_tree_verbatim` must reproduce its source VERBATIM,
+/// including the crate's own lock-record and residue/temp spellings, so running
+/// the guard here would change the copy's contract. Every OTHER caller comes
+/// through the guarded [`symlink`]; the fd-confined primitives in
+/// `crate::atomic` run the reserved-spelling authority themselves and need
+/// nothing from this function.
+///
 /// This is the crate's ONE production std-symlink site (a name CREATION), so
 /// the crate-root `#![deny(clippy::disallowed_methods)]` is relaxed here for
 /// exactly this function: the three platform-symlink wrappers below are on the
 /// deny list and this is the single reviewed entry point to them. No other
 /// production site may call them.
 #[allow(clippy::disallowed_methods)]
-pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+pub(crate) fn symlink_verbatim(target: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(target, link)
