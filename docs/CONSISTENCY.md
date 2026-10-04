@@ -383,7 +383,10 @@ whole suite stay green (659 + 2 lib, every integration suite, 11 doc-tests):
 `lock` is covered by
 `a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token`,
 `lock_remote` by `a_transport_without_an_endpoint_identity_cannot_mint_a_remote_token`,
-and `lock_with_in_root_lock` by a test added in round 3 for exactly this reason.
+and `lock_with_in_root_lock` by `a_composed_mint_refuses_a_non_local_source_without_an_endpoint_identity`,
+added in round 3 for exactly this reason (it must PRE-CREATE the destination root,
+because the endpoint guard is ordered before `require_existing_root`, so an absent
+root would refuse for a different reason and mask the guard's removal).
 The guard was present on all three from the start; on the third it was
 UNREGRESSIBLE, which is one step from absent. The lesson is this file's usual
 one: a guard is a guard only if a test notices its removal, and a coverage claim
