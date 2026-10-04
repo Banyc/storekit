@@ -39,10 +39,12 @@ This block is the ONE enumeration of the mutations that do NOT take
 `(&RootDir, &RootedRelativePath)`, and it is MACHINE-CHECKED: a test finds exactly one
 such block, resolves every name in it to a real item, and separately derives the public
 raw-path surface so that a member missing from the block is a FAILING TEST. The
-read-only primitives that also take a `&Path` (`platform::file_mode`,
-`atomic::path_state`, `sync::diff::local_manifest`, `manifest::canonicalize_tree(_destination)`,
-`manifest::verify_tree_metadata`, `RootDir::open`, `OwnedRoot::parse`,
-`atomic::temp_name_for`) are exempt in that test, each with its reason.
+primitives that also take a `&Path` but are NOT name mutations are exempt in that test,
+each with a stated reason, in the reviewed exemption list inside `src/atomic/guard.rs` —
+read-only probes, path algebra, and the `DestinationOwnership` / `sync` entry points
+whose `&Path` is the ROOT rather than the name being mutated. That list, not this row,
+is the enumeration: the test derives the population, and the exemptions are the residue
+a reviewer checks one entry at a time.
 
 ## What constraint 8 closed
 

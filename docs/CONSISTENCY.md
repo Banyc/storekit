@@ -98,6 +98,13 @@ Named, scoped, not pursued:
   (`libc::shm_rename` is FreeBSD-only), so on both targets they are decoration;
   they are kept as the reviewed set's record rather than pruned, and this is the
   residual that covers them.
+- **The far-side root of an `SshTransport` destination is unresolvable from here.**
+  When the remote is not local its root names a path on another host, so nothing this
+  host can see establishes that it is disjoint from the local root — they may be a
+  bind mount, a shared filesystem, or an `ssh` target that is this very host. No
+  refusal is computed there and none is implied: a caller that co-locates the two on
+  one filesystem enforces disjointness itself. Stated at `src/sync/apply.rs`'s module
+  docs.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

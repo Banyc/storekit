@@ -173,6 +173,13 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// `docs/CONSISTENCY.md`, axis M) — and a public-API name is justified by a
 /// consumer's need, never by this crate's own tests. The Windows port keeps
 /// the same PUBLIC name because its fd surface is path-based throughout.
+///
+/// THE `fault` SEAM: `fault` is consulted before each stage that can fail and an
+/// `Err` it returns INJECTS that failure, so a test can drive every failure path.
+/// It is a test seam rather than a production knob — an ordinary caller passes
+/// `&mut |_| None` — and it is a required parameter rather than a defaulted one
+/// so that no production call site acquires fault-injection behaviour by
+/// omission. See [`ReplaceStage`].
 pub fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
@@ -1241,6 +1248,9 @@ fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Er
 /// the cleanup failure carried with the original one), so a failed replace
 /// leaves no stray temp; the post-rename parent-fsync failure is NOT a
 /// cleanup point (the temp name no longer exists).
+///
+/// THE `fault` SEAM: see [`write_atomic_replace`]; an ordinary caller passes
+/// `&mut |_| None`.
 pub fn write_atomic_replace_fd(
     root: &RootDir,
     rel: &RootedRelativePath,

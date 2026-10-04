@@ -111,8 +111,9 @@ MATCH. They deliberately leave the application lock record and the case/trailing
 dot aliases alone, so they are NOT on their own the answer to "may I use this
 name": `is_reserved_name` is the primitive the broad authorities are BUILT on
 (`is_unaddressable_name`, `is_reserved_case_alias`), and `is_reserved_path` is
-public for a caller that needs exactly the byte-exact question — this crate does
-not call it. What the sync STRIPS with is the BROAD authority:
+public for a caller that needs exactly the byte-exact question — this crate's
+PRODUCTION code does not call it (a unit test does). What the sync STRIPS with is
+the BROAD authority:
 `is_unaddressable_path` for the source view and `is_residue_path` for the
 destination view, at `sync::diff`'s `strip_reserved` call sites. An unaddressable
 spelling is refused as an identifier and is never transferred by a sync. A
@@ -410,7 +411,9 @@ takes responsibility for exactly this, and no more.
   raw `syscall(SYS_…)`, an `extern "C"` declaration, a `windows_sys` creator, a
   proc-macro-generated call, third-party code. Keeping the funnel complete is a REVIEW
   responsibility over the symbols the crate actually names. `docs/CONSISTENCY.md`
-  lists every stated residual with its reach.
+  states the residuals the CONTRACT rests on, and `docs/API-CONSTRAINTS.md` names the
+  ones its constraints leave at each item; a seam with a reach of its own states it
+  where it lives.
 
 The operative definition of the funnel is the set of
 `#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level in the
@@ -432,21 +435,29 @@ cargo test
 STOREKIT_FULL_TESTS=1 cargo test       # NOT optional; see below
 cargo check --all-targets --target x86_64-pc-windows-msvc
 cargo test --doc
+RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --no-deps
 ```
 
-`STOREKIT_FULL_TESTS=1` does not add test names: FOUR tests consult it, measured
-with `rg -n slow_tests_enabled src`. Three return early with a printed skip
+`cargo doc` is in the gate because a doc link that no longer resolves is a citation
+that has drifted: the `-A` allows module docs to link PRIVATE items, which this crate
+does deliberately for its maintainers, while an UNRESOLVED link — a renamed item, a
+misspelled path — stays a hard error.
+
+`STOREKIT_FULL_TESTS=1` does not add test names: FOUR tests consult it. Three
+return early with a printed skip
 reason — the atomic replace's sweep over EVERY pre-rename stage, the
 concurrent-controller ssh case, and the every-boundary swap case — and one
 widens its own exhaustive sweep instead
 (`valid_name_agrees_with_the_independent_characterization`). The default run
-covers sampled shapes; the widened run covers all of them. The real-`sshd`
-suites do NOT consult it and run under plain `cargo test` on Linux.
+covers sampled shapes; the widened run covers all of them. (The search
+`rg -n slow_tests_enabled src` returns SIX hits: those four, the definition, and
+one `use`.)
 
 TWO clippy commands, and the second is not optional: `--all-targets` compiles the HOST
 only, and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module is
-invisible to both. On Linux the real-`sshd` suites (`remote_lock`, `ssh_farside_*`) are
-part of `cargo test`.
+invisible to both. On Linux, `remote_lock` — which stands up a REAL `sshd` — is
+part of `cargo test`, while the `ssh_farside_*` suites drive the far-side
+protocol through a `PATH` shim, not a real `ssh`.
 
 ## Rules for changing this crate
 

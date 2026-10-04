@@ -25,28 +25,40 @@
 //! is a root directory; a name is a validated string; a transfer is a
 //! comparison of two manifests.
 //!
-//! # The name-mutation funnel is enforced by the COMPILER, not a source scan
+//! # The name-mutation funnel: what the compiler refuses, and what is NOT promised
 //!
-//! Every inode-NAME mutation (`std::fs` and `libc`) may be issued only from a
-//! site annotated with `#[allow(clippy::disallowed_methods)]` — a funnel module
-//! carrying the module-level attribute, or a single reviewed function carrying the
-//! item-level one. Everywhere else the lint is a hard
-//! error: `#![deny(clippy::disallowed_methods)]` below, with the symbol list in
-//! `clippy.toml`. Because the lint matches the RESOLVED symbol, no spelling
-//! route evades it — an alias, a re-export, a raw identifier, a parenthesized
-//! or referenced callee, a `macro_rules!` body, or a `#[path]`-relocated
-//! module all resolve to the same disallowed path. The SET of annotated sites is
-//! the funnel's membership, and it is deliberately not enumerated here: it is
-//! whatever `rg -n 'allow\(clippy::disallowed_methods\)' src` reports, and each
-//! site carries a comment naming the rule it implements. A symbol the funnel
-//! itself calls is checked against `clippy.toml` by
-//! `atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`,
-//! so the deny list cannot drift from the code.
+//! THREE devices, each with a different job, and none of them a completeness proof:
 //!
-//! This is a COMPLETENESS device, distinct from the count PIN in
-//! `atomic::guard.rs`: the pin notices when the funnel's OWN calls change
-//! (inside the allowed modules, where this lint is blind); the lint notices a
-//! call anywhere else. Neither covers the other.
+//! * **The resolved-symbol deny** — `#![deny(clippy::disallowed_methods)]` below,
+//!   with the symbol list in `clippy.toml` — refuses a call to a LISTED symbol from
+//!   any site not carrying `#[allow(clippy::disallowed_methods)]`: a funnel module
+//!   with the module-level attribute, or a single reviewed function with the
+//!   item-level one. Because the lint matches the RESOLVED symbol, no spelling route
+//!   reaches a listed symbol — an alias, a re-export, a raw identifier, a
+//!   parenthesized or referenced callee, a `macro_rules!` body, or a
+//!   `#[path]`-relocated module all resolve to the same disallowed path — and
+//!   `atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`
+//!   keeps the list from drifting from what the funnel itself calls. The list is
+//!   deliberately WIDER than the funnel: naming a symbol the funnel does not call
+//!   today is how a route it could acquire later is refused in advance.
+//! * **The `libc` pin**
+//!   (`atomic::guard::tests::every_production_libc_reference_is_pinned`) enumerates
+//!   every production `libc` reference by file, symbol and count and asserts that the
+//!   map of references NOT on the pin is EMPTY, so an unreviewed reference fails a
+//!   test. It records a REVIEW; it does not prove a pinned reference harmless.
+//! * **The count pins** notice a change INSIDE the funnel — where this lint is
+//!   allowed and therefore blind — for every call their derivation can RESOLVE: a
+//!   direct call, an inherent or builder method on a path-resolvable receiver, or a
+//!   call held in an enclosing `let`. A call whose receiver arrives as a parameter, a
+//!   return, a struct field or a function pointer moves no count.
+//!
+//! **NOT promised:** that EVERY name mutation anywhere goes through this funnel. That
+//! claim quantifies over the whole language and is not certifiable — a mutating symbol
+//! nobody listed, a raw `syscall(SYS_…)`, a local `extern "C"` declaration, a
+//! `windows_sys` creator, a macro that emits a call, and third-party code are outside
+//! every device above. Keeping the symbol set complete is a REVIEW responsibility. The
+//! contract this crate DOES hold is in `README.md`, and every stated residual with its
+//! reach is in `docs/CONSISTENCY.md`.
 #![deny(clippy::disallowed_methods)]
 
 pub mod atomic;

@@ -80,6 +80,13 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// enumerates. It is PUBLIC because it is part of the interface this crate
 /// was extracted from — and on this port it IS the body of the fd surface
 /// ([`write_atomic_replace_fd`]), which is path-based throughout.
+///
+/// THE `fault` SEAM: `fault` is consulted before each stage that can fail and an
+/// `Err` it returns INJECTS that failure, so a test can drive every failure path.
+/// It is a test seam rather than a production knob — an ordinary caller passes
+/// `&mut |_| None` — and it is a required parameter rather than a defaulted one
+/// so that no production call site acquires fault-injection behaviour by
+/// omission. See [`ReplaceStage`].
 pub fn write_atomic_replace(
     path: &Path,
     bytes: &[u8],
@@ -903,6 +910,9 @@ pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &RootedRelativePath) -> Resu
 /// Path-based atomic replace (see [`write_atomic_replace`]). Refuses a crate
 /// lock-record spelling (the stable-inode discipline's structural guard; see
 /// the Unix port).
+///
+/// THE `fault` SEAM: see [`write_atomic_replace`]; an ordinary caller passes
+/// `&mut |_| None`.
 pub fn write_atomic_replace_fd(
     root: &RootDir,
     rel: &RootedRelativePath,
