@@ -425,70 +425,6 @@ historical register ("`parse_mode` was removed"), and no text scan distinguishes
 than shipped, and it is recorded here because a discarded instrument is the same
 mistake as the defects it was meant to catch.
 
-## The adversarial review (round 3)
-
-Six findings, all fixed. Three of them are about ONE thing — the `std::fs` audit's
-coverage versus its claim — and one of those is a claim I wrote in round 2.
-
-| # | finding | axis | fixed by |
-|---|---|---|---|
-| 1 | The audit was a TEXT scanner losing to Rust, in three ways, each proven GREEN end-to-end with a real production module compiled into the library (macOS and Linux): a CROSS-FILE module alias (`pub(crate) use std::fs as hidden_fs;` in module A, called as `crate::a::hidden_fs::remove_file` in B — the scanner resolved `use` items per FILE); a RAW IDENTIFIER (`use std::fs as r#fx;` + `r#fx::remove_file` — names were matched as byte strings, so `r#fx != fx`); and exemption by path POSITION (`src/probe/tests.rs`, declared `mod tests;` with no `#[cfg]`, was treated as test-only and could hold a raw `libc::unlinkat`). | H | `pmxknosuoqzn` |
-| 2 | Manifest paths were converted to host paths with the HOST path model, so on Windows the two distinct manifest entries `a\b` and `a/b` address ONE file — while the crate's own model holds both at once (`canonicalize_tree` yields `["a\\b", "a/b"]`), and its docs called the `/`-only wire rule "exactly the wire analogue of requiring every OS path `Component` to be `Normal`", which is false on Windows. | E | `vxpuyqzwuvpk` |
-| 3 | "`DestinationTree` cannot be used as a SOURCE manifest" was broader than the compile-checked property: `TreeMetadata`'s fields are `pub`, so a caller can REBUILD one from the destination's public accessors, and `verify_tree_metadata` then accepts it. | A | `okwtkumrzkll` |
-| 4 | Constraint #4's sentence "each enum carries an explicit `Unclassified` fallback" and its `*_reason()` convention are false for `ReservedKind` (a closed set of three, accessor `reserved_kind()`). Written this round while completing the row. | A | `xqtovuozkyst` |
-| 5 | The composed mint's endpoint guard (`lock_with_in_root_lock`) had NO test — the round-3 review REMOVED the call and the whole suite stayed green — and the round-2 sentence claiming "the new test fails when the three calls are removed" was therefore false for one of the three. | H, A | `okwtkumrzkll` (test), `ukpvrzlplzvt` (doc) |
-| 6 | The "ONE tolerated mutation" COUNT survived in four more places (`src/atomic/unix.rs` twice, `src/atomic/windows.rs` twice, and the constraint-8 bullet) after being refuted in round 1, and constraint #1's enumeration was missing a THIRD member, `lock::AdministrativeRecoveryGuard::acquire` — a public call that creates or truncates a lock record at a caller-supplied path. | M, A | `xqtovuozkyst`, `okwtkumrzkll` |
-
-**Finding 1 is the round's lesson: three rounds of adversarial review each found a
-NEW route through the same audit, so the fix was to change the MECHANISM rather
-than to close the route.** The audit now PARSES the crate's source with `syn`:
-`use` trees are expanded to leaves (raw identifiers normalised, inline `mod`
-blocks advancing the module path, block-local `use` reached), a crate-wide alias
-table is built to a FIXPOINT so resolution is transitive and independent of `use`
-order, and the pin counts RESOLVED production calls instead of byte-matching the
-canonical spelling (a superset of the old count, so "adding a production call
-changes a number" still holds; no pinned number changed). Exemption under `src/`
-is now derived ONLY from `cfg` gating, and the positional arm is restricted to the
-crate-root `tests`/`benches`/`examples` DIRECTORIES. The claims that could not
-survive were removed rather than reworded: the audit no longer says it refuses
-"every IMPORT route", it says which routes it resolves and names its residue (a
-call inside a macro or an `include!`d file from outside the package, a value
-carried through a function pointer or `dyn` dispatch, a raw `extern "C"`
-declaration, inode-preserving mutations). A text scanner cannot win against a
-language with aliases, raw identifiers, cross-module re-exports and macros; a
-parser cannot either, but it retires the whole SPELLING class instead of one
-spelling at a time, and what is left is a short list of mechanisms rather than an
-open-ended "any spelling we did not think of".
-
-**Finding 2 shows the same "wrong population" mistake in the platform axis: the
-wire model was host-independent but the CONVERSION to host paths was not.** The
-fix routes every such conversion through one authority,
-`RootedRelativePath::from_manifest(&str)`, which splits on `/` and requires each
-segment to be exactly one host `Component::Normal` (17 sites: the address
-dispatch, the parent/ancestor walks, three depth counts, `file_name`,
-`strip_prefix`, and `reserved.rs`'s predicates). Unix is unchanged (a `\` is an
-ordinary byte, one component); on Windows a segment the host cannot name is
-REFUSED with a typed error instead of being silently split, and the flip of the
-old Windows test records that its acceptance WAS the defect. The symlink TARGET
-is deliberately NOT converted: it is link DATA the kernel dereferences with the
-host's own model.
-
-**Two of the six findings are sentences I wrote in round 2**, in the very
-paragraphs recording that a constraint had been marked done while incomplete:
-the `Unclassified`/`*_reason()` generalisation, and a coverage claim asserting
-that ONE test proved three call sites when the third had no test at all. The
-second is worth stating as a rule: **a coverage claim spanning several call sites
-must name a test for EACH**, because "the new test fails when the calls are
-removed" is exactly the kind of sentence that reads as verified and is not — the
-round-3 reviewer removed one call and the entire suite stayed green.
-
-**Finding 6 is the third recurrence of one error: a COUNT standing in for a
-RULE.** Round 1 refuted "ONE tolerated exception"; the enumeration that replaced
-it then missed the sidecar helper (round 2) and now `AdministrativeRecoveryGuard::acquire`
-(round 3). A count is not a rule, and a list is not a population: only an
-enumeration paired with the GENERAL rule it exemplifies survives contact with a
-reviewer who greps for the next member.
-
 ## The adversarial review (round 2)
 
 Same two reviewers, same byte-identical prompt, run against the FIXED tree. Eight
@@ -554,3 +490,128 @@ naming neither `libc` nor `std::fs`, and inode-preserving mutations. The sidecar
 helper's raw `base: &Path` still follows pre-existing intermediate symlinks
 (bounded by caller trust in `base` and by the spelling's lexical confinement,
 now that the reserved-name hole is closed).
+
+## The adversarial review (round 3)
+
+Six findings, all fixed. Three of them are about ONE thing — the `std::fs` audit's
+coverage versus its claim — and one of those is a claim I wrote in round 2.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The audit was a TEXT scanner losing to Rust, in three ways, each proven GREEN end-to-end with a real production module compiled into the library (macOS and Linux): a CROSS-FILE module alias (`pub(crate) use std::fs as hidden_fs;` in module A, called as `crate::a::hidden_fs::remove_file` in B — the scanner resolved `use` items per FILE); a RAW IDENTIFIER (`use std::fs as r#fx;` + `r#fx::remove_file` — names were matched as byte strings, so `r#fx != fx`); and exemption by path POSITION (`src/probe/tests.rs`, declared `mod tests;` with no `#[cfg]`, was treated as test-only and could hold a raw `libc::unlinkat`). | H | `pmxknosuoqzn` |
+| 2 | Manifest paths were converted to host paths with the HOST path model, so on Windows the two distinct manifest entries `a\b` and `a/b` address ONE file — while the crate's own model holds both at once (`canonicalize_tree` yields `["a\\b", "a/b"]`), and its docs called the `/`-only wire rule "exactly the wire analogue of requiring every OS path `Component` to be `Normal`", which is false on Windows. | E | `vxpuyqzwuvpk` |
+| 3 | "`DestinationTree` cannot be used as a SOURCE manifest" was broader than the compile-checked property: `TreeMetadata`'s fields are `pub`, so a caller can REBUILD one from the destination's public accessors, and `verify_tree_metadata` then accepts it. | A | `okwtkumrzkll` |
+| 4 | Constraint #4's sentence "each enum carries an explicit `Unclassified` fallback" and its `*_reason()` convention are false for `ReservedKind` (a closed set of three, accessor `reserved_kind()`). Written this round while completing the row. | A | `xqtovuozkyst` |
+| 5 | The composed mint's endpoint guard (`lock_with_in_root_lock`) had NO test — the round-3 review REMOVED the call and the whole suite stayed green — and the round-2 sentence claiming "the new test fails when the three calls are removed" was therefore false for one of the three. | H, A | `okwtkumrzkll` (test), `ukpvrzlplzvt` (doc) |
+| 6 | The "ONE tolerated mutation" COUNT survived in four more places (`src/atomic/unix.rs` twice, `src/atomic/windows.rs` twice, and the constraint-8 bullet) after being refuted in round 1, and constraint #1's enumeration was missing a THIRD member, `lock::AdministrativeRecoveryGuard::acquire` — a public call that creates or truncates a lock record at a caller-supplied path. | M, A | `xqtovuozkyst`, `okwtkumrzkll` |
+
+**Finding 1 is the round's lesson: three rounds of adversarial review each found a
+NEW route through the same audit, so the fix was to change the MECHANISM rather
+than to close the route.** The audit now PARSES the crate's source with `syn`:
+`use` trees are expanded to leaves (raw identifiers normalised, inline `mod`
+blocks advancing the module path, block-local `use` reached), a crate-wide alias
+table is built to a FIXPOINT so resolution is transitive and independent of `use`
+order, and the pin counts RESOLVED production calls instead of byte-matching the
+canonical spelling (a superset of the old count, so "adding a production call
+changes a number" still holds; no pinned number changed). Exemption under `src/`
+is now derived ONLY from `cfg` gating, and the positional arm is restricted to the
+crate-root `tests`/`benches`/`examples` DIRECTORIES. The claims that could not
+survive were removed rather than reworded: the audit no longer says it refuses
+"every IMPORT route", it says which routes it resolves and names its residue (a
+call inside a macro or an `include!`d file from outside the package, a value
+carried through a function pointer or `dyn` dispatch, a raw `extern "C"`
+declaration, inode-preserving mutations). A text scanner cannot win against a
+language with aliases, raw identifiers, cross-module re-exports and macros; a
+parser cannot either, but it retires the whole SPELLING class instead of one
+spelling at a time, and what is left is a short list of mechanisms rather than an
+open-ended "any spelling we did not think of".
+
+**Finding 2 shows the same "wrong population" mistake in the platform axis: the
+wire model was host-independent but the CONVERSION to host paths was not.** The
+fix routes every such conversion through one authority,
+`RootedRelativePath::from_manifest(&str)`, which splits on `/` and requires each
+segment to be exactly one host `Component::Normal` (17 sites: the address
+dispatch, the parent/ancestor walks, three depth counts, `file_name`,
+`strip_prefix`, and `reserved.rs`'s predicates). Unix is unchanged (a `\` is an
+ordinary byte, one component); on Windows a segment the host cannot name is
+REFUSED with a typed error instead of being silently split, and the flip of the
+old Windows test records that its acceptance WAS the defect. The symlink TARGET
+is deliberately NOT converted: it is link DATA the kernel dereferences with the
+host's own model.
+
+**Two of the six findings are sentences I wrote in round 2**, in the very
+paragraphs recording that a constraint had been marked done while incomplete:
+the `Unclassified`/`*_reason()` generalisation, and a coverage claim asserting
+that ONE test proved three call sites when the third had no test at all. The
+second is worth stating as a rule: **a coverage claim spanning several call sites
+must name a test for EACH**, because "the new test fails when the calls are
+removed" is exactly the kind of sentence that reads as verified and is not — the
+round-3 reviewer removed one call and the entire suite stayed green.
+
+**Finding 6 is the third recurrence of one error: a COUNT standing in for a
+RULE.** Round 1 refuted "ONE tolerated exception"; the enumeration that replaced
+it then missed the sidecar helper (round 2) and now `AdministrativeRecoveryGuard::acquire`
+(round 3). A count is not a rule, and a list is not a population: only an
+enumeration paired with the GENERAL rule it exemplifies survives contact with a
+reviewer who greps for the next member.
+
+Note on the LOG's own order: this file's round sections were briefly out of order
+(round 3 sat before round 2) because one section was appended against the wrong
+anchor. A log is a document like any other, and its order is a claim about which
+round came first. It is fixed; the sections run 1, 2, 3, 4.
+
+## The adversarial review (round 4)
+
+Eight findings, all fixed — and six of them attack the SAME mechanism, which is
+what made this the round that changed the mechanism rather than patching it again.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The `std::fs` audit, now parsing, was STILL a detector losing to Rust. Five routes, each proven GREEN end-to-end with real production code compiled into the library (macOS and Linux): a parenthesized callee `(std::fs::remove_file)(p)` and a referenced one `(&std::fs::rename)(a,b)` (canonical spellings, so the route scanner deliberately ignored them while the counter counted only `Expr::Path` callees); a cross-file alias reached through `#[path = "x.rs"] mod m;` (the alias table was keyed by a module path derived from the FILE's location); a glob over a local re-exporting module (`use crate::alias_a::*;` then `hidden_fs::remove_file`); a raw-identifier `libc::r#rmdir` INSIDE the funnel (keyed as `libc::r`, so the funnel's own pinned count saw no change); and a module declared BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;`, which is compiled as production while the exemption (any test-implying declaration) skipped it. | H | `yuyktpzxplkm`, `ztpnpxuyuump` |
+| 2 | The claim that the parsed count was a "SUPERSET of the old byte count" was FALSE: the byte scan counted a `macro_rules!` body containing `std::fs::remove_file($p)`, which a parse of EXPRESSIONS cannot see, so the replacement had quietly LOST coverage while claiming a gain. | A, H | `ztpnpxuyuump` |
+| 3 | `platform::chmod`'s own doc called itself "the crate's ONE mode-bit authority ... the funnel rule keeps mode changes on this one entry point", while `src/atomic/unix.rs` called `std::fs::set_permissions` directly at five production sites. | A | `vkmwrqoqnzlt` |
+| 4 | `src/reserved.rs` listed the local transport's staged-publish rename/remove/create as "remaining unguarded `std::fs` mutations" — they are capability-gated workers that TAKE a `GuardedRel`, i.e. the funnel's own code. | A, M | `vkmwrqoqnzlt` |
+| 5 | Constraint #1's enumeration missed a FOURTH member, `sync::Residue::discard`. | M | the round-4 docs commits |
+| 6 | Two cross-repo citations had drifted under the claim: deploy's `store::atomic::windows` (cited for the `write_atomic_replace` restoration) no longer exists at deploy's HEAD, and deploy's transport trait — cited as DECLARING `exists` as a required method — is now itself a re-export of the crate's. The substantive evidence (a consumer's call shapes) still held; the citations did not. | A, M | the round-4 docs commits |
+| 7 | Axis J quoted bare counts (191 items crate-wide, 11 in `atomic`) with no counting rule; a reviewer reproducing under a STATED but different rule got 173 and 37. Both instruments agree on the property (0 unix-only, 0 windows-only) and disagree on a number that was never the claim. | A | the round-4 docs commits |
+| 8 | README's "an audit's shape is part of its guarantee" bullet said a file gated `#[cfg(all(test, unix))] mod x;` "reads as production code and trips both pins" — false, because the crate's own `cfg_implies_test` treats `all(test, …)` as test-implying and exempts the file. | A | the round-4 docs commits |
+
+**Finding 1 is why the ENFORCEMENT moved.** Rounds 2, 3 and 4 each found new
+syntactic routes through a source-inspecting detector, and each fix made the
+detector cleverer while the claim it had to support ("SPELLING is not a variable",
+"refuses every IMPORT route") got harder to keep true. The resolution was to stop
+asking one mechanism to do two jobs:
+
+* **Completeness** — "no mutation outside the funnel, whatever the spelling" — is
+  now a **resolved-symbol deny** (`clippy.toml` + crate-root
+  `#![deny(clippy::disallowed_methods)]`). The compiler resolves every spelling to
+  one symbol, so the shapes above are measured IMMUNE rather than enumerated
+  further, and the allow list (three funnel modules, two capability-gated workers,
+  `platform::chmod`, and one reviewed exception for the ssh hostkey cache) is the
+  operative definition of the funnel's membership. It runs under `cargo clippy`,
+  which is why that command is part of the gate and `cargo test` alone is not
+  enough.
+* **The funnel's own changes** are the audits' remaining job, and the one a lint
+  structurally cannot do: inside the allowed modules the deny is blind, so
+  `std_fs_name_mutation_counts_are_pinned` and
+  `no_libc_reference_outside_the_funnel` are what notice a new or changed call
+  there, under `cargo test`, i.e. always.
+
+Neither device is claimed to cover the other, and each says so in its own doc.
+This is the round where the loop stopped making a detector smarter and changed
+WHAT enforces the rule — the same move as the earlier `Sanction`,
+`DestinationOwnership` and plan-free-containment changes, applied to the crate's
+own meta-rule.
+
+**Two more instances of "a count, a list, or a number standing in for a rule":**
+the enumeration gained a fourth missing member (`Residue::discard`) — the third
+recurrence of the count→list→list error — and axis J's counts were unreproducible
+because the counting RULE was never stated, which the crate's own rule ("a claim
+is a measurement or it is a label") forbids. The numbers are gone; the property,
+independently reproduced by two reviewers, stays.
+
+**And the drift class reached across repositories.** Two citations of `deploy`
+pointed at code deleted or replaced there since the claim was written. Axis A's
+rule about citations applies to cross-repo citations too, and had not been
+applied: a citation is a claim about a REVISION, and this crate cannot see the
+revisions that drift under it.
