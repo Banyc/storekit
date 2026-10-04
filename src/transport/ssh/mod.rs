@@ -2387,6 +2387,15 @@ impl Remote for SshTransport {
         false
     }
 
+    fn endpoint_identity(&self) -> Option<String> {
+        // The CONNECTION TARGET and port: `user@address` is what `ssh` dials,
+        // so two transports that reach different hosts (or different ports on
+        // the same host) never share a value even when their deployment roots
+        // spell the same layout path. The root is deliberately NOT part of the
+        // value — it is compared separately by the ownership binding.
+        Some(format!("ssh://{}:{}", self.target, self.port))
+    }
+
     fn prepare_identity(&self) -> Result<()> {
         // Create the local ControlMaster socket directory (0700) before any
         // ssh op: the multiplexing sockets live here, keyed by the CONNECTION

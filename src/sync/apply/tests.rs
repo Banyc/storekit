@@ -995,6 +995,12 @@ impl AfterWrite {
 struct RecordingRemote {
     inner: LocalTransport,
     is_local: bool,
+    /// The transport's stated ENDPOINT IDENTITY (see
+    /// [`Remote::endpoint_identity`]). `None` by default: the double's ordinary
+    /// tests exercise the local/weak paths, which do not need one. A test that
+    /// mints a remote ownership token states one (or deliberately leaves it
+    /// `None` to pin the fail-closed refusal).
+    endpoint_identity: Option<String>,
     fail_writes: bool,
     /// Fail only the Nth `write` call (1-based), so a test can let an earlier
     /// file install succeed and then fail a later one.
@@ -1180,6 +1186,7 @@ impl RecordingRemote {
         RecordingRemote {
             inner,
             is_local,
+            endpoint_identity: None,
             fail_writes: false,
             fail_nth_write: None,
             fail_write_after_write: false,
@@ -1242,6 +1249,13 @@ impl RecordingRemote {
     /// far side is described by a crafted manifest instead of this host's tree.
     fn with_manifest_output(mut self, output: String) -> RecordingRemote {
         self.manifest_output = Some(output);
+        self
+    }
+
+    /// State an ENDPOINT identity on this double, so it can mint a remote
+    /// ownership token (see [`Remote::endpoint_identity`]).
+    fn with_endpoint_identity(mut self, identity: &str) -> RecordingRemote {
+        self.endpoint_identity = Some(identity.to_string());
         self
     }
 
@@ -1501,6 +1515,9 @@ impl Remote for RecordingRemote {
     }
     fn is_local(&self) -> bool {
         self.is_local
+    }
+    fn endpoint_identity(&self) -> Option<String> {
+        self.endpoint_identity.clone()
     }
     fn prepare_identity(&self) -> Result<()> {
         self.identity_calls.fetch_add(1, Ordering::SeqCst);
@@ -12696,7 +12713,8 @@ fn lock_remote_refuses_a_transport_without_far_side_locking() {
     write(&src.join("f"), b"payload");
     fs::create_dir_all(&dst).unwrap();
     let before = canonicalize_tree(&dst).unwrap();
-    let remote = RecordingRemote::over(transport(&dst), false);
+    let remote = RecordingRemote::over(transport(&dst), false)
+        .with_endpoint_identity("test://recording-remote");
     let error = match DestinationOwnership::lock_remote(Direction::Push, &src, &remote) {
         Err(error) => error,
         Ok(_) => panic!("a transport without far-side locking must be refused"),

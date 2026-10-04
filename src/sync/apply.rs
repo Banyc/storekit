@@ -2267,8 +2267,10 @@ pub fn sync(
     ownership: DestinationOwnership,
 ) -> SyncResult {
     // The token is BOUND to the run it was acquired for: a token acquired for
-    // another direction or destination is refused rather than used, so a caller
-    // cannot take the lock on one destination and mutate another.
+    // another direction, another local root, another transport PATH spelling,
+    // or another transport ENDPOINT is refused rather than used, so a caller
+    // cannot take the lock on one destination (or read a plan from one source)
+    // and mutate another.
     //
     // The FAR-SIDE session lives HERE, in this stack frame, for the whole run
     // (exactly as `HeldLocks` does for the local records), so it is dropped
@@ -2478,8 +2480,9 @@ pub enum DestinationOwnership {
 /// cannot build one — from a struct literal, a `From`/`Default` impl, a clone,
 /// or a bare [`crate::lock::FileLock`] — without calling the acquiring
 /// constructor. It carries the preflight the acquisition performed (the pinned
-/// local root, the strict source manifest, and the destination identity) so
-/// the run uses exactly the tree the lock was taken for.
+/// local root, the strict source manifest, the transport's PATH spelling, and
+/// its ENDPOINT identity) so the run uses exactly the tree the lock was taken
+/// for.
 pub struct LockedDestination {
     prepared: Prepared,
     guard: FileLock,
@@ -2506,9 +2509,9 @@ pub struct InRootLock(FileLock);
 /// cannot build one — from a struct literal, a `From`/`Default` impl, a clone,
 /// or a bare [`crate::lock::FileLock`] — without calling the acquiring
 /// constructor. It carries the preflight the acquisition performed (the pinned
-/// local root, the strict source manifest, and the destination identity) so the
-/// run uses exactly the tree the far-side lock was taken for, and the session
-/// that holds the far-side record.
+/// local root, the strict source manifest, the transport's PATH spelling, and
+/// its ENDPOINT identity) so the run uses exactly the tree the far-side lock was
+/// taken for, and the session that holds the far-side record.
 ///
 /// # What this DOES and DOES NOT guarantee
 ///
@@ -2582,6 +2585,10 @@ impl DestinationOwnership {
     /// * a LOCAL destination is REFUSED (a PULL's destination is always local) —
     ///   use [`DestinationOwnership::lock`];
     /// * a destination whose record cannot be derived is REFUSED;
+    /// * a transport that does not state an ENDPOINT IDENTITY
+    ///   ([`crate::transport::Remote::endpoint_identity`] is `None`) is REFUSED:
+    ///   a remote ownership token that is bound only to a path spelling could
+    ///   be replayed against a different host that reports the same path;
     /// * a transport whose [`crate::transport::Remote::lock_far_side`] is the
     ///   default (it does not implement far-side locking) REFUSES with a typed
     ///   error naming the override it needs.
@@ -2607,6 +2614,24 @@ impl DestinationOwnership {
                 "refusing to acquire a FAR-SIDE lock for {}: it names a LOCAL destination (a \
                  PULL's destination is always local), whose record is on this host. Use \
                  `DestinationOwnership::lock` for a local destination.",
+                prepared.dest_root.display()
+            )));
+        }
+        // The token MUST be bound to an ENDPOINT, not merely to a path: two
+        // hosts that report the same layout path would otherwise be
+        // interchangeable, and the token could be replayed against the wrong
+        // one. Fail closed exactly as the `lock_far_side` default does — a
+        // remote ownership token that is not bound to an endpoint is not
+        // ownership.
+        if remote.endpoint_identity().is_none() {
+            return Err(Error::preflight(format!(
+                "refusing to own the remote destination {}: this transport cannot state an \
+                 ENDPOINT IDENTITY, so a token minted here would be bound only to the PATH \
+                 spelling and could be replayed against a DIFFERENT host that reports the same \
+                 root. Override `Remote::endpoint_identity` to return a stable string \
+                 identifying the transport's endpoint (host/port/account), or, if the caller \
+                 holds the destination for the run, pass `DestinationOwnership::Unowned` (the \
+                 explicitly weaker path).",
                 prepared.dest_root.display()
             )));
         }
@@ -2721,31 +2746,85 @@ impl DestinationOwnership {
 
 /// What a run determines BEFORE the destination lock is taken, so a refusal
 /// leaves no residue and the lock is held only for a run that will proceed.
+///
+/// The TRANSPORT BINDING is two fields, not one: [`Self::remote_root`] is the
+/// transport's PATH spelling and [`Self::remote_identity`] is its ENDPOINT
+/// (host/port/account). Both are recorded at acquisition and re-checked
+/// against the run's own transport before anything is mutated, so a token
+/// minted against one host cannot be replayed against another that merely
+/// reports the same layout path, and (for [`Direction::Pull`], where the
+/// remote is the SOURCE) a plan read from one source cannot be applied against
+/// a different live source.
 struct Prepared {
     direction: Direction,
     local: LocalSide,
     dest_root: PathBuf,
     dest_is_local: bool,
+    /// `normalize_root(remote.root())` at acquisition: the remote's PATH
+    /// spelling, recorded for BOTH directions (the destination for a PUSH, the
+    /// source for a PULL).
+    remote_root: PathBuf,
+    /// `remote.endpoint_identity()` at acquisition: the remote's ENDPOINT
+    /// identity, recorded for BOTH directions. `None` when the transport
+    /// states none; `None` compares equal to `None`.
+    remote_identity: Option<String>,
     source_meta: TreeMetadata,
 }
 
 impl Prepared {
     /// Whether this preflight was taken for exactly this run. A token acquired
-    /// for another direction or destination is refused rather than used.
+    /// for another direction, another LOCAL root, another transport PATH
+    /// spelling, or another transport ENDPOINT is refused rather than used.
+    ///
+    /// The remote checks run for BOTH directions. For a PUSH the remote is the
+    /// DESTINATION, so they bind the host the run will mutate; for a PULL the
+    /// remote is the SOURCE, so they bind the tree the token's
+    /// [`Self::source_meta`] plan was read from — without them a PULL token
+    /// would be replayed against a different live source.
     fn matches(&self, direction: Direction, local_root: &Path, remote: &dyn Remote) -> Result<()> {
+        // (1) The direction and the pinned LOCAL root.
+        if self.direction != direction || normalize_root(local_root) != self.local.root_path {
+            return Err(Error::preflight(format!(
+                "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
+                self.direction,
+                self.local.root_path.display(),
+                self.dest_root.display(),
+                direction
+            )));
+        }
+        // (2) The transport's PATH spelling, for BOTH directions.
+        let remote_root = normalize_root(remote.root());
+        if remote_root != self.remote_root {
+            return Err(Error::preflight(format!(
+                "the destination ownership was taken for a {:?} run against a transport rooted at {} but called against a transport whose ROOT spelling is {}: the transport's ROOT differs, so the run would mutate a different tree than the one the token was taken for; acquire ownership for the run you are about to make",
+                self.direction,
+                self.remote_root.display(),
+                remote_root.display()
+            )));
+        }
+        // (3) The transport's ENDPOINT identity, for BOTH directions. This is
+        // the HOST/PORT/ACCOUNT axis: the root check above cannot distinguish
+        // two hosts that report the same layout path.
+        let remote_identity = remote.endpoint_identity();
+        if remote_identity != self.remote_identity {
+            return Err(Error::preflight(format!(
+                "the destination ownership was taken for a {:?} run against transport endpoint {} but called against transport endpoint {}: the transport's ENDPOINT IDENTITY differs, so the token would be replayed against a different host than the one it was taken for; acquire ownership for the run you are about to make",
+                self.direction,
+                describe_endpoint(&self.remote_identity),
+                describe_endpoint(&remote_identity)
+            )));
+        }
+        // (4) The derived destination shape (a transport that flipped LOCALness
+        // with the same root and identity must still be refused).
         let dest_root = match direction {
-            Direction::Push => normalize_root(remote.root()),
+            Direction::Push => remote_root,
             Direction::Pull => self.local.root_path.clone(),
         };
         let dest_is_local = match direction {
             Direction::Push => remote.is_local(),
             Direction::Pull => true,
         };
-        if self.direction != direction
-            || normalize_root(local_root) != self.local.root_path
-            || dest_root != self.dest_root
-            || dest_is_local != self.dest_is_local
-        {
+        if dest_root != self.dest_root || dest_is_local != self.dest_is_local {
             return Err(Error::preflight(format!(
                 "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
                 self.direction,
@@ -2755,6 +2834,16 @@ impl Prepared {
             )));
         }
         Ok(())
+    }
+}
+
+/// Render an endpoint identity for a refusal: the value when the transport
+/// states one, and an explicit `None` (which is itself a binding the caller
+/// cannot verify) when it does not.
+fn describe_endpoint(identity: &Option<String>) -> String {
+    match identity {
+        Some(value) => format!("{value:?}"),
+        None => "`None` (the transport states no endpoint identity)".to_string(),
     }
 }
 
@@ -2826,11 +2915,19 @@ fn prepare(
         Direction::Pull => Side::Remote(remote),
     };
     let source_meta = source.manifest()?;
+    // (4) RECORD THE TRANSPORT BINDING, both halves, for BOTH directions: the
+    // remote's PATH spelling and its ENDPOINT identity. This is what `matches`
+    // re-checks before the run mutates anything. A push records the
+    // DESTINATION's; a pull records the SOURCE's.
+    let remote_root = normalize_root(remote.root());
+    let remote_identity = remote.endpoint_identity();
     Ok(Prepared {
         direction,
         local,
         dest_root,
         dest_is_local,
+        remote_root,
+        remote_identity,
         source_meta,
     })
 }

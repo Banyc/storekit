@@ -425,6 +425,34 @@ pub trait Remote {
     /// default): a new remote transport that forgets is a compile error, not
     /// a silent local-verification bug.
     fn is_local(&self) -> bool;
+    /// A STABLE string identifying the transport's ENDPOINT — the host, port,
+    /// and account the transport connects to — NOT the path. The path is
+    /// compared separately ([`Remote::root`]); this is the other half of the
+    /// destination binding that `crate::sync::DestinationOwnership` records at
+    /// acquisition and re-checks before a run mutates anything.
+    ///
+    /// The contract: two transports that address DIFFERENT endpoints (a
+    /// different host, a different port, a different account) must return
+    /// DIFFERENT values, and one transport must return the SAME value for the
+    /// whole life of a run. The value is opaque: callers compare it for
+    /// equality and may print it in a diagnostic, never parse it. Including
+    /// the connection target is the point — [`SshTransport`] returns
+    /// `ssh://{target}:{port}` so two hosts that report the same layout path
+    /// cannot be confused for one another.
+    ///
+    /// `None` means the transport cannot state an endpoint identity. It is the
+    /// DEFAULT so third-party implementations keep compiling, and it is SAFE
+    /// for read-only use: a `None` identity still compares equal to another
+    /// `None`, so a token minted through [`Remote::lock_far_side`]'s
+    /// local-destination sibling is not silently strengthened. It is NOT safe
+    /// to MINT a remote ownership token from: see
+    /// [`Remote::lock_far_side`] and
+    /// [`crate::sync::DestinationOwnership::lock_remote`], which REFUSE a
+    /// `None` identity rather than hand out an unbound token. A transport that
+    /// wants remote ownership MUST override this.
+    fn endpoint_identity(&self) -> Option<String> {
+        None
+    }
     /// Read the WHOLE entry at `rel` into memory.
     ///
     /// MEMORY BOUND: the entire entry is materialized as one `Vec<u8>` (and the
