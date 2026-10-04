@@ -704,3 +704,17 @@ implied to be checked.
   a changed parameter type can compile clean there and fail to compile on the
   other host. A green gate on one platform is not evidence for the other — it is
   not even evidence that the other platform BUILDS.
+- **A deletion is justified by the ASSERTIONS that cover it, not by a count.**
+  Removing a test is safe exactly when a per-test reconciliation shows that each
+  of its assertions exists somewhere else — and any assertion that does not is
+  PORTED, never dropped. A preserved test count is evidence of nothing: 52 tests
+  can be deleted with zero coverage lost, and one test can be deleted with
+  everything lost. The reconciliation table is the artifact that discharges this
+  rule; a count cannot.
+- **An audit's shape is part of its guarantee.** Both source audits strip
+  `#[cfg(test)]` items AND the attribute that follows them, so
+  `#[cfg(test)] #[cfg(unix)]` is stripped while `#[cfg(all(test, unix))]` is NOT —
+  a large platform-gated test suite written the second way reads as production
+  code and trips both pins. When adding a gated test module, keep the attributes
+  separate, and state what an audit actually skips rather than what it appears to
+  skip.
