@@ -205,6 +205,16 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// trailing `.`/` ` address one entry, and the crate does not refuse the
 /// spelling. (A `.` elsewhere is unaffected — `a.b` is one component on every
 /// supported host.)
+///
+/// The reason it is not closed is not convenience, and it is worth writing
+/// down because the opposite choice looks free: this rule also validates
+/// HOST- and USER-like scalars, and for those a trailing `.` is the legitimate
+/// ABSOLUTE spelling (`example.com.` is a valid FQDN and resolvers and
+/// provisioning tools emit it). Refusing the spelling would reject a real value
+/// and push a normalization the crate cannot perform onto every consumer. So
+/// of the two halves, the case-fold half is impossible to close per name and
+/// the dot half would refuse a valid host spelling — which is why BOTH are
+/// stated here rather than one of them being closed silently.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= crate::atomic::NAME_MAX
