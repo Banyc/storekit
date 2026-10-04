@@ -6015,4 +6015,179 @@ impl S {
             block_names.len()
         );
     }
+
+    /// Locate a free fn by name anywhere in a parsed file's item tree, so an
+    /// audit can pin calls INSIDE a named body rather than anywhere in the file.
+    fn find_free_fn<'a>(items: &'a [syn::Item], name: &str) -> Option<&'a syn::ItemFn> {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) if unraw(&function.sig.ident) == name => {
+                    return Some(function);
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, inner)) = &module.content
+                        && let Some(found) = find_free_fn(inner, name)
+                    {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The sync-capable calls one named replace body makes, each with the
+    /// visit order that decides "before"/"after the rename". A single monotone
+    /// counter over the two call node kinds makes the relative order of a
+    /// `sync_all` method call and the `rename`/`renameat_fd` call decidable
+    /// WITHOUT matching a variable name for the rename.
+    #[derive(Default, Debug)]
+    struct ReplaceSyncWalk {
+        next: usize,
+        rename_at: Option<usize>,
+        sync_all_at: Vec<usize>,
+        file_open_at: Vec<usize>,
+        fsync_dir_fd_at: Vec<usize>,
+    }
+
+    impl ReplaceSyncWalk {
+        fn bump(&mut self) -> usize {
+            let at = self.next;
+            self.next += 1;
+            at
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for ReplaceSyncWalk {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let at = self.bump();
+            if unraw(&call.method) == "sync_all" {
+                self.sync_all_at.push(at);
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let at = self.bump();
+            if let Some(path) = callee_path(&call.func) {
+                let segments = path_segments(path);
+                match segments.last().map(String::as_str) {
+                    Some("rename" | "renameat_fd") => self.rename_at = Some(at),
+                    Some("fsync_dir_fd") => self.fsync_dir_fd_at.push(at),
+                    _ => {}
+                }
+                let tail = &segments[segments.len().saturating_sub(2)..];
+                if tail == ["File", "open"] {
+                    self.file_open_at.push(at);
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+
+    /// SOURCE-SHAPE AUDIT: the DURABLE atomic replace paths must CALL a real
+    /// temp-file sync and a real parent-directory sync, and those calls must be
+    /// INSIDE the named function bodies — not merely present in the file. The
+    /// replace's fault hooks RETURN BEFORE each real syscall
+    /// (`ReplaceStage::Sync` before the temp `sync_all`, `ReplaceStage::DirSync`
+    /// before the parent open + `sync_all` / before `fsync_dir_fd`), so
+    /// deleting the real `sync_all`/`fsync_dir_fd` while still returning
+    /// `ReplaceOutcome::ReplacedDurable` used to be invisible: no test executed
+    /// or observed those syscalls, and the ordering probes asserted the RENAME
+    /// only (the path-based variant had no stage-4 probe at all).
+    ///
+    /// WHAT THIS PROVES: within the parsed body of `write_atomic_replace`
+    /// (path-based) there is a `sync_all()` call BEFORE the rename and a
+    /// `File::open(...)` call plus a `sync_all()` call AFTER it; within the
+    /// parsed body of `replace_core` (fd-based) there is a `sync_all()` call
+    /// BEFORE the `renameat_fd` and an `fsync_dir_fd(...)` call AFTER it. So
+    /// the call is present and WOULD RUN when that stage is reached, and
+    /// removing it — or moving it out of the named body — makes this test fail.
+    ///
+    /// WHAT THIS DOES NOT PROVE: that the syscall RAN or that it succeeded.
+    /// No in-process test can observe a fsync reaching the device; this audit
+    /// pins presence and position in the source. The dynamic REACH half — that
+    /// a successful durable replace actually records the post-rename
+    /// parent-fsync probe — is asserted in
+    /// `atomic::unix::tests::a_missing_parent_chain_is_committed_durably_before_the_rename`
+    /// and
+    /// `atomic::unix::tests::the_path_based_replace_commits_new_parent_entries_before_the_rename`.
+    #[test]
+    fn durable_replace_paths_call_a_real_directory_sync_and_a_real_temp_sync() {
+        let mut paths = Vec::new();
+        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut paths);
+        let sources: Vec<(String, String)> = paths
+            .iter()
+            .map(|file| {
+                (
+                    crate_relative(file),
+                    std::fs::read_to_string(file).expect("read source file"),
+                )
+            })
+            .collect();
+        let gated = test_only_gated_paths();
+        let parsed = parse_crate(&sources, &gated);
+        let unix = parsed
+            .iter()
+            .find(|source| source.rel == "src/atomic/unix.rs")
+            .expect("the Unix replace implementation must be part of the parsed crate");
+        let walk = |name: &str| -> ReplaceSyncWalk {
+            let function = find_free_fn(&unix.file.items, name).unwrap_or_else(|| {
+                panic!(
+                    "`{name}` must exist in src/atomic/unix.rs; this audit pins the call shape of \
+                     its body, so a rename must update the audit rather than silently lose the \
+                     pin"
+                )
+            });
+            let mut audit = ReplaceSyncWalk::default();
+            syn::visit::Visit::visit_block(&mut audit, &function.block);
+            audit
+        };
+
+        // PATH-BASED `write_atomic_replace`: `tmp_file.sync_all()` BEFORE the
+        // rename, then `File::open(parent)` + `dir.sync_all()` AFTER it.
+        let audit = walk("write_atomic_replace");
+        let rename = audit.rename_at.unwrap_or_else(|| {
+            panic!("write_atomic_replace must call the install (`rename`) inside its body")
+        });
+        assert!(
+            audit.sync_all_at.iter().any(|at| *at < rename),
+            "write_atomic_replace must call `sync_all()` on the TEMP file BEFORE the rename; the \
+             `ReplaceStage::Sync` fault hook returns before the real syscall, so removing it while \
+             still returning `ReplacedDurable` must fail here: {audit:?}"
+        );
+        assert!(
+            audit.file_open_at.iter().any(|at| *at > rename),
+            "write_atomic_replace must OPEN THE PARENT directory AFTER the rename, or there is no \
+             directory to fsync; the `ReplaceStage::DirSync` fault hook returns before the real \
+             open, so removing it while still reporting a durable outcome must fail here: \
+             {audit:?}"
+        );
+        assert!(
+            audit.sync_all_at.iter().any(|at| *at > rename),
+            "write_atomic_replace must call `sync_all()` on the PARENT DIRECTORY AFTER the rename, \
+             or `ReplacedDurable` ('the parent-directory fsync succeeded') is a false claim and \
+             deleting the real parent fsync is invisible: {audit:?}"
+        );
+
+        // FD-BASED `replace_core`: `f.sync_all()` BEFORE the renameat, then
+        // `fsync_dir_fd(&parent_fd)` AFTER it.
+        let audit = walk("replace_core");
+        let rename = audit.rename_at.unwrap_or_else(|| {
+            panic!("replace_core must call the install (`renameat_fd`) inside its body")
+        });
+        assert!(
+            audit.sync_all_at.iter().any(|at| *at < rename),
+            "replace_core must call `sync_all()` on the TEMP file BEFORE the renameat; the \
+             `ReplaceStage::Sync` fault hook returns before the real syscall, so removing it while \
+             still returning `ReplacedDurable` must fail here: {audit:?}"
+        );
+        assert!(
+            audit.fsync_dir_fd_at.iter().any(|at| *at > rename),
+            "replace_core must call `fsync_dir_fd(&parent_fd)` AFTER the renameat, or \
+             `ReplacedDurable` ('the parent-directory fsync succeeded') is a false claim and \
+             deleting the real fsync is invisible: {audit:?}"
+        );
+    }
 }

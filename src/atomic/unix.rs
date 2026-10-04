@@ -271,6 +271,7 @@ pub fn write_atomic_replace(
     if let Some(e) = fault(ReplaceStage::DirSync) {
         return Ok(ReplaceOutcome::ReplacedDurabilityUnknown { error: e });
     }
+    probe_fsync_replace_parent();
     if let Some(parent) = path.parent() {
         let dir = match std::fs::File::open(parent) {
             Ok(dir) => dir,
@@ -4502,6 +4503,14 @@ mod tests {
                 "{expected:?} must be committed BEFORE the rename: {events:?}"
             );
         }
+        assert!(
+            events
+                .iter()
+                .position(|event| event == "fsync-replace-parent")
+                .is_some_and(|at| at > rename_at),
+            "a durable fd-based replace must RECORD the post-rename parent-directory fsync, so \
+             `ReplacedDurable` is pinned by REACH and not only by source shape: {events:?}"
+        );
     }
 
     /// The same ordering for the PATH-BASED replace (the Windows local path,
@@ -4538,6 +4547,14 @@ mod tests {
                 "every created directory entry must be committed BEFORE the rename: {events:?}"
             );
         }
+        assert!(
+            events
+                .iter()
+                .position(|event| event == "fsync-replace-parent")
+                .is_some_and(|at| at > rename_at),
+            "a durable path-based replace must RECORD the post-rename parent-directory fsync, so \
+             `ReplacedDurable` is pinned by REACH and not only by source shape: {events:?}"
+        );
     }
 
     // -----------------------------------------------------------------
