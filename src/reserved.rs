@@ -325,11 +325,24 @@ pub fn is_residue_path(path: &str) -> bool {
 /// * the PATH-BASED helpers the manifest/retention machinery uses take an
 ///   ordinary path. `set_private`,
 ///   `ensure_private_dir_durable`, the PATH-BASED `write_atomic_replace`, and
-///   the descriptor-relative `set_private_fd` now consult the guard too; the
-///   remaining unguarded `std::fs` mutations are the local transport's
-///   crate-INTERNAL staged-publish rename/remove/create on its own temp/swap
-///   names, the destination-root `create_dir_all`, and the ssh hostkey cache
-///   — none of which a caller can steer to the record's spelling.
+///   the descriptor-relative `set_private_fd` now consult the guard too. The
+///   local transport's crate-INTERNAL staged-publish workers
+///   (`durable_create_new`, `remove_file_if_inner`) run INSIDE the funnel:
+///   each takes a [`crate::atomic::GuardedRel`] capability that
+///   `GuardedRel::new_for_owned_lock_record` mints only after the guard has
+///   run, so their rename/remove/create on the crate's own temp/swap names is
+///   the funnel's own code, not a path around it. Only two production
+///   mutation families never consult the guard: the transport's own
+///   destination-root/layout DIRECTORY creation (`create_dir_all` on
+///   `self.base` and its bootstrap dirs, which creates directories rather
+///   than mutating an existing NAME), and the private ssh hostkey cache's
+///   drop-and-re-pin `remove_file`/create under the transport's own resolved
+///   `cache_dir` (`hostkey.rs`) — a path derived from the transport's private
+///   cache, never from a caller's store-relative name, so neither can be
+///   steered to the record's spelling. The AUTHORITATIVE list of which module
+///   may spell which disallowed symbol is `clippy.toml`'s comment plus the
+///   per-module `#![allow(clippy::disallowed_methods)]`s — consult those
+///   rather than keeping a second list here.
 ///   `copy_tree_verbatim` is the ONE production path-based copy that
 ///   deliberately CARRIES reserved and temp spellings into its destination, so
 ///   it does not consult the guard — and does not need to. It never REMOVES,

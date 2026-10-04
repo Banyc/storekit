@@ -147,8 +147,7 @@ fn probe_fsync_replace_parent() {}
 /// constraint #1 removed the public path-based `set_private`).
 pub(crate) fn set_private(path: &Path) -> Result<()> {
     refuse_reserved_mutation(path, Sanction::None)?;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)
+    crate::platform::chmod(path, 0o600)
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
 }
 /// The PATH-BASED, UNCONFINED durable atomic replace: write a UNIQUE hidden
@@ -362,8 +361,7 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
                 return Err(Error::store(format!("mkdir {}: {e}", component.display())));
             }
         }
-        let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(component, perms)
+        crate::platform::chmod(component, 0o700)
             .map_err(|e| Error::store(format!("chmod {}: {e}", component.display())))?;
     }
     // Durable commit of every NEW directory entry: fsync the parent of each
@@ -561,7 +559,7 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
     if !root_preexisting {
         std::fs::create_dir_all(&dst)
             .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
-        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700))
+        crate::platform::chmod(&dst, 0o700)
             .map_err(|e| Error::store(format!("chmod {}: {e}", dst.display())))?;
     }
 
@@ -606,7 +604,7 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
                 }
                 Err(e) => return Err(Error::store(format!("mkdir {}: {e}", to.display()))),
             }
-            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o700))
+            crate::platform::chmod(&to, 0o700)
                 .map_err(|e| Error::store(format!("chmod {}: {e}", to.display())))?;
             dirs.push((to.clone(), meta.permissions().mode() & 0o7777));
             let child_entries = std::fs::read_dir(&from)
@@ -678,7 +676,7 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
     // so a read-only source tree copies cleanly and the tree is faithful.
     dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
     for (p, mode) in dirs {
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
+        crate::platform::chmod(&p, mode)
             .map_err(|e| Error::store(format!("chmod {}: {e}", p.display())))?;
     }
     Ok(())
