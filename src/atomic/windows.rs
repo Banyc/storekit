@@ -23,6 +23,25 @@
 //!
 //! Selected by the single `#[cfg(windows)]` `mod` declaration in
 //! [`super`].
+//!
+//! # How the funnel rule is enforced here
+//!
+//! This module is the guarded name-mutation funnel for Windows: the crate's
+//! Windows `std::fs` replacement/removal primitives live here and each presents
+//! the SAME reserved-spelling guard the Unix port uses (the guard's grammar is
+//! platform-independent; see [`super::guard`]). The module-level
+//! `#![allow(clippy::disallowed_methods)]` below is what lets those calls
+//! compile while the crate-root `#![deny(clippy::disallowed_methods)]` rejects
+//! the same RESOLVED symbols everywhere else. That lint is the COMPLETENESS
+//! device: it matches the symbol the compiler resolved, so no alias, re-export,
+//! raw identifier, macro body, `#[path]` relocation, or parenthesized or
+//! referenced callee can evade it.
+//!
+//! The count PIN in [`crate::atomic::guard`]'s tests is a DIFFERENT device with
+//! a DIFFERENT job: it notices when THIS module's own call counts change —
+//! inside the allow, where the lint is deliberately blind. Neither device
+//! covers the other, so both stay.
+#![allow(clippy::disallowed_methods)]
 
 use super::*;
 use std::io::Write;

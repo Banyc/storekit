@@ -24,6 +24,23 @@
 //! deployment, release, ledger, or record-book concept appears here. A store
 //! is a root directory; a name is a validated string; a transfer is a
 //! comparison of two manifests.
+//!
+//! # The name-mutation funnel is enforced by the COMPILER, not a source scan
+//!
+//! Every inode-NAME mutation (`std::fs` and `libc`) may be issued only from the
+//! guarded funnel modules, each of which carries a module-level
+//! `#![allow(clippy::disallowed_methods)]`. Everywhere else the lint is a hard
+//! error: `#![deny(clippy::disallowed_methods)]` below, with the symbol list in
+//! `clippy.toml`. Because the lint matches the RESOLVED symbol, no spelling
+//! route evades it — an alias, a re-export, a raw identifier, a parenthesized
+//! or referenced callee, a `macro_rules!` body, or a `#[path]`-relocated
+//! module all resolve to the same disallowed path.
+//!
+//! This is a COMPLETENESS device, distinct from the count PIN in
+//! `atomic::guard.rs`: the pin notices when the funnel's OWN calls change
+//! (inside the allowed modules, where this lint is blind); the lint notices a
+//! call anywhere else. Neither covers the other.
+#![deny(clippy::disallowed_methods)]
 
 pub mod atomic;
 mod casefold;

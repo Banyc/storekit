@@ -466,6 +466,7 @@ impl SshRunner {
 // production-source audit in `atomic::guard` strips this test module.
 #[cfg(test)]
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
 mod runner_property_tests {
     use super::*;
     use crate::error::Error;

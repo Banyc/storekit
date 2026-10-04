@@ -140,6 +140,19 @@
 //!     let _ = write_atomic_replace_fd(root, raw, b"x", &mut |_| None);
 //! }
 //! ```
+//!
+//! # How the funnel rule is enforced in this module
+//!
+//! The platform-independent path-based replace here
+//! ([`write_atomic_replace`]'s failed-temp cleanup) is one of the funnel's own
+//! mutation sites; it consults the reserved-spelling guard through
+//! [`guard::refuse_reserved_mutation`]. The module-level
+//! `#![allow(clippy::disallowed_methods)]` below lets that call compile while
+//! the crate-root `#![deny(clippy::disallowed_methods)]` rejects the same
+//! RESOLVED symbols everywhere else. The count PIN in [`guard`]'s tests is a
+//! different device: it watches the funnel's own call counts change, inside the
+//! allow where the lint is blind. Neither device covers the other.
+#![allow(clippy::disallowed_methods)]
 
 use crate::error::{Error, ReservedKind, Result, StoreKind};
 use crate::relpath::RootedRelativePath;

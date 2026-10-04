@@ -28,6 +28,9 @@
 //! genuinely absent the harness reports that clearly rather than silently
 //! passing.
 #![cfg(unix)]
+// Test-only fixtures drive the same name-mutating primitives the funnel guards;
+// the production name-mutation rule does not apply to this test crate.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

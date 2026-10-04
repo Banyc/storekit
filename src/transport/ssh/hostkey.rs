@@ -41,6 +41,13 @@ pub(crate) fn keyscan_args(port: u16, address: &str) -> Vec<String> {
 /// transport-construction boundary from the environment snapshot — never
 /// read from the process env here), and `env` is the snapshot whose
 /// variables ride the `ssh-keygen` fingerprint-verification child.
+// KNOWN RESIDUE, NOT THE GUARDED FUNNEL: this one cache-file mutation drops a
+// stale/unreadable pinned key before re-pinning. The path is derived from the
+// transport's own private `cache_dir`, never from a caller's store-relative
+// name, so it cannot name a lock record; it is a reviewed exception rather
+// than a funnel call. The narrow allow keeps the crate-root deny armed for the
+// rest of this module.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn pin_known_hosts(
     fingerprint: &str,
     target: &str,

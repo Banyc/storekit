@@ -826,6 +826,9 @@ mod tests {
     // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
     // Windows; do not let them fail a `-D warnings` Windows gate.
     #![cfg_attr(not(unix), allow(dead_code))]
+    // Test-only fixtures drive the same `std::fs`/`libc` primitives the funnel
+    // guards; exempt from the production name-mutation rule.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::env::SysEnv;
     use crate::test_support::{announce_skip, fixture_tmpdir};

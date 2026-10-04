@@ -1,0 +1,48 @@
+# The guarded NAME-MUTATION funnel (see src/atomic/mod.rs, "The
+# reserved-spelling guard is STRUCTURAL, not a list of call sites").
+#
+# WHY A LINT AND NOT A SOURCE AUDIT. The compiler resolves every spelling of a
+# name to ONE symbol, so a `disallowed_methods` entry catches what a text or
+# AST scan has to enumerate and can miss: a parenthesized callee
+# `(std::fs::remove_file)(p)`, a referenced callee `(&std::fs::rename)(a, b)`,
+# a same-file or cross-file `use ... as` alias, a re-export, a raw identifier,
+# a `macro_rules!` body, a `#[path]`-relocated module, and a `libc` extern fn.
+# The lint is the COMPLETENESS device. It is armed by
+# `#![deny(clippy::disallowed_methods)]` at the crate root (src/lib.rs), so a
+# violation fails `cargo clippy --all-targets -- -D warnings`.
+#
+# DIVISION OF LABOUR. The count PIN
+# (`atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` and the
+# `libc` funnel counts in `no_libc_reference_outside_the_funnel`) is a DIFFERENT
+# device with a DIFFERENT job: it notices when the funnel's OWN calls change —
+# i.e. inside the very modules where this lint is `#![allow]`ed and therefore
+# blind — while this lint notices a call anywhere ELSE. Neither device covers
+# the other; both stay.
+#
+# The symbols below are the inode-NAME mutators (plus the mode-bit setter) whose
+# authority the funnel owns. A production call may appear only in an annotated
+# funnel module (see the `#![allow]` list in the crate). The `libc` set is the
+# whole POSIX name-mutation family, including the plain (non-`*at`) forms the
+# funnel does not currently call: the point is to close the CLASS, so a new
+# `libc::unlink` route fails the lint even though no `libc::unlink` exists yet.
+disallowed-methods = [
+  # std::fs — the removal/replacement/rename/link/permission calls.
+  { path = "std::fs::remove_file", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::remove_dir", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::remove_dir_all", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::rename", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::hard_link", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::set_permissions", reason = "mode-bit authority is funnel-owned; call platform::chmod instead" },
+  # libc — the POSIX name-mutation syscalls the funnel wraps as `*at` calls.
+  { path = "libc::unlink", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::unlinkat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::rmdir", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::rename", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::renameat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::link", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::linkat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::symlink", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::symlinkat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::mkdir", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::mkdirat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
+]

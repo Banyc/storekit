@@ -32,6 +32,9 @@
 //! coverage (one Linux sshd, one macOS sshd) is recorded in the change's test
 //! evidence, not in this file.
 #![cfg(unix)]
+// Test-only fixtures drive the same name-mutating primitives the funnel guards;
+// the production name-mutation rule does not apply to this test crate.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

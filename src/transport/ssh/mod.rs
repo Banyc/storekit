@@ -3368,6 +3368,9 @@ mod tests_ssh {
     // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
     // Windows; do not let them fail a `-D warnings` Windows gate.
     #![cfg_attr(not(unix), allow(dead_code))]
+    // Test-only fixtures drive the same `std::fs`/`libc` primitives the funnel
+    // guards; exempt from the production name-mutation rule.
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::transport::ssh::runner::SSH_COMMAND_TIMEOUT_SECS;
     #[cfg(test)]
@@ -6586,6 +6589,7 @@ mod tests_ssh {
 /// to the `std::fs` / `libc` audits as production code.
 #[cfg(test)]
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
 mod fingerprint_ssh_tests {
     use super::*;
     use crate::transport::{

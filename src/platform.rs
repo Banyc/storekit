@@ -16,6 +16,14 @@ use std::path::Path;
 /// Set a file's mode bits — a no-op on Windows (no Unix mode bits; file
 /// ACLs are the privacy mechanism). Documented weaker guarantee of the
 /// Windows port.
+///
+/// This is the crate's ONE mode-bit authority, so the crate-root
+/// `#![deny(clippy::disallowed_methods)]` is relaxed here for that single
+/// `std::fs::set_permissions` call: `set_permissions` changes an inode's mode,
+/// never its name, so it cannot free or swap a lock record's inode, but the
+/// funnel rule keeps mode changes on this one entry point rather than letting
+/// a caller scatter raw calls.
+#[allow(clippy::disallowed_methods)]
 pub fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {

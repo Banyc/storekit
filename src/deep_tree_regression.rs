@@ -20,6 +20,9 @@
 //! deliberately SMALL thread stack, and exits; the parent asserts the child
 //! exited successfully and cleans the tree up before asserting.
 #![cfg(unix)]
+// Test-only construction drives the same name-mutating primitives the funnel
+// guards; this module is exempt from the production name-mutation rule.
+#![allow(clippy::disallowed_methods)]
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

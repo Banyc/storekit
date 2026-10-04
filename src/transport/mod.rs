@@ -1660,6 +1660,13 @@ pub(crate) struct CreateNewOptions<'a> {
 /// is never followed, a mode mismatch, or an unreadable entry is a real
 /// conflict). `Ok(AlreadyPresent)` runs the parent fsync too, so the
 /// convergent path still returns with a durable entry.
+///
+/// This is a GUARDED mutation worker: its `guarded: GuardedRel<'_>` argument is
+/// the unforgeable capability [`crate::atomic::guard`] mints only after the
+/// reserved-spelling check passes, so the `std::fs` calls below are the
+/// funnel's own. The crate-root deny is relaxed for exactly this function; the
+/// count pin watches its call counts change.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn durable_create_new(
     base: &Path,
     guarded: crate::atomic::GuardedRel<'_>,
@@ -2048,6 +2055,9 @@ impl VerifySwap {
         true
     }
 
+    // Test-only swap fixture: it drives the same name-mutating primitives the
+    // funnel guards, so it is exempt from the production name-mutation rule.
+    #[allow(clippy::disallowed_methods)]
     fn swap(&self, p: &Path) {
         // Move the ORIGINAL entry aside (its inode survives for identity
         // checks — and for the post-open boundaries, the opened descriptor
@@ -3221,6 +3231,11 @@ impl LocalTransport {
         crate::atomic::GuardedRel::new_for_owned_lock_record(rel.as_path(), &owned)
     }
 
+    // A GUARDED mutation worker, reached only with a
+    // `crate::atomic::GuardedRel<'_>` capability (the guard has already run on
+    // this name); this is the funnel's own `std::fs` use, so the crate-root deny
+    // is relaxed for exactly this method while the count pin watches it change.
+    #[allow(clippy::disallowed_methods)]
     fn remove_file_if_inner(
         &self,
         guarded: crate::atomic::GuardedRel<'_>,
@@ -3360,11 +3375,14 @@ impl LocalTransport {
     }
 }
 
+// Test-only fixtures drive the same `std::fs` primitives the funnel guards;
+// they are exempt from the production name-mutation rule.
 #[cfg(test)]
 mod tests {
     // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
     // Windows; do not let them fail a `-D warnings` Windows gate.
     #![cfg_attr(not(unix), allow(dead_code))]
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     // Modes and (device, inode)/nlink are Unix filesystem properties: the
     // tests that read them are `#[cfg(unix)]`, so the import is too.

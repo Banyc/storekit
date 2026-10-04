@@ -61,6 +61,25 @@
 //! above — [`openat_no_follow`], [`write_file_fd`], [`write_atomic_cas_fd`],
 //! or the read-side [`read_fd`] / [`path_state_fd`], all of which open the
 //! final component with `O_NOFOLLOW` and so genuinely refuse it.
+//!
+//! # How the funnel rule is enforced here
+//!
+//! This module IS the guarded name-mutation funnel for Unix: every production
+//! `libc` name-mutating syscall the crate issues lives here, together with the
+//! path-based `std::fs::rename` of the deliberately-named
+//! [`write_atomic_replace`]. The module-level
+//! `#![allow(clippy::disallowed_methods)]` below is what lets those calls
+//! compile while the crate-root `#![deny(clippy::disallowed_methods)]` rejects
+//! the same RESOLVED symbols everywhere else. That lint is the COMPLETENESS
+//! device: it matches the symbol the compiler resolved, so no alias, re-export,
+//! raw identifier, macro body, `#[path]` relocation, or parenthesized or
+//! referenced callee can evade it.
+//!
+//! The count PIN in [`crate::atomic::guard`]'s tests is a DIFFERENT device with
+//! a DIFFERENT job: it notices when THIS module's own call counts change —
+//! inside the allow, where the lint is deliberately blind. Neither device
+//! covers the other, so both stay.
+#![allow(clippy::disallowed_methods)]
 
 use super::*;
 use std::ffi::{CStr, CString};

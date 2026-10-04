@@ -273,6 +273,7 @@ fn is_single_host_component(segment: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use proptest::prelude::*;

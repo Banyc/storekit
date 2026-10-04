@@ -23,6 +23,9 @@
 //!   claimed it was not. The fix normalizes the source spelling first.
 //! * I6(a) — the copy had no `RLIMIT_NOFILE` subprocess regression.
 #![cfg(unix)]
+// Test-only fixtures drive the same name-mutating primitives the funnel guards;
+// the production name-mutation rule does not apply to this test crate.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 
