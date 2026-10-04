@@ -323,516 +323,103 @@ simplification; removing one means adding back the logic it removes.
 
 ## Design conflicts surfaced by the consumer audit
 
-Three places where this crate's guarantees and a real consumer's design pull
-apart. They are recorded here, with evidence and the decision, so the owner
-decides them deliberately rather than by omission. (a), (b) and (c) are CLOSED —
-(a) by the composed ownership form below, (b) by the persistent far-side lock
-session below, (c) by the fd-confined tree helpers.
+Three places where this crate's guarantees and a real consumer's design pulled apart.
+All three are CLOSED, and the decisions are binding.
 
-### (a) The sync lock is a SIBLING of the destination root, not the in-root layout lock — CLOSED (composed BY NAME)
+**(a) The sync lock is a SIBLING of the destination root, not the in-root layout
+lock.** Two records guard one destination — the sibling `.<name>.operation.lock`
+(outside the root) and the caller's in-root `Layout::lock` — so they are composed BY
+NAME rather than chosen: `DestinationOwnership::lock_with_in_root_lock` takes the
+sibling record first and then the in-root one (both NON-BLOCKING, so the canonical
+order cannot deadlock), and it requires the destination root to PRE-EXIST. The in-root
+record is destination RESIDUE (`reserved::is_residue_path`), so the run strips it from
+the view it judges, never transfers it and never destroys it; it is reported in
+`SyncReport::residue`. A documented objection to composing them — "the record would
+create the destination root and enter the manifest the run is judging" — was false in
+its second half, which is why it was revisited.
 
-The ONE entry point `sync` takes `<parent>/.<name>.operation.lock`
-(`sync::destination_lock_path`; the rationale is in the `sync` module docs)
-when its `ownership` argument is the unforgeable
-`DestinationOwnership::Locked` token (acquired by
-`DestinationOwnership::lock`), while `Layout::lock` names the IN-ROOT
-`state/operation.lock` (`transport::Layout::lock`). They are DIFFERENT FILES, so
-the two locks do NOT exclude each other on their own: a consumer that holds its
-own in-root `operation.lock` and then calls a plain `sync` ends up with two
-files that both claim to be "the operation lock", and that run is not excluded
-by the consumer's lock (also in the `sync` module docs).
+**(b) Ownership of a REMOTE destination is a persistent FAR-SIDE session.**
+`DestinationOwnership::lock_remote` + `Remote::lock_far_side`: a long-lived local
+`ssh` client whose remote process holds `flock(LOCK_EX|LOCK_NB)`, released when stdin
+reaches EOF, i.e. released on every exit path including a panic. It is NOT a lease —
+it cannot outlive its client. The trait's default REFUSES, so a transport that does
+not override it cannot own a remote destination, and the explicitly named weaker path
+is `DestinationOwnership::Unowned`. `SshTransport` overrides it (perl, because BSD has
+no `flock(1)`), and a contended acquisition returns the typed `LockContended`. A
+token is bound to the transport that minted it: direction, pinned local root, remote
+root spelling, endpoint identity, remote localness — each compared, each pinned by a
+test per direction.
 
-DECISION (the crate's own recommendation, taken): the acquiring constructor now
-has a NAMED composed form,
-`DestinationOwnership::lock_with_in_root_lock(direction, local_root, remote,
-&layout.lock)`, which takes BOTH records and holds them for the whole run. It
-returns the unforgeable `DestinationOwnership::LockedWithInRoot(LockedDestination,
-InRootLock)` token; `DestinationOwnership::lock` is UNCHANGED and still takes the
-sibling record alone, so the plain path is byte-for-byte the same. The caller
-supplies its own `Layout::lock` path (a `RootedRelativePath`), because `Remote`
-exposes no `Layout` accessor and a hard-coded `state/operation.lock` would be
-wrong for a custom layout.
+**(c) The fd-confined tree helpers a consumer calls are public.** `deploy` calls
+`copy_dir_recursive_fd` and `fsync_tree_recursive_fd` from its own store module and
+drives a staged publish through the sidecar critical section; the crate exposes those
+(`copy_tree_verbatim`, `copy_dir_recursive_fd`, `with_operation_lock_sidecar` with
+`SIDECAR_WAIT_TIMEOUT`/`SIDECAR_RETRY_INTERVAL`) rather than leaving the consumer to
+reimplement them. A public name is justified by a CONSUMER's need, never by this
+crate's own production.
 
-The composition is honest about its costs, all pinned by tests:
+## The contract
 
-* **Canonical order, no deadlock.** The sibling record is taken FIRST and the
-  caller's in-root record second; the order is enforced in the constructor, not
-  selectable by the caller. Both acquisitions are NON-BLOCKING (`flock LOCK_NB`
-  / `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY`), so a process can never WAIT
-  while holding one record — two composed runs contending in either order fail
-  with the typed `Error::LockContended` instead of deadlocking. Sibling-first is
-  the outer gate: a run that loses the sibling record never touches the
-  destination root.
-* **The destination ROOT must already exist.** Taking an in-root record creates
-  the record and any missing parent directory inside the root, so a composed
-  run that let the root be created would create the destination root before the
-  destination manifest is read — the surprise the sibling location exists to
-  avoid, and (for a PULL) a contradiction of the lazy-root adoption rule. The
-  composed constructor therefore REFUSES a missing (typed `Error::NotFound`) or
-  non-directory destination root BEFORE the sibling record is created, so the
-  refusal leaves nothing behind. The in-root record's own missing parent
-  directory INSIDE the existing root is still created (at the store-private
-  mode).
-* **The in-root record is invisible to the run, but its parent directory is
-  not.** The record is destination RESIDUE
-  (`reserved::is_residue_path`: its component is the application-lock spelling),
-  so `apply_manifests` strips it from the destination view — it is never
-  transferred and never destroyed; it is reported in `SyncReport::residue`. An
-  empty parent directory the lock creates is ordinary content: under
-  `Extraneous::Delete` its removal is refused because it holds residue, so
-  neither the directory nor the record is destroyed. (The earlier claim in this
-  section that an in-root record "would enter the destination manifest the run
-  is judging" was FALSE for the record itself; see `docs/CONSISTENCY.md`.)
-* **The default does not change.** Plain `sync`/`push`/`pull` behaviour —
-  including "a fully-refused pull creates NOTHING, not even the root" — is
-  untouched: the plain constructor never creates or holds the in-root record.
+This crate is the store SUBSTRATE its consumers build stores on: atomic replace, root
+confinement, locks, validated ids and paths, manifest and wire, transport, sync. It
+takes responsibility for exactly this, and no more.
 
-Do NOT move the sync's own record in-root: that still breaks the
-"a fully-refused pull creates NOTHING" contract. The composed form exists
-precisely so the in-root record is only taken when the caller names it and
-accepts the root-must-exist cost.
+* **Enforced.** (a) The mutation symbols THIS crate funnels are denied outside the
+  funnel modules by the compiler, on BOTH targets, so no spelling or module route
+  reaches them (`clippy.toml`; the list names what the funnel uses). (b) No `libc`
+  reference appears outside the funnel AT ALL — the outside reference map is asserted
+  EMPTY, so there is nothing to make safe and no belt is needed. (c) The funnel's OWN
+  call counts are pinned per file and per symbol, so a changed or added call inside the
+  funnel forces review.
+* **Guaranteed as an API.** Root confinement (a relative symlink target cannot leave
+  the root, and neither can a mutation named by `(&RootDir, &RootedRelativePath)`), the
+  atomic replace's commit points and its reported durability, lock mutual exclusion
+  with a record never destroyed by adoption, validated ids and paths, manifest fidelity
+  and wire injectivity, the ownership binding, and the typed error kinds.
+* **NOT promised.** Completeness of the SYMBOL SET — a mutating symbol nobody listed, a
+  raw `syscall(SYS_…)`, an `extern "C"` declaration, a `windows_sys` creator, a
+  proc-macro-generated call, third-party code. Keeping the funnel complete is a REVIEW
+  responsibility over the symbols the crate actually names. `docs/CONSISTENCY.md`
+  lists every stated residual with its reach.
 
-### (b) Ownership enforcement was unavailable for exactly the remote case — CLOSED (a persistent far-side lock session)
+The operative definition of the funnel is the set of
+`#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level in the
+funnel modules, or item-level on an individual reviewed function. A module-level
+attribute is INHERITED by that module's children, so the effective set is the annotated
+modules AND their descendants, and it is not enumerated here: it is whatever
+`rg -n 'allow\(clippy::disallowed_methods\)' src` reports plus the modules those
+attributes cover.
 
-The ONE entry point `sync` took the destination's operation lock only through
-the unforgeable `DestinationOwnership::Locked` token, which
-`DestinationOwnership::lock` produces by ACTUALLY taking the lock on a LOCAL
-record; a remote (SSH) destination could never be locked, because a one-shot
-far-side `flock` lived inside a single remote command and died with it (the
-`sync` module docs). The acquiring constructor therefore REFUSED such a
-destination, and the only way to reach it was to pass
-`DestinationOwnership::Unowned` at the call site. The crate's strongest
-guarantee therefore applied to the case a cross-host tool uses LEAST.
+## The gate
 
-DECISION (the crate's own recommendation, taken): a remote destination can now be
-OWNED, BY NAME, through
-`DestinationOwnership::lock_remote(direction, local_root, remote)`, which holds
-the destination's operation lock ON THE FAR SIDE for the whole run. The refusal
-is KEPT: `DestinationOwnership::lock` still refuses a remote destination exactly
-as before, and `DestinationOwnership::Unowned` still reaches it; `lock_remote`
-is an ADDITIONAL, explicitly-named way to own it, not a widening of the weak
-path.
+Read exit codes DIRECTLY, never through a pipe. On either platform:
 
-* **The record is the SAME one the local case uses.**
-  `destination_lock_path`'s derivation — a SIBLING of the destination root,
-  `.<name>.operation.lock` — is applied to the far-side root spelling, so a
-  far-side holder and a local one contend on one record by construction.
-* **The mechanism is a persistent far-side lock session, not a widened
-  `sync`.** `lock_remote` spawns a long-lived local `ssh` client whose remote
-  `perl` opens the record `O_RDWR|O_CREAT|O_NOFOLLOW` at `0600`, takes
-  `flock(LOCK_EX|LOCK_NB)`, writes the holder identity into the record, prints a
-  `LOCKOK` readiness line, and then BLOCKS reading stdin. `perl`'s built-in
-  `flock` is used deliberately: the far side may be GNU or BSD, `flock(1)` does
-  not exist on macOS, and perl is already required for the crate's other
-  far-side primitives.
-* **Acquisition is NON-BLOCKING.** A live holder is the typed
-  `Error::LockContended` IMMEDIATELY, never a wait (the far-side `flock` is
-  `LOCK_EX|LOCK_NB`).
-* **The lock is held for the run's duration and released on EVERY exit path.**
-  The session guard lives for the whole `sync` call (it is in `sync`'s stack
-  frame, exactly as `HeldLocks` is); its `Drop` closes the client's stdin, waits
-  bounded for the far-side holder to exit, then kills and reaps the client — so
-  an ordinary return, an error return, and a panic unwind all release it.
-* **A lost connection releases it, and is REPORTED.** A far-side lock cannot
-  outlive its client: if the connection dies, the holder sees EOF and exits and
-  the kernel releases the `flock`. That is a real property with a consequence
-  the crate STATES rather than hides — the far-side lock SERIALISES concurrent
-  runs but is NOT a lease. A run whose session died mid-run returns a typed
-  transport failure naming the lost lock, never a clean `Ok`.
-* **Fail closed on an unusable far side.** No `perl` is
-  `TransportKind::InterpreterMissing`; an uncreatable or read-only parent, or a
-  real `flock` failure, is `TransportKind::FarSideScript` with an actionable
-  message; a transport that does not implement far-side locking
-  (`Remote::lock_far_side`'s DEFAULT) is a typed `Preflight` refusal naming the
-  override it needs. The run never proceeds unowned.
-* **The unowned path is UNCHANGED.** A remote destination without `lock_remote`
-  is still refused by `DestinationOwnership::lock` exactly as before, and
-  `DestinationOwnership::Unowned` still reaches it.
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings   # NOT optional
+cargo test
+cargo check --all-targets --target x86_64-pc-windows-msvc
+```
 
-The limitation that REMAINS: a NON-COOPERATING far-side writer that never takes
-the record is outside the crate's exclusion, exactly as for a local
-destination — the crate cannot force another program to take the lock — and a
-far-side lock cannot outlive its client, so it is not a lease.
-
-### (c) The fd-confined tree helpers the source tool calls had no public equivalent — CRATE DEFECT, FIXED HERE
-
-`~/code/deploy` calls `copy_dir_recursive_fd` and `fsync_tree_recursive_fd`
-(from its `store::local`, defined in its `store::atomic::unix`), but the crate
-had dropped them
-and `Remote::{copy_tree,fsync_tree}` are NOT 1:1 replacements: both require
-`RootedRelativePath` endpoints under ONE transport root (the deploy call site
-copies from an arbitrary, possibly out-of-root source), and `Remote::fsync_tree`
-is PATH-based (`WalkDir`, so a symlinked component is followed) where the
-source tool's version refuses one. The migration was blocked on this, so this
-change re-adds the PUBLIC `atomic::copy_dir_recursive_fd` and `atomic::fsync_tree_recursive_fd`,
-ITERATIVE and descriptor-confined. Their exact
-deltas from `deploy`'s originals (each documented on the primitive itself):
-
-* ITERATIVE, not recursive — the source tool's original recursed one Rust
-  frame per level, so a deep tree aborted the host; the re-added forms hold an
-  explicit heap `Vec` stack and surface a clean `Err` at the descriptor limit.
-  Proven by `deep_tree_fd_copy_does_not_abort_the_process` and
-  `deep_tree_fd_fsync_does_not_abort_the_process` (depth 256). The stack is
-  PROFILE-DEPENDENT and the numbers are MEASURED (depth 256, both platforms):
-  in DEBUG the fd copy aborts at 16/24 KiB on Linux and fits from 32 KiB
-  (macOS fits 16 KiB), while the recursive reference aborts at 64 KiB and
-  needs >256 KiB on macOS — so the tests use 64 KiB; in RELEASE the fd copy
-  and fsync fit 8 KiB on both platforms, while the recursive reference aborts
-  through 64 KiB and first survives at 96 KiB — so the tests use 24 KiB. The
-  calibration test (`deep_tree_recursive_reference_copy_aborts_at_the_fd_stack`)
-  additionally requires the recursive reference to abort at TWICE the fd
-  stack, asserting a >=2x margin rather than relying on a hard-coded number
-  that sat 1.5x below the release cliff.
-* `fsync_tree_recursive_fd` reopens each root-relative path COMPONENT-WISE, so
-  its cost is O(depth^2) `openat` calls (measured 1202 / 17042 / 264722 at
-  depth 32 / 128 / 512 on Linux). It stays fail-closed, error-propagating,
-  deepest-first, and iterative; the cost is stated on the primitive (documented,
-  not changed).
-* TWO-PHASE mode finalize — a read-only source directory copies cleanly (the
-  source tool's one-phase original failed with `EACCES`); the final modes are
-  still EXACT, including the setuid/setgid/sticky bits.
-* The destination intermediates are created at the store-private `0o700` mode
-  (the shared directory authority); only the FINAL copied directory takes the
-  source's mode, and an intermediate staging directory is outside the copied
-  tree, so it is not part of a staged-object digest.
-* The ONE reserved-spelling gate runs on every destination mutation (the
-  source tool's original had none), so a source entry named like a lock record
-  (e.g. `operation.lock`) is REFUSED rather than copied into the destination
-  namespace, and a residue-spelled destination component is refused BEFORE
-  anything is created (the source tool's original created it and then reported
-  the refusal in removal vocabulary).
-* Every landed NAME runs the crate's ONE name authority: valid UTF-8, already
-  NFC, free of NUL/LF/CR/TAB, within `NAME_MAX`, and not
-  [`reserved::is_unaddressable_name`] — so a crate-temp-shaped or reserved
-  name (which the documented recovery sweep or the manifest strip would
-  remove) is REFUSED instead of landed, while spaces, quotes, `$`, `;`, `*`,
-  leading `-`, and 255-byte names still copy.
-* A source entry that is not a regular file, directory, or symlink (a FIFO,
-  socket, or device) is REFUSED through the crate's `O_NONBLOCK`-classified
-  open, so a FIFO cannot block the copy, and a HARD LINK is refused rather
-  than silently duplicated into an independent regular file.
-* A source/destination OVERLAP (either inside the other, or equal) is refused
-  before anything is created, decided by directory IDENTITY (`(st_dev, st_ino)`
-  on Unix, volume serial + file index on Windows), not by path spelling, so a
-  Linux `mount --bind` alias, a macOS firmlink, a Windows junction, or a
-  case-fold-equal `dst_rel` can no longer be created INSIDE the source and run
-  the walk without bound. The destination ANCHOR (the deepest existing
-directory on `dst_rel`) is compared with the opened source; a component that
-  cannot be opened as a directory, and any identity-probe failure, refuse (fail
-  closed). The one case identity cannot catch (two paths onto one tree that
-  report DIFFERENT device numbers) is documented rather than hidden.
-* A FAILED COPY RESTORES EVERY MODE IT CHANGED (an RAII journal): a
-  pre-existing destination directory goes back to its original mode and a
-  directory the call created goes back to the removable `0o700`, so a failed
-  copy can never leave the SOURCE mutated (the fold-equal case), nor leave a
-  destination the CALL CREATED that the crate's own `remove_dir_all_fd` cannot
-  remove. A pre-existing destination keeps its own mode. On success the exact
-  modes are applied and the journal is disarmed.
-* SYMLINK LANDING IS ALL-OR-NOTHING, like the file (`O_EXCL`) and directory
-  (`mkdirat`) rules: a copied symlink over a pre-existing file, directory, or
-  symlink is REFUSED (`symlinkat` `EEXIST`) and the old entry is left intact,
-  where the public `symlink_fd`'s replace semantics used to unlink and destroy
-  a live destination file. A copied file uses create-new and a copied directory
-  `mkdirat`, so all six kind pairs refuse rather than replace.
-* The SOURCE spelling is normalized (`normalize_root`) and its FINAL component
-  must not be a symlink, so a trailing-separator symlink source (`link/`) is
-  refused instead of followed — POSIX resolves a trailing separator as an
-  intermediate component, whose `lstat` reports a directory.
-* The descriptor bound is stated and MEASURED: the walk holds one source
-  descriptor per level, and a destination mutation holds O(1) because the
-  ancestor chain is re-opened one component at a time (depth 256 succeeds at
-  `RLIMIT_NOFILE=262`); the TIME cost is O(depth) `openat` calls per
-  destination entry. `dir_entry_names` buffers a directory's whole name list
-  (measured ~50 B/entry); the widest directory, not the depth, bounds that
-  heap.
-* FIDELITY IS TO THE MANIFEST MODEL: content, modes (with the special bits),
-  and symlink targets — the fields `canonicalize_tree` digests — are faithful,
-  so a copied tree passes the digest. mtime/atime/xattrs/ACLs/ownership are NOT
-  carried; a caller that needs them restores them.
-* A symlink's TARGET is judged by the crate's own containment rule through the
-  SAME indexed authority the two manifest views use
-  (`manifest::SymlinkContainmentIndex` + `check_relative_symlink_target_indexed`,
-  full-Unicode-case-fold), built from a filesystem enumeration of the source
-  subtree and the destination entries the run leaves in place, so a target that
-  escapes the root or resolves through a symlink component (inside the copied
-  subtree, or a surviving destination-only symlink in the destination root) is
-  refused and the destination always `canonicalize_tree`s cleanly. A tree that
-  cannot be enumerated is refused (fail closed), and a source that changes
-  shape during the copy is detected by an end-of-run re-enumeration (the copy's
-  analogue of `sync`'s source re-read); the copy does not lock an arbitrary
-  source, so a caller that needs a hard guarantee must serialize the source.
-* NOT atomic, NOT durable, and PARTIAL ON FAILURE: there is no temp directory
-  and no final rename, so entries appear in place, an error mid-walk leaves a
-  partial destination tree, and nothing is fsynced; a caller that needs more
-  copies into a staging path it owns and renames it into place. A partial
-  destination the call CREATED is removable with `remove_dir_all_fd` (the modes
-  were restored); a pre-existing one keeps its own mode. The empty ancestors
-  the call created are kept so that documented cleanup keeps working.
-* The `dst_rel` PATH is exempt from the documented recovery sweep (a
-  temp-shaped staging component like `.staged.tmp.1.2/root` is needed by
-  `deploy`), but a temp-shaped ENTRY name is refused — so a caller that leaves
-  a copy AT a temp-shaped destination loses the whole tree to the sweep and
-  must rename it into place.
-* The destination side is descriptor-confined (a symlinked component is
-  refused); the source side is a path-based READ, exactly as the original. The
-  Windows port is path-based with the port's documented weaker guarantee, and
-  it materializes each file whole through `std::fs::read` (the Unix port
-  streams through a 64 KiB heap buffer).
-
-**The tolerant sibling, for the case the landing rule is WRONG for.** The
-refusal above is correct for LANDING a tree into a store root, and wrong for
-CLONING a live base that already holds `operation.lock` or crash residue. That
-second case is served by the deliberately-named PUBLIC
-`atomic::copy_tree_verbatim(src, dst)` — the weak/tolerant path (API constraint
-#8, verdict N), which copies reserved spellings and crate-temp shapes
-VERBATIM, recreates symlinks (absolute and escaping targets included, with no
-containment check), carries modes exactly (two-phase, so a read-only source
-copies), and REFUSES what it cannot reproduce faithfully rather than skipping
-it (a hard link is `StoreKind::CopyHardLink`, a FIFO/socket/device is
-`StoreKind::CopySourceNotRegular`, opened `O_NONBLOCK` so it cannot block). Its
-consequence is stated at the primitive and is not negotiable: the destination
-**must not be used as a store root** and must not be handed to the documented
-recovery sweep, because the names it carries are exactly the ones the sweep
-removes. Landing is all-or-nothing (every entry is created new; a pre-existing
-one is refused, never replaced), so the tolerant copy can never destroy a live
-entry or split a lock holder; source/destination OVERLAP is refused by the
-canonical spellings with `StoreKind::CopyOverlap`. `deploy`'s retention
-checkpoint clones a live base with it (its local test helper and the documented
-gap at `deploy/src/retention/checkpoint/mod.rs` are what this closes).
+TWO clippy commands, and the second is not optional: `--all-targets` compiles the HOST
+only, and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module is
+invisible to both. On Linux the real-`sshd` suites (`remote_lock`, `ssh_farside_*`) are
+part of `cargo test`.
 
 ## Rules for changing this crate
 
-**Mechanically enforced today.** TWO devices with DIFFERENT jobs — neither covers
-the other, and the gate must run both.
-
-* The **resolved-symbol deny** (`clippy.toml` + `#![deny(clippy::disallowed_methods)]`
-at the crate root) makes the compiler refuse a call to any listed name-mutating
-symbol — the free-function removal/replace/rename family, the name-CREATING std
-wrappers, the mode authority, and the `libc` syscalls the funnel wraps — from any
-module not granted the allow. The list itself is the authority and is deliberately
-not repeated here: an earlier version of this bullet enumerated it and went stale
-within one round. This is the **completeness** device: it matches the symbol the
-compiler RESOLVED,
-so no alias, raw identifier, cross-module re-export, glob, parenthesized or
-referenced callee, macro body, or `#[path]`-relocated module evades it — all eight
-shapes were measured against it, as were the name-ADOPTING inherent/builder forms
-(`File::create`, `OpenOptions::{create,create_new}`, `DirBuilder::create`,
-`std::fs::copy`). It runs only under `cargo clippy`, and only for the target being
-compiled, so the gate is TWO clippy commands and one of them is not optional:
-`cargo clippy --all-targets -- -D warnings` for the host and
-`cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings` for the
-Windows-only code — `cargo check --target …` does NOT substitute, because rustc
-does not run lints (measured: a `#[cfg(windows)]` module calling denied symbols is
-invisible to the host run and red under the Windows one). The Windows run reports
-config-time "does not refer to a reachable function" warnings for entries whose
-symbols do not resolve on that target — **16 at this revision**, and the number
-MOVES whenever the deny list gains a platform-specific entry: it has been stated as
-9, then 13, then 16 across three rounds, each figure written from a report rather
-than measured. It is therefore a COMMAND and not a figure:
-`cargo clippy --all-targets --target x86_64-pc-windows-msvc 2>&1 | grep -c 'does not refer'`.
-The warnings are correct for the host and do not fail the run. `cargo test` alone exercises neither clippy command.
-* The **two source audits** in `atomic::guard::tests` run under `cargo test`, i.e.
-always: `no_libc_reference_outside_the_funnel`
-fails when a `libc` reference appears outside the funnel or when the funnel's own
-per-module `libc` reference surface changes, and
-`std_fs_name_mutation_counts_are_pinned` fails when a production name-mutating call
-count changes (removal, replacement, creation or mode). The funnel's membership is
-DERIVED from the source (the modules carrying the module-level allow), so neither
-audit's prose restates it. Their job is what
-the lint cannot do — notice when the funnel's OWN calls change, inside the modules
-where the deny is allowed and therefore blind — and they are INDEPENDENT of the
-lint's symbol resolution. They are NOT the same kind of device, and an earlier
-version of this sentence said BOTH "resolve the enumerated import routes by
-PARSING the sources": only `std_fs_name_mutation_counts_are_pinned` parses (with
-`syn`, which is what retires the spelling class);
-`no_libc_reference_outside_the_funnel` is a REFERENCE SCANNER over comment- and
-string-stripped text — it does not parse, and it does NOT resolve an alias (`use
-libc as c; c::unlinkat(...)` records a bare `libc`, which its own doc states).
-Aliased and re-exported `libc` spellings are caught by the resolved-symbol deny
-and by the exact per-module reference pin, not by that scanner.
-
-**The contract, stated so that it can be kept.** An earlier version of this section
-said the devices back "the rule that every name mutation goes through the ONE guarded
-funnel". That is a claim about the whole language — every spelling, alias, macro,
-builder, module route, `extern "C"` declaration, raw syscall number and third-party
-call — and NO finite mechanism certifies it. Five adversarial rounds were spent
-proving that, one artifact at a time (a 7-name spot list, a 54-entry literal, a
-71-entry "independent" anchor, a file derived as that anchor intersected with
-`libc`), and each artifact produced the next hole. The claim is WITHDRAWN, and the
-crate takes responsibility for exactly this:
-
-* **What it ENFORCES.** (a) The mutation symbols THIS crate funnels are denied
-  outside the funnel modules by the compiler, on both targets, so no spelling or
-  module route reaches them (`clippy.toml`; the list names what the funnel uses).
-  (b) No `libc` reference at all appears outside the funnel: the outside reference
-  map is asserted EMPTY, so there is nothing to make safe and no belt is needed.
-  (c) The funnel's OWN call counts are pinned per file and per symbol, so a changed
-  or added call inside the funnel forces review.
-* **What it does NOT promise.** Completeness of the SYMBOL SET: a mutating symbol
-  nobody listed, a raw `syscall(SYS_...)`, an `extern "C"` declaration the crate
-  writes itself, a `windows_sys` creator, a proc-macro-generated call — none is
-  detected, and none is claimed. Keeping the funnel complete is a REVIEW
-  responsibility, exercised on the symbols the crate actually names.
-* **What it GUARANTEES as an API.** The public surface's own properties: root
-  confinement, the atomic replace's commit-point protocol and its reported
-  durability, lock mutual exclusion and a record that is never destroyed by
-  adoption, validated ids and paths, manifest fidelity and wire injectivity, the
-  ownership binding, and the typed error kinds. Those are the crate's product;
-  the funnel rule is how its own implementation is kept honest.
-
-The operative definition of the funnel's membership is the set of
-`#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level
-in the funnel modules, item-level on the individual reviewed functions
-(capability-gated workers, the path-based mode authority, the cross-platform
-symlink helper, the creation helpers, and one reviewed exception for the ssh
-hostkey cache). A module-level attribute is INHERITED by that module's child
-modules, so the EFFECTIVE set is the annotated modules AND their descendants —
-`atomic::guard`, for instance, is inside the funnel by inheritance rather than by
-an attribute of its own, which is why the rule is stated as "annotated item or
-module" rather than enumerated. That set is deliberately NOT listed here: it is
-whatever `rg -n 'allow\(clippy::disallowed_methods\)' src` reports plus the modules
-those attributes cover, each site carrying a
-comment naming the rule it implements, and
-`atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`
-checks the SYMBOL side of the same property against `clippy.toml`. `clippy.toml`
-itself holds only the DENY side: an earlier version of this sentence called its
-"allow list" the operative definition, and there is no allow list there to read,
-while a second version enumerated the sites and went stale within one round.
-
-**Review conventions, NOT mechanical checks.** The rest of this list is enforced
-by review: in particular "fix the class, not the instance", "an oracle must be
-able to express the failure it is meant to catch", "a document that contradicts
-the code is a defect in whichever is wrong", "a green gate on one platform is
-not evidence for another", and "no assertion is weakened or deleted" have no
-test that would catch their violation. An aspiration presented as an enforcement
-is the same defect as a false claim, so they are labelled here rather than
-implied to be checked.
-
-- A behaviour fix lands with a test that fails before the change. A test that
-  cannot fail before says so in its own comment.
-- No assertion is weakened or deleted to make a change land.
-- **A public-API deletion is justified only by a CONSUMER's need, never by this
-  crate's own tests.** The crate exists to be consumed, so its own suite passing
-  means nothing about a consumer's call sites: "our production never did" and
-  "only a test used it" are evidence about the WRONG population, and a consumer
-  that DECLARES the name in its interface or CALLS it in production is the
-  authority. When a name is weak, NAME the weakness — a default whose doc states
-  what it discards, a doc that points at the typed alternative — rather than
-  deleting it; that is rule 2 ("a weaker guarantee is reachable only through an
-  entry point whose name states it"), not an exception to it.
-  `tests/consumer_fit.rs` is the backstop: it exercises the shapes a consumer
-  requires (against the public API only), so a deletion is a compile failure
-  rather than a silent green.
-- A green gate on one platform is not evidence for another.
-- Fix the class, not the instance: a rule bypassed on a path other than the one
-  reported is still broken.
-- An oracle must be able to express the failure it is meant to catch — in the
-  inputs it varies and in the paths it samples.
-- A document that contradicts the code is a defect in whichever is wrong.
-- A fold is a DENIAL tool, never a PERMISSION tool. Unifying spellings (case,
-  trailing dot/space) may only make the crate refuse MORE; it must never decide
-  that two spellings are one thing when the thing grants a right. Ownership of
-  a resource is decided by IDENTITY — the resolved on-disk entry (device and
-  inode) — not by whether two spellings fold together, because on some
-  filesystems a folded spelling is a different entry that another holder owns.
-  The one spelling fallback allowed is byte-exact equality while the entry does
-  not exist yet (creating it). Concretely: refusing a lock-record spelling folds
-  case and the Win32 trailing dot/space, while the protocol's authority to
-  break the lock record it owns compares the candidate's resolved identity with
-  the layout lock's and refuses every alias that is a distinct entry.
-- Refusing a case beats transforming it; deleting a capability beats shipping a
-  broken one.
-- State every bound with the reason it holds, and every cost with its number.
-  A cost asserted without a measurement is a guess wearing a number's clothes.
-- **A guarantee belongs at ONE authority every path passes through.** And the
-  corollary that cost three separate fixes: *co-location is not co-application*.
-  Two authorities applied at the same call sites diverge by one line each
-  (a guarded `renameat_paths` beside an unguarded `renameat_fd`; a lock-record
-  check beside a missing residue check). When two must both apply, they are ONE
-  function, so that carrying one and skipping the other is not expressible.
-- **A residual must be scoped to exactly the operation it justifies.** A stated
-  limit, an exemption or a sanctioned break that is broader than its reason
-  reads as a documented guarantee while acting as a hole. "The sanctioned lock
-  protocol" excused a method that accepted any path; check each residual's reach
-  against its justification, not its wording.
-- **Agreement between views is not soundness.** Unifying two views onto one rule
-  makes a wrong rule *consistent*, not correct — and consistency is what makes it
-  harder to see. Prove the shared rule against the world; do not infer it from
-  the views agreeing with each other.
-- **A safety argument must cover the part of the input whose treatment changed,**
-  not the part that was already correct. An argument about the link's parent
-  components says nothing about the target's components, and the target is the
-  half the change altered.
-- **A fold that feeds a decision which GRANTS must be at least as broad as the
-  host's fold.** The rule above (a fold is for denial) has this corollary: reuse
-  a denial-grade fold for a permission decision and over-refusal silently becomes
-  under-refusal. `str::to_lowercase` is a lowering, not a case fold.
-- **A bound that is not injective converts a loud failure into a silent alias.**
-  Check that a bounded derivation is a bijection on the inputs it accepts.
-- **Pin the MAPPING, not just the mechanism.** A test that the machinery runs is
-  not a test that it maps correctly; an inverted mapping once passed every test
-  in the suite.
-- **A bound test must measure the quantity that can regress** — not a proxy that
-  happens to move with it (a count is blind to a quadratic).
-- **When a fix changes what a signal MEANS, revisit every consumer of it.**
-- **Whatever the address model accepts, every operation must be total over it.**
-  If parsing admits a shape, every primitive that receives it must have a defined
-  answer — otherwise the boundary is the bug.
-- **A value feeding a length-limited resource must be bounded**, with the limit
-  named and the overflow refused.
-- **A primitive re-added from legacy code re-imports that legacy's hazards**
-  unless each one is re-closed against the authorities the codebase has built
-  since. It arrived with a FIFO hang, an unbounded recursion and a data-loss
-  route that the newer substrate already knew how to refuse.
-- **A test that cannot fail is worse than no test**, and a pre-fix proof that was
-  not RUN is not a proof. Record which of the two you have.
-- **A green gate can be a stale binary.** Cargo's fingerprint does not include
-  `CARGO_MANIFEST_DIR`, so moving the crate's directory reuses objects compiled
-  at the old path — and a test that bakes `env!("CARGO_MANIFEST_DIR")` (both
-  source audits do) then reads a directory that no longer exists. Run
-  `cargo clean -p storekit` after moving the tree, and treat a gate that ran
-  without a rebuild after a path change as NOT RUN. The same applies to the
-  REVISION: a checkout whose working copy is still parented to an older tip
-  reports on a tree that no longer exists, so name the revision a gate or a
-  count was taken from — a number measured against the wrong tree reads exactly
-  like a real one.
-- **A signature change is not verified until every supported platform has
-  COMPILED it.** A call site inside a `#[cfg(...)]` block is invisible to the
-  other platform's gate: a test gated to Linux is never built by a macOS run, so
-  a changed parameter type can compile clean there and fail to compile on the
-  other host. A green gate on one platform is not evidence for the other — it is
-  not even evidence that the other platform BUILDS.
-- **A deletion is justified by the ASSERTIONS that cover it, not by a count.**
-  Removing a test is safe exactly when a per-test reconciliation shows that each
-  of its assertions exists somewhere else — and any assertion that does not is
-  PORTED, never dropped. A preserved test count is evidence of nothing: 52 tests
-  can be deleted with zero coverage lost, and one test can be deleted with
-  everything lost. The reconciliation table is the artifact that discharges this
-  rule; a count cannot.
-- **An audit's shape is part of its guarantee.** Exemption is by COMPILE-TIME
-  gating, and the two forms behave differently:
-  * a separate FILE is exempt iff EVERY `mod` declaration naming it is
-    `cfg`-gated on `test`, where `cfg_implies_test` understands `all(test, …)`
-    and `any(...)` — so `#[cfg(all(test, unix))] mod x;` DOES exempt `src/x.rs`.
-    An earlier version of this bullet said the opposite (that a file gated that
-    way "reads as production code and trips both pins"); that was true of the
-    filename-suffix rule it replaced and is false now.
-  * an INLINE module in a production file is stripped only when its attribute
-    run contains `#[cfg(test)]`; `#[cfg(all(test, unix))] mod x { … }` written
-    inline is NOT recognised as test-only, so its body reads as production
-    (true for the audits; the clippy deny does not parse attributes at all and
-    fires on the resolved symbol wherever it is).
-  * a file declared BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is
-    PRODUCTION: the exemption requires EVERY declaration to be test-gated,
-    because otherwise a production module can hide behind a same-named test twin.
-- **A claim is a measurement or it is a label.** Every behavioural or countable
-  claim in `README.md`, `docs/API-CONSTRAINTS.md` and `docs/CONSISTENCY.md`
-  either names the command, test or table that produced it, or says in the
-  sentence itself that it is an assertion nobody has measured. The adversarial
-  review's first round refuted EIGHT such claims — the loudest being a paragraph
-  titled "The delta, measured" that described a strictness the code did not
-  have, and a count ("the ONE tolerated exception") that was off by seven. A
-  claim is not weaker for admitting it is unmeasured; it is checkable, which is
-  the only property that matters to the next reader. This one is a norm and not
-  a test: no text scan can tell a claim from a historical mention, so the
-  enforcement is the review.
+* **One logical change per commit**, gated before it lands and on both platforms.
+* **No assertion is weakened or deleted.** A test that encoded a LOOSER rule may be
+  flipped, but only explicitly, with the reason recorded at the test. A deletion is
+  justified by the ASSERTIONS that cover it — a per-test reconciliation — never by a
+  preserved test count, and never by whether this crate's own production happens to
+  use the name.
+* **A claim is a measurement or it is a label.** Cite a command, a test or a table, or
+  say in the sentence that it is unmeasured; cite items by name, never by line number.
+  `docs/CONSISTENCY.md` carries the rules this crate earned — they are binding.
+* **Port the coverage, do not widen the surface.** When a public name moves, the
+  consumer must still compile: fix the consumer in the same round.
+* **A weak path is reachable only through a name that states it.**
+* **Evidence is about a REVISION.** This crate's own docs, its consumers' trees and any
+  cited specification drift; re-read before relying on one.
