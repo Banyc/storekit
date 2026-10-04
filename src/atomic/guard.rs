@@ -673,6 +673,17 @@ mod tests {
     /// against each other by
     /// `every_libc_call_symbol_the_tree_references_is_classified`, so neither
     /// the family nor the tree's references can silently lag the other.
+    ///
+    /// ROUND 11: the family is the belt's clause (a), and it is now a SUPERSET
+    /// of the independently-specified anchor [`INDEPENDENT_KNOWN_NAME_MUTATORS`]
+    /// — the set the belt oracle actually iterates. Clause (a) is the ONLY
+    /// device that refuses a symbol the tree does not reference, so an anchor
+    /// member absent here would be pinnable outside the funnel with no device
+    /// noticing; the oracle fails on exactly that. The family is also LARGER
+    /// than the hand list round 10 shipped: the POSIX IPC name API, the
+    /// template temp-name creators, the missing time setters, `fchmodat2` and
+    /// the ACL setters join it, so a pinned reference to any of them is refused
+    /// too.
     const MUTATING_LIBC_SYSCALLS: &[&str] = &[
         // REMOVE / REPLACE / LINK
         "unlink",
@@ -686,6 +697,10 @@ mod tests {
         "linkat",
         "symlink",
         "symlinkat",
+        // REMOVE a POSIX IPC name (message queue / semaphore / shared memory).
+        "mq_unlink",
+        "sem_unlink",
+        "shm_unlink",
         // CREATE a name
         "mkdir",
         "mkdirat",
@@ -702,6 +717,17 @@ mod tests {
         "mkfifoat",
         "clonefile",
         "clonefileat",
+        // CREATE a POSIX IPC name.
+        "mq_open",
+        "sem_open",
+        "shm_open",
+        // CREATE a name through a template (`mkstemp`/`mkdtemp` and friends
+        // both choose a spelling and ADOPT it).
+        "mkstemp",
+        "mkostemp",
+        "mkstemps",
+        "mkostemps",
+        "mkdtemp",
         // `bind` on an `AF_UNIX` pathname socket CREATES a directory entry at
         // the bound path (the raw-syscall twin of
         // `std::os::unix::net::UnixListener::bind`, which `clippy.toml` denies).
@@ -714,6 +740,7 @@ mod tests {
         "chmod",
         "fchmod",
         "fchmodat",
+        "fchmodat2",
         "chown",
         "fchown",
         "lchown",
@@ -724,6 +751,9 @@ mod tests {
         "utimes",
         "futimens",
         "utimensat",
+        "futimes",
+        "futimesat",
+        "lutimes",
         "setxattr",
         "lsetxattr",
         "fsetxattr",
@@ -735,33 +765,38 @@ mod tests {
         "lchflags",
         "setattrlist",
         "exchangedata",
+        "acl_set_file",
+        "acl_set_link_np",
         // FILESYSTEM MOUNTS
         "mount",
         "umount",
         "umount2",
     ];
 
-    /// The NAME-MUTATION family as an INDEPENDENT LITERAL ORACLE, and the
-    /// reason each member is in the class. It is deliberately NOT derived from
-    /// [`MUTATING_LIBC_SYSCALLS`] or [`NON_MUTATING_LIBC_CALLS`]: the belt is
-    /// the device that makes a REVIEWED `.pin` outside the funnel safe, so its
-    /// property must survive a reclassification of those two lists. A member
-    /// MOVED from [`MUTATING_LIBC_SYSCALLS`] into
-    /// [`NON_MUTATING_LIBC_CALLS`] changes only this oracle's side of a set
-    /// equality, so [`the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel`]
-    /// fails — which no predicate of the form "for every member of
-    /// [`MUTATING_LIBC_SYSCALLS`], …" can, since the moved symbol is no longer
-    /// a member to iterate.
+    /// The NAME-MUTATION family as a LITERAL, kept in step with the belt's
+    /// clause (a) by set equality. It is deliberately NOT derived from
+    /// [`MUTATING_LIBC_SYSCALLS`] or [`NON_MUTATING_LIBC_CALLS`], so a MOVE of a
+    /// member out of the code family into the review list changes this side of
+    /// the equality.
     ///
-    /// The justification is the shared CLASS, exactly as in
-    /// [`MUTATING_LIBC_SYSCALLS`]'s doc: a member can FREE or SWAP a directory
-    /// entry, ADOPT/CREATE a name (including by `open`/`creat` with `O_CREAT`),
-    /// or change metadata attached to a NAME (mode/owner/time/xattr/flags), or
-    /// change the mount NAME SPACE. The descriptor-bound variants
+    /// THIS LITERAL IS ONE HALF OF A CO-EDITABLE PAIR and is therefore NOT the
+    /// oracle. Round 10 shipped this list and [`INDEPENDENT_KNOWN_NAME_MUTATORS`]
+    /// as two hand-written literals in this file and compared them to each
+    /// other, so deleting `chown` from both and adding it to
+    /// [`NON_MUTATING_LIBC_CALLS`] disarmed the belt with every arm green
+    /// (measured; 52 of the 54 members could be moved the same way). The anchor
+    /// [`INDEPENDENT_KNOWN_NAME_MUTATORS`] is the THIRD artifact the oracle
+    /// iterates, and co-editing this pair against it now fails.
+    ///
+    /// The justification is the shared CLASS, and every member's individual
+    /// class and reason live in [`INDEPENDENT_KNOWN_NAME_MUTATORS`]: a member
+    /// can FREE or SWAP a directory entry, ADOPT/CREATE a name, create or
+    /// remove a POSIX IPC name, choose-and-adopt a temp name, or change
+    /// metadata attached to a NAME (mode/owner/time/xattr/flags/ACL), or change
+    /// the mount NAME SPACE. The descriptor-bound variants
     /// (`fchmod`/`fchown`/`ftruncate`/`futimens`) are included because the code
-    /// family includes them; were they reclassified as non-mutating, both sides
-    /// of the equality and the disjointness assertion would demand the change be
-    /// stated here with a new reason.
+    /// family includes them; reclassifying one demands the change be stated in
+    /// the anchor with a new class and reason.
     const KNOWN_NAME_MUTATORS: &[&str] = &[
         // FREE or SWAP a directory entry.
         "unlink",
@@ -771,6 +806,10 @@ mod tests {
         "rename",
         "renameat",
         "renameat2",
+        // FREE a POSIX IPC name.
+        "mq_unlink",
+        "sem_unlink",
+        "shm_unlink",
         // CREATE or replace a LINK at a name.
         "link",
         "linkat",
@@ -785,6 +824,16 @@ mod tests {
         "mkfifoat",
         "clonefile",
         "clonefileat",
+        // CREATE a POSIX IPC name.
+        "mq_open",
+        "sem_open",
+        "shm_open",
+        // CREATE a name through a template.
+        "mkstemp",
+        "mkostemp",
+        "mkstemps",
+        "mkostemps",
+        "mkdtemp",
         // ADOPT or TRUNCATE a name through an open with O_CREAT/O_TRUNC.
         "open",
         "openat",
@@ -799,6 +848,7 @@ mod tests {
         "chmod",
         "fchmod",
         "fchmodat",
+        "fchmodat2",
         "chown",
         "fchown",
         "lchown",
@@ -809,6 +859,9 @@ mod tests {
         "utimes",
         "futimens",
         "utimensat",
+        "futimes",
+        "futimesat",
+        "lutimes",
         "setxattr",
         "lsetxattr",
         "fsetxattr",
@@ -820,10 +873,419 @@ mod tests {
         "lchflags",
         "setattrlist",
         "exchangedata",
+        "acl_set_file",
+        "acl_set_link_np",
         // Change the mount NAME SPACE.
         "mount",
         "umount",
         "umount2",
+    ];
+
+    /// The CLOSED set of name-mutation CLASSES an anchor entry may claim. The
+    /// anchor's class field is checked against this list, so a new member cannot
+    /// be admitted under an ad-hoc class string invented at the point of edit;
+    /// adding a class is a visible review of the CLASS axis, not just of one
+    /// symbol.
+    const KNOWN_NAME_MUTATOR_CLASSES: &[&str] = &[
+        "free-or-swap-a-directory-entry",
+        "link-at-a-name",
+        "create-a-directory-entry",
+        "adopt-or-truncate-through-an-open",
+        "bind-a-pathname-socket",
+        "create-or-remove-a-posix-ipc-name",
+        "create-a-name-through-a-temp-template",
+        "change-metadata-attached-to-a-name",
+        "change-the-mount-name-space",
+    ];
+
+    /// THE INDEPENDENTLY-SPECIFIED ANCHOR, and the per-symbol class + reason
+    /// that justifies membership. This is the artifact the belt oracle
+    /// ITERATES; it is not compared to another list of its own kind. Every
+    /// member must (1) be on [`MUTATING_LIBC_SYSCALLS`], because clause (a) of
+    /// the derived belt is the only device that refuses a symbol the tree does
+    /// not reference, (2) be ABSENT from [`NON_MUTATING_LIBC_CALLS`], and (3)
+    /// be REFUSED by the DEFAULT-DENY half of the belt when a source references
+    /// it, so the anchor is not circular through the family. The set is
+    /// strictly LARGER than the 54-member family round 10 shipped: `lutimes`,
+    /// `futimes`/`futimesat`, `fchmodat2`, the POSIX IPC names
+    /// (`mq_open`/`sem_open`/`shm_open` and their `*_unlink` twins), the
+    /// template temp-name creators (`mkstemp`/`mkostemp`/`mkstemps`/
+    /// `mkostemps`/`mkdtemp`), and the ACL setters were in NEITHER hand list,
+    /// and they are named in the oracle as negative controls so the anchor
+    /// cannot be silently narrowed back.
+    ///
+    /// THE ANCHOR'S OWN BOUNDARY — IT IS A LIST TOO. It covers the
+    /// POSIX.1-2017, Linux, and BSD/macOS `libc` name-mutation surface: the
+    /// remove/replace/link entry calls, the entry creators (directory, node,
+    /// FIFO, clone, template temp names), the adopt/truncate open family, the
+    /// pathname-socket bind, the POSIX IPC name API, the name-attached metadata
+    /// setters (mode/owner/time/xattr/flags/ACL), and the mount name space. It
+    /// does NOT cover, and a mutator OUTSIDE it is a STATED RESIDUAL: (a) a raw
+    /// syscall reached by NUMBER or by a local `extern "C"` declaration
+    /// (`syscall(SYS_…)`, an `io_uring` submission, a `windows_sys` creator),
+    /// which has no `libc::<name>` symbol for this anchor to key on — those are
+    /// refused, not enumerated, by the `libc`-reference surface pin in
+    /// [`no_libc_reference_outside_the_funnel`] and by the raw-`extern "C"`
+    /// residue named in this module's docs; and (b) a `libc` name this anchor
+    /// does not list, which is admitted only by ADDING it here with a class and
+    /// a reason — the act that reviews it.
+    const INDEPENDENT_KNOWN_NAME_MUTATORS: &[(&str, &str, &str)] = &[
+        // free-or-swap-a-directory-entry
+        (
+            "unlink",
+            "free-or-swap-a-directory-entry",
+            "removes one name from its parent directory",
+        ),
+        (
+            "unlinkat",
+            "free-or-swap-a-directory-entry",
+            "the dirfd-relative twin of unlink",
+        ),
+        (
+            "remove",
+            "free-or-swap-a-directory-entry",
+            "removes a name (a file or an empty directory)",
+        ),
+        (
+            "rmdir",
+            "free-or-swap-a-directory-entry",
+            "removes an empty directory name",
+        ),
+        (
+            "rename",
+            "free-or-swap-a-directory-entry",
+            "re-links the source name and frees the target name",
+        ),
+        (
+            "renameat",
+            "free-or-swap-a-directory-entry",
+            "the dirfd-relative twin of rename",
+        ),
+        (
+            "renameat2",
+            "free-or-swap-a-directory-entry",
+            "rename with flags; can also swap two names",
+        ),
+        // link-at-a-name
+        (
+            "link",
+            "link-at-a-name",
+            "creates a second name for one inode",
+        ),
+        (
+            "linkat",
+            "link-at-a-name",
+            "the dirfd-relative twin of link",
+        ),
+        ("symlink", "link-at-a-name", "creates a symlink name"),
+        (
+            "symlinkat",
+            "link-at-a-name",
+            "the dirfd-relative twin of symlink",
+        ),
+        // create-a-directory-entry
+        (
+            "mkdir",
+            "create-a-directory-entry",
+            "creates a directory name",
+        ),
+        (
+            "mkdirat",
+            "create-a-directory-entry",
+            "the dirfd-relative twin of mkdir",
+        ),
+        (
+            "mknod",
+            "create-a-directory-entry",
+            "creates a device, socket, or FIFO name",
+        ),
+        (
+            "mknodat",
+            "create-a-directory-entry",
+            "the dirfd-relative twin of mknod",
+        ),
+        ("mkfifo", "create-a-directory-entry", "creates a FIFO name"),
+        (
+            "mkfifoat",
+            "create-a-directory-entry",
+            "the dirfd-relative twin of mkfifo",
+        ),
+        (
+            "clonefile",
+            "create-a-directory-entry",
+            "creates a new name as a copy-on-write clone",
+        ),
+        (
+            "clonefileat",
+            "create-a-directory-entry",
+            "the dirfd-relative twin of clonefile",
+        ),
+        // adopt-or-truncate-through-an-open
+        (
+            "open",
+            "adopt-or-truncate-through-an-open",
+            "adopts or truncates a name with O_CREAT/O_TRUNC",
+        ),
+        (
+            "openat",
+            "adopt-or-truncate-through-an-open",
+            "the dirfd-relative twin of open",
+        ),
+        (
+            "open64",
+            "adopt-or-truncate-through-an-open",
+            "the large-file-offset spelling of open",
+        ),
+        (
+            "openat64",
+            "adopt-or-truncate-through-an-open",
+            "the large-file-offset spelling of openat",
+        ),
+        (
+            "openat2",
+            "adopt-or-truncate-through-an-open",
+            "openat with an extensible how-struct; can adopt a name",
+        ),
+        (
+            "creat",
+            "adopt-or-truncate-through-an-open",
+            "creates or truncates a name",
+        ),
+        (
+            "creat64",
+            "adopt-or-truncate-through-an-open",
+            "the large-file-offset spelling of creat",
+        ),
+        // bind-a-pathname-socket
+        (
+            "bind",
+            "bind-a-pathname-socket",
+            "an AF_UNIX bind creates the bound pathname entry",
+        ),
+        // create-or-remove-a-posix-ipc-name
+        (
+            "mq_open",
+            "create-or-remove-a-posix-ipc-name",
+            "creates or opens a POSIX message-queue name",
+        ),
+        (
+            "mq_unlink",
+            "create-or-remove-a-posix-ipc-name",
+            "removes a POSIX message-queue name",
+        ),
+        (
+            "sem_open",
+            "create-or-remove-a-posix-ipc-name",
+            "creates or opens a POSIX named-semaphore name",
+        ),
+        (
+            "sem_unlink",
+            "create-or-remove-a-posix-ipc-name",
+            "removes a POSIX named-semaphore name",
+        ),
+        (
+            "shm_open",
+            "create-or-remove-a-posix-ipc-name",
+            "creates or opens a POSIX shared-memory name",
+        ),
+        (
+            "shm_unlink",
+            "create-or-remove-a-posix-ipc-name",
+            "removes a POSIX shared-memory name",
+        ),
+        // create-a-name-through-a-temp-template
+        (
+            "mkstemp",
+            "create-a-name-through-a-temp-template",
+            "chooses a spelling and creates the file name",
+        ),
+        (
+            "mkostemp",
+            "create-a-name-through-a-temp-template",
+            "mkstemp with extra open flags",
+        ),
+        (
+            "mkstemps",
+            "create-a-name-through-a-temp-template",
+            "mkstemp with a suffix",
+        ),
+        (
+            "mkostemps",
+            "create-a-name-through-a-temp-template",
+            "mkostemp with a suffix",
+        ),
+        (
+            "mkdtemp",
+            "create-a-name-through-a-temp-template",
+            "chooses a spelling and creates the directory name",
+        ),
+        // change-metadata-attached-to-a-name
+        (
+            "chmod",
+            "change-metadata-attached-to-a-name",
+            "sets a mode on a name",
+        ),
+        (
+            "fchmod",
+            "change-metadata-attached-to-a-name",
+            "sets a mode on a descriptor's open name",
+        ),
+        (
+            "fchmodat",
+            "change-metadata-attached-to-a-name",
+            "sets a mode on a name relative to a dirfd",
+        ),
+        (
+            "fchmodat2",
+            "change-metadata-attached-to-a-name",
+            "fchmodat with flags; can act on a symlink's own name",
+        ),
+        (
+            "chown",
+            "change-metadata-attached-to-a-name",
+            "sets an owner on a name",
+        ),
+        (
+            "fchown",
+            "change-metadata-attached-to-a-name",
+            "sets an owner on a descriptor's open name",
+        ),
+        (
+            "lchown",
+            "change-metadata-attached-to-a-name",
+            "sets an owner on a symlink's own name",
+        ),
+        (
+            "fchownat",
+            "change-metadata-attached-to-a-name",
+            "sets an owner relative to a dirfd, with symlink flags",
+        ),
+        (
+            "truncate",
+            "change-metadata-attached-to-a-name",
+            "changes a named file's length",
+        ),
+        (
+            "ftruncate",
+            "change-metadata-attached-to-a-name",
+            "changes a descriptor's open file length",
+        ),
+        (
+            "utime",
+            "change-metadata-attached-to-a-name",
+            "sets a name's access and modify times",
+        ),
+        (
+            "utimes",
+            "change-metadata-attached-to-a-name",
+            "sets a name's times with microsecond precision",
+        ),
+        (
+            "futimens",
+            "change-metadata-attached-to-a-name",
+            "sets a descriptor's open name's times with nanosecond precision",
+        ),
+        (
+            "utimensat",
+            "change-metadata-attached-to-a-name",
+            "sets a name's times relative to a dirfd",
+        ),
+        (
+            "futimes",
+            "change-metadata-attached-to-a-name",
+            "sets a descriptor's open file's times",
+        ),
+        (
+            "futimesat",
+            "change-metadata-attached-to-a-name",
+            "sets a name's times relative to a dirfd",
+        ),
+        (
+            "lutimes",
+            "change-metadata-attached-to-a-name",
+            "sets a symlink's own times",
+        ),
+        (
+            "setxattr",
+            "change-metadata-attached-to-a-name",
+            "sets an extended attribute on a name",
+        ),
+        (
+            "lsetxattr",
+            "change-metadata-attached-to-a-name",
+            "sets an extended attribute on a symlink's own name",
+        ),
+        (
+            "fsetxattr",
+            "change-metadata-attached-to-a-name",
+            "sets an extended attribute on a descriptor's open name",
+        ),
+        (
+            "removexattr",
+            "change-metadata-attached-to-a-name",
+            "removes an extended attribute from a name",
+        ),
+        (
+            "lremovexattr",
+            "change-metadata-attached-to-a-name",
+            "removes an extended attribute from a symlink's own name",
+        ),
+        (
+            "fremovexattr",
+            "change-metadata-attached-to-a-name",
+            "removes an extended attribute from a descriptor's open name",
+        ),
+        (
+            "chflags",
+            "change-metadata-attached-to-a-name",
+            "changes a name's file flags",
+        ),
+        (
+            "fchflags",
+            "change-metadata-attached-to-a-name",
+            "changes a descriptor's open name's file flags",
+        ),
+        (
+            "lchflags",
+            "change-metadata-attached-to-a-name",
+            "changes a symlink's own name's file flags",
+        ),
+        (
+            "setattrlist",
+            "change-metadata-attached-to-a-name",
+            "sets name-attached attributes in bulk (macOS)",
+        ),
+        (
+            "exchangedata",
+            "change-metadata-attached-to-a-name",
+            "swaps the contents of two names (macOS)",
+        ),
+        (
+            "acl_set_file",
+            "change-metadata-attached-to-a-name",
+            "sets an ACL on a name",
+        ),
+        (
+            "acl_set_link_np",
+            "change-metadata-attached-to-a-name",
+            "sets an ACL on a symlink's own name",
+        ),
+        // change-the-mount-name-space
+        (
+            "mount",
+            "change-the-mount-name-space",
+            "attaches a filesystem at a name",
+        ),
+        (
+            "umount",
+            "change-the-mount-name-space",
+            "detaches the filesystem at a name",
+        ),
+        (
+            "umount2",
+            "change-the-mount-name-space",
+            "the flag-taking twin of umount",
+        ),
     ];
 
     /// The `libc::<fn>` CALL symbols the tree references that are REVIEWED as
@@ -1195,6 +1657,77 @@ mod tests {
     fn collect_uses(file: &syn::File, base: &[String]) -> Vec<(CanonPath, Vec<UseLeaf>)> {
         let mut out = Vec::new();
         let mut collector = UseCollector {
+            module: base.to_vec(),
+            out: &mut out,
+        };
+        syn::visit::Visit::visit_file(&mut collector, file);
+        out
+    }
+
+    /// A local NON-GENERIC `type` alias (`type ZZBuilder =
+    /// std::fs::OpenOptions;`) with the path it names and the module it is
+    /// declared in. Round 10's resolver keyed the owner on the literal
+    /// last-segment name, so a `type` alias of a builder type was invisible to
+    /// BOTH the funnel closure and the count pin: inside a funnel module,
+    /// `type ZZBuilder = std::fs::OpenOptions;` followed by
+    /// `ZZBuilder::new().write(true).create_new(true).open(p)?` left clippy,
+    /// `every_mutation_symbol_the_funnel_uses_is_denied_crate_wide` and
+    /// `std_fs_name_mutation_counts_are_pinned` all green. A `use … as` alias
+    /// WAS resolved; a `type` alias was not.
+    struct TypeAlias {
+        module: CanonPath,
+        local: String,
+        target: Vec<String>,
+    }
+
+    /// Collect every local non-generic `type X = <path>;` item of one file,
+    /// tagged with the module path it is declared in. The walk mirrors
+    /// [`UseCollector`], so a BLOCK-LOCAL alias is collected too. A generic
+    /// alias (`type X<T> = …`) is skipped deliberately: the resolver
+    /// substitutes a path PREFIX, and a generic alias is not usable as a bare
+    /// prefix without turbofish (`X::<T>::new`), which this resolver does not
+    /// model; the pair-less boundary names the omission.
+    struct TypeAliasCollector<'out> {
+        module: CanonPath,
+        out: &'out mut Vec<TypeAlias>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for TypeAliasCollector<'_> {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if let Some((_, items)) = &item.content {
+                let mut child = self.module.clone();
+                child.push(unraw(&item.ident));
+                let saved = std::mem::replace(&mut self.module, child);
+                for inner in items {
+                    self.visit_item(inner);
+                }
+                self.module = saved;
+            }
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if item.generics.params.is_empty()
+                && let syn::Type::Path(type_path) = &*item.ty
+                && type_path.qself.is_none()
+            {
+                self.out.push(TypeAlias {
+                    module: self.module.clone(),
+                    local: unraw(&item.ident),
+                    target: path_segments(&type_path.path),
+                });
+            }
+            syn::visit::visit_item_type(self, item);
+        }
+    }
+
+    /// Every local non-generic `type` alias of one parsed file, with the module
+    /// path it is declared in. The fixpoint in [`build_index`] resolves each
+    /// alias's target through the same alias table, so `type A = O;` with
+    /// `use std::fs::OpenOptions as O;` resolves to the same canonical builder
+    /// owner as the direct spelling.
+    fn collect_type_aliases(file: &syn::File, base: &[String]) -> Vec<TypeAlias> {
+        let mut out = Vec::new();
+        let mut collector = TypeAliasCollector {
             module: base.to_vec(),
             out: &mut out,
         };
@@ -1644,13 +2177,19 @@ mod tests {
         visitor.escape
     }
 
-    /// Resolve every `use` alias in the parsed crate TRANSITIVELY: a leaf's
-    /// path is re-resolved until the alias table stops changing, so
-    /// `use s::fs::…` is resolved even when `use std as s;` appears after it.
+    /// Resolve every `use` alias AND every local non-generic `type` alias in
+    /// the parsed crate TRANSITIVELY: a leaf's path is re-resolved until the
+    /// alias table stops changing, so `use s::fs::…` is resolved even when
+    /// `use std as s;` appears after it, and `type A = O;` resolves through
+    /// `use std::fs::OpenOptions as O;`.
     fn build_index(parsed: &[ParsedSource]) -> FsIndex {
         let uses: Vec<Vec<(CanonPath, Vec<UseLeaf>)>> = parsed
             .iter()
             .map(|source| collect_uses(&source.file, &source.module))
+            .collect();
+        let type_aliases: Vec<Vec<TypeAlias>> = parsed
+            .iter()
+            .map(|source| collect_type_aliases(&source.file, &source.module))
             .collect();
         let mut index = FsIndex::default();
         for pass in 0..256 {
@@ -1712,6 +2251,26 @@ mod tests {
                             index.aliases.entry(key).or_insert(target);
                         }
                     }
+                }
+            }
+            // ROUND-11 P2-C: local non-generic `type` aliases are bindings too.
+            // A `type ZZBuilder = std::fs::OpenOptions;` inside a funnel module
+            // must resolve to the same canonical builder owner as the direct
+            // spelling, or `ZZBuilder::new()…create_new(…)` is invisible to both
+            // the closure derivation and the count pin. Resolve the alias TARGET
+            // through the same table (so `type A = O;` chains through a `use …
+            // as`), and only keep bindings that resolve under `std`/`libc`: the
+            // index is a `std::fs`/`libc` resolver, and admitting a local type
+            // path would let an unrelated `type` name canonicalize to `std::fs`.
+            for aliases in &type_aliases {
+                for alias in aliases {
+                    let canonical = index.resolve_path(&alias.module, &alias.target);
+                    if !matches!(canonical.first().map(String::as_str), Some("std" | "libc")) {
+                        continue;
+                    }
+                    let mut key = alias.module.clone();
+                    key.push(alias.local.clone());
+                    index.aliases.insert(key, canonical);
                 }
             }
             if index.aliases == before {
@@ -3062,78 +3621,153 @@ mod tests {
         );
     }
 
-    /// ROUND-10 ORACLE, INDEPENDENT OF **BOTH** CLASSIFICATION LISTS. The
-    /// `libc` belt is the device cited to make a REVIEWED PIN outside the
-    /// funnel safe, so it must REFUSE a pinned known name-mutating syscall even
-    /// if the two lists are edited against each other. For a symbol the lint
-    /// does not deny (`libc::chmod`) the belt is the SOLE device.
+    /// ROUND-11 ANCHOR ORACLE. The `libc` belt is the device cited to make a
+    /// REVIEWED PIN outside the funnel safe, so it must REFUSE a pinned known
+    /// name-mutating syscall even if the two classification lists are edited
+    /// against each other. For a symbol the lint does not deny (`libc::chmod`)
+    /// the belt is the SOLE device.
     ///
-    /// Round 9's oracle used a SEVEN-name literal and a predicate of the form
-    /// "for every member of MUTATING_LIBC_SYSCALLS, …". Two reviewers moved
-    /// `chmod` / `chown` / `mknodat` / `remove` / `renameat2` / `truncate` /
-    /// `fchmodat` / `utimensat` into NON_MUTATING_LIBC_CALLS and the belt went
-    /// green: the moved symbol is no longer a member to iterate, and
-    /// `every_libc_call_symbol_the_tree_references_is_classified` only tests
-    /// membership in the UNION. That oracle was LIST-shaped — it answered "is
-    /// the list the list?" instead of "is the property true?".
+    /// WHAT ROUND 10 GOT WRONG. [`KNOWN_NAME_MUTATORS`] and
+    /// [`MUTATING_LIBC_SYSCALLS`] are two hand-written literals IN THIS FILE, and
+    /// every arm but (5) compared them to EACH OTHER. A set equality between
+    /// things you edit together is not an oracle: deleting `chown` from BOTH
+    /// literals and adding it to [`NON_MUTATING_LIBC_CALLS`] disarmed the belt
+    /// with every arm green (measured; the same 3-way edit works for 52 of the
+    /// 54 round-10 members). Arm (5) hardcoded only `chmod` and `renameat2`, so
+    /// it did not notice the other 52.
     ///
-    /// This oracle is PROPERTY-shaped. [`KNOWN_NAME_MUTATORS`] is an
-    /// independent literal with its own justification, and the test asserts
-    /// (1) SET EQUALITY with [`MUTATING_LIBC_SYSCALLS`] — a MOVE out of the code
-    /// family, an ADD, or a REMOVE changes one side and fails; (2) DISJOINTNESS
-    /// from [`NON_MUTATING_LIBC_CALLS`], checked against the LITERAL so a MOVE
-    /// fails here too; (3) every literal member is REFUSED by the belt the
-    /// audit DERIVES from a source that references it, via the audit's OWN
-    /// predicate ([`libc_reference_outside_funnel_is_allowed`]); (4) the
-    /// DEFAULT-DENY clause ALONE — a belt built with no family contribution, so
-    /// the property does not depend on [`MUTATING_LIBC_SYSCALLS`] at all — also
-    /// refuses every literal member, which is the anti-circular half, because
-    /// the only way to disarm it is the exclusion a MOVE into the non-mutating
-    /// review list would add; and (5) names a symbol the lint does NOT deny, so
-    /// the belt is the SOLE device there.
+    /// THIS ORACLE ITERATES [`INDEPENDENT_KNOWN_NAME_MUTATORS`], the THIRD
+    /// artifact, and asserts:
+    /// (0) the anchor is non-trivial, its classes come from the CLOSED
+    ///     [`KNOWN_NAME_MUTATOR_CLASSES`] set, every entry carries a non-empty
+    ///     reason distinct from its class, and the named negative controls
+    ///     (`lutimes`, `fchmodat2`, `mq_open`, …) are still present;
+    /// (1) the two family literals name the SAME symbols AND the anchor names
+    ///     every family member and nothing else — so co-editing BOTH family
+    ///     literals leaves the anchor naming a symbol the family lost, and fails
+    ///     here; a family member with no anchor entry fails too (membership
+    ///     requires an individual class + reason, not merely "it is in the
+    ///     list");
+    /// (2) DISJOINTNESS from [`NON_MUTATING_LIBC_CALLS`], checked against the
+    ///     ANCHOR, so a 3-way MOVE into the review list fails even if both
+    ///     family literals were edited to match;
+    /// (3) every anchor member is REFUSED by the belt the audit DERIVES from a
+    ///     source that references it, via the audit's OWN predicate
+    ///     ([`libc_reference_outside_funnel_is_allowed`]);
+    /// (4) the DEFAULT-DENY clause ALONE — a belt built with no family
+    ///     contribution, so the property does not depend on
+    ///     [`MUTATING_LIBC_SYSCALLS`] at all — also refuses every anchor member:
+    ///     the anti-circular half, whose only disarm is the exclusion a MOVE into
+    ///     the non-mutating review list would add; and
+    /// (5) for EVERY anchor member the lint does NOT deny, the belt is the SOLE
+    ///     device, with a non-vacuous count, so the arm is not a hardcoded pair.
     #[test]
     fn the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel() {
-        // (1) ANTI-CIRCULAR SET EQUALITY. The literal oracle and the code's
-        // family must name the SAME symbols. This is the arm a MOVE cannot
-        // evade: removing a member from MUTATING_LIBC_SYSCALLS (into the
-        // non-mutating list or nowhere) leaves it in the literal.
+        // (0) THE ANCHOR ITSELF: a closed class set, an individual reason per
+        // symbol, no duplicates, and the named negative controls that stop the
+        // anchor from being narrowed back to the round-10 family.
+        let classes: BTreeSet<&str> = KNOWN_NAME_MUTATOR_CLASSES.iter().copied().collect();
+        let mut anchor: BTreeSet<&str> = BTreeSet::new();
+        for (symbol, class, reason) in INDEPENDENT_KNOWN_NAME_MUTATORS {
+            assert!(
+                classes.contains(class),
+                "the anchor entry {symbol} claims the class {class:?}, which is not in the closed \
+                 KNOWN_NAME_MUTATOR_CLASSES set {classes:?}; add the class deliberately or fix the \
+                 spelling"
+            );
+            assert!(
+                !reason.trim().is_empty() && reason != class,
+                "the anchor entry {symbol} must carry a reason distinct from its class ({class:?})"
+            );
+            assert!(
+                anchor.insert(symbol),
+                "the anchor names {symbol} more than once; a duplicate makes the reason table \
+                 ambiguous"
+            );
+        }
+        assert!(
+            anchor.len() >= 60,
+            "the independently-specified anchor must be the reviewed family, not a stub: {}",
+            anchor.len()
+        );
+        // THE NAMED NEGATIVE CONTROLS. These were in NEITHER round-10 hand list;
+        // they are the members that make the anchor larger than that family, so
+        // removing one is the narrowing this arm exists to fail on.
+        for symbol in [
+            "chown",
+            "mknodat",
+            "lutimes",
+            "futimes",
+            "futimesat",
+            "fchmodat2",
+            "mq_open",
+            "mq_unlink",
+            "sem_open",
+            "sem_unlink",
+            "shm_open",
+            "shm_unlink",
+            "mkstemp",
+            "mkostemp",
+            "mkstemps",
+            "mkostemps",
+            "mkdtemp",
+            "acl_set_file",
+            "acl_set_link_np",
+        ] {
+            assert!(
+                anchor.contains(symbol),
+                "the independently-specified anchor lost the negative control {symbol}; it must \
+                 stay anchored OUTSIDE the co-editable family pair"
+            );
+        }
+
+        // (1) THE FAMILY VS THE ANCHOR. The two family literals must agree with
+        // each other, and the anchor must name EVERY family member (the belt's
+        // clause (a) is the only device that refuses an unreferenced symbol) and
+        // NOTHING outside it.
         let code_family: BTreeSet<&str> = MUTATING_LIBC_SYSCALLS.iter().copied().collect();
         let literal_family: BTreeSet<&str> = KNOWN_NAME_MUTATORS.iter().copied().collect();
-        let missing_from_code: Vec<&&str> = literal_family.difference(&code_family).collect();
-        let missing_from_literal: Vec<&&str> = code_family.difference(&literal_family).collect();
-        assert!(
-            missing_from_code.is_empty(),
-            "these KNOWN name mutators are absent from MUTATING_LIBC_SYSCALLS, so the belt \
-             (whose family clause is that list) has stopped refusing them: {missing_from_code:?}. A \
-             MOVE of a family member into NON_MUTATING_LIBC_CALLS disarms the belt, which is the \
-             device that makes a reviewed pin outside the funnel safe; state the reclassification \
-             here with its justification or restore the member."
+        assert_eq!(
+            code_family, literal_family,
+            "the two family literals disagree: MUTATING_LIBC_SYSCALLS={code_family:?} \
+             KNOWN_NAME_MUTATORS={literal_family:?}"
         );
+        let missing_from_family: Vec<&&str> = anchor.difference(&code_family).collect();
         assert!(
-            missing_from_literal.is_empty(),
-            "MUTATING_LIBC_SYSCALLS names {missing_from_literal:?}, which the independent \
-             KNOWN_NAME_MUTATORS oracle does not. A new family member must be added to the literal \
-             WITH its reason, so the oracle keeps tracking the CLASS rather than the list."
+            missing_from_family.is_empty(),
+            "these ANCHOR name mutators are absent from MUTATING_LIBC_SYSCALLS: \
+             {missing_from_family:?}. The anchor is the artifact this oracle iterates, so \
+             co-editing BOTH family literals to drop a member (the round-10 evasion) fails \
+             here: the anchor still names it, and clause (a) of the belt no longer refuses it. \
+             Restore the family member or state the reclassification in the anchor."
+        );
+        let missing_from_anchor: Vec<&&str> = code_family.difference(&anchor).collect();
+        assert!(
+            missing_from_anchor.is_empty(),
+            "MUTATING_LIBC_SYSCALLS names {missing_from_anchor:?}, which the anchor does not. \
+             Every family member needs an individual class + reason in \
+             INDEPENDENT_KNOWN_NAME_MUTATORS: membership must be a reviewed justification, not \
+             merely `it is in the list`."
         );
 
-        // (2) DISJOINTNESS, checked against the LITERAL as well as the code
-        // list, so a member moved into the review list for non-mutating calls
-        // fails here even if it were also removed from MUTATING_LIBC_SYSCALLS.
-        let overlap: Vec<&&str> = KNOWN_NAME_MUTATORS
+        // (2) DISJOINTNESS, checked against the ANCHOR, so a MOVE of an anchor
+        // member into the review list fails even if both family literals were
+        // edited to match the move.
+        let overlap: Vec<&&str> = anchor
             .iter()
             .filter(|symbol| NON_MUTATING_LIBC_CALLS.contains(symbol))
             .collect();
         assert!(
             overlap.is_empty(),
-            "NON_MUTATING_LIBC_CALLS claims these code-independent KNOWN name mutators, which \
-             disarms the belt by excluding them from its default-deny clause: {overlap:?}"
+            "NON_MUTATING_LIBC_CALLS claims these independently-specified KNOWN name mutators, \
+             which disarms the belt by excluding them from its default-deny clause: {overlap:?}"
         );
 
-        // (3)+(4) Each literal member is refused by the DERIVED belt AND by the
+        // (3)+(4) Each anchor member is refused by the DERIVED belt AND by the
         // default-deny clause ALONE. The synthetic source makes the symbol a
         // referenced `libc::<fn>(…)` call, exactly how the real tree puts a
         // symbol on the belt.
-        for symbol in KNOWN_NAME_MUTATORS {
+        for symbol in &anchor {
             let sources = vec![(
                 "src/prod/synthetic.rs".to_string(),
                 format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
@@ -3158,21 +3792,17 @@ mod tests {
             );
         }
 
-        // (5) For a symbol the clippy deny does NOT name, the belt is the SOLE
-        // device. `libc::chmod` and `libc::renameat2` are name mutators on the
-        // belt and absent from clippy.toml, so a non-funnel production
-        // reference can only be refused by this belt.
+        // (5) For EVERY anchor member the clippy deny does NOT name, the belt is
+        // the SOLE device. Derived from the anchor rather than hardcoded to a
+        // pair, and the count must be non-vacuous, so the arm cannot pass by
+        // naming only symbols the lint already denies.
         let denied = denied_symbols_from_clippy_toml();
-        for symbol in ["chmod", "renameat2"] {
-            assert!(
-                KNOWN_NAME_MUTATORS.contains(&symbol),
-                "{symbol} must stay on the code-independent family oracle"
-            );
-            assert!(
-                !denied.contains(&format!("libc::{symbol}")),
-                "clippy.toml now denies libc::{symbol}; this arm exists to prove the BELT refuses a \
-                 symbol the lint does not, so the arm must be re-pointed at one the lint omits"
-            );
+        let mut lint_omitted = 0usize;
+        for symbol in &anchor {
+            if denied.contains(&format!("libc::{symbol}")) {
+                continue;
+            }
+            lint_omitted += 1;
             let sources = vec![(
                 "src/prod/synthetic.rs".to_string(),
                 format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
@@ -3184,6 +3814,11 @@ mod tests {
                  production reference would be undefended: {belt:?}"
             );
         }
+        assert!(
+            lint_omitted >= 5,
+            "only {lint_omitted} anchor members are outside clippy.toml's deny; this arm exists to \
+             prove the BELT refuses a symbol the lint does not, so it must not become vacuous"
+        );
     }
 
     /// STRUCTURAL AUDIT (`std::fs`): the `std::fs`/`std::os` calls that can
@@ -4832,6 +5467,16 @@ mod tests {
     /// must therefore spell the call directly or as a local binding, both of
     /// which the arms above see; this residual is a real reach INSIDE the
     /// funnel, not a hole the lint closes.
+    ///
+    /// ROUND 11 P2-C CLOSED ONE SPELLING: a `type` ALIAS of the builder type
+    /// used to be a hole in BOTH devices — inside a funnel module,
+    /// `type ZZBuilder = std::fs::OpenOptions;` followed by
+    /// `ZZBuilder::new().write(true).create_new(true).open(p)?` left clippy,
+    /// this derivation and the count pin all green, because the owner was keyed
+    /// on the literal last-segment name and only `use … as` aliases were
+    /// resolved. [`build_index`] now resolves local non-generic `type` aliases
+    /// too, so the spelling IS seen; the direct-spelling control still exists in
+    /// [`funnel_symbol_surface_sees_associated_builder_and_local_arms`].
     #[test]
     fn every_mutation_symbol_the_funnel_uses_is_denied_crate_wide() {
         let mut paths = Vec::new();
@@ -5050,6 +5695,21 @@ fn split_local() {
     opts.append(true);
 }
 
+// ROUND-11 P2-C: a local non-generic `type` alias of the builder type. The
+// resolver used to key the owner on the literal last-segment name, so this
+// spelling recorded NOTHING and the closure + count pin were both blind to it;
+// a `use … as` alias WAS resolved.
+type ZZBuilder = std::fs::OpenOptions;
+
+fn type_alias_builder(p: &std::path::Path) {
+    let _ = ZZBuilder::new().mode(0o600).create_new(true).open(p);
+}
+
+fn block_type_alias_builder(p: &std::path::Path) {
+    type ZZLocalBuilder = std::fs::DirBuilder;
+    let _ = ZZLocalBuilder::new().recursive(true).create(p);
+}
+
 fn not_attributed(p: &std::path::Path) {
     // CONTROLS: a method on the `open` RESULT, and a method on an unrelated
     // local, must NOT be attributed to the builder.
@@ -5081,6 +5741,12 @@ fn not_attributed(p: &std::path::Path) {
             "std::fs::DirBuilder::default",
             "std::fs::OpenOptions::create",
             "std::fs::OpenOptions::read",
+            // ROUND-11 P2-C: the builder reached through a local non-generic
+            // `type` ALIAS. `mode`/`recursive` are spelled ONLY through the
+            // aliases here, so their presence pins the alias resolution rather
+            // than the direct spelling beside it.
+            "std::fs::OpenOptions::mode",
+            "std::fs::DirBuilder::recursive",
         ] {
             assert!(
                 used.contains(expected),
@@ -5208,6 +5874,53 @@ impl S {
         );
     }
 
+    /// ROUND-11 P3-D REGRESSION ARM. `funnel_modules` / `funnel_symbol_surface`
+    /// treat a CHILD FILE of an allow-bearing parent module as inside the region
+    /// by an ANCESTOR-OR-SELF prefix test ([`module_is_in_funnel_region`]), the
+    /// exact reach of Rust's attribute inheritance. Round 10 shipped that
+    /// derivation with NO test that fails when it regresses to an EXACT-module
+    /// match: the only symbol `src/atomic/guard.rs` contributes to the real
+    /// closure is already on the deny list, so replacing the prefix test with
+    /// equality left all 690 tests green.
+    ///
+    /// This arm drives the closure over a SYNTHETIC source set — an
+    /// allow-bearing parent module (`src/prod/parent/mod.rs`, which is how a
+    /// `#![allow(clippy::disallowed_methods)]` in a `mod.rs` reaches its child
+    /// FILES) plus a CHILD file (`src/prod/parent/child.rs`) using
+    /// `std::fs::DirBuilder::new`, a symbol that is NEITHER denied NOR reviewed.
+    /// An exact-match derivation reports the child's use as UNDEFENDED and this
+    /// test fails; only the ancestor-or-self prefix test reaches it. The symbol
+    /// facts are asserted too, so the arm proves the CLOSURE would name the use
+    /// rather than merely that a set contains a string.
+    #[test]
+    fn funnel_region_closure_reaches_a_child_file_of_an_allow_bearing_parent() {
+        const SYMBOL: &str = "std::fs::DirBuilder::new";
+        let files = vec![
+            (
+                "src/prod/parent/mod.rs".to_string(),
+                "#![allow(clippy::disallowed_methods)]\nmod child;\n".to_string(),
+            ),
+            (
+                "src/prod/parent/child.rs".to_string(),
+                "pub fn adopt() { let _ = std::fs::DirBuilder::new(); }\n".to_string(),
+            ),
+        ];
+        let gated = BTreeSet::new();
+        let used = funnel_symbol_surface(&files, &gated);
+        assert!(
+            used.contains(SYMBOL),
+            "the closure derivation must reach a CHILD FILE of an allow-bearing parent module \
+             (Rust attribute inheritance), or the region derivation is exact-match only: \
+             {used:?}"
+        );
+        let denied = reconciled_denied_symbols();
+        assert!(
+            !denied.contains(SYMBOL) && !FUNNEL_SYMBOLS_NOT_DENIED.contains(&SYMBOL),
+            "{SYMBOL} must stay outside both review doors, so this arm proves the closure test \
+             would report the child-file use as undefended"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // CONSTRAINT #1 (docs/API-CONSTRAINTS.md): the pair-less mutation
     // enumeration is DERIVED from the public surface, not enumerated by hand.
@@ -5299,14 +6012,20 @@ impl S {
     /// `Result<String>`), because the type system does not distinguish a
     /// path-spelled string from any other string and this crate has public fns
     /// taking one for a non-path reason; any type not on the container list
-    /// above (`HashMap<_, PathBuf>`, `BTreeMap<_, PathBuf>`); and any `use … as`
-    /// ALIAS of `Path`/`PathBuf` (the predicate matches the last-segment NAME,
-    /// so `use std::path::Path as ZP;` leaves `&ZP` outside the class). The
-    /// boundary is a stated property pinned in BOTH directions by
+    /// above (`HashMap<_, PathBuf>`, `BTreeMap<_, PathBuf>`); and any ALIAS of
+    /// `Path`/`PathBuf` — BOTH a `use … as` alias and a LOCAL non-generic
+    /// `type` alias. The predicate matches the last-segment NAME, so
+    /// `use std::path::Path as ZP;` and `type ZP = std::path::Path;` both leave
+    /// `&ZP` outside the class. The boundary is a stated property pinned in
+    /// BOTH directions by
     /// [`pair_less_derivation_boundary_is_the_syntactic_path_class`], not an
     /// implication of this list. The alias case is measured, not assumed:
-    /// `audited_fns` resolves no `use … as`, so the predicate is deliberately
-    /// name-based and the statement says so.
+    /// `audited_fns` resolves neither an import nor a `type` alias, so the
+    /// predicate is deliberately name-based and the statement says so. (The
+    /// FsIndex-backed derivations — the funnel surface and the `std::fs` count
+    /// pin — DO resolve local non-generic `type` aliases; this syntactic
+    /// derivation deliberately does not, and the `type` case is pinned in both
+    /// directions to keep the statement matching the code.)
     fn type_is_raw_path(ty: &syn::Type) -> bool {
         match ty {
             syn::Type::Reference(reference) => type_is_raw_path(&reference.elem),
@@ -5755,6 +6474,40 @@ impl S {
                  an alias"
             );
         }
+        // OUT OF CLASS: a LOCAL non-generic `type` ALIAS of `Path`/`PathBuf`
+        // (round 11 P2-E/P3-E). Like `use … as`, the predicate matches the
+        // last-segment NAME, so `type ZP = std::path::Path;` leaves `&ZP`
+        // outside the class BY CONSTRUCTION. The FsIndex-backed derivations DO
+        // resolve `type` aliases; this syntactic derivation deliberately does
+        // not, and the boundary statement says so. Both directions: the alias
+        // is refused, the canonical name beside it is still seen, and the
+        // literal spelling `Path` beside an UNRELATED `type` alias is
+        // unaffected.
+        for (prelude, param) in [
+            ("type ZP = std::path::Path;", "(p: &ZP)"),
+            ("type ZP = std::path::PathBuf;", "(p: ZP)"),
+            ("type ZP = std::path::PathBuf;", "(p: &[ZP])"),
+            // A CHAINED `type` alias must not leak either: `ZQ` names `ZP`,
+            // which names `Path`, and the name-based predicate still refuses it.
+            ("type ZP = std::path::Path;\ntype ZQ = ZP;", "(p: &ZQ)"),
+        ] {
+            assert!(
+                !derived_in(prelude, param),
+                "{param} is a local `type` ALIAS of a raw path / an unrelated type and is the \
+                 stated out-of-class boundary; it must NOT be derived"
+            );
+        }
+        for (prelude, param) in [
+            ("type ZP = std::path::Path;", "(p: &Path)"),
+            ("type ZP = std::path::PathBuf;", "(p: PathBuf)"),
+            ("type ZP = std::path::PathBuf;", "(p: &[PathBuf])"),
+        ] {
+            assert!(
+                derived_in(prelude, param),
+                "{param} names the canonical raw path and must be in the derived class even beside \
+                 a local `type` alias"
+            );
+        }
     }
 
     /// The token streams of every `macro_rules!` DEFINITION in `file`, rendered
@@ -5800,13 +6553,40 @@ impl S {
         None
     }
 
+    /// The index of the `>` matching the `<` at `open` in a flat token list, or
+    /// `None` when unbalanced. `->` is TWO flat tokens (`-`, `>`), so the `>`
+    /// that closes an arrow is not counted; a nested `>` (as in `Vec<Vec<T>>`)
+    /// is.
+    fn match_angle_group(list: &[String], open: usize) -> Option<usize> {
+        if list.get(open).map(String::as_str) != Some("<") {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut previous = "";
+        for (offset, token) in list[open..].iter().enumerate() {
+            match token.as_str() {
+                "<" => depth += 1,
+                ">" if previous != "-" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(open + offset);
+                    }
+                }
+                _ => {}
+            }
+            previous = token;
+        }
+        None
+    }
+
     /// The names of `pub fn` items a macro TOKEN STREAM spells with a
     /// `Path`/`PathBuf` token inside their parameter list. This is the
     /// token-level backstop for [`production_macro_bodies_emitting_public_path_fns_are_refused`];
     /// it deliberately scans TOKENS rather than parsing items, so it still sees
     /// a `pub fn $name(p: &Path)` whose metavariable would make an item parse
     /// fail. It is conservative: a `Path` token anywhere in a `pub fn`
-    /// parameter list is enough, so it cannot pass by accident.
+    /// parameter list, a trailing `where` clause, or (round 11) behind a
+    /// `<…>` GENERIC-PARAMETER group is enough, so it cannot pass by accident.
     fn macro_body_public_path_fns(tokens: impl std::fmt::Display) -> Vec<String> {
         let list = macro_token_list(tokens);
         let mut out = Vec::new();
@@ -5837,22 +6617,56 @@ impl S {
             let Some(name) = list.get(k).cloned() else {
                 break;
             };
-            if list.get(k + 1).map(String::as_str) != Some("(") {
+            k += 1;
+            // ROUND-11 P2-B: skip a `<…>` GENERIC-PARAMETER group after the
+            // name. Round 10 expected `(` IMMEDIATELY, so
+            // `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
+            // skipped entirely — a real public raw-path mutator with the
+            // tripwire AND the pair-less derivation both green.
+            if list.get(k).map(String::as_str) == Some("<") {
+                match match_angle_group(&list, k) {
+                    Some(close) => k = close + 1,
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            if list.get(k).map(String::as_str) != Some("(") {
                 i += 1;
                 continue;
             }
-            match match_group(&list, k + 1) {
-                Some(close) => {
-                    if list[k + 2..close]
-                        .iter()
-                        .any(|token| token == "Path" || token == "PathBuf")
-                    {
-                        out.push(name);
-                    }
-                    i = close + 1;
+            let close = match match_group(&list, k) {
+                Some(close) => close,
+                None => {
+                    i += 1;
+                    continue;
                 }
-                None => i += 1,
+            };
+            // ROUND-11 P2-B: the round-10 scan stopped at the parameter list,
+            // so `pub fn f<T>(p: T) where T: AsRef<Path> {}` was invisible too.
+            // Extend the scanned range across a trailing `where` clause, up to
+            // the body opener or the declaration terminator.
+            let mut end = close + 1;
+            if list.get(end).map(String::as_str) == Some("where") {
+                let mut depth = 0i32;
+                while end < list.len() {
+                    match list[end].as_str() {
+                        "{" | ";" if depth == 0 => break,
+                        "(" | "[" => depth += 1,
+                        ")" | "]" => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                }
             }
+            if list[k + 1..end]
+                .iter()
+                .any(|token| token == "Path" || token == "PathBuf")
+            {
+                out.push(name);
+            }
+            i = end;
         }
         out
     }
@@ -5891,10 +6705,49 @@ impl S {
     /// type out of a metavariable (`pub fn f(p: &$ty)`) or an alias
     /// (`pub fn f(p: ZP)` under `use std::path::Path as ZP`) is not seen. The
     /// scan is conservative in the other direction (a `Path`/`PathBuf` token
-    /// anywhere in a `pub fn` parameter list is refused), so it cannot pass by
+    /// anywhere in a `pub fn` parameter list, a trailing `where` clause, or
+    /// behind a `<…>` generic-parameter group is refused), so it cannot pass by
     /// accident.
+    ///
+    /// ROUND 11 P2-B: the round-10 scan required `(` IMMEDIATELY after the fn
+    /// name, so `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
+    /// skipped, and it stopped at the parameter-list close, so a
+    /// `where T: AsRef<Path>` bound was invisible too. Both are now scanned and
+    /// both are pinned as test arms below.
     #[test]
     fn production_macro_bodies_emitting_public_path_fns_are_refused() {
+        // ROUND-11 P2-B ARMS: the token scan must see a `pub fn` whose name is
+        // followed by a `<…>` generic-parameter group and/or a `where` clause.
+        // Before the fix these returned EMPTY, which is why a generic
+        // `pub fn zz<T>(_p: &Path)` planted in a production `macro_rules!` body
+        // passed with the tripwire green.
+        assert_eq!(
+            macro_body_public_path_fns("pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}"),
+            vec!["zz_generic_path_fn".to_string()],
+            "a `pub fn` followed by a `<…>` generic-parameter group must still be scanned"
+        );
+        assert_eq!(
+            macro_body_public_path_fns("pub fn zz_lifetime_path_fn<'a>(_p: &'a Path) {}"),
+            vec!["zz_lifetime_path_fn".to_string()],
+            "a lifetime-parameter group is a `<…>` group too"
+        );
+        assert_eq!(
+            macro_body_public_path_fns("pub fn zz_where_path_fn<T>(_p: T) where T: AsRef<Path> {}"),
+            vec!["zz_where_path_fn".to_string()],
+            "the scan must reach a trailing `where` clause"
+        );
+        // NEGATIVE CONTROLS: a generic fn with NO path token, and a generic fn
+        // whose `->` return arrow must not unbalance the `<>` scan.
+        assert!(
+            macro_body_public_path_fns("pub fn zz_generic_plain_fn<T>(_p: &T) {}").is_empty(),
+            "a generic fn with no Path/PathBuf token must NOT be an offender"
+        );
+        assert!(
+            macro_body_public_path_fns("pub fn zz_nonpath_fn<T: Into<u64>>(_p: T) -> u64 { 0 }")
+                .is_empty(),
+            "a `->` arrow's `>` must not unbalance the generic-group scan"
+        );
+
         let mut files = Vec::new();
         collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
         let sources: Vec<(String, String)> = files
@@ -5950,8 +6803,10 @@ impl S {
     ///   explicitly: `&str`, `String`, `&OsStr`, `OsString`, `&[u8]`, a
     ///   CONTAINER of those spellings (`&[String]`, `Vec<String>`, `(String,)`,
     ///   `Result<String>`), a type not on the container list
-    ///   (`HashMap<_, PathBuf>`), and any `use … as` ALIAS of `Path`/`PathBuf`
-    ///   (the predicate matches the NAME, not the resolution). A STRING IS A
+    ///   (`HashMap<_, PathBuf>`), any `use … as` ALIAS of `Path`/`PathBuf`, and a
+    ///   LOCAL non-generic `type` ALIAS of `Path`/`PathBuf` (`type ZP =
+    ///   std::path::Path;`) — for both aliases the predicate matches the NAME,
+    ///   not the resolution, and `audited_fns` resolves neither. A STRING IS A
     ///   PATH SPELLING, NOT A PATH: the
     ///   type system does not distinguish a path-spelled string from any other
     ///   string, this crate already has public fns taking a string for a
