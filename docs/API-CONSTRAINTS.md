@@ -118,8 +118,10 @@ digits — the spelling `serialize` emits — so the accepted set equals the emi
 the parse is INJECTIVE (which the digest depends on, since `compute_tree_digest` hashes
 the VALIDATED values re-serialized as `{:04o}`). Narrowed on the READ path:
 `"644"`, `"00644"`, `"10644"` (the setuid form: it was masked to `0o644`), `"+755"`,
-`"37777777777"`, `"77777"`, `"07777"`, `"17777"` — eight distinct spellings across four
-rows — used to load and now fail to load; nothing old-refused is now accepted. `"0644"`,
+`"37777777777"`, `"77777"`, `"07777"`, `"17777"` — eight distinct spellings, in four
+shapes: too few digits, zero-padded, carrying file-type bits, and a sign or a value
+beyond `0o7777` — used to load and now fail to load; nothing old-refused is now
+accepted. `"0644"`,
 `"0755"`, `"0000"` and every value in `0..=0o7777` are unchanged. The rule governs the
 JSON `tree.json` wire ONLY: the far-side listing frame carries the raw `st_mode` in HEX,
 where masking the file-type bits is the semantics.

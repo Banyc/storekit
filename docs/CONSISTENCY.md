@@ -67,9 +67,12 @@ Named, scoped, not pursued:
   goes through the guarded funnel — that claim quantifies over the whole language
   (spellings, aliases, macros, builders, module routes, `extern "C"`, raw syscall
   numbers, third-party code). What the crate enforces is bounded: the symbols it
-  funnels are denied outside the funnel modules by the compiler on both targets, no
-  `libc` reference appears outside the funnel at all, and the funnel's own call counts
-  are pinned. Completeness of the SYMBOL SET is a review responsibility.
+  funnels — including the `libc` symbols its wrappers call, which is what closes the
+  cross-module alias route — are denied by the compiler on both targets in every module
+  without the allow; every production `libc` reference is either inside a funnel module
+  or NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
+  own call counts are pinned. The pin records a review, not a proof. Completeness of
+  the SYMBOL SET is a review responsibility.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

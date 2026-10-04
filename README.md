@@ -364,13 +364,17 @@ This crate is the store SUBSTRATE its consumers build stores on: atomic replace,
 confinement, locks, validated ids and paths, manifest and wire, transport, sync. It
 takes responsibility for exactly this, and no more.
 
-* **Enforced.** (a) The mutation symbols THIS crate funnels are denied outside the
-  funnel modules by the compiler, on BOTH targets, so no spelling or module route
-  reaches them (`clippy.toml`; the list names what the funnel uses). (b) No `libc`
-  reference appears outside the funnel AT ALL — the outside reference map is asserted
-  EMPTY, so there is nothing to make safe and no belt is needed. (c) The funnel's OWN
-  call counts are pinned per file and per symbol, so a changed or added call inside the
-  funnel forces review.
+* **Enforced.** (a) The mutation symbols THIS crate funnels — including the `libc`
+  symbols its wrappers call — are denied by the compiler, on BOTH targets, in every
+  module that does not carry the allow, so no spelling, alias or module route reaches
+  them (`clippy.toml`; the list names what the funnel uses). (b) Every production
+  `libc` reference is either inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`)
+  or NAMED in the audit's pin, by file, symbol and count; the map of references NOT on
+  the pin is asserted EMPTY, so an unreviewed `libc` reference is a failing test. The
+  pin records a REVIEW, not a proof: a pinned reference is one somebody looked at, and
+  whether the mutation it performs is refused is the deny's business only if the deny
+  names the symbol. (c) The funnel's OWN call counts are pinned per file and per
+  symbol, so a changed or added call inside the funnel forces review.
 * **Guaranteed as an API.** Root confinement (a relative symlink target cannot leave
   the root, and neither can a mutation named by `(&RootDir, &RootedRelativePath)`), the
   atomic replace's commit points and its reported durability, lock mutual exclusion
