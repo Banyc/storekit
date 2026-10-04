@@ -858,8 +858,12 @@ oracle is now a 54-entry independent literal with SET EQUALITY against the famil
 a disjointness assertion, and an ANTI-CIRCULAR half (a default-deny-only belt), with
 the misfiling proved for two different symbols; the funnel region is derived by
 transitive attribute reach and both P1 halves have a pre/post measurement; the dead
-check is deleted and every surviving token axis has a remove-and-test entry (a
-table naming the tests that fail when each comparison is removed); the direction
+check is deleted and every surviving token axis has a remove-and-test entry (the
+axis-to-test table is recorded in the round-11 entry below, together with the PUSH
+twin that entry added — at round 10 the localness row was PULL-only, so an earlier
+version of this sentence claiming "a table naming the tests that fail when each
+comparison is removed" described evidence that lived in a fix agent's report
+rather than in this log); the direction
 axis has the test that notices its removal; the macro class is STATED with a
 tripwire (expansion is unsound — metavariables and repetitions), and the container
 class is extended with the boundary test pinned in both directions.

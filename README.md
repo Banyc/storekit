@@ -87,9 +87,13 @@ primitives (or make every path you want kept part of the source).
 A consumer can ask whether a name may be used BEFORE it fails. The authority
 is `storekit::is_unaddressable_name` (one path segment) and its path form
 `storekit::is_unaddressable_path` (a canonical manifest path): these are the
-predicate the identifier rule `storekit::id::valid_name` itself consults, so
-`valid_name(s)` is false exactly when `s` is not a single safe segment OR is
-unaddressable. They report every spelling the crate refuses to name — the
+predicate the identifier rule `storekit::id::valid_name` itself consults. The
+implication runs ONE WAY: `valid_name(s)` false does NOT mean `s` is a single safe
+segment, because the identifier rule ALSO constrains the charset
+(`[A-Za-z0-9-_.]`, so `Ünïcode` is refused and is not unaddressable), the first byte
+(no leading `-`), the length (`NAME_MAX`) and the `.`/`..` spellings — so read these
+predicates as "spellings the crate cannot address", NOT as a `valid_name` oracle.
+They report every spelling the crate refuses to name — the
 `.sync-aside.` claim-aside prefix, the `.<name>.operation.lock` record, the
 application lock record `operation.lock`, case aliases of any of those, crate
 temp shapes, and the Win32 trailing-dot/space aliases of a lock record (refused

@@ -236,8 +236,11 @@ value would yield one `tree_sha256` from two different wire records.
 | `"8"`, `""`, `"0o644"`, `"0x1a4"`, `" 644"`, `"0644 "`, `"-644"`, `"0644a"` | refused | refused |
 
 **No row is old-refused/new-accepted: the change narrows only.** It is a real
-behaviour change on the read path — a `tree.json` carrying one of the six
-non-canonical spellings above used to load and now fails to load — and it is the
+behaviour change on the read path — a `tree.json` carrying any of the
+non-canonical spellings in the table above used to load and now fails to load
+(EIGHT distinct spellings across the four narrowed rows; an earlier version of
+this sentence said "six", a figure written from memory rather than counted in the
+table beside it) — and it is the
 reading these documents already claimed. No in-tree fixture used a non-canonical
 spelling (`sync/diff.rs` uses `"0644"`). The rule governs the JSON `tree.json`
 wire ONLY: the far-side listing frame carries the raw `st_mode` in HEX
