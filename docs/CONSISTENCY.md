@@ -1030,3 +1030,65 @@ round's were the round-11 count (nine for ten) and the 186 → 174 total (delete
 value sat in a table or an output I had just produced — and the remedy is the one
 the log now applies to itself: state the command, or state the gap, but do not state
 a figure nobody measured.
+
+## The contract was RE-BASED (owner decision)
+
+The loop did **not** exit clean, and this section says so plainly: after thirteen
+rounds the contract was re-based by the owner, because the property being certified
+was uncertifiable.
+
+**What was promised, and what it cost.** `README` and this log asserted a universal —
+"every name mutation goes through the ONE guarded funnel", enforced by a
+"**completeness** device" — a claim quantifying over the whole language: every
+spelling, alias, macro, builder chain, module route, `extern "C"` declaration, raw
+syscall number and third-party call. Five rounds were spent trying to discharge it,
+each producing a new artifact and, in the next round, a new hole:
+
+| round | the artifact | the hole the next round found |
+|---|---|---|
+| 9 | a 7-name spot list of "known name mutators" | a family member outside those 7 (`chmod`, `chown`, `mkfifo`, …) |
+| 10 | a 54-entry literal plus set-equality with the family | both literals are in the same file — co-edit them and the belt is disarmed for 52/54 |
+| 11 | a 71-entry "independently specified anchor" | the oracle forced `anchor == family`, so the anchor certified nothing; only the 19 controls were protected |
+| 12 | a file "derived from the pinned `libc` crate" | it is `anchor ∩ libc` — an intersection can only REMOVE, so a `libc`-exported mutator absent from the hand list (`fopen`) is ungoverned |
+| 13 | the compiler's resolved-symbol deny | the right mechanism — but the claim attached to it was still universal, and the artifact it replaced still existed |
+
+A universal quantifier over a language is not discharged by enumerating spellings,
+and **each enumeration is itself a new unaudited surface** — which is exactly what the
+five rounds measured. The error was not in any one list; it was in the contract that
+required a list.
+
+**What replaces it.** The bounded contract now stated in `README` ("The contract,
+stated so that it can be kept"):
+
+1. **Enforced**: the mutation symbols THIS crate funnels are denied outside the funnel
+   by the compiler, on both targets, so no spelling or module route reaches them; NO
+   `libc` reference appears outside the funnel — the outside reference map is asserted
+   **EMPTY**, which removes the need for a belt, an anchor, negative controls and a
+   residual list, so that apparatus is **DELETED rather than extended**; and the
+   funnel's own call counts stay pinned, so a changed or added call forces review.
+2. **Not promised**: completeness of the SYMBOL SET — a mutating symbol nobody listed,
+   a raw `syscall(SYS_…)`, an `extern "C"` declaration, a `windows_sys` creator, a
+   proc-macro-generated call, third-party code. Keeping the funnel complete is a
+   REVIEW responsibility over the symbols the crate actually names.
+3. **Guaranteed as an API** — the product: root confinement, the atomic replace's
+   commit points and reported durability, lock mutual exclusion and a record never
+   destroyed by adoption, validated ids and paths, manifest fidelity and wire
+   injectivity, the ownership binding, typed error kinds.
+
+**Why this is not a manufactured clean round.** The loop's exit condition is a round
+in which both reviewers return zero actionable findings; under the old contract that
+was unreachable, because each round found a REAL defect in a device whose stated
+property was broader than its mechanism. The re-basing is the OWNER's decision, made
+for the reason above; it is recorded here in place; and the loop then re-runs under
+the new contract — where the last five rounds' device findings are not "out of scope"
+but **deleted**, because the artifact that produced them no longer exists. A scope
+narrowed by the orchestrator to reach an empty round would be the cardinal sin; a
+contract re-based by the owner, with the withdrawn claim named and the cost of
+holding it measured, is a decision about what this crate is for.
+
+**Superseded claims, marked as history rather than silently edited.** The round-4
+entry's *"Completeness — 'no mutation outside the funnel, whatever the spelling'"*,
+and the round-9/10/11/12 entries' descriptions of the belt/oracle/anchor as
+"independent", "anchored outside the co-editable pair" or "derived from something
+this crate does not edit" describe artifacts that no longer exist and a claim that is
+withdrawn; they are kept as the record of how the contract was found to be wrong.

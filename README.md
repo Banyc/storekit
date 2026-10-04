@@ -651,8 +651,36 @@ libc as c; c::unlinkat(...)` records a bare `libc`, which its own doc states).
 Aliased and re-exported `libc` spellings are caught by the resolved-symbol deny
 and by the exact per-module reference pin, not by that scanner.
 
-Together they back the rule that every name mutation goes through the ONE guarded
-funnel, and the operative definition of that membership is the set of
+**The contract, stated so that it can be kept.** An earlier version of this section
+said the devices back "the rule that every name mutation goes through the ONE guarded
+funnel". That is a claim about the whole language — every spelling, alias, macro,
+builder, module route, `extern "C"` declaration, raw syscall number and third-party
+call — and NO finite mechanism certifies it. Five adversarial rounds were spent
+proving that, one artifact at a time (a 7-name spot list, a 54-entry literal, a
+71-entry "independent" anchor, a file derived as that anchor intersected with
+`libc`), and each artifact produced the next hole. The claim is WITHDRAWN, and the
+crate takes responsibility for exactly this:
+
+* **What it ENFORCES.** (a) The mutation symbols THIS crate funnels are denied
+  outside the funnel modules by the compiler, on both targets, so no spelling or
+  module route reaches them (`clippy.toml`; the list names what the funnel uses).
+  (b) No `libc` reference at all appears outside the funnel: the outside reference
+  map is asserted EMPTY, so there is nothing to make safe and no belt is needed.
+  (c) The funnel's OWN call counts are pinned per file and per symbol, so a changed
+  or added call inside the funnel forces review.
+* **What it does NOT promise.** Completeness of the SYMBOL SET: a mutating symbol
+  nobody listed, a raw `syscall(SYS_...)`, an `extern "C"` declaration the crate
+  writes itself, a `windows_sys` creator, a proc-macro-generated call — none is
+  detected, and none is claimed. Keeping the funnel complete is a REVIEW
+  responsibility, exercised on the symbols the crate actually names.
+* **What it GUARANTEES as an API.** The public surface's own properties: root
+  confinement, the atomic replace's commit-point protocol and its reported
+  durability, lock mutual exclusion and a record that is never destroyed by
+  adoption, validated ids and paths, manifest fidelity and wire injectivity, the
+  ownership binding, and the typed error kinds. Those are the crate's product;
+  the funnel rule is how its own implementation is kept honest.
+
+The operative definition of the funnel's membership is the set of
 `#[allow(clippy::disallowed_methods)]` ATTRIBUTES in the source — module-level
 in the funnel modules, item-level on the individual reviewed functions
 (capability-gated workers, the path-based mode authority, the cross-platform
