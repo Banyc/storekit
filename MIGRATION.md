@@ -25,9 +25,10 @@ domain. This file is the ordered checklist and the record of what does NOT map.
    existing on-disk state, and the one that fails closed if skipped. **DONE.**
 3. **Swap the substrate in dependency order**: `digest`/`platform`/`trace` →
    `atomic` → `lock` → `root`/`owned_root` → `relpath` → `transport` (+ runner,
-   ssh) → `manifest`/`canonical`.
+   ssh) → `manifest`/`canonical`. **DONE** (the final split is recorded below).
 4. **Adopt `sync`** only where a transfer is a plain mirror of one tree into
-   another.
+   another. **DONE** for the manifest slice: it is NOT adopted by
+   `deploy/remote/canonical/materialize.rs` (see below).
 
 ## Module map
 
@@ -39,7 +40,8 @@ domain. This file is the ordered checklist and the record of what does NOT map.
 | `identity::*` (`id_newtype!`, `valid_name`, `valid_hex_digest`) | `id::*` | 1:1. The macro names `serde` through the crate, so the call site needs no `serde` dependency. |
 | `remote/transport/rooted.rs` | `relpath::RootedRelativePath` | `from_validated` is **crate-private**; use the fallible `parse` at the boundary (a `LazyLock` for the static spellings). |
 | `remote/transport/mod.rs`, `runner/**`, `ssh/**` | `transport::*` | `Layout` is a constructor argument; `LocalTransport::new(env, base, layout)`. `Remote::exists` is a default method; `metadata_opt` is the typed probe. |
-| `remote/canonical/mod.rs` (tree half) | `manifest::*` | Pick by ROLE: `canonicalize_tree` for a source (strict), `canonicalize_tree_destination` for a destination (tolerant, `UnsupportedEntry { path, kind, reason }`). The `_checked` assemblers carry the completeness fact. |
+| `remote/canonical/mod.rs` (tree half) | `manifest::*` | Pick by ROLE: `canonicalize_tree` for a source (strict), `canonicalize_tree_destination` for a destination (tolerant, `UnsupportedEntry { path, kind, reason }`). The `_checked` assemblers carry the completeness fact. **DONE**: `deploy`'s half is deleted and the substrate names re-exported; `deploy` has no tolerant destination path, so it uses the strict source walk for destinations and compares digests. |
+| `remote/canonical/materialize.rs` | — | **STAYS in `deploy`.** It is the config-driven mapping/template materializer (`materialize_variant`, `TemplateVars`, `render_template`), not a tree-transfer protocol and not a plain mirror, so `sync` does not replace it. |
 | *(new)* | `atomic::copy_dir_recursive_fd` + `fsync_tree_recursive_fd` | `deploy`'s shape: an arbitrary, possibly out-of-root `&Path` source into a root-confined `RootedRelativePath` staging destination, then canonicalize + digest + rename. |
 | *(new)* | `atomic::copy_tree_verbatim(src, dst)` | The TOLERANT clone: copies a tree (reserved spellings, the `operation.lock` record, and crate-temp shapes included) between two ordinary absolute paths. Use it for `retention`'s clone of a live base; the destination is NOT a store root and must never be handed to the recovery sweep. |
 | *(new)* | `transport::{with_operation_lock_sidecar, SIDECAR_WAIT_TIMEOUT, SIDECAR_RETRY_INTERVAL}` | The operation-scoped sidecar critical section (blocking-with-deadline, re-entrant, same record/inode as the far-side lock path). Replaces `deploy`'s own platform flock triple in `deploy/lock/{unix,windows}.rs` and its `remote::transport::{with_operation_lock_sidecar, wait_for_sidecar_flock, ensure_operation_lock_sidecar_durable}`. |
@@ -107,7 +109,28 @@ a stored identity for no benefit.
 The crate will not adopt a foreign format silently, and should not: silently
 adopting would misidentify a deployment directory.
 
-## Verification per step
+## The `manifest`/`canonical` split (DONE)
+
+`deploy/remote/canonical/mod.rs`'s tree half is the substrate's
+`manifest::*`; `deploy`'s copy is deleted and the substrate names re-exported.
+The swap replaces `deploy`'s LEXICAL, tree-ROOT-relative symlink containment
+with the substrate's PHYSICAL walk from the link's containing directory: a
+target that traverses a symlink component (intermediate or final) is now
+refused, and a POSIX in-root target such as `dir/link -> ../other` is now
+accepted (an over-refusal `deploy` could never have stored is lifted). Names
+must already be NFC/UTF-8, targets must be UTF-8, the wire assembler takes the
+walk's exit status (`canonicalize_remote_entries_checked`), splits on LF alone,
+requires six fields and a parent-closed manifest, and enforces `NAME_MAX`. The
+byte format is unchanged for a tree both walks accept, so no stored `tree.json`
+or digest changes.
+
+`deploy/remote/canonical/materialize.rs` STAYS. It is a mapping-set → staging
+tree materializer (multiple sources placed into one content-addressed tree,
+`{{var}}` rendering, per-mapping mode overrides, symlink/special sources
+refused), not a plain mirror of one tree into another; the substrate's `sync`
+engine cannot express its placement or rendering, so the answer to the step-4
+question for this file is **do not adopt `sync`**.
+
 
 - the crate's gate on BOTH platforms, plus `tests/consumer_fit.rs`, which fails
   to COMPILE if a consumer-required name is removed;
