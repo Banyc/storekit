@@ -548,10 +548,14 @@ mod runner_property_tests {
         /// The fake's wait closure blocks BEFORE its first wait: the wait
         /// thread is a live waiter while the deadline races it.
         Wait,
-        /// The fake's wait closure blocks AFTER recording its reap and BEFORE
-        /// returning the completion: a deadline kill in this window finds the
-        /// reaped handle consumed and is a no-op — join-before-kill, the
-        /// barrier property's window reached via delay injection.
+        /// The child has ALREADY exited and been reaped when the runner holds
+        /// it, and the fake's wait closure then blocks BEFORE returning the
+        /// completion. For a self-completing stall the fake records the reap
+        /// in `spawn`, before the runner's deadline clock starts, so the
+        /// premise "the deadline fired after the reap" is deterministic; a
+        /// deadline reached in this window finds the reaped handle consumed
+        /// and a kill is a no-op — join-before-kill, the barrier property's
+        /// window reached via delay injection.
         AfterReap,
     }
 
@@ -776,9 +780,15 @@ mod runner_property_tests {
             // real runner's consumed-handle no-op). The barrier parks the wait
             // AFTER the reap but BEFORE the completion notification — the
             // window the pid-reuse test exploits; only that test sets it.
-            self.reaped.store(true, Ordering::SeqCst);
-            self.collected.store(true, Ordering::SeqCst);
-            self.state.push(LogEntry::Reap { pid: self.pid });
+            //
+            // EXACTLY ONE Reap is recorded per child: an `AfterReap`
+            // self-completing child was already reaped at spawn (the
+            // deterministic deadline-after-reap premise — see
+            // `FakeSeam::spawn`), so the `swap` keeps that single entry.
+            if !self.reaped.swap(true, Ordering::SeqCst) {
+                self.collected.store(true, Ordering::SeqCst);
+                self.state.push(LogEntry::Reap { pid: self.pid });
+            }
             // Injected scheduler delay at the AFTER-REAP stage: the child is
             // reaped but the completion has not been delivered — a deadline
             // reached in this window makes the runner's kill a no-op on the
@@ -1023,6 +1033,27 @@ mod runner_property_tests {
                 deadline: Arc::new(DeadlineSignal::new()),
                 state: self.state.clone(),
             });
+            // DETERMINISTIC deadline-after-reap premise. The `AfterReap`
+            // placement models a child that has already exited and been reaped
+            // when the runner's deadline path inspects `reaped`: the wait
+            // closure then blocks past the deadline and the runner must return
+            // the closure's REAL result, never a fabricated `Timeout`. A
+            // child that exits on its own is therefore reaped HERE — before
+            // `spawn` returns and before the runner starts its deadline
+            // clock — so the premise holds however the scheduler interleaves
+            // the wait thread. Recording the reap in the wait closure instead
+            // would make the premise a RACE against the (2 ms) deadline: a
+            // descheduled wait thread loses it, the runner correctly observes
+            // a not-yet-reaped child and takes the documented kill path, and
+            // the deadline-after-reap assertion fails for a scheduling reason
+            // rather than a runner defect. `Hang` is excluded: a hung child
+            // exists only until the runner kills it, so it cannot be reaped
+            // before the deadline.
+            if self.delay_at == DelayAt::AfterReap && self.stall != Stall::Hang {
+                ctl.reaped.store(true, Ordering::SeqCst);
+                ctl.collected.store(true, Ordering::SeqCst);
+                self.state.push(LogEntry::Reap { pid });
+            }
             // The kill handle: the runner's deadline path requests the kill
             // through THIS handle — never through a detached pid — and the
             // fake records it against the same child the wait reaps. On a
@@ -2091,7 +2122,10 @@ mod runner_property_tests {
     /// and EXITED, so after the flip removal the runner must return the
     /// closure's REAL result — never a deadline `Timeout`. This is the property
     /// half of the `-1`-meaning fix: a deadline that did not interrupt a
-    /// running command is not a timeout.
+    /// running command is not a timeout. The premise is deterministic: the fake
+    /// records the reap in `spawn` (before the runner's deadline clock starts)
+    /// and the wait closure blocks past the deadline only then, so this branch
+    /// is exercised on every run regardless of scheduler load.
     fn deadline_fires_after_reap(stall: Stall, at: DelayAt, size: DelaySize) -> bool {
         size == DelaySize::Past
             && at == DelayAt::AfterReap
@@ -2156,6 +2190,17 @@ mod runner_property_tests {
             );
         }
         if deadline_fires_after_reap(stall, at, size) {
+            // The premise is now deterministic: the fake records the reap in
+            // `spawn`, before the runner's deadline clock starts, so the
+            // runner must observe `reaped` and take the reaped path — a
+            // recorded kill would prove the premise did not hold (the child
+            // was not yet reaped at the deadline) and the classification
+            // below would be asserting a scheduling accident.
+            assert!(
+                state.kill_pids().is_empty(),
+                "the deadline fired after the reap, so no kill may be recorded ({label}): {:?}",
+                state.log_snapshot()
+            );
             // The child was REAPED before the deadline fired: the deadline did
             // not interrupt the command, so the returned outcome must be the
             // closure's REAL result. A bare `!matches!(outcome, Timeout)` was
