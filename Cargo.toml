@@ -24,3 +24,9 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# The `std::fs` name-mutation audit PARSES each crate source instead of
+# matching text, so raw identifiers, whitespace, and cross-file module aliases
+# are no longer spellable evasions. `default-features = false` keeps the
+# derive macro, printing, and the proc-macro bridge out of the build; `full`
+# gives the complete item/expression AST and `visit` the immutable walker.
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
