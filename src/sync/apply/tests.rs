@@ -2251,6 +2251,227 @@ fn an_unsupported_destination_symlink_component_cannot_be_escaped_through() {
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
+/// G2, the RESIDUE blind spot. The destination supplies the traversed component
+/// `.sync-aside.1.2` as a symlink that points OUTSIDE the root, and `.sync-aside.`
+/// is a genuine claim-aside (residue, not a crate temp), so the destination
+/// strip removes it before the diff AND from the result-containment index. The
+/// walk then resolves the component `Absent` and PERMITS the source link, which
+/// the run installs so it escapes through the residue symlink.
+///
+/// This is the same shape as
+/// [`a_destination_resident_symlink_component_makes_the_run_refuse`], except the
+/// destination component is spelled in the residue namespace. Under
+/// `Extraneous::Keep` the residue survives the run (it is not in the diff), so a
+/// correct result view MUST still constrain the link. Pre-fix the run returned
+/// `Ok` and `read(dst/link)` yielded the outside canary.
+#[cfg(unix)]
+#[test]
+fn a_destination_residue_symlink_component_cannot_be_escaped_through_under_keep() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("keep"), b"payload");
+    // The source link walks through a component only the destination supplies.
+    std::os::unix::fs::symlink(".sync-aside.1.2/secret", src.join("link")).unwrap();
+    // The destination supplies it as a SYMLINK, in the residue namespace.
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink("../outside", dst.join(".sync-aside.1.2")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains(".sync-aside.1.2"),
+        "the run must refuse, naming the residue component, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the escaping link must never be materialized: {err}"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// G2, the residue blind spot under `Extraneous::Delete`. Residue is NEVER
+/// removed by a run, so the `Delete` skip of destination-only entries (which is
+/// sound only for entries the run actually removes) must NOT skip it. The
+/// destination residue symlink survives `Delete` and still redirects the
+/// installed link outside.
+#[cfg(unix)]
+#[test]
+fn a_destination_residue_symlink_component_cannot_be_escaped_through_under_delete() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("keep"), b"payload");
+    std::os::unix::fs::symlink(".sync-aside.1.2/secret", src.join("link")).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink("../outside", dst.join(".sync-aside.1.2")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains(".sync-aside.1.2"),
+        "the run must refuse, naming the residue component, got: {msg}"
+    );
+    assert!(
+        fs::symlink_metadata(dst.join("link")).is_err(),
+        "the escaping link must never be materialized: {err}"
+    );
+    // The residue itself is never removed, and the outside canary is intact.
+    assert!(
+        fs::symlink_metadata(dst.join(".sync-aside.1.2"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "residue survives Extraneous::Delete: {err}"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// G2 CONTROL: the SAME shape with the destination component spelled OUTSIDE
+/// the residue namespace (`sub`, ordinary content) is refused today, proving the
+/// result-containment check runs and that residue is the specific blind spot.
+#[cfg(unix)]
+#[test]
+fn a_destination_non_residue_symlink_component_is_refused_as_control() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("keep"), b"payload");
+    std::os::unix::fs::symlink("sub/secret", src.join("link")).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink("../outside", dst.join("sub")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("escaping symlink") && msg.contains("sub"),
+        "an ordinary destination symlink component is already refused, got: {msg}"
+    );
+    assert!(fs::symlink_metadata(dst.join("link")).is_err());
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// G2, the CRATE-TEMP half of the `Delete` distinction. A crate-temp shape
+/// (`.sync-aside.<name>.tmp.<pid>.<n>`) is UNADDRESSABLE but NOT residue: it
+/// holds no original, so `Extraneous::Delete` DOES remove it. The result view
+/// must therefore OMIT it under `Delete` (the run removes it), so the link is
+/// permitted and simply dangles once the temp is gone — it must not be refused
+/// for a component the run destroys.
+#[cfg(unix)]
+#[test]
+fn extraneous_delete_removes_a_crate_temp_symlink_component_and_permits_the_link() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("keep"), b"payload");
+    // A crate-temp SHAPE, not a claim-aside: removable destination content.
+    let temp = ".sync-aside.x.tmp.1.2";
+    assert!(crate::atomic::is_crate_temp_name(temp));
+    assert!(!crate::reserved::is_residue_path(temp));
+    std::os::unix::fs::symlink(format!("{temp}/secret"), src.join("link")).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink("../outside", dst.join(temp)).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete)
+        .expect("a crate-temp destination symlink is removable content, not residue");
+    assert!(
+        fs::symlink_metadata(dst.join(temp)).is_err(),
+        "Extraneous::Delete removes a crate temp: {report:?}"
+    );
+    assert!(
+        fs::read(dst.join("link")).is_err(),
+        "the link is installed and dangles; it must not resolve to the outside canary"
+    );
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// G2, the crate-temp counterpart under `Keep`: the temp SURVIVES the run, so
+/// the walk must resolve the component to a symlink and REFUSE. This pins that
+/// crate-temp content is not specially ignored by the result view under `Keep`.
+#[cfg(unix)]
+#[test]
+fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("keep"), b"payload");
+    let temp = ".sync-aside.x.tmp.1.2";
+    std::os::unix::fs::symlink(format!("{temp}/secret"), src.join("link")).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink("../outside", dst.join(temp)).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write(&outside.join("secret"), b"SECRET");
+
+    let err = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap_err();
+    assert!(
+        err.to_string().contains("escaping symlink"),
+        "the surviving temp symlink still redirects the link: {err}"
+    );
+    assert!(fs::symlink_metadata(dst.join("link")).is_err());
+    assert_eq!(read(&outside.join("secret")), b"SECRET");
+}
+
+/// G2, NO OVER-REFUSAL: a residue entry that is a real DIRECTORY redirects
+/// nothing, so a source link whose walk passes through it is legitimate and the
+/// run must still succeed and materialize it. The result index must record the
+/// residue entry as NOT a symlink rather than dropping it or treating it as a
+/// redirect.
+#[cfg(unix)]
+#[test]
+fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&src).unwrap();
+    std::os::unix::fs::symlink(".sync-aside.1.2/target", src.join("link")).unwrap();
+    write(&dst.join(".sync-aside.1.2/target"), b"inside");
+
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+        .expect("a residue DIRECTORY does not redirect a link and must not refuse it");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(
+        read(&dst.join("link")),
+        b"inside",
+        "the link resolves through the in-root residue directory"
+    );
+}
+
+/// G2, NO OVER-REFUSAL: the same with a residue REGULAR FILE. The component is
+/// not a symlink, so it redirects nothing and the link must be installed.
+#[cfg(unix)]
+#[test]
+fn a_destination_residue_file_does_not_break_a_legitimate_link() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&src).unwrap();
+    std::os::unix::fs::symlink(".sync-aside.3.4", src.join("link")).unwrap();
+    write(&dst.join(".sync-aside.3.4"), b"inside");
+
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep)
+        .expect("a residue FILE does not redirect a link and must not refuse it");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(read(&dst.join("link")), b"inside");
+}
+
 #[test]
 fn equal_trees_perform_zero_transfers() {
     let dir = fixture_tmpdir(&env()).unwrap();

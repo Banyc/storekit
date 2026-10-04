@@ -3454,6 +3454,19 @@ fn run(
     // and the diff reports it as destination-only (`extraneous`) — the spelling
     // the report doc promises.
     let dest_residue = reserved_paths(&destination.meta);
+    // THE RESULT VIEW INCLUDES RESIDUE. The strip below drops residue (a
+    // `.sync-aside.<pid>.<n>` claim-aside, the lock record) from the diff,
+    // because the run never transfers and never removes it. That is right for
+    // the diff and WRONG for the containment index: the result view must be the
+    // destination AS IT WILL BE AFTER THE RUN, and residue SURVIVES the run
+    // under BOTH `Extraneous::Keep` and `Extraneous::Delete`. Indexing the
+    // stripped destination resolved a residue component `Absent`, so a source
+    // link whose target walked through a residue SYMLINK was PERMITTED and the
+    // run installed a link that reached outside the root. Keep a borrow of the
+    // RAW destination entries (the very observation the enclosing function
+    // read) and index THOSE, so a residue entry constrains the walk exactly as
+    // the entry that will still be there does.
+    let destination_result_view = &destination;
     // The strip is the PUBLIC diff surface's own authority
     // ([`apply_manifests`]), so a consumer that builds a status on the raw
     // manifest primitives can reproduce exactly this decision surface instead
@@ -3500,6 +3513,12 @@ fn run(
     // naming the destination component; the caller can delete that entry first,
     // use `Extraneous::Delete` when the source does not hold the path, or remove
     // the source link, and re-run.
+    //
+    // The result view is built from the RAW destination entries, BEFORE the
+    // residue strip. Residue is not destination-only content the run may remove:
+    // it survives `Extraneous::Delete` too, so it must constrain the walk under
+    // BOTH policies; only a destination-only entry the run actually REMOVES
+    // (removable under `Delete`, and not residue) is skipped.
     let needs_result_containment = source_meta.entries.iter().any(|e| {
         e.entry_type == EntryKind::Symlink
             && e.symlink_target
@@ -3512,17 +3531,26 @@ fn run(
             .iter()
             .map(|e| e.path.as_str())
             .collect();
-        let mut result: Vec<(&str, bool)> =
-            Vec::with_capacity(diff.dest.entries.len() + source_meta.entries.len());
-        for entry in &diff.dest.entries {
+        let mut result: Vec<(&str, bool)> = Vec::with_capacity(
+            destination_result_view.meta.entries.len() + source_meta.entries.len(),
+        );
+        for entry in &destination_result_view.meta.entries {
             // The source's own entry SHADOWS the destination entry at the same
             // path (it is installed over it, or already matches it).
             if source_paths.contains(entry.path.as_str()) {
                 continue;
             }
-            // A destination-only entry survives only under `Keep`; under
-            // `Delete` the run removes it, so it must NOT constrain the link.
-            if extraneous == Extraneous::Delete {
+            // A destination-only entry survives the run only under `Keep`; under
+            // `Delete` the run removes it, so it must NOT constrain the link —
+            // BUT residue is NEVER removed (not even by `Delete`: a removal
+            // that would destroy residue is refused, so the entry stays put),
+            // and it must therefore constrain even under `Delete`. The
+            // predicate is the SAME one the destination strip uses
+            // ([`crate::reserved::is_residue_path`]), so this skip means "the
+            // run actually removes it" rather than a blanket `Delete` skip: a
+            // crate-temp shape ([`crate::atomic::is_crate_temp_name`]) is
+            // removable destination content and IS removed, residue is not.
+            if extraneous == Extraneous::Delete && !crate::reserved::is_residue_path(&entry.path) {
                 continue;
             }
             result.push((entry.path.as_str(), entry.entry_type == EntryKind::Symlink));
