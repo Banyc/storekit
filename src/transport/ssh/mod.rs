@@ -399,6 +399,13 @@ pub struct SshTransport {
     /// option (a `ProxyJump`, a `CertificateFile`, a `HostKeyAlgorithms`) is
     /// passed through verbatim. See [`SshTransport::with_ssh_option`].
     ssh_options: Vec<String>,
+    /// Test-only swap injection for the descriptor-bound verification helper:
+    /// a [`VerifySwap`](crate::transport::VerifySwap) stored as a Rust VALUE
+    /// (never via env) that `verify_open_script` embeds as literals.
+    /// `#[cfg(test)]`-gated so nothing test-shaped compiles into non-test
+    /// builds.
+    #[cfg(test)]
+    test_verify_swap: std::sync::Mutex<Option<crate::transport::VerifySwap>>,
 }
 
 impl SshTransport {
@@ -501,6 +508,8 @@ impl SshTransport {
             verbose,
             identity_file: None,
             ssh_options: Vec::new(),
+            #[cfg(test)]
+            test_verify_swap: std::sync::Mutex::new(None),
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
@@ -540,6 +549,21 @@ impl SshTransport {
         )?;
         t.runner = runner;
         Ok(t)
+    }
+
+    /// Test-only setter for the descriptor-bound verification swap injection:
+    /// stores a [`VerifySwap`](crate::transport::VerifySwap) as a Rust VALUE
+    /// (never via an environment variable, so no ambient state can arm it)
+    /// that `verify_open_script` embeds into the remote helper as literals.
+    /// `#[cfg(test)]`-gated so nothing test-shaped compiles into non-test
+    /// builds. (The unix-gated fake-ssh suite is its only caller, so on the
+    /// Windows test target — which has no such suite — it is dead by design.)
+    #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn set_test_verify_swap(&self, swap: Option<crate::transport::VerifySwap>) {
+        if let Ok(mut g) = self.test_verify_swap.lock() {
+            *g = swap;
+        }
     }
 
     /// The `provision_layout` command: `mkdir -p <root> <bootstrap_dirs...>`.
@@ -1885,8 +1909,71 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// The path is a positional argument after `--` (single-quoted); the
     /// perl is multi-line inside the single-quoted `-e` argument (shell
     /// single quotes span newlines).
+    ///
+    /// Test-only swap injection is via a `#[cfg(test)]` Rust VALUE seam
+    /// ([`SshTransport::test_verify_swap`] set through
+    /// [`SshTransport::set_test_verify_swap`]): the
+    /// [`VerifySwap`](crate::transport::VerifySwap) is passed as a Rust value
+    /// and, when present, is embedded into the helper as literal
+    /// `my $swap = "..."` / `my $boundary = "..."` assignments — never via
+    /// environment variables. Production builds contain no swap logic at all.
     fn verify_open_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
+        #[cfg(test)]
+        {
+            #[allow(clippy::collapsible_if)]
+            if let Ok(guard) = self.test_verify_swap.lock() {
+                if let Some(swap) = guard.as_ref() {
+                    let kind_str = match swap.kind() {
+                        crate::transport::VerifySwapKind::Symlink => "symlink",
+                        crate::transport::VerifySwapKind::Directory => "directory",
+                        crate::transport::VerifySwapKind::DifferentInode => "inode",
+                    };
+                    let boundary_str = match swap.boundary() {
+                        crate::transport::VerifySwapBoundary::BeforeOpen => "before_open",
+                        crate::transport::VerifySwapBoundary::AfterOpen => "after_open",
+                        crate::transport::VerifySwapBoundary::AfterFstat => "after_fstat",
+                    };
+                    return format!(
+                        "perl -e 'use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);\n\
+                         my $p = $ARGV[0];\n\
+                         my $swap = \"{kind}\";\n\
+                         my $boundary = \"{boundary}\";\n\
+                         my $swap_at = sub {{\n\
+                           my $orig = $p . \".swap-orig\";\n\
+                           my $t = $p . \".swap-target\";\n\
+                           rename($p, $orig);\n\
+                           if ($swap eq \"symlink\") {{ symlink($t, $p); }}\n\
+                           elsif ($swap eq \"directory\") {{ mkdir($p); }}\n\
+                           elsif ($swap eq \"inode\") {{ rename($t, $p); }}\n\
+                         }};\n\
+                         if ($swap && $boundary eq \"before_open\") {{ $swap_at->(); }}\n\
+                         if (!sysopen(FH, $p, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                         if ($swap && $boundary eq \"after_open\") {{ $swap_at->(); }}\n\
+                         my @s = stat(FH);\n\
+                         if (!@s) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                         if ($swap && $boundary eq \"after_fstat\") {{ $swap_at->(); }}\n\
+                         my $type = $s[2] & 0170000;\n\
+                         if ($type == 0100000) {{\n\
+                           my $content = \"\";\n\
+                           while (1) {{\n\
+                             my $n = sysread(FH, my $buf, 65536);\n\
+                             if (!defined $n) {{ printf \"E\\t%d\\n\", $! + 0; exit 0; }}\n\
+                             last if $n == 0;\n\
+                             $content .= $buf;\n\
+                           }}\n\
+                           printf \"O\\t%x\\n%s\", $s[2] & 0xffff, $content;\n\
+                           exit 0;\n\
+                         }}\n\
+                         printf \"N\\t%x\\n\", $s[2] & 0xffff;\n\
+                         ' -- {p}",
+                        kind = kind_str,
+                        boundary = boundary_str,
+                        p = p
+                    );
+                }
+            }
+        }
         format!(
             "perl -e 'use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);\n\
              my $p = $ARGV[0];\n\
@@ -6470,6 +6557,1974 @@ mod tests_ssh {
                         "a pre-install/publish failure must install nothing"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The FAKE-SSH integration tests: a hermetic emulated remote (a fake `ssh`
+/// that remaps the configured deploy dir to a local dir) drives the REAL
+/// `SshTransport` end to end, so the descriptor-bound verification, the
+/// framed lstat protocol, the fingerprint pin/reuse policy, and the
+/// create-new verdicts are asserted against the production entry points
+/// without any network. `#[cfg(test)]` + `#[cfg(unix)]`-only and
+/// crate-internal, so nothing test-shaped (and no public surface) exists in a
+/// production build, and the Windows test target (which compiles no unix
+/// symlink/permission fixture) is untouched. The two attributes are SEPARATE
+/// on purpose: the crate's `production_only` source filter strips a
+/// `#[cfg(test)]`-gated item (and any attributes following it), so folding the
+/// gate into one `#[cfg(all(test, unix))]` would leave the whole suite visible
+/// to the `std::fs` / `libc` audits as production code.
+#[cfg(test)]
+#[cfg(unix)]
+mod fingerprint_ssh_tests {
+    use super::*;
+    use crate::transport::{
+        NotRegularFileKind, VerifiedExisting, VerifySwapBoundary, VerifySwapKind,
+    };
+    #[cfg(test)]
+    use proptest::prelude::*;
+    #[cfg(test)]
+    use proptest::test_runner::RngSeed;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    // HERMETIC SNAPSHOT: every fake-ssh test builds ONE `SysEnv::from_map`
+    // carrying the fake bin dir first in `PATH` plus the fake-ssh variables
+    // (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`) and the per-test pin
+    // cache (`STOREKIT_TEST_SSH_KNOWNHOSTS_DIR`). The transport spawns its children
+    // (ssh / ssh-keyscan / ssh-keygen / stat) with that snapshot's variables
+    // (`SysEnv::apply_to_command`: env_clear + the snapshot's vars), so the
+    // fake binaries resolve and their
+    // inputs ride the same child env — the process-global environment is
+    // NEVER touched (no lock, no set_var, no cross-test interference).
+
+    struct FakeSsh {
+        bin: PathBuf,
+        remote_root: PathBuf,
+        fingerprint: String,
+        deploy_dir: PathBuf,
+        address: String,
+        keyscan_log: PathBuf,
+        /// Every fake-`ssh` invocation's FULL argv (one argument per line, a
+        /// `---` separator between invocations) — recorded so a test can
+        /// prove a given payload never entered the transmitted command (the
+        /// write invocation's argv is byte-for-byte the payload-INDEPENDENT
+        /// command string).
+        argv_log: PathBuf,
+    }
+
+    impl FakeSsh {
+        /// Generate a REAL ed25519 host key (never a hardcoded fake), compute
+        /// its SHA256 fingerprint, and write fake `ssh`/`ssh-keyscan`/`stat`
+        /// executables into `bin` that emulate a remote host rooted at
+        /// `remote_root`.
+        fn new(bin: PathBuf, remote_root: PathBuf, address: &str, deploy_dir: &Path) -> FakeSsh {
+            std::fs::create_dir_all(&bin).unwrap();
+            let keyfile = bin.join("hostkey");
+            let out = std::process::Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-f"])
+                .arg(&keyfile)
+                .output()
+                .expect("ssh-keygen must be available");
+            assert!(out.status.success(), "ssh-keygen failed");
+            let pubkey = std::fs::read_to_string(keyfile.with_extension("pub"))
+                .expect("read generated pubkey")
+                .trim()
+                .to_string();
+            let fp = std::process::Command::new("ssh-keygen")
+                .args([
+                    "-lf",
+                    keyfile.with_extension("pub").to_str().unwrap(),
+                    "-E",
+                    "sha256",
+                ])
+                .output()
+                .expect("ssh-keygen -lf must run");
+            assert!(fp.status.success());
+            let fingerprint = String::from_utf8_lossy(&fp.stdout)
+                .split_whitespace()
+                .nth(1)
+                .expect("fingerprint field")
+                .to_string();
+
+            let keyscan_log = bin.join("keyscan.log");
+            let argv_log = bin.join("ssh-argv.log");
+
+            // Fake `ssh`: parse `-o`/`-p`/`--` like OpenSSH, remap every
+            // occurrence of the configured remote deploy dir to the local
+            // emulation root, and run the single (fully shell-quoted) remote
+            // command with `sh -c`. Every invocation's FULL argv is recorded
+            // to `argv_log` (one argument per line, `---` separator) so a
+            // test can prove the payload never enters the command string —
+            // the recorded argv must be byte-for-byte the payload-INDEPENDENT
+            // reference command. The recording block reads no stdin, so the
+            // piped payload flows through this shim untouched into the remote
+            // `cat > "$tmp"` (the shell execs the command with stdin intact).
+            std::fs::write(
+                bin.join("ssh"),
+                format!(
+                    r##"#!/bin/sh
+# Fake `ssh` for tests: emulates a remote host whose filesystem is a local
+# directory. `FAKE_SSH_ROOT` is the local dir; `FAKE_SSH_REMOTE_PREFIX` is the
+# configured remote deploy dir (e.g. /srv/deploy/app). Every occurrence of the
+# remote prefix in the (fully shell-quoted) remote command is remapped to
+# $FAKE_SSH_ROOT$FAKE_SSH_REMOTE_PREFIX, then the command runs with `sh -c`.
+# The piped stdin payload is inherited untouched (no -n, no stdin reads here).
+FAKE_ROOT="${{FAKE_SSH_ROOT:?FAKE_SSH_ROOT not set}}"
+REMOTE_PREFIX="${{FAKE_SSH_REMOTE_PREFIX:?FAKE_SSH_REMOTE_PREFIX not set}}"
+{{
+  printf '%s\n' "$0"
+  for a in "$@"; do
+    printf '%s\n' "$a"
+  done
+  printf '%s\n' '---'
+}} >> '{argv_log}'
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -p) shift 2 ;;
+    --) shift; cmd="$*"; break ;;
+    *) shift ;;
+  esac
+done
+[ -n "$cmd" ] || exit 0
+remapped=$(printf '%s' "$cmd" | awk -v old="$REMOTE_PREFIX" -v new="$FAKE_ROOT$REMOTE_PREFIX" '{{ gsub(old, new); printf "%s", $0 }}')
+exec sh -c "$remapped"
+"##,
+                    argv_log = argv_log.display(),
+                ),
+            )
+            .unwrap();
+
+            // Fake ssh-keyscan: record every invocation (so tests can prove the
+            // cached pin is reused) and answer with the generated host key.
+            std::fs::write(
+                bin.join("ssh-keyscan"),
+                format!(
+                    r#"#!/bin/sh
+printf 'keyscan\n' >> '{log}'
+host=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) shift 2 ;;
+    -T) shift 2 ;;
+    -t) shift 2 ;;
+    -*) shift ;;
+    *) host="$1"; shift ;;
+  esac
+done
+[ -n "$host" ] || host='{address}'
+printf '%s %s\n' "$host" '{pubkey}'
+"#,
+                    log = keyscan_log.display(),
+                    address = address,
+                    pubkey = pubkey,
+                ),
+            )
+            .unwrap();
+
+            // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it):
+            // the transport's list script uses `stat -c '%f'` (raw mode in
+            // hex). The metadata path no longer calls `stat` at all — it runs
+            // the framed perl `lstat` helper directly — so the shim's `%s %f`
+            // branch implements the SAME framed protocol (P/A/E frames from a
+            // REAL lstat errno; a missing path reports `A\t2`), keeping the
+            // fixture faithful for any caller that still formats through
+            // `stat`. `/usr/bin/perl` (absolute) is used so an injected fake
+            // `perl` in the test bin dir never shadows the shim's interpreter.
+            std::fs::write(
+                bin.join("stat"),
+                r#"#!/bin/sh
+fmt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) fmt="$2"; shift 2 ;;
+    -L) shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+case "$fmt" in
+  "%f")
+    /usr/bin/perl -e 'my @s = lstat($ARGV[0]); printf "%x\n", $s[2] & 0xffff;' "$1"
+    ;;
+  "%s %f")
+    /usr/bin/perl -e 'my @s = lstat($ARGV[0]); if (@s) { printf "P\t%s\t%x\n", $s[7], $s[2] & 0xffff; exit 0; } my $e = $! + 0; print(($e == 2 || $e == 20) ? "A\t$e\n" : "E\t$e\n");' "$1"
+    ;;
+  *)
+    exec /usr/bin/stat "$@"
+    ;;
+esac
+"#,
+            )
+            .unwrap();
+
+            // Fake `mv` emulating GNU coreutils `mv -T` (no-target-directory):
+            // macOS BSD mv lacks `-T` and, like GNU mv without `-T`, treats a
+            // destination that is a symlink to a directory as the directory
+            // itself and moves the source INTO it. The deploy tool's `current`
+            // swap depends on GNU `-T` semantics, so strip the flag and remove
+            // any existing destination first.
+            std::fs::write(
+                bin.join("mv"),
+                r#"#!/bin/sh
+if [ "$1" = "-T" ]; then
+  shift
+  src="$1"; dst="$2"
+  if [ -n "$src" ] && [ -n "$dst" ]; then
+    rm -f -- "$dst"
+  fi
+  exec /bin/mv -- "$src" "$dst"
+fi
+exec /bin/mv "$@"
+"#,
+            )
+            .unwrap();
+
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["ssh", "ssh-keyscan", "stat", "mv"] {
+                let p = bin.join(name);
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+
+            FakeSsh {
+                bin,
+                remote_root,
+                fingerprint,
+                deploy_dir: deploy_dir.to_path_buf(),
+                address: address.to_string(),
+                keyscan_log,
+                argv_log,
+            }
+        }
+
+        /// A fingerprint-only `SshTransport` (no `known_hosts`) rooted at
+        /// `self.deploy_dir`, pinning into the per-test `cache` dir with the
+        /// hermetic snapshot `env` (the fake ssh binaries resolve from its
+        /// `PATH`).
+        fn transport(&self, cache: &Path, env: &SysEnv) -> SshTransport {
+            SshTransport::new(
+                "deploy",
+                &self.address,
+                2222,
+                &self.deploy_dir,
+                Layout::empty(),
+                None,
+                Some(self.fingerprint.as_str()),
+                cache,
+                env,
+                false,
+            )
+            .unwrap()
+        }
+    }
+
+    /// Build the hermetic fake-ssh snapshot: `bin` prepended to the ambient
+    /// `PATH`, the per-test pin `cache`, and the fake-ssh variables. The
+    /// transport's children receive exactly these variables — the process
+    /// env is never mutated, so no two tests (in any binary) can interfere.
+    fn fake_env(bin: &Path, cache: &Path, root: &Path, prefix: &str) -> SysEnv {
+        fake_env_with(bin, cache, root, prefix, &[])
+    }
+
+    /// [`fake_env`] with EXTRA snapshot variables (e.g. arbitrary ambient
+    /// variables for production invariance testing).
+    fn fake_env_with(
+        bin: &Path,
+        cache: &Path,
+        root: &Path,
+        prefix: &str,
+        extra: &[(&str, &str)],
+    ) -> SysEnv {
+        let base = crate::test_support::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base.child_env().into_iter().collect();
+        let mut paths: Vec<_> = base
+            .path()
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
+        paths.insert(0, bin.to_path_buf());
+        let joined = std::env::join_paths(paths).unwrap();
+        vars.insert(OsString::from("PATH"), joined);
+        vars.extend(std::collections::BTreeMap::from([
+            (
+                OsString::from("STOREKIT_TEST_SSH_KNOWNHOSTS_DIR"),
+                cache.as_os_str().to_owned(),
+            ),
+            (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
+            (
+                OsString::from("FAKE_SSH_REMOTE_PREFIX"),
+                OsString::from(prefix),
+            ),
+        ]));
+        for (k, v) in extra {
+            vars.insert(OsString::from(k), OsString::from(*v));
+        }
+        SysEnv::from_map(vars)
+    }
+
+    /// Overwrite a protocol-faithful fake binary (written by [`FakeSsh::new`])
+    /// with a custom script for a single focused test — the transport resolves
+    /// every binary (`ssh`, `perl`, `stat`, ...) from the fake bin dir's
+    /// `PATH`, so the override is picked up by every remote command. Kept
+    /// executable like the originals.
+    fn write_fake_bin(bin: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = bin.join(name);
+        std::fs::write(&p, body).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+    }
+
+    /// Overwrite the fake `perl` so the transport's framed `lstat` helper
+    /// resolves to a script that emits `stdout` verbatim (or performs the
+    /// injected process-level behavior). The fake shim runs the helper as
+    /// `perl -e '…' -- <path>`, so a `perl` in the fake bin shadows the real
+    /// interpreter for metadata reads while every other binary is untouched.
+    fn write_fake_lstat(bin: &Path, stdout: &str) {
+        write_fake_bin(bin, "perl", &format!("#!/bin/sh\nprintf '{stdout}\n'\n"));
+    }
+
+    /// The far-side perl FILE-fsync snippet's test token, carried verbatim in
+    /// the shipped command ([`PERL_FSYNC_FILE`]) so a fake `perl` can recognise
+    /// exactly the file-fsync call without disturbing the other perl calls in
+    /// the same script.
+    const FSYNC_FILE_TOKEN: &str = "STOREKIT_TEST_FSYNC_FILE";
+    /// The DIRECTORY-fsync counterpart of [`FSYNC_FILE_TOKEN`]
+    /// ([`PERL_FSYNC_DIR`]).
+    const FSYNC_DIR_TOKEN: &str = "STOREKIT_TEST_FSYNC_DIR";
+
+    /// Overwrite the fake `perl` so the transport's PORTABLE perl fsync
+    /// snippets ([`PERL_FSYNC_FILE`] / [`PERL_FSYNC_DIR`]) record the path they
+    /// fsync into `log` (`file:<path>` / `dir:<path>`) and then delegate every
+    /// other invocation to the REAL perl, so the rest of the remote script is
+    /// unaffected. The pre-fix GNU-only `sync <operand>` no longer exists far
+    /// side, so a probe of `sync` would prove nothing about the durability
+    /// branch.
+    fn write_fake_perl_fsync_log(bin: &Path, log: &Path) {
+        let real = real_perl();
+        write_fake_bin(
+            bin,
+            "perl",
+            &format!(
+                "#!/bin/sh\n\
+                 log={log}\n\
+                 last=''; for a in \"$@\"; do last=$a; done\n\
+                 case \"$*\" in\n\
+                   *{dir_token}*) printf 'dir:%s\\n' \"$last\" >> \"$log\" ;;\n\
+                   *{file_token}*) printf 'file:%s\\n' \"$last\" >> \"$log\" ;;\n\
+                 esac\n\
+                 exec {real} \"$@\"\n",
+                log = shell_quote(&log.to_string_lossy()),
+                dir_token = FSYNC_DIR_TOKEN,
+                file_token = FSYNC_FILE_TOKEN,
+                real = shell_quote(&real.to_string_lossy()),
+            ),
+        );
+    }
+
+    /// The REAL perl, resolved from the TEST process's OWN `PATH` (the fake bin
+    /// dir is prepended only to the CHILD snapshot's `PATH`, so the test host's
+    /// perl is still the one the fake probe must delegate to).
+    fn real_perl() -> PathBuf {
+        for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+            let cand = Path::new(dir).join("perl");
+            if cand.is_file() {
+                return cand;
+            }
+        }
+        panic!("no `perl` on PATH; the far-side scripts require perl");
+    }
+
+    /// Read the fake ssh's recorded invocations (see `FakeSsh::new`): each
+    /// invocation is one argv vector (the recorded arguments verbatim, in
+    /// order), separated by the `---` marker line.
+    fn read_ssh_argv_log(log: &Path) -> Vec<Vec<String>> {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let mut invocations = Vec::new();
+        let mut current = Vec::new();
+        for line in text.lines() {
+            if line == "---" {
+                invocations.push(std::mem::take(&mut current));
+            } else {
+                current.push(line.to_string());
+            }
+        }
+        if !current.is_empty() {
+            invocations.push(current);
+        }
+        invocations
+    }
+
+    // Scenario (a): a fingerprint-only configuration can make a STATUS request
+    // once the identity has been prepared. Before preparation it cannot even
+    // build its ssh arguments — the exact regression this feature fixes.
+    #[test]
+    fn status_succeeds_with_fingerprint_only_config() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "status-unit.test",
+            Path::new("/srv/deploy/status-unit"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/status-unit",
+        );
+        let t = fake.transport(&cache, &env);
+        // Regression: without prepare_identity the transport refuses to
+        // build ssh arguments (no pinned key yet).
+        let err = t.ssh_args().unwrap_err();
+        assert!(
+            err.to_string().contains("host identity is not configured"),
+            "got: {err}"
+        );
+        t.prepare_identity().unwrap();
+        let args = t.ssh_args().unwrap();
+        assert!(
+            args.iter().any(|a| a.starts_with("UserKnownHostsFile=")),
+            "pinned known-hosts file must be used after prepare_identity"
+        );
+        // A REQUEST now succeeds end-to-end through the fake remote: the
+        // pinned identity is usable. The emulated remote is empty, so a
+        // metadata read is a CONFIRMED absence (`Ok(None)`), never a failure.
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("absent.json")).unwrap())
+                .unwrap()
+                .is_none(),
+            "after prepare_identity a fingerprint-only transport must serve requests"
+        );
+        // The pinned cache file was created on the LOCAL host.
+        let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+        assert!(pinned.exists(), "pinned file must exist");
+    }
+
+    /// Pinning is idempotent: a second `prepare_identity` validates the cached
+    /// pinned file against the configured fingerprint and reuses it WITHOUT
+    /// re-running `ssh-keyscan`; a tampered cache is dropped and re-fetched.
+    #[test]
+    fn fingerprint_pin_is_validated_and_reused() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote-root"),
+            "pin-unit.test",
+            Path::new("/srv/deploy/pin-unit"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/pin-unit");
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+        t.prepare_identity().unwrap();
+        let calls = std::fs::read_to_string(&fake.keyscan_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 1, "cached pin must be reused without re-keyscan");
+        // A tampered cache is not trusted: dropped and re-pinned.
+        let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+        std::fs::write(&pinned, "evil.example.com ssh-ed25519 AAAA\n").unwrap();
+        t.prepare_identity().unwrap();
+        let calls = std::fs::read_to_string(&fake.keyscan_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 2, "tampered pin must be re-fetched");
+        let text = std::fs::read_to_string(&pinned).unwrap();
+        assert!(
+            text.contains("ssh-ed25519"),
+            "repinned file must hold a valid key line"
+        );
+    }
+
+    /// The framed absence protocol: `metadata_opt` runs the perl `lstat`
+    /// helper — whose frames carry the ACTUAL errno — and maps ONLY the
+    /// confirmed-absence frames (`A` with ENOENT/ENOTDIR) to `Ok(None)`;
+    /// every other outcome (error frames, malformed frames, nonzero exit) is
+    /// an error, never absence. The happy path (present entries) is
+    /// unchanged: the type bits still decode from the raw mode into
+    /// is_symlink/is_dir/is_file.
+    #[test]
+    fn metadata_opt_structured_absence_protocol() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "meta-unit.test",
+            Path::new("/srv/deploy/meta-unit"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/meta-unit",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-unit");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+        let file = remote_deploy.join("app.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("app.txt", remote_deploy.join("link")).unwrap();
+        std::os::unix::fs::symlink("missing-target", remote_deploy.join("dangling")).unwrap();
+
+        // Present regular file: strictly parsed `size` + `rawmode`.
+        let meta = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap()
+            .expect("present file must be Some");
+        assert!(meta.is_file && !meta.is_dir && !meta.is_symlink);
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.mode, 0o100644);
+
+        // Present symlink and DANGLING symlink: lstat semantics decode the
+        // symlink type bits (the helper lstats the link itself, so a dangling
+        // link is still PRESENT).
+        for rel in ["link", "dangling"] {
+            let m = t
+                .metadata_opt(&RootedRelativePath::parse(Path::new(rel)).unwrap())
+                .unwrap()
+                .expect("present symlink must be Some");
+            assert!(m.is_symlink && !m.is_file && !m.is_dir, "{rel}");
+        }
+
+        // Confirmed absence: the helper's real lstat fails with ENOENT (2)
+        // for a missing final component and for a missing ancestor -> `A`
+        // frames -> None.
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("absent.txt")).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("missing/dir/entry")).unwrap())
+                .unwrap()
+                .is_none(),
+            "a missing parent is also a confirmed absence"
+        );
+
+        // `metadata()` keeps delegating: confirmed absence -> NotFound.
+        let err = t
+            .metadata(&RootedRelativePath::parse(Path::new("absent.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "metadata() must map confirmed absence to NotFound, got: {err}"
+        );
+    }
+
+    /// THE absence-vs-permission regression: a remote `lstat` that fails with
+    /// EACCES (permission denied) is an `E` frame with errno 13 — an ERROR,
+    /// never absence. The old shell-boolean guard (`[ ! -e ]` succeeds on
+    /// EACCES just like on ENOENT) reported permission failures as absent;
+    /// the frame carries the errno so the parser cannot confuse them.
+    #[test]
+    fn metadata_opt_eacces_is_an_error_never_absence() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "meta-eacces.test",
+            Path::new("/srv/deploy/meta-eacces"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/meta-eacces",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-eacces");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+        std::fs::write(remote_deploy.join("app.txt"), b"x").unwrap();
+
+        // A fake `perl` whose lstat fails with EACCES: `E\t13` on stdout,
+        // exit 0 (the FRAME is the signal).
+        write_fake_lstat(&fake.bin, "E\t13");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("errno 13"),
+            "EACCES must be an error naming the errno, got: {err}"
+        );
+
+        // Restore the real helper (drop the fake `perl`): confirmed absence
+        // still resolves to None through the REAL errno.
+        std::fs::remove_file(fake.bin.join("perl")).unwrap();
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("absent.txt")).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Malformed frames (exit 0 with garbage) are errors — every frame is
+    /// parsed strictly, with no lenient fallback: wrong prefix, missing
+    /// fields, extra fields, and extra lines are all rejected.
+    #[test]
+    fn metadata_opt_rejects_malformed_frames() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "meta-mal.test",
+            Path::new("/srv/deploy/meta-mal"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/meta-mal");
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+
+        let remote_deploy = fake.remote_root.join("srv/deploy/meta-mal");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+        std::fs::write(remote_deploy.join("app.txt"), b"x").unwrap();
+
+        // Garbage (no prefix at all).
+        write_fake_lstat(&fake.bin, "garbage");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "garbage stdout must be malformed, got: {err}"
+        );
+
+        // Wrong prefix.
+        write_fake_lstat(&fake.bin, "X\t2");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "wrong prefix must be malformed, got: {err}"
+        );
+
+        // Present frame with the mode field missing.
+        write_fake_lstat(&fake.bin, "P\t5");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "missing mode field must be malformed, got: {err}"
+        );
+
+        // Absent frame with the errno field missing.
+        write_fake_lstat(&fake.bin, "A");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "missing errno field must be malformed, got: {err}"
+        );
+
+        // Present frame plus a stray extra field.
+        write_fake_lstat(&fake.bin, "P\t5\t81a4\textra");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "extra field must be malformed, got: {err}"
+        );
+
+        // More than one frame line.
+        write_fake_lstat(&fake.bin, "P\t5\t81a4\nE\t13");
+        let err = t
+            .metadata_opt(&RootedRelativePath::parse(Path::new("app.txt")).unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("malformed"),
+            "extra lines must be malformed, got: {err}"
+        );
+    }
+
+    /// The lstat outcomes the fake remote can be told to emit. The property
+    /// dimension: ONLY the absence errnos (ENOENT/ENOTDIR) may produce
+    /// `Ok(None)`; every other outcome — EACCES, EIO, malformed frames,
+    /// signal-killed commands, transport failures — is an error.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LstatOutcome {
+        Present,
+        AbsentEnoent,
+        AbsentEnotdir,
+        ErrorEacces,
+        ErrorEio,
+        MalformedGarbage,
+        MalformedWrongPrefix,
+        MalformedTruncated,
+        MalformedMissingErrno,
+        MalformedExtraField,
+        MalformedTwoLines,
+        SignalKilled,
+        TransportSpawnFailure,
+    }
+
+    impl LstatOutcome {
+        /// The frame the fake `perl` must emit for this outcome; `None` when
+        /// the outcome is injected at the process level (signal-killed
+        /// command, spawn failure).
+        fn frame(self) -> Option<&'static str> {
+            match self {
+                LstatOutcome::Present => Some("P\t5\t81a4"),
+                LstatOutcome::AbsentEnoent => Some("A\t2"),
+                LstatOutcome::AbsentEnotdir => Some("A\t20"),
+                LstatOutcome::ErrorEacces => Some("E\t13"),
+                LstatOutcome::ErrorEio => Some("E\t5"),
+                LstatOutcome::MalformedGarbage => Some("garbage"),
+                LstatOutcome::MalformedWrongPrefix => Some("X\t2"),
+                LstatOutcome::MalformedTruncated => Some("P\t5"),
+                LstatOutcome::MalformedMissingErrno => Some("A"),
+                LstatOutcome::MalformedExtraField => Some("P\t5\t81a4\textra"),
+                LstatOutcome::MalformedTwoLines => Some("P\t5\t81a4\nE\t13"),
+                LstatOutcome::SignalKilled | LstatOutcome::TransportSpawnFailure => None,
+            }
+        }
+
+        /// Only the absence errnos (ENOENT/ENOTDIR) are confirmed absence.
+        fn is_absence(self) -> bool {
+            matches!(
+                self,
+                LstatOutcome::AbsentEnoent | LstatOutcome::AbsentEnotdir
+            )
+        }
+
+        /// Every non-absence outcome must be an error.
+        fn is_error(self) -> bool {
+            !matches!(
+                self,
+                LstatOutcome::Present | LstatOutcome::AbsentEnoent | LstatOutcome::AbsentEnotdir
+            )
+        }
+    }
+
+    fn all_lstat_outcomes() -> Vec<LstatOutcome> {
+        vec![
+            LstatOutcome::Present,
+            LstatOutcome::AbsentEnoent,
+            LstatOutcome::AbsentEnotdir,
+            LstatOutcome::ErrorEacces,
+            LstatOutcome::ErrorEio,
+            LstatOutcome::MalformedGarbage,
+            LstatOutcome::MalformedWrongPrefix,
+            LstatOutcome::MalformedTruncated,
+            LstatOutcome::MalformedMissingErrno,
+            LstatOutcome::MalformedExtraField,
+            LstatOutcome::MalformedTwoLines,
+            LstatOutcome::SignalKilled,
+            LstatOutcome::TransportSpawnFailure,
+        ]
+    }
+
+    proptest! {
+        // FIXED-SEED property (0x5EED_5EED, per house style), bounded cases:
+        // the lstat OUTCOME is injected through a fake `perl` (frames) or a
+        // fake `ssh` (signal-killed command / spawn failure) and driven
+        // through the REAL transport + parser. ONLY the absence errnos
+        // (ENOENT/ENOTDIR) return `Ok(None)`; every other outcome returns
+        // `Err`, and for the error cases the caller-level gate
+        // (`swap_current`) also errors and leaves the `current` link
+        // byte-identical — a failed lstat is never absence, so it can never
+        // drive a swap/removal (the same fail-closed rule retention relies
+        // on: zero deletions on a failed read).
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn lstat_outcome_injection(outcome in prop::sample::select(all_lstat_outcomes())) {
+            let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "lstat-prop.test",
+                Path::new("/srv/deploy/lstat-prop"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/lstat-prop",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+
+            // Inject the outcome BEFORE the first remote metadata read.
+            match outcome {
+                LstatOutcome::SignalKilled => {
+                    // The remote command is killed by a signal: the runner's
+                    // direct child dies by SIGTERM, so its exit status carries
+                    // no code (never a success).
+                    write_fake_bin(&fake.bin, "ssh", "#!/bin/sh\nkill -TERM $$\n");
+                }
+                LstatOutcome::TransportSpawnFailure => {
+                    // The transport cannot even spawn the remote command (a
+                    // real dead/broken ssh surfaces the same class of failure
+                    // as a `run_remote` error).
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(
+                        fake.bin.join("ssh"),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    write_fake_lstat(&fake.bin, outcome.frame().unwrap());
+                }
+            }
+
+            // FRAME-LEVEL: the real transport parses the injected outcome.
+            let result = t.metadata_opt(&RootedRelativePath::parse(Path::new("probe")).unwrap());
+            match result {
+                Ok(Some(meta)) => {
+                    // ONLY the Present outcome may be `Some`.
+                    assert_eq!(
+                        outcome,
+                        LstatOutcome::Present,
+                        "{outcome:?} must not be Some"
+                    );
+                    assert!(meta.is_file && !meta.is_dir && !meta.is_symlink);
+                    assert_eq!(meta.size, 5);
+                    assert_eq!(meta.mode, 0o100644);
+                }
+                Ok(None) => {
+                    // ONLY the absence errnos (ENOENT/ENOTDIR) may be `None`.
+                    assert!(outcome.is_absence(), "{outcome:?} must not be None");
+                }
+                Err(e) => {
+                    assert!(
+                        outcome.is_error(),
+                        "{outcome:?} must not error, got: {e}"
+                    );
+                    let msg = e.to_string();
+                    match outcome {
+                        LstatOutcome::ErrorEacces => {
+                            assert!(msg.contains("errno 13"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::ErrorEio => {
+                            assert!(msg.contains("errno 5"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::MalformedGarbage
+                        | LstatOutcome::MalformedWrongPrefix
+                        | LstatOutcome::MalformedTruncated
+                        | LstatOutcome::MalformedMissingErrno
+                        | LstatOutcome::MalformedExtraField
+                        | LstatOutcome::MalformedTwoLines => {
+                            assert!(msg.contains("malformed"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::SignalKilled => {
+                            assert!(msg.contains("ssh lstat failed"), "{outcome:?}: {msg}")
+                        }
+                        LstatOutcome::TransportSpawnFailure => {
+                            assert!(msg.contains("ssh"), "{outcome:?}: {msg}")
+                        }
+                        _ => unreachable!()}
+                }
+            }
+
+
+        }
+    }
+
+    #[test]
+    fn try_write_new_preinstall_failure_is_an_error_never_a_verdict() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "preinst-ssh.test",
+            Path::new("/srv/deploy/preinst-ssh"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/preinst-ssh",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+        let remote_deploy = fake.remote_root.join("srv/deploy/preinst-ssh");
+        std::fs::create_dir_all(&remote_deploy).unwrap();
+
+        // The temp allocation fails remotely: the script exits the reserved
+        // PRE-INSTALL code (never the conflict verdict), and the transport
+        // propagates the error.
+        write_fake_bin(&fake.bin, "mktemp", "#!/bin/sh\nexit 1\n");
+        let err = t
+            .try_write_new(
+                &RootedRelativePath::parse(Path::new("state/op.json")).unwrap(),
+                b"payload",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ssh try_write_new failed"),
+            "a pre-install failure must be a propagated error, got: {err}"
+        );
+        assert!(
+            !remote_deploy.join("state/op.json").exists(),
+            "a pre-install failure must install nothing"
+        );
+    }
+
+    /// The transport-level verdict matrix over the fake ssh remote: the TYPED
+    /// verdict survives the ssh transport boundary. A fake `sync` logger in
+    /// the fake bin dir records every sync the remote script (and the
+    /// transport's AlreadyPresent retry) performs, so the parent-durability
+    /// property is OBSERVABLE: the parent sync runs for `Created` AND for
+    /// `AlreadyPresent` (an identical retry establishes the parent's
+    /// durability — the fix for the old script, which only synced on the
+    /// fresh-install path), and NOT for `Conflict` (a different winner is not
+    /// ours to bless). A mode mismatch over identical bytes stays `Conflict`.
+    #[derive(Clone, Copy, Debug)]
+    enum SshVerdictState {
+        Fresh,
+        ExactExisting,
+        DifferentBytes,
+        DifferentMode,
+        PublishedBeforeParentSync,
+    }
+
+    fn ssh_verdict_state() -> impl Strategy<Value = SshVerdictState> {
+        prop_oneof![
+            Just(SshVerdictState::Fresh),
+            Just(SshVerdictState::ExactExisting),
+            Just(SshVerdictState::DifferentBytes),
+            Just(SshVerdictState::DifferentMode),
+            Just(SshVerdictState::PublishedBeforeParentSync),
+        ]
+    }
+
+    proptest! {
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_verdicts_over_ssh(
+            payload in prop::collection::vec(prop::char::range('a', 'z'), 1..32),
+            state in ssh_verdict_state(),
+        ) {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let payload: String = payload.into_iter().collect();
+            let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "verdict-ssh.test",
+                Path::new("/srv/deploy/verdict-ssh"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/verdict-ssh",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+            let remote_deploy = fake.remote_root.join("srv/deploy/verdict-ssh");
+            std::fs::create_dir_all(&remote_deploy).unwrap();
+
+            // A fake `perl` that records the path of every PORTABLE perl
+            // fsync the remote script runs (`PERL_FSYNC_FILE` /
+            // `PERL_FSYNC_DIR`, carrying the crate's test tokens) and
+            // delegates every other invocation to the REAL perl, so the test
+            // can prove WHICH branch established the parent-directory
+            // durability. (The pre-fix GNU-only `sync <operand>` no longer
+            // exists far side, so probing `sync` would prove nothing.)
+            let sync_log = tmp.path().join("sync.log");
+            write_fake_perl_fsync_log(&fake.bin, &sync_log);
+
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let dest = remote_deploy.join(rel.as_path());
+            let parent = dest.parent().unwrap().to_path_buf();
+            let data = payload.as_bytes();
+            let final_mode = IMMUTABLE_RECORD_MODE & 0o7777;
+
+            match state {
+                SshVerdictState::Fresh => {
+                    let verdict = t
+                        .try_write_new(&rel, data)
+                        .expect("the fresh ssh install must succeed");
+                    prop_assert_eq!(verdict, CreateNewVerdict::Created);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        data,
+                        "Ok(Created) must imply exact bytes"
+                    );
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        final_mode,
+                        "Ok(Created) must imply the final mode"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        log.lines()
+                            .any(|l| l == format!("dir:{}", parent.display())),
+                        "Created must sync the parent directory, log: {log:?}"
+                    );
+                }
+                SshVerdictState::ExactExisting => {
+                    // An EXACT existing entry (bytes AND mode identical): the
+                    // identical retry converges — AlreadyPresent, and the
+                    // retry ESTABLISHES the parent durability (the transport
+                    // syncs the parent on this branch too).
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, data).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, data)
+                        .expect("an identical retry must converge, not error");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        data,
+                        "the identical retry must not touch the winner"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        log.lines()
+                            .any(|l| l == format!("dir:{}", parent.display())),
+                        "AlreadyPresent must sync the parent directory, log: {log:?}"
+                    );
+                }
+                SshVerdictState::DifferentBytes => {
+                    // A winner with DIFFERENT bytes: Conflict, never replaced,
+                    // and NOT synced (a foreign winner is not ours to bless).
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, b"foreign-winner").unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, data)
+                        .expect("a different-content winner is a verdict, not an I/O error");
+                    let is_content_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                    );
+                    prop_assert!(is_content_mismatch);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        b"foreign-winner",
+                        "the conflict must NEVER replace the winner"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        !log.lines()
+                            .any(|l| l == format!("dir:{}", parent.display())),
+                        "Conflict must not sync the foreign winner's parent, log: {log:?}"
+                    );
+                }
+                SshVerdictState::DifferentMode => {
+                    // Identical bytes but a DIFFERENT mode: still Conflict —
+                    // the mode is part of the record (the spec: "a mode
+                    // mismatch must remain Conflict"), never blessed.
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, data).unwrap();
+                    let other_mode = if final_mode == 0o600 { 0o640 } else { 0o600 };
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(other_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, data)
+                        .expect("a mode mismatch is a verdict, not an I/O error");
+                    let is_mode_mismatch = matches!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch { .. })
+                    );
+                    prop_assert!(is_mode_mismatch);
+                    let meta = std::fs::metadata(&dest).unwrap();
+                    prop_assert_eq!(
+                        meta.mode() & 0o7777,
+                        other_mode,
+                        "the mode mismatch must never be replaced"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        !log.lines()
+                            .any(|l| l == format!("dir:{}", parent.display())),
+                        "a mode-mismatch Conflict must not sync, log: {log:?}"
+                    );
+                }
+                SshVerdictState::PublishedBeforeParentSync => {
+                    // A crash-simulated state: the entry EXISTS with the
+                    // intended bytes and mode, but its parent was never synced.
+                    // The retry verifies it as AlreadyPresent AND establishes
+                    // the parent durability.
+                    std::fs::create_dir_all(&parent).unwrap();
+                    std::fs::write(&dest, data).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(final_mode))
+                        .unwrap();
+                    let verdict = t
+                        .try_write_new(&rel, data)
+                        .expect("the retry over a published-before-parent-sync entry must converge");
+                    prop_assert_eq!(verdict, CreateNewVerdict::AlreadyPresent);
+                    prop_assert_eq!(
+                        std::fs::read(&dest).unwrap(),
+                        data,
+                        "the winner must stay intact"
+                    );
+                    let log = std::fs::read_to_string(&sync_log).unwrap_or_default();
+                    prop_assert!(
+                        log.lines()
+                            .any(|l| l == format!("dir:{}", parent.display())),
+                        "the AlreadyPresent retry must establish the parent durability, log: {log:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Arbitrary bytes for the byte-preservation property: EVERY byte class
+    /// the old lossy stringification mangled — NULs, non-UTF8, control
+    /// chars, quotes, backslashes, shell metacharacters — plus long payloads
+    /// that straddle the pipe buffer (the stdin payload is written by the
+    /// runner's wait closure, so a payload larger than the pipe must still
+    /// flow through the remote `cat` exactly).
+    fn arbitrary_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..4096),
+            // A dedicated long-payload leg: 16–64 KiB, around the 16–64 KiB
+            // pipe-buffer boundary, so the write blocks on the pipe and the
+            // remote `cat` must drain it to complete the install.
+            prop::collection::vec(any::<u8>(), 16_384..65_536),
+        ]
+    }
+
+    proptest! {
+        // THE BYTE-PRESERVATION PROPERTY (the create-new fix): `try_write_new`
+        // is a BYTE API, so ARBITRARY `Vec<u8>` must round-trip EXACTLY —
+        // `try_write_new(rel, data)` then `read(rel)` == `data` byte-for-byte
+        // — through the ssh transport (over the fake remote) AND the local
+        // transport. The ssh side proves the payload travels on the runner's
+        // STDIN: the fake ssh recorded every invocation's argv, and the write
+        // invocation's argv equals the payload-INDEPENDENT reference command
+        // built by `write_new_cmd` — the payload never enters the command
+        // string. (A naive "payload is not a substring of the command" check
+        // would be unsound: a payload like `cat` legitimately appears inside
+        // the fixed script text — exact argv equality is the real proof.)
+        // Bounded cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(16),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_arbitrary_bytes_roundtrip(data in arbitrary_bytes()) {
+            let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "bytes-prop.test",
+                Path::new("/srv/deploy/bytes-prop"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/bytes-prop",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let verdict = t
+                .try_write_new(&rel, &data)
+                .expect("the fresh byte install must succeed");
+            prop_assert_eq!(verdict, CreateNewVerdict::Created);
+            let read_back = t.read(&rel).expect("read back over ssh");
+            prop_assert_eq!(
+                read_back.as_slice(),
+                data.as_slice(),
+                "arbitrary bytes must round-trip EXACTLY through the ssh transport"
+            );
+
+            // The payload never enters the transmitted command: the fake ssh
+            // recorded the write invocation's argv, and it must equal the
+            // payload-INDEPENDENT reference command (the fixed script text) —
+            // the payload travels via stdin, so no byte of it can be in argv.
+            let mut expected = vec!["ssh".to_string()];
+            expected.extend(t.ssh_args().expect("prepared identity"));
+            expected.push("--".into());
+            // The command travels wrapped in `bash -c '...'` (the transport
+            // forces bash semantics regardless of the login shell), so the
+            // reference command is the wrapped form.
+            expected.push(format!(
+                "bash -c {}",
+                shell_quote(&SshTransport::write_new_cmd(
+                    t.root(),
+                    rel.as_path(),
+                    IMMUTABLE_RECORD_MODE,
+                    data.len() as u64,
+                ))
+            ));
+            let invocations = read_ssh_argv_log(&fake.argv_log);
+            let write_inv = invocations
+                .first()
+                .expect("the write ssh invocation must be recorded");
+            // Skip argv[0]: the OS rewrites it to the resolved fake-ssh path
+            // (an exec detail, not the transport's data). The transmitted
+            // ARGS — identity options, `--`, and the payload-INDEPENDENT
+            // command — are what the assertion is about: the payload never
+            // enters the command string.
+            prop_assert_eq!(
+                &write_inv[1..],
+                &expected[1..],
+                "the write invocation's args must be the payload-independent command"
+            );
+
+            // The LOCAL transport is byte-preserving too: the same arbitrary
+            // bytes round-trip exactly through the canonical primitive
+            // (`durable_create_new`), so the byte API is meaningful on both
+            // sides of the transport split.
+            let local = crate::transport::LocalTransport::new(
+                &crate::test_support::fixture_env(),
+                tmp.path().join("local"),
+                Layout::empty(),
+            )
+            .expect("local transport");
+            let local_rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let local_verdict = local
+                .try_write_new(&local_rel, &data)
+                .expect("the fresh local byte install must succeed");
+            prop_assert_eq!(local_verdict, CreateNewVerdict::Created);
+            let local_read_back = local.read(&local_rel).expect("local read back");
+            prop_assert_eq!(
+                local_read_back.as_slice(),
+                data.as_slice(),
+                "arbitrary bytes must round-trip EXACTLY through the local transport"
+            );
+        }
+    }
+
+    // The cross-product create-new verification matrix — the central
+    // verification contract, property-tested over the FULL product of FOUR
+    // INDEPENDENTLY generated mismatch dimensions — ENTRY TYPE (absent /
+    // regular / DIRECTORY / SYMLINK / other-fifo) × CONTENT (exact /
+    // semantically-equal / different) × READABILITY (readable / unreadable)
+    // × MODE (exact / wrong) — over TRANSPORT (Local + Ssh-with-fake) × the
+    // caller's CONTENT EQUIVALENCE (Exact / Semantic). The expected verdict
+    // is NEVER computed per cell: the ORACLE ([`oracle_expected`]) resolves
+    // EVERY generated combination through the DOCUMENTED first-failure
+    // precedence of [`verify_existing`] (lstat absence → regular-file type →
+    // readability → exact mode → content equivalence), and the fixture
+    // pre-creates each cell so the DOMINANT mismatch is the ONLY constructed
+    // difference: a CONTENT-only mismatch cell pre-creates WITH THE INTENDED
+    // MODE (content is the only difference); a MODE-only cell uses the
+    // intended content with a wrong mode; a TYPE cell uses whatever mode
+    // such an entry naturally has (its class is the type class per the
+    // precedence); a READABILITY cell is a regular file stripped of ALL
+    // permissions (the read — precedence step 3, before the mode check —
+    // fails even when its mode is wrong). `Created` ONLY for absent;
+    // `AlreadyPresent` ONLY for a REGULAR FILE with the REQUIRED MODE and an
+    // ACCEPTED content equivalence; every other combination is `Conflict`
+    // carrying the oracle's first applicable class — a directory →
+    // NotRegularFile, a SYMLINK → NotRegularFile and NEVER FOLLOWED (the
+    // symlink points at a matching regular file, so a following stat would
+    // wrongly accept it), an unreadable file → Unreadable, a wrong mode →
+    // ModeMismatch, different content → ContentMismatch. The `Other` (fifo)
+    // kind is generated only for the LOCAL leg: the ssh perl-lstat's
+    // THREE-way classification (dir/symlink/file) cannot express a fifo — it
+    // reports as a file, and reading it with `cat` would block the transport.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XTransport {
+        Local,
+        Ssh,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XEntry {
+        Absent,
+        Regular,
+        Directory,
+        Symlink,
+        Other,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XMode {
+        Exact,
+        Wrong,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XContent {
+        Exact,
+        Semantic,
+        Different,
+    }
+
+    /// The READABILITY dimension — generated independently of
+    /// type/content/mode: an UNREADABLE cell is a regular file stripped of
+    /// ALL permissions (chmod 0o000), so the verification's READ — precedence
+    /// step 3, before the mode check — fails with EACCES and the verdict is
+    /// [`VerifiedExisting::Unreadable`] even when the file's mode is wrong.
+    /// Only a regular file is ever constructed unreadable: a non-regular
+    /// entry's class is decided by the TYPE check (step 2, before any read),
+    /// and the oracle resolves such a combination to the type class.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum XReadability {
+        Readable,
+        Unreadable,
+    }
+
+    fn x_entry_strategy(transport: XTransport) -> BoxedStrategy<XEntry> {
+        let all = prop_oneof![
+            Just(XEntry::Absent),
+            Just(XEntry::Regular),
+            Just(XEntry::Directory),
+            Just(XEntry::Symlink),
+            Just(XEntry::Other),
+        ]
+        .boxed();
+        match transport {
+            XTransport::Local => all,
+            // The ssh perl-lstat classifies dir/symlink/file only: a fifo
+            // reports as a file and its `cat` read would block, so the Ssh
+            // leg filters the inexpressible fifo kind out of the same
+            // strategy.
+            XTransport::Ssh => all
+                .prop_filter("fifo is not expressible over the ssh lstat", |e| {
+                    *e != XEntry::Other
+                })
+                .boxed(),
+        }
+    }
+
+    /// Compare the implementation's verdict with the oracle's expected
+    /// verdict. [`VerifiedExisting::Unreadable`] is compared BY CLASS: its
+    /// message carries the errno text of the underlying read failure, which
+    /// differs between the LOCAL `std::fs::read` and the ssh `cat` — the
+    /// class is the contract, the message is not. Every other variant
+    /// (including the `ModeMismatch` actual/required fields) must match
+    /// EXACTLY.
+    fn verdicts_equivalent(a: &CreateNewVerdict, b: &CreateNewVerdict) -> bool {
+        match (a, b) {
+            (
+                CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(_)),
+                CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(_)),
+            ) => true,
+            _ => a == b,
+        }
+    }
+
+    /// Does the generated pre-existing CONTENT satisfy the caller's
+    /// EQUIVALENCE (precedence step 5)? Mirrors [`content_equivalent`]:
+    /// exact bytes always; a semantically-equal reordering only under the
+    /// Semantic relation.
+    fn content_accepted(content: XContent, equivalence: ContentEquivalence) -> bool {
+        match (content, equivalence) {
+            (XContent::Exact, _) => true,
+            (XContent::Semantic, ContentEquivalence::Semantic) => true,
+            (XContent::Semantic, ContentEquivalence::Exact) => false,
+            (XContent::Different, _) => false,
+        }
+    }
+
+    /// THE ORACLE — the expected [`CreateNewVerdict`] for a generated
+    /// (entry, mode, content, readability, equivalence) cell, resolved from
+    /// the DOCUMENTED first-failure precedence of [`verify_existing`]
+    /// (shared by `durable_create_new`'s verify-on-retry and the SSH EEXIST
+    /// verification): lstat absence → regular-file type → readability →
+    /// exact mode → content equivalence. The FIRST applicable class WINS — a
+    /// cell with several mismatches (an unreadable directory, an unreadable
+    /// wrong-mode file) is classified by the earliest failing check, exactly
+    /// like the implementation. The proptest asserts the implementation's
+    /// verdict equals THIS oracle for every generated combination — never an
+    /// ad-hoc per-cell expectation.
+    fn oracle_expected(
+        entry: XEntry,
+        mode: XMode,
+        content: XContent,
+        readability: XReadability,
+        equivalence: ContentEquivalence,
+        required_mode: u32,
+        wrong_mode: u32,
+    ) -> CreateNewVerdict {
+        match entry {
+            // 1. lstat absence — the only `Created` cell.
+            XEntry::Absent => CreateNewVerdict::Created,
+            // 2. regular-file type — BEFORE readability/mode/content: even an
+            //    unreadable or wrong-mode directory/symlink/other is the TYPE
+            //    class.
+            XEntry::Directory => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Directory,
+            }),
+            XEntry::Symlink => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Symlink,
+            }),
+            XEntry::Other => CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Other,
+            }),
+            XEntry::Regular => {
+                // 3. readability — the read precedes the mode check: an
+                //    unreadable regular file is Unreadable even with a wrong
+                //    mode.
+                if readability == XReadability::Unreadable {
+                    CreateNewVerdict::Conflict(VerifiedExisting::Unreadable(
+                        "the fixture stripped all permissions".to_string(),
+                    ))
+                // 4. exact mode — a mode mismatch is reported before the
+                //    content is even compared.
+                } else if mode == XMode::Wrong {
+                    CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                        actual: wrong_mode,
+                        required: required_mode,
+                    })
+                // 5. content equivalence — AlreadyPresent ONLY for regular +
+                //    exact mode + accepted content.
+                } else if content_accepted(content, equivalence) {
+                    CreateNewVerdict::AlreadyPresent
+                } else {
+                    CreateNewVerdict::Conflict(VerifiedExisting::ContentMismatch)
+                }
+            }
+        }
+    }
+
+    proptest! {
+        // Bounded cases (house style), fixed seed 0x5EED_5EED, no failure
+        // persistence, and every case drives its OWN fixture (per-fixture
+        // isolation — a fifo or symlink in one case can never leak into
+        // another).
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn try_write_new_verification_cross_product(
+            (transport, entry, mode, content, readability, equivalence) in prop_oneof![
+                Just(XTransport::Local),
+                Just(XTransport::Ssh),
+            ]
+            .prop_flat_map(|t| {
+                (
+                    Just(t),
+                    x_entry_strategy(t),
+                    prop_oneof![Just(XMode::Exact), Just(XMode::Wrong)],
+                    prop_oneof![
+                        Just(XContent::Exact),
+                        Just(XContent::Semantic),
+                        Just(XContent::Different),
+                    ],
+                    // The FOUR mismatch dimensions (content, type,
+                    // readability, mode) are generated INDEPENDENTLY — the
+                    // cross-product covers every combination, and the ORACLE
+                    // resolves the precedence whenever several apply.
+                    prop_oneof![Just(XReadability::Readable), Just(XReadability::Unreadable)],
+                    prop_oneof![
+                        Just(ContentEquivalence::Exact),
+                        Just(ContentEquivalence::Semantic),
+                    ],
+                )
+            }),
+        ) {
+            use crate::transport::LocalTransport;
+            use std::ffi::CString;
+            use std::os::unix::fs::PermissionsExt;
+
+            // The immutable-record intent: a JSON payload whose key order can
+            // be re-arranged without changing its value.
+            let intent: &[u8] = br#"{"a":1,"b":2}"#;
+            let required_mode = IMMUTABLE_RECORD_MODE & 0o7777;
+            let wrong_mode = if required_mode == 0o600 { 0o640 } else { 0o600 };
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+
+            // Each case drives its OWN transport fixture: LocalTransport
+            // rooted at a fresh dir, or the fake-ssh transport rooted at a
+            // fresh emulated remote.
+            let (handle, dest): (Box<dyn Remote>, std::path::PathBuf) = match transport {
+                XTransport::Local => {
+                    let t = LocalTransport::new(
+                        &crate::test_support::fixture_env(),
+                        tmp.path().join("r"),
+                        Layout::empty(),
+                    )
+                    .unwrap();
+                    let dest = t.root().join(rel.as_path());
+                    (Box::new(t), dest)
+                }
+                XTransport::Ssh => {
+                    let fake = FakeSsh::new(
+                        tmp.path().join("bin"),
+                        tmp.path().join("remote"),
+                        "xprod-ssh.test",
+                        Path::new("/srv/deploy/xprod-ssh"),
+                    );
+                    let cache = tmp.path().join("knownhosts");
+                    let env = fake_env(
+                        &fake.bin,
+                        &cache,
+                        &fake.remote_root,
+                        "/srv/deploy/xprod-ssh",
+                    );
+                    let t = fake.transport(&cache, &env);
+                    t.prepare_identity().unwrap();
+                            let dest = fake.remote_root.join("srv/deploy/xprod-ssh").join(rel.as_path());
+                    (Box::new(t), dest)
+                }
+            };
+
+            // Stage the EXISTING entry per (entry, mode, content,
+            // readability). A CONTENT-only mismatch cell pre-creates the
+            // existing file WITH THE INTENDED MODE (mode == Exact →
+            // required_mode), so content is the ONLY difference and the
+            // verdict is the content class — never a spurious mode mismatch
+            // from a fixture that left the winner at `write`'s umask default.
+            // A MODE-only cell uses the intended content with a wrong mode. A
+            // TYPE cell uses whatever mode such an entry naturally has (its
+            // class is the type class per the precedence). An UNREADABLE cell
+            // strips ALL permissions from the regular file: the
+            // verification's read (precedence step 3, BEFORE the mode check)
+            // then fails → Unreadable regardless of the mode. A symlink
+            // points AT a matching regular file (intent bytes, required mode)
+            // — a FOLLOWING stat would accept it, the lstat must not (the
+            // symlink-never-followed guarantee).
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            let existing_bytes: &[u8] = match content {
+                XContent::Exact => intent,
+                XContent::Semantic => br#"{"b":2,"a":1}"#,
+                XContent::Different => br#"{"a":9,"b":9}"#};
+            let entry_mode = match mode {
+                XMode::Exact => required_mode,
+                XMode::Wrong => wrong_mode};
+            match entry {
+                XEntry::Absent => {}
+                XEntry::Regular => {
+                    std::fs::write(&dest, existing_bytes).unwrap();
+                    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(entry_mode))
+                        .unwrap();
+                    if readability == XReadability::Unreadable {
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o000))
+                            .unwrap();
+                    }
+                }
+                XEntry::Directory => std::fs::create_dir(&dest).unwrap(),
+                XEntry::Symlink => {
+                    let target = dest.with_file_name("target.json");
+                    std::fs::write(&target, intent).unwrap();
+                    std::fs::set_permissions(
+                        &target,
+                        std::fs::Permissions::from_mode(required_mode),
+                    )
+                    .unwrap();
+                    std::os::unix::fs::symlink(&target, &dest).unwrap();
+                }
+                XEntry::Other => {
+                    // Local-only: the strategy never generates Other for Ssh.
+                    prop_assert_eq!(transport, XTransport::Local, "fifo is local-only");
+                    let c = CString::new(dest.as_os_str().as_encoded_bytes()).unwrap();
+                    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+                    prop_assert_eq!(
+                        rc,
+                        0,
+                        "mkfifo {} must succeed: {}",
+                        dest.display(),
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+
+            let verdict = handle
+                .try_write_new_with(&rel, intent, equivalence)
+                .expect("a create-new attempt must return a verdict, never hang");
+
+            // THE ORACLE comparison: the implementation's verdict must equal
+            // the FIRST APPLICABLE class from the DOCUMENTED first-failure
+            // precedence — computed by [`oracle_expected`], never by ad-hoc
+            // per-cell logic.
+            let expected = oracle_expected(
+                entry,
+                mode,
+                content,
+                readability,
+                equivalence,
+                required_mode,
+                wrong_mode,
+            );
+            prop_assert!(
+                verdicts_equivalent(&verdict, &expected),
+                "cross-product mismatch: transport={:?} entry={:?} mode={:?} content={:?} readability={:?} equivalence={:?}: implementation={verdict:?} oracle={expected:?}",
+                transport,
+                entry,
+                mode,
+                content,
+                readability,
+                equivalence
+            );
+        }
+    }
+
+    /// The swap-at-every-boundary property of the descriptor-bound
+    /// verification over the SSH transport: the destination (a REGULAR file
+    /// matching the intent) is swapped at EVERY boundary of the ONE remote
+    /// helper's open→fstat→read sequence — BEFORE the `O_NOFOLLOW` sysopen,
+    /// BETWEEN the open and the fstat, BETWEEN the fstat and the read — via
+    /// a `#[cfg(test)]` Rust VALUE seam (`SshTransport::test_verify_swap`
+    /// set through `set_test_verify_swap`): the `VerifySwap` is passed as a
+    /// Rust value and embedded into the helper as literal assignments, never
+    /// via environment variables. The verdict must NEVER mix two inodes'
+    /// observations:
+    ///
+    /// * a swap BEFORE the open changes WHAT is opened: a symlink →
+    ///   NotRegularFile{Symlink} (the `O_NOFOLLOW` open never follows, even a
+    ///   symlink pointing at a regular file whose bytes+mode match), a
+    ///   directory → NotRegularFile{Directory}, a different-inode regular
+    ///   file (mode AND content both differing from the intent) →
+    ///   ModeMismatch naming the SWAPPED inode's mode — a REJECTION;
+    /// * a swap AFTER the open is HARMLESS: the opened fd pins the ORIGINAL
+    ///   inode, so the helper's fstat + read observe it and the verdict is
+    ///   AlreadyPresent (the swapped-in observations differ from the
+    ///   original's, so a metadata/content mix — or a path re-open — would
+    ///   NOT yield AlreadyPresent and the assertion would catch it).
+    ///
+    /// Structural TOCTOU closure: the verification is ONE remote exec — the
+    /// recorded ssh invocation log contains EXACTLY ONE `sysopen` helper
+    /// invocation (write + verify-open [+ parent sync on AlreadyPresent]),
+    /// never the old lstat-then-separate-read pair. Bounded cases, fixed
+    /// seed 0x5EED_5EED (house style), no persistence.
+    fn ssh_swap_case() -> impl Strategy<Value = (VerifySwapBoundary, VerifySwapKind)> {
+        prop_oneof![
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::BeforeOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::BeforeOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterOpen, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterOpen,
+                VerifySwapKind::DifferentInode
+            )),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Symlink)),
+            Just((VerifySwapBoundary::AfterFstat, VerifySwapKind::Directory)),
+            Just((
+                VerifySwapBoundary::AfterFstat,
+                VerifySwapKind::DifferentInode
+            )),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn verify_existing_swap_at_every_boundary_ssh(
+            (boundary, kind) in ssh_swap_case(),
+        ) {
+            // SLOW-test gate: exceeds ~20 s under the FULL gate
+            if !crate::test_support::slow_tests_enabled() {
+                eprintln!("skipped: slow test — set STOREKIT_FULL_TESTS=1 to run");
+                return Ok(());
+            }
+            use std::os::unix::fs::PermissionsExt;
+
+            let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "swap-ssh.test",
+                Path::new("/srv/deploy/swap-ssh"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            let env = fake_env(
+                &fake.bin,
+                &cache,
+                &fake.remote_root,
+                "/srv/deploy/swap-ssh",
+            );
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+
+            let required = IMMUTABLE_RECORD_MODE & 0o7777;
+            let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };
+            let intended: &[u8] = br#"{"a":1,"b":2}"#;
+            let swapped_content: &[u8] = br#"{"a":9,"b":9}"#;
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let remote_deploy = fake.remote_root.join("srv/deploy/swap-ssh");
+            let dest = remote_deploy.join(rel.as_path());
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            // The ORIGINAL entry: a regular file matching the intent.
+            std::fs::write(&dest, intended).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
+            // The pre-staged swap entry (`$path.swap-target` — the helper's
+            // Rust VALUE seam derives the name from the destination): the symlink
+            // target AND the different-inode file, with mode + content both
+            // differing from the original's (any mix is detectable).
+            let target = dest.with_file_name("record.json.swap-target");
+            std::fs::write(&target, swapped_content).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(wrong_mode)).unwrap();
+            // Inject the swap as a Rust VALUE through the `#[cfg(test)]` seam
+            // — never via environment variables. The helper embeds the
+            // boundary/kind as literals.
+            t.set_test_verify_swap(Some(crate::transport::VerifySwap::new(
+                boundary, kind, &target,
+            )));
+
+            let verdict = t
+                .try_write_new(&rel, intended)
+                .expect("a create-new attempt must return a verdict, never hang");
+
+            match boundary {
+                VerifySwapBoundary::BeforeOpen => match kind {
+                    VerifySwapKind::Symlink => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Symlink}),
+                        "a pre-open symlink swap must be rejected — the remote O_NOFOLLOW open never follows"
+                    ),
+                    VerifySwapKind::Directory => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::NotRegularFile {
+                            kind: NotRegularFileKind::Directory}),
+                        "a pre-open directory swap must be rejected"
+                    ),
+                    VerifySwapKind::DifferentInode => prop_assert_eq!(
+                        verdict,
+                        CreateNewVerdict::Conflict(VerifiedExisting::ModeMismatch {
+                            actual: wrong_mode & 0o7777,
+                            required}),
+                        "a pre-open different-inode swap must be rejected with the SWAPPED inode's mode"
+                    )},
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => prop_assert_eq!(
+                    verdict,
+                    CreateNewVerdict::AlreadyPresent,
+                    "a post-open swap is harmless: the helper's fd pins the ORIGINAL inode, so the verdict must reflect ITS metadata AND content — never a mix"
+                )}
+
+            // Structural TOCTOU closure: the verification is ONE remote
+            // helper exec — the recorded ssh invocation log holds EXACTLY ONE
+            // DESCRIPTOR-BOUND VERIFY-OPEN invocation (the helper that opens
+            // with `O_NOFOLLOW`; the create-new path's portable perl fsync
+            // snippets also call `sysopen`, but WITHOUT `O_NOFOLLOW`, so the
+            // anchor isolates the verification), and the total is write +
+            // verify-open (+ the parent fsync only for AlreadyPresent), never
+            // the old lstat-then-separate-read pair.
+            let invocations = read_ssh_argv_log(&fake.argv_log);
+            let verify_invs = invocations
+                .iter()
+                .filter(|inv| inv.iter().any(|a| a.contains("O_NOFOLLOW")))
+                .count();
+            prop_assert_eq!(
+                verify_invs,
+                1,
+                "the verification must be ONE remote helper operation, got invocations: {:?}",
+                invocations
+            );
+            let expected_total = match boundary {
+                // write + verify-open: a rejection runs no parent sync.
+                VerifySwapBoundary::BeforeOpen => 2,
+                // write + verify-open + the AlreadyPresent parent sync.
+                VerifySwapBoundary::AfterOpen | VerifySwapBoundary::AfterFstat => 3};
+            prop_assert_eq!(
+                invocations.len(),
+                expected_total,
+                "unexpected ssh invocation count (write + verify-open [+ parent sync]): {:?}",
+                invocations
+            );
+        }
+    }
+
+    /// Production verification leaves the filesystem byte-for-byte unchanged
+    /// and returns the same verdict regardless of arbitrary ambient
+    /// environment variables. The production `verify_open_script` contains
+    /// ZERO swap/hook/env logic, so even when the child env carries
+    /// `DEPLOY_VERIFY_SWAP`/`DEPLOY_VERIFY_SWAP_BOUNDARY` (the variables the
+    /// old hook read), the verification must behave identically to a baseline
+    /// run with no extra vars and must not litter `.swap-orig`/`swap-target`
+    /// or mutate any entry. This property generates arbitrary env maps
+    /// (0..=20 random names/values) deliberately mixed with the old hook's
+    /// trigger pairs, drives the production `try_write_new` → verify path
+    /// through the fake-ssh transport, and asserts both invariants. It would
+    /// fail against the pre-fix code where the env reached the perl helper
+    /// and fired the swap.
+    fn arb_env_name() -> impl Strategy<Value = String> {
+        // Valid env names: [A-Za-z_][A-Za-z0-9_]{0,39} but the spec says
+        // [A-Za-z0-9_]{1,40} — we use the looser set with first char not
+        // digit to keep names shell-safe; length 1..12 keeps the map small.
+        prop::string::string_regex("[A-Za-z_][A-Za-z0-9_]{0,11}").unwrap()
+    }
+
+    fn arb_env_value() -> impl Strategy<Value = String> {
+        // Printable ASCII without NUL/newline, 1..32 chars, non-empty.
+        prop::string::string_regex("[ -~]{1,32}").unwrap()
+    }
+
+    fn arb_env_vars() -> impl Strategy<Value = Vec<(String, String)>> {
+        prop::collection::vec((arb_env_name(), arb_env_value()), 0..=20)
+    }
+
+    fn snapshot_remote_recursive(root: &Path) -> Vec<(String, String)> {
+        use std::os::unix::fs::MetadataExt;
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+            let entries: Vec<_> = std::fs::read_dir(dir)
+                .map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut sorted = entries;
+            sorted.sort();
+            for p in sorted {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let md = std::fs::symlink_metadata(&p).unwrap();
+                let mode = md.mode() & 0o7777;
+                let ft = md.file_type();
+                if ft.is_symlink() {
+                    let target = std::fs::read_link(&p)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((rel, format!("symlink:{target}:{mode:04o}")));
+                } else if ft.is_dir() {
+                    out.push((rel, format!("dir:{mode:04o}")));
+                    walk(root, &p, out);
+                } else if ft.is_file() {
+                    let data = std::fs::read(&p).unwrap_or_default();
+                    let hash = crate::digest::sha256_bytes(&data);
+                    out.push((rel, format!("file:{hash}:{mode:04o}:{}", data.len())));
+                } else {
+                    out.push((rel, format!("other:{mode:04o}")));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut out);
+        }
+        out.sort();
+        out
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_support::proptest_cases(64),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn verify_production_unchanged_by_ambient_env_ssh(
+            base_vars in arb_env_vars(),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let fake = FakeSsh::new(
+                tmp.path().join("bin"),
+                tmp.path().join("remote"),
+                "ambient-ssh.test",
+                Path::new("/srv/deploy/ambient-ssh"),
+            );
+            let cache = tmp.path().join("knownhosts");
+            // Stage the standard original file — same fixture as the swap
+            // test: a regular file matching the intent with IMMUTABLE_RECORD_MODE.
+            let required = IMMUTABLE_RECORD_MODE & 0o7777;
+            let intended: &[u8] = br#"{"a":1,"b":2}"#;
+            let rel = RootedRelativePath::parse(Path::new("state/record.json")).unwrap();
+            let remote_deploy = fake.remote_root.join("srv/deploy/ambient-ssh");
+            let dest = remote_deploy.join(rel.as_path());
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(&dest, intended).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(required)).unwrap();
+            // Snapshot BEFORE the production verification.
+            let before = snapshot_remote_recursive(&fake.remote_root);
+
+            // Build the enriched ambient env: arbitrary vars + deliberate
+            // old-hook trigger pairs (every kind × boundary combo that would
+            // fire the pre-fix hook). Guard reserved vars so the harness stays
+            // authoritative (skip or override LAST).
+            let reserved = ["PATH", "FAKE_SSH_ROOT", "FAKE_SSH_REMOTE_PREFIX", "STOREKIT_TEST_SSH_KNOWNHOSTS_DIR"];
+            let mut enriched: Vec<(String, String)> = base_vars.into_iter().filter(|(k, _)| !reserved.contains(&k.as_str())).collect();
+            // Deliberately include hook triggers — at least one per case, and
+            // cover all kind/boundary combos across the property's cases via
+            // the arbitrary base plus these fixed triggers. The last occurrence
+            // of each key wins in the BTreeMap, so these authoritative triggers
+            // are last and will fire pre-fix.
+            enriched.push(("DEPLOY_VERIFY_SWAP".to_string(), "symlink".to_string()));
+            enriched.push(("DEPLOY_VERIFY_SWAP_BOUNDARY".to_string(), "before_open".to_string()));
+            // Also include other combos to ensure the property would catch any
+            // hook variant; the map's last value wins, but we add them as
+            // separate keys would not work — instead we push a second trigger
+            // pair with different values under alternative env names that the
+            // old hook would not read, but the arbitrary base already covers
+            // random names. The key point is at least one valid trigger is
+            // present; we keep the property deterministic by always pushing the
+            // before_open/symlink combo.
+            let extra_refs: Vec<(&str, &str)> = enriched.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let env = fake_env_with(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/ambient-ssh", &extra_refs);
+            let t = fake.transport(&cache, &env);
+            t.prepare_identity().unwrap();
+
+            // BASELINE verdict: same fixture with NO arbitrary vars should be
+            // AlreadyPresent (regular file with exact mode + exact bytes).
+            // We assert the production op returns that baseline and leaves the
+            // filesystem unchanged.
+            let verdict = t.try_write_new(&rel, intended).expect("production verification must return a verdict");
+            let after = snapshot_remote_recursive(&fake.remote_root);
+
+            prop_assert_eq!(
+                verdict,
+                CreateNewVerdict::AlreadyPresent
+            );
+            prop_assert!(
+                after == before,
+                "production verification must leave filesystem byte-for-byte unchanged — before {:?} after {:?}",
+                before,
+                after
+            );
+            // Also assert no swap litter was left behind (would be caught by
+            // the byte-for-byte equality, but make the failure more explicit).
+            for (rel_path, _) in &after {
+                prop_assert!(
+                    !rel_path.contains(".swap-orig") && !rel_path.contains(".swap-target"),
+                    "no swap litter must remain after production verification, got {:?}",
+                    rel_path
+                );
             }
         }
     }

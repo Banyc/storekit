@@ -1976,6 +1976,17 @@ impl VerifySwap {
         }
     }
 
+    /// The boundary this swap fires at (the SSH helper embeds it as a literal).
+    pub(crate) fn boundary(&self) -> VerifySwapBoundary {
+        self.boundary
+    }
+
+    /// The kind of entry this swap places at the destination (the SSH helper
+    /// embeds it as a literal).
+    pub(crate) fn kind(&self) -> VerifySwapKind {
+        self.kind
+    }
+
     /// Fire the swap exactly once when the boundary matches; `true` when it
     /// fired (the destination was replaced with the swap entry).
     pub(crate) fn fire(&self, boundary: VerifySwapBoundary, p: &Path) -> bool {
