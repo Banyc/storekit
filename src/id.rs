@@ -2,7 +2,9 @@
 //!
 //! A value that names something in a store must be a safe single path
 //! segment: the crate stores validated names VERBATIM, so the valid set must
-//! be injective into the filesystem (see [`valid_name`]). The
+//! be injective into the filesystem — on the case-sensitive,
+//! trailing-dot-preserving addressing the crate canonicalizes against. The
+//! folding-host residual is stated at [`valid_name`]. The
 //! [`id_newtype!`] macro wraps such a validated string in a newtype whose
 //! construction validates the invariant, so an invalid value cannot exist.
 //!
@@ -183,8 +185,26 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// crate accepted but the sync cannot transfer (and cannot destroy through
 /// its sanctioned delete route) would be a name the crate could never
 /// replicate. No re-encoding is needed: the valid set is already
-/// filesystem-safe, so two distinct valid names ALWAYS map to two distinct
-/// path components.
+/// filesystem-safe, so on a CASE-SENSITIVE, TRAILING-DOT-PRESERVING filesystem
+/// two distinct valid names map to two distinct path components.
+///
+/// That guarantee is SCOPED to that addressing, and the scope is the honest
+/// boundary rather than a hedge. On a folding host it does NOT hold for
+/// ordinary names, and no validation of a SINGLE name can restore it:
+/// `A`/`a`, and `a.`/`a`, are one directory entry on Windows and on default
+/// APFS, and each is a collision between TWO distinct names rather than a
+/// property of either one. The crate's own BOOKKEEPING is still protected
+/// there — the reserved-spelling denial above already folds case and strips a
+/// trailing `.`/` `, so no valid name can alias a lock record, a claim aside or
+/// a temp shape on any supported host. A caller that needs two ids to stay
+/// distinct on a folding host must not choose names that fold together.
+///
+/// RESIDUAL: a trailing `.`/` ` is the one half of that alias a per-name rule
+/// COULD close, by refusing it. It is left open and stated here rather than
+/// closed, with its reach: on a folding host two ids differing only by a
+/// trailing `.`/` ` address one entry, and the crate does not refuse the
+/// spelling. (A `.` elsewhere is unaffected — `a.b` is one component on every
+/// supported host.)
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= crate::atomic::NAME_MAX

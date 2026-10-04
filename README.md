@@ -98,8 +98,13 @@ on every platform, so an id does not mean different things on different hosts).
 MATCH the sync uses to strip reserved components, and they deliberately leave
 the application lock record and the case/trailing-dot aliases alone — they are
 NOT, on their own, the answer to "may I use this name". An unaddressable
-spelling is refused as an identifier, is never transferred by a sync, and is
-never destroyed by `Extraneous::Delete`.
+spelling is refused as an identifier and is never transferred by a sync. A
+RESIDUE spelling (an unaddressable one that is not a crate temp) is also never
+destroyed by `Extraneous::Delete`: it survives every extraneous policy and is
+reported in `SyncReport::residue`. A crate TEMP shape is the exception — it is
+the documented target of the recovery sweep, so `Extraneous::Delete` DOES remove
+it and reports it in `Extraneous` — so "unaddressable" must not be read as
+"undeletable".
 
 ## Fidelity scope
 
