@@ -296,7 +296,9 @@ impl OwnedLockRecord {
 /// is the record.
 ///
 /// PRIVATE to this module by design: the only in-crate ways to run it are the
-/// two [`GuardedRel`] constructors, so a caller cannot consult the guard
+/// THREE [`GuardedRel`] minting constructors ([`GuardedRel::new`],
+/// [`GuardedRel::new_for_owned_lock_record`], [`GuardedRel::new_for_residue`]),
+/// so a caller cannot consult the guard
 /// without minting the capability the mutators demand.
 fn refuse_lock_record(rel: &Path) -> Result<()> {
     for component in rel.components() {
@@ -418,7 +420,7 @@ pub(crate) enum GuardScope {
 
 /// An unforgeable proof that the guard ran on a root-relative path, together
 /// with the scope it authorized. The fields are PRIVATE to this module, so the
-/// only way to obtain a value is one of the two constructors (each runs the
+/// only way to obtain a value is one of the THREE minting constructors (each runs the
 /// guard) — no other module, including a future mutation primitive, can
 /// construct one directly, and the rel-path mutators accept nothing else.
 #[derive(Clone, Copy)]
@@ -2500,6 +2502,18 @@ mod tests {
         belt
     }
 
+    /// Whether a `libc` REFERENCE found OUTSIDE the funnel is ALLOWED by the
+    /// derived [`mutating_libc_belt`]. Extracted from the audit body so the
+    /// ORACLE
+    /// [`the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel`]
+    /// drives the SAME predicate the audit uses rather than a re-implementation:
+    /// the belt is the device cited to make a REVIEWED PIN safe, so it must be
+    /// provable that a pinned family member is refused.
+    fn libc_reference_outside_funnel_is_allowed(belt: &BTreeSet<String>, reference: &str) -> bool {
+        let symbol = reference.strip_prefix("libc::").unwrap_or("");
+        !belt.contains(symbol) && reference != "libc::*" && reference != "libc"
+    }
+
     /// Exemption follows the crate-root DIRECTORY or the GATING, never a name
     /// and never an interior component. A file under `src/**/tests.rs` or
     /// `src/**/tests/` is PRODUCTION unless EVERY `mod` declaration that names
@@ -2680,9 +2694,8 @@ mod tests {
                 continue;
             }
             for (reference, count) in refs {
-                let symbol = reference.strip_prefix("libc::").unwrap_or("");
                 assert!(
-                    !belt.contains(symbol) && reference != "libc::*" && reference != "libc",
+                    libc_reference_outside_funnel_is_allowed(&belt, &reference),
                     "{rel} references the mutating/aliased libc facility {reference:?}: a \
                      name-mutating syscall may be issued only from the guarded funnel \
                      ({funnel_modules:?}); a `use libc … as alias` or a re-export does not exempt it"
@@ -2889,6 +2902,70 @@ mod tests {
                 && mutating_libc_belt(&[]).contains("mkfifo"),
             "`libc::mkfifo` creates a name and the tree references it; it MUST be on the belt"
         );
+    }
+
+    /// ROUND-9 ORACLE, INDEPENDENT OF THE REVIEW LIST. The `libc` belt is the
+    /// device cited to make a REVIEWED PIN outside the funnel safe, so it must
+    /// REFUSE a pinned known name-mutating syscall even if the two
+    /// classification lists are edited against each other.
+    ///
+    /// Round 9's repro: `libc::unlinkat` was MOVED out of
+    /// [`MUTATING_LIBC_SYSCALLS`] into [`NON_MUTATING_LIBC_CALLS`], a
+    /// production NON-funnel `libc::unlinkat` was added, pinned in the OUTSIDE
+    /// map, and every existing test stayed green — the belt, the very device
+    /// that makes the reviewed pin safe, could not fail for the property it is
+    /// quoted to protect. `every_libc_call_symbol_the_tree_references_is_classified`
+    /// only checks membership in the UNION, so it cannot see the misfiling; the
+    /// disjointness assertion and this literal expected-mutating list can.
+    ///
+    /// The list below is a LITERAL, not derived from either constant, and the
+    /// source is synthetic text, so the oracle exercises the DERIVED belt and
+    /// the audit's OWN refusal predicate
+    /// ([`libc_reference_outside_funnel_is_allowed`]) without depending on the
+    /// crate's real tree or on `NON_MUTATING_LIBC_CALLS`.
+    #[test]
+    fn the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel() {
+        const KNOWN_NAME_MUTATORS: &[&str] = &[
+            "unlinkat",
+            "renameat",
+            "mkdirat",
+            "symlinkat",
+            "linkat",
+            "mkfifo",
+            "openat",
+        ];
+        let overlap: Vec<&&str> = MUTATING_LIBC_SYSCALLS
+            .iter()
+            .filter(|symbol| NON_MUTATING_LIBC_CALLS.contains(symbol))
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "`MUTATING_LIBC_SYSCALLS` and `NON_MUTATING_LIBC_CALLS` must be DISJOINT, or moving a \
+             family member into the review list silently disarms the belt: {overlap:?}"
+        );
+        for symbol in KNOWN_NAME_MUTATORS {
+            assert!(
+                MUTATING_LIBC_SYSCALLS.contains(symbol),
+                "{symbol} mutates a NAME by POSIX definition and must be on the belt's family list, \
+                 whichever way the review list is edited"
+            );
+            assert!(
+                !NON_MUTATING_LIBC_CALLS.contains(symbol),
+                "the review list for NON-mutating calls must not claim the name mutator {symbol}"
+            );
+            let sources = vec![(
+                "src/prod/synthetic.rs".to_string(),
+                format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
+            )];
+            let belt = mutating_libc_belt(&sources);
+            let reference = format!("libc::{symbol}");
+            assert!(
+                !libc_reference_outside_funnel_is_allowed(&belt, &reference),
+                "a pinned OUTSIDE reference to the name mutator {reference} was ALLOWED by the \
+                 belt; the belt is DERIVED, so a non-funnel production reference must land on it: \
+                 {belt:?}"
+            );
+        }
     }
 
     /// STRUCTURAL AUDIT (`std::fs`): the `std::fs`/`std::os` calls that can
@@ -3134,17 +3211,28 @@ mod tests {
     /// call".
     #[test]
     fn the_count_pin_sees_every_adopting_symbol_the_deny_names() {
-        // (1) The two devices cannot drift: every pin-attributable `clippy.toml`
-        // deny entry is in the derived table, mapped to its canonical path.
+        // (1) The two devices cannot drift: every path-shaped `clippy.toml`
+        // entry, read INDEPENDENTLY from the raw file — NOT by iterating the
+        // function that built `table` — is in the derived pin table, mapped to
+        // its canonical path. This arm used to loop over
+        // `reconciled_denied_symbols()` and compare against the table that same
+        // function produced: a map checked against its own producer, which
+        // stayed green while a reformatted entry dropped `std::fs::hard_link`
+        // from BOTH sides (measured). The raw read cannot be produced by the
+        // table, so losing a symbol now fails here.
         let table = name_mutation_symbols();
-        for path in reconciled_denied_symbols() {
-            let segments: Vec<String> = path.split("::").map(str::to_string).collect();
+        let clippy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("clippy.toml");
+        let clippy_text = std::fs::read_to_string(&clippy_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", clippy_path.display()));
+        for path in raw_denied_path_strings(&clippy_text) {
+            let canonical = synthetic_builder_spelling(&path).unwrap_or(path);
+            let segments: Vec<String> = canonical.split("::").map(str::to_string).collect();
             if let Some(key) = pin_key_for(&segments) {
                 assert_eq!(
                     table.get(key.as_str()),
                     Some(&segments),
-                    "clippy.toml denies {path} but the derived pin table does not map {key:?} to \
-                     it: {table:?}"
+                    "clippy.toml denies {canonical} but the derived pin table does not map {key:?} \
+                     to it: {table:?}"
                 );
             }
         }
@@ -4293,25 +4381,103 @@ mod tests {
         used
     }
 
-    /// The `path = "…"` entries of `clippy.toml`'s `disallowed-methods`, read
-    /// MECHANICALLY so the consistency test compares the file the COMPILER
-    /// reads with the funnel's resolved surface, not a hand-kept copy.
+    /// Read the DOUBLE-QUOTED string values inside `clippy.toml`'s
+    /// `disallowed-methods` ARRAY that begin with a namespace the deny list
+    /// tracks (`std::fs::`, `std::os::`, `libc::`).
+    ///
+    /// A RAW scan, deliberately NOT a TOML parse: it is the INDEPENDENT side of
+    /// the cross-check in [`denied_symbols_from_clippy_toml`] and of the count
+    /// pin's arm (1), so a path-shaped spelling the parse fails to extract is a
+    /// FAILING TEST rather than a silently dropped deny. It reads only the
+    /// array body, because the prose above and below it quotes whole phrases
+    /// and `extern "C"`; the deny ENTRIES live only inside the array.
+    fn raw_denied_path_strings(text: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let Some(header) = text
+            .lines()
+            .position(|line| line.trim_start().starts_with("disallowed-methods"))
+        else {
+            return out;
+        };
+        let array: String = text.lines().skip(header).collect::<Vec<_>>().join("\n");
+        let Some(open) = array.find('[') else {
+            return out;
+        };
+        let body = &array[open + 1..];
+        let end = body.find(']').unwrap_or(body.len());
+        let mut rest = &body[..end];
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { break };
+            let value = &after[..close];
+            if value.starts_with("std::fs::")
+                || value.starts_with("std::os::")
+                || value.starts_with("libc::")
+            {
+                out.insert(value.to_string());
+            }
+            rest = &after[close + 1..];
+        }
+        out
+    }
+
+    /// The `path` values of `clippy.toml`'s `disallowed-methods`, read by
+    /// PARSING the file as TOML — the way clippy reads it — so every valid
+    /// spelling clippy accepts is a spelling this reader accepts too.
+    ///
+    /// A line-shaped reader that required one exact spelling
+    /// (`line.strip_prefix("{ path = \"")`) silently DROPPED a reformatted
+    /// entry, which made the derived pin table and the crate-wide deny
+    /// DISAGREE: clippy still refused a non-funnel call (exit 101) while the
+    /// derived table lacked the symbol, so the count pin lost it (round 8's
+    /// exact failure mode) and the closure reported a FALSE "undefended"
+    /// symbol.
+    ///
+    /// The CROSS-CHECK below compares the parse against
+    /// [`raw_denied_path_strings`]: every path-shaped string in the array must
+    /// be in the parsed set, so a future spelling this extraction misses fails
+    /// a test instead of silently losing a deny.
     fn denied_symbols_from_clippy_toml() -> BTreeSet<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("clippy.toml");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let document: toml::Value = toml::from_str(&text)
+            .unwrap_or_else(|error| panic!("{} is not valid TOML: {error}", path.display()));
+        let entries = document
+            .get("disallowed-methods")
+            .and_then(toml::Value::as_array)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} must carry a `disallowed-methods` array of entries",
+                    path.display()
+                )
+            });
         let mut out = BTreeSet::new();
-        for line in text.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("{ path = \"") else {
-                continue;
-            };
-            let Some(end) = rest.find('"') else { continue };
-            out.insert(rest[..end].to_string());
+        for entry in entries {
+            let denied = entry
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "every `disallowed-methods` entry must carry a string `path`; this one \
+                         does not: {entry:?}"
+                    )
+                });
+            out.insert(denied.to_string());
         }
         assert!(
             out.len() > 15,
             "the clippy.toml deny list must parse to the real list: {out:?}"
+        );
+        let found = raw_denied_path_strings(&text);
+        let missed: Vec<&String> = found.difference(&out).collect();
+        assert!(
+            missed.is_empty(),
+            "{} carries path-shaped string(s) the TOML parse did not extract as \
+             `disallowed-methods` `path` values: {missed:?}. Every spelling clippy accepts must \
+             enter the derived deny table, or the count pin and the crate-wide deny disagree; \
+             give the spelling a `path` key or remove the stray path-shaped string",
+            path.display()
         );
         out
     }
@@ -4384,19 +4550,23 @@ mod tests {
     /// macro body.
     ///
     /// NAMED RESIDUALS of the DERIVATION (not of the deny, whose resolution is
-    /// type-based and therefore still catches every one of them): the visitor
-    /// recognises a builder by its SYNTACTIC chain or by a `let` binding in an
-    /// ENCLOSING block, so a builder that reaches a method through a FUNCTION
-    /// PARAMETER or a STRUCT FIELD (`fn f(o: &mut OpenOptions) { o.create(true) }`),
-    /// through a FUNCTION RETURN (`make_opts().create(true)`), through a
-    /// FUNCTION-POINTER binding (`let c = std::fs::File::create; c(p)`), or whose
-    /// method call sits inside a macro body (`o.create(true)`) is not recorded
-    /// in `used`. The residual's only consequence is that if such a call were
-    /// the funnel's ONLY use of the symbol, this derivation would not name it;
-    /// the crate-wide deny still refuses the call everywhere, which is why the
-    /// residual is stated rather than claimed covered. A new funnel primitive
-    /// should spell the call directly or as a local binding, both of which the
-    /// arms above see.
+    /// type-based): the visitor recognises a builder by its SYNTACTIC chain or
+    /// by a `let` binding in an ENCLOSING block, so a builder that reaches a
+    /// method through a FUNCTION PARAMETER or a STRUCT FIELD (`fn f(o: &mut
+    /// OpenOptions) { o.create(true) }`), through a FUNCTION RETURN
+    /// (`make_opts().create(true)` — measured: such a body puts only
+    /// `std::fs::OpenOptions::new` in `used`, not the `OpenOptions::create` the
+    /// chain spelling records), through a FUNCTION-POINTER binding (`let c =
+    /// std::fs::File::create; c(p)`), or whose method call sits inside a macro
+    /// body (`o.create(true)`) is not recorded in `used`. THE MITIGATION IS
+    /// NARROWER THAN IT LOOKS: the crate-wide deny is ALLOWED inside a funnel
+    /// module — that is what makes the funnel the blind spot this derivation
+    /// exists to cover — so a FUNNEL-ONLY use reached through one of these
+    /// spellings is invisible to BOTH devices: this derivation does not record
+    /// it, and the deny cannot fire where it is allowed. A new funnel primitive
+    /// must therefore spell the call directly or as a local binding, both of
+    /// which the arms above see; this residual is a real reach INSIDE the
+    /// funnel, not a hole the lint closes.
     #[test]
     fn every_mutation_symbol_the_funnel_uses_is_denied_crate_wide() {
         let mut paths = Vec::new();
@@ -4838,12 +5008,16 @@ impl S {
     /// `impl Into<PathBuf>` (and the same nested through `Option`/`Box`).
     ///
     /// OUT OF CLASS, deliberately: a bare `&str`, `String`, `&OsStr`, or
-    /// `OsString`. A string is a path SPELLING, not a path, and the type system
-    /// does not distinguish a path-spelled string from any other string; this
-    /// crate has public fns taking one for a non-path reason. The boundary is a
-    /// stated property pinned by
+    /// `OsString`; and any `use … as` ALIAS of `Path`/`PathBuf` (the predicate
+    /// matches the last-segment NAME, so `use std::path::Path as ZP;` leaves
+    /// `&ZP` outside the class). A string is a path SPELLING, not a path, and
+    /// the type system does not distinguish a path-spelled string from any
+    /// other string; this crate has public fns taking one for a non-path
+    /// reason. The boundary is a stated property pinned by
     /// [`pair_less_derivation_boundary_is_the_syntactic_path_class`], not an
-    /// implication of this list.
+    /// implication of this list. The alias case is measured, not assumed:
+    /// `audited_fns` resolves no `use … as`, so the predicate is deliberately
+    /// name-based and the statement says so.
     fn type_is_raw_path(ty: &syn::Type) -> bool {
         match ty {
             syn::Type::Reference(reference) => type_is_raw_path(&reference.elem),
@@ -5171,15 +5345,18 @@ impl S {
     /// path SPELLING, not a path, and this crate already has public fns that
     /// take one for non-path reasons (`is_reserved_name`, `valid_hex_digest`,
     /// the error constructors), so extending the class would make the
-    /// derivation a superset that no longer pins path mutations. The boundary is
-    /// therefore STATED, not implied: a `pub fn f(name: &str)` that builds
-    /// `Path::new(name)` is out of class BY CONSTRUCTION, and this test pins that
-    /// the code does what the statement says — both directions, so the statement
-    /// cannot rot into a false claim about the code.
+    /// derivation a superset that no longer pins path mutations. A `use … as`
+    /// ALIAS of `Path`/`PathBuf` is likewise NOT in the class: the predicate
+    /// matches the last-segment NAME, and `audited_fns` resolves no imports, so
+    /// `use std::path::Path as ZP; pub fn f(p: &ZP)` is out of class BY
+    /// CONSTRUCTION. The boundary is therefore STATED, not implied, and this
+    /// test pins that the code does what the statement says — both directions,
+    /// including the alias case — so the statement cannot rot into a false
+    /// claim about the code.
     #[test]
     fn pair_less_derivation_boundary_is_the_syntactic_path_class() {
-        let derived = |param: &str| {
-            let source = format!("pub fn probe{param} {{}}");
+        let derived_in = |prelude: &str, param: &str| {
+            let source = format!("{prelude}\npub fn probe{param} {{}}");
             let files = vec![("src/prod/boundary.rs".to_string(), source)];
             let parsed = parse_crate(&files, &BTreeSet::new());
             let fns = audited_fns(&parsed, &BTreeSet::new());
@@ -5188,6 +5365,7 @@ impl S {
                 .map(|collected| collected.takes_raw_path)
                 .expect("the synthetic `probe` must parse")
         };
+        let derived = |param: &str| derived_in("", param);
         // IN CLASS: a raw path, so the derivation sees it.
         for param in [
             "(p: &Path)",
@@ -5215,6 +5393,32 @@ impl S {
                 "{param} is the stated out-of-class boundary and must NOT be derived"
             );
         }
+        // OUT OF CLASS: a `use … as` ALIAS of `Path`/`PathBuf`. The predicate
+        // matches the last-segment NAME, not the resolution, so an aliased
+        // spelling of a raw path is out of class BY CONSTRUCTION. Both
+        // directions: the alias case is refused, and the canonical name beside
+        // the same alias is still seen, so this pins the NAME-based predicate
+        // rather than the presence of a `use`.
+        for (prelude, param) in [
+            ("use std::path::Path as ZP;", "(p: &ZP)"),
+            ("use std::path::PathBuf as ZP;", "(p: ZP)"),
+        ] {
+            assert!(
+                !derived_in(prelude, param),
+                "{param} is a `use … as` ALIAS of a raw path and is the stated out-of-class \
+                 boundary; it must NOT be derived"
+            );
+        }
+        for (prelude, param) in [
+            ("use std::path::Path as ZP;", "(p: &Path)"),
+            ("use std::path::PathBuf as ZP;", "(p: PathBuf)"),
+        ] {
+            assert!(
+                derived_in(prelude, param),
+                "{param} names the canonical raw path and must be in the derived class even beside \
+                 an alias"
+            );
+        }
     }
 
     /// FIX 4: the constraint-1 enumeration is DERIVED, not enumerated. This
@@ -5232,7 +5436,9 @@ impl S {
     ///   the same wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`, `impl
     ///   AsRef<Path>` / `impl Into<PathBuf>`, and a generic type param bounded
     ///   the same way. OUT OF CLASS, explicitly: `&str`, `String`, `&OsStr`,
-    ///   `OsString`, and `&[u8]`. A STRING IS A PATH SPELLING, NOT A PATH: the
+    ///   `OsString`, `&[u8]`, and any `use … as` ALIAS of `Path`/`PathBuf`
+    ///   (the predicate matches the NAME, not the resolution). A STRING IS A
+    ///   PATH SPELLING, NOT A PATH: the
     ///   type system does not distinguish a path-spelled string from any other
     ///   string, this crate already has public fns taking a string for a
     ///   non-path reason (`is_reserved_name`, `valid_hex_digest`, the error

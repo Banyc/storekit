@@ -55,10 +55,30 @@
 #     no jurisdiction over: `transport::ensure_operation_lock_sidecar_durable`,
 #     `transport::LocalTransport::root_dir`, `transport::provision_layout`,
 #     `sync::apply::create_lock_parent`, `sync::apply::root_for_mutation`, and
-#     `transport::ssh::SshTransport::prepare_identity`.
+#     `transport::ssh::SshTransport::prepare_identity`;
+#   * `transport::open_verify_local` — the LOCAL descriptor-bound verify open.
+#     Its `custom_flags` set is `O_NOFOLLOW | O_NONBLOCK` on a READ-ONLY
+#     `OpenOptions` (`read(true)`, NO `create`/`create_new`), so it ADOPTS no
+#     name and creates no entry; the deny of `OpenOptionsExt::custom_flags` is
+#     relaxed for exactly this descriptor-bound sequence, the way
+#     `platform::chmod` relaxes `set_permissions`. It is a PRODUCTION item
+#     (`#[cfg(test)]` is on the `swap` PARAMETER only).
 #
-# Every OTHER `#[allow(clippy::disallowed_methods)]` in the crate sits on a
-# `#[cfg(test)]` module; none of those is a production funnel.
+# ENUMERATE the current attributes rather than trusting this comment:
+#
+#     rg -n 'allow\(clippy::disallowed_methods\)' src
+#
+# Every attribute that command lists and this comment does NOT name above must
+# sit on a `#[cfg(test)]` module or item — none of those is a production
+# funnel. THE INHERITANCE RULE: a module-level inner
+# `#![allow(clippy::disallowed_methods)]` applies to every item in the module
+# AND to every child module declared in it (including a `mod`/`#[path]` child
+# file), which is why the three `atomic` files are ONE funnel region and why
+# `atomic/guard.rs`, a child of `atomic/mod.rs`, carries no attribute of its
+# own. Naming the enumeration command here keeps the list checkable, so it
+# cannot go stale silently the way the previous "Every OTHER attribute sits on
+# a `#[cfg(test)]` module" sentence did (it missed
+# `transport::open_verify_local`, a production item-level allow).
 #
 # The `libc` set names the POSIX name-mutation syscalls the funnel owns: the
 # `*at` forms it calls, their plain (non-`*at`) forms, and the `open`/`openat`

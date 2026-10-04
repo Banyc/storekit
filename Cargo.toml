@@ -30,3 +30,5 @@ proptest = "1"
 # derive macro, printing, and the proc-macro bridge out of the build; `full`
 # gives the complete item/expression AST and `visit` the immutable walker.
 syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+# Parses `clippy.toml` as TOML so the audit accepts every spelling clippy accepts
+toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
