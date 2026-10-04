@@ -101,19 +101,20 @@ segment, because the identifier rule ALSO constrains the charset
 (`[A-Za-z0-9-_.]`, so `Ünïcode` is refused and is not unaddressable), the first byte
 (no leading `-`), the length (`NAME_MAX`) and the `.`/`..` spellings — so read these
 predicates as "spellings the crate cannot address", NOT as a `valid_name` oracle.
-They report every spelling the crate refuses to name — the
+They report the spellings the crate reserves for its OWN bookkeeping — the
 `.sync-aside.` claim-aside prefix, the `.<name>.operation.lock` record, the
 application lock record `operation.lock`, case aliases of any of those, crate
 temp shapes, and the Win32 trailing-dot/space aliases of a lock record (refused
 on every platform, so an id does not mean different things on different hosts).
 `is_reserved_name` / `is_reserved_path` are NARROWER — the byte-exact reserved
-MATCH, with no production caller inside this crate, present for a consumer that
-needs the byte-exact question. They deliberately leave the application lock
-record and the case/trailing-dot aliases alone, so they are NOT on their own the
-answer to "may I use this name". What the sync STRIPS with is the BROAD
-authority: `is_unaddressable_path` for the source view and `is_residue_path` for
-the destination view, at `sync::diff`'s `strip_reserved` call sites. An
-unaddressable
+MATCH. They deliberately leave the application lock record and the case/trailing-
+dot aliases alone, so they are NOT on their own the answer to "may I use this
+name": `is_reserved_name` is the primitive the broad authorities are BUILT on
+(`is_unaddressable_name`, `is_reserved_case_alias`), and `is_reserved_path` is
+public for a caller that needs exactly the byte-exact question — this crate does
+not call it. What the sync STRIPS with is the BROAD authority:
+`is_unaddressable_path` for the source view and `is_residue_path` for the
+destination view, at `sync::diff`'s `strip_reserved` call sites. An unaddressable
 spelling is refused as an identifier and is never transferred by a sync. A
 RESIDUE spelling (an unaddressable one that is not a crate temp) is also never
 destroyed by `Extraneous::Delete`: it survives every extraneous policy and is

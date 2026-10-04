@@ -7,10 +7,10 @@ domain. This file is the ordered checklist and the record of what does NOT map.
 **Status: the deploy-side migration is DONE, and this file is its record.**
 `deploy`'s substrate now comes from the crate (the last slice was the `id`
 newtype machinery). The checklist below is therefore a record of what was done
-and why, not a plan — the same convention as `EXTRACTION.md`. Two questions in it
-stay OPEN and are marked where they appear: whether `sync` should replace `deploy`'s
-own transfer protocol (answered NO for `materialize`, which is domain), and the
-receiver-marker adoption (done).
+and why, not a plan — the same convention as `EXTRACTION.md`. The two questions
+it raised are both RESOLVED and marked where they appear: whether `sync` should
+replace `deploy`'s own transfer protocol (answered NO for `materialize`, which is
+domain), and the receiver-marker adoption (done).
 
 ## What the migration is not
 

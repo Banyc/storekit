@@ -19,7 +19,7 @@ known it is recorded as a residual with its window named, not pursued.
 | F | a constant ↔ its derivation ↔ the resource's limit | `NAME_MAX` temp overflow; the `sun_path` reserve; path-limit parity between ports |
 | G | an error class ↔ the condition it reports | a legacy marker read as corruption; a removal-worded message on a create |
 | H | a test's name ↔ the failure it can express | tautological assertions; a count-based bound test blind to quadratic behaviour; a guard that cannot fail; a check whose derivation came from the value it certified |
-| I | an audit pin ↔ the actual count | the funnel `openat` count (moved deliberately, twice, each time with the reason at the pin) |
+| I | an audit pin ↔ the actual count | the funnel `openat` count (moved deliberately, twice; the number is a reviewed constant that a change must update, which is what forces the review) |
 | J | the `unix` ↔ `windows` twin surface | a public function present on one platform only |
 | K | the revision you are READING ↔ the revision you BELIEVE you are reading | a surface count and a whole gate read from a checkout parented to the previous tip |
 | L | the platform you COMPILE ↔ the platform you claim | a call site inside `#[cfg(target_os = "linux")]` that a macOS gate never compiles; a lint that never compiles `#[cfg(windows)]` code, so the device was absent on that target |
@@ -94,6 +94,10 @@ Named, scoped, not pursued:
   typo there produces a non-fatal config-time `does not refer to a reachable
   function` diagnostic that the gate's `-D warnings` does not cover, so it can rot
   silently. A typo in a symbol the funnel DOES use is caught by the closure test.
+  Some wider-set entries name symbols no supported target exports at all
+  (`libc::shm_rename` is FreeBSD-only), so on both targets they are decoration;
+  they are kept as the reviewed set's record rather than pruned, and this is the
+  residual that covers them.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

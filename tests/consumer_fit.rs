@@ -5,8 +5,9 @@
 //! this crate's OWN suite is still a build break for a consumer. A prior pass
 //! deleted `Remote::exists` and demoted `atomic::write_atomic_replace(&Path)`,
 //! justified by "our production never did"; the population that mattered was
-//! the CONSUMER's interface, where deploy both declares `exists` as a required
-//! trait method and calls the path-based replace. This file is the class fix:
+//! the CONSUMER's interface, where deploy's interface requires `exists` (this
+//! crate supplies it as a DEFAULT method, so a transport may override it with a
+//! cheaper probe) and calls the path-based replace. This file is the class fix:
 //! it NAMES the required shapes and exercises them through the PUBLIC API only,
 //! so a future deletion of any of them is a loud COMPILE failure here — exactly
 //! the failure a consumer would get, and exactly the failure no unit test in
@@ -17,8 +18,9 @@
 //! by `file:line`: a consumer's line numbers move under it, and this crate's own
 //! rules forbid resting a claim on one.
 //!
-//! * `Remote::exists` — `src/remote/transport/mod.rs`, the REQUIRED trait method
-//!   `fn exists(&self, rel: &RootedRelativePath) -> bool;`, called in production
+//! * `Remote::exists` — `src/remote/transport/mod.rs`, the trait method the
+//!   consumer's interface requires, `fn exists(&self, rel: &RootedRelativePath)
+//!   -> bool`, called in production
 //!   by `src/remote/helper/mod.rs`, `src/remote/helper/durable.rs` and
 //!   `src/store/local/objects.rs`.
 //! * the path-based atomic replace — the ABSOLUTE-PATH call shape
@@ -123,10 +125,12 @@ fn remote_existence_probe_and_typed_absence() {
     }
 }
 
-/// The path-based UNCONFINED atomic replace (deploy's
-/// `src/store/atomic/windows.rs:196`) AND its confined equivalent
-/// `write_atomic_replace_fd` (deploy's `write_atomic_replace_at` resolves
-/// through it). Both must be nameable, and both must install the bytes.
+/// The path-based UNCONFINED atomic replace — the ABSOLUTE-PATH call shape the
+/// consumer's Windows port used at the revision above; that port's
+/// `store/atomic/windows.rs` is now a re-export of this crate, so the durable
+/// evidence is the CALL SHAPE, not a file that moves under it — AND its confined
+/// equivalent `write_atomic_replace_fd` (deploy's `write_atomic_replace_at`
+/// resolves through it). Both must be nameable, and both must install the bytes.
 #[test]
 fn atomic_replace_path_based_and_confined() {
     let tmp = tempfile::tempdir().expect("tempdir");
