@@ -12,17 +12,21 @@
 //! the failure a consumer would get, and exactly the failure no unit test in
 //! this crate can produce.
 //!
-//! The evidence each group pins (file:line in `~/code/deploy`, reproduced from
-//! the consumer's own working copy):
+//! The evidence each group pins is the CONSUMER's own call shape, read at
+//! `~/code/deploy` `@` = `a76da6d4` (tip `2a2af061`). It is cited by NAME, not
+//! by `file:line`: a consumer's line numbers move under it, and this crate's own
+//! rules forbid resting a claim on one.
 //!
-//! * `Remote::exists` — `src/remote/transport/mod.rs:326`
-//!   (`fn exists(&self, rel: &RootedRelativePath) -> bool;`), called in
-//!   production by `src/remote/helper/mod.rs`, `src/remote/helper/durable.rs`
-//!   and `src/store/local/objects.rs`.
-//! * the path-based atomic replace — `src/store/atomic/windows.rs:196`
-//!   (`write_atomic_replace(&root.path().join(rel), ..)`); its descriptor-
-//!   relative wrapper `write_atomic_replace_at` drives the confined
-//!   `write_atomic_replace_fd`.
+//! * `Remote::exists` — `src/remote/transport/mod.rs`, the REQUIRED trait method
+//!   `fn exists(&self, rel: &RootedRelativePath) -> bool;`, called in production
+//!   by `src/remote/helper/mod.rs`, `src/remote/helper/durable.rs` and
+//!   `src/store/local/objects.rs`.
+//! * the path-based atomic replace — the ABSOLUTE-PATH call shape
+//!   `write_atomic_replace(&root.path().join(rel), ..)`, which the consumer's
+//!   Windows port uses. That port's `store/atomic/windows.rs` is now a re-export
+//!   of this crate, so the durable evidence is the CALL SHAPE, not a file that
+//!   moves under it; its descriptor-relative wrapper
+//!   `write_atomic_replace_at` drives the confined `write_atomic_replace_fd`.
 //! * the tree pair — `copy_dir_recursive_fd` (out-of-root `&Path` source into a
 //!   root-confined `RootedRelativePath` staging destination) then
 //!   `fsync_tree_recursive_fd`; recorded in the README's "Design conflicts

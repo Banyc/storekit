@@ -73,6 +73,14 @@ Named, scoped, not pursued:
   or NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
   own call counts are pinned. The pin records a review, not a proof. Completeness of
   the SYMBOL SET is a review responsibility.
+- **The funnel-side pin is a SYNTACTIC derivation**, so its guarantee has a shape
+  boundary: it resolves a direct call, an inherent or builder method on a
+  path-resolvable receiver, and a call held in an enclosing `let`. A name-adopting
+  call whose receiver arrives as a FUNCTION PARAMETER, a RETURN, a STRUCT FIELD or a
+  function pointer — or one a macro emits — moves no pinned count, and inside a
+  funnel module the deny is allowed there, so nothing else refuses it either. That
+  shape is outside the pin's guarantee rather than a hole in a promise, and the
+  contract's clause (c) says so.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

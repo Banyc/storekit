@@ -22,10 +22,11 @@ the tests.
    one, that file is domain code and must be dropped.
 2. **Visibility.** An item is `pub` only if a CONSUMER needs it; `pub(crate)` is the
    default answer for anything the crate's own paths can reach. A deletion justified
-   by *"the crate's own tests do not use it"* is not justified at all. The consumers
-   are `~/code/deploy` and `~/code/ckpt`; the durable guard for their needs is
-   `tests/consumer_fit.rs`, which fails to COMPILE if a consumer-required name is
-   removed.
+   by *"the crate's own tests do not use it"* is not justified at all. The
+   consumers are `~/code/deploy`, which depends on the crate, and `~/code/ckpt`,
+   which is the NEXT one and does not depend on it yet — so the durable guard,
+   `tests/consumer_fit.rs`, pins `deploy`'s needs and no `ckpt` need. That guard
+   fails to COMPILE if a consumer-required name is removed.
 3. **Test helpers.** `crate::testutil::{fixture_env, fixture_tmpdir, proptest_cases,
    slow_tests_enabled}` are `crate::test_support::{...}` here. Any other
    `crate::testutil::*` use means the test is domain-bound: drop it and record the drop.

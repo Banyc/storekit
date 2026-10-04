@@ -49,7 +49,10 @@ caller.
 9. **Frame or refuse at every boundary that re-interprets a value.** Shell
    operands are one quoted word each, parents computed rather than derived by a
    shell, `--` before a value that may start with `-`. Wire records are
-   delimited by a byte a name cannot contain, with the name last.
+   delimited by a byte a name cannot contain. The far-side LISTING frame carries
+   the name LAST (NUL-delimited); the manifest's tree record is tab-delimited
+   with the path FIRST, and that is safe only because every name containing NUL,
+   LF, CR or TAB is refused everywhere, so no reader depends on field position.
 
 ## Refused, by rule
 
@@ -297,18 +300,16 @@ simplification; removing one means adding back the logic it removes.
   `WalkDir` plus `symlink_metadata`/`read` on accumulated PATHS, so a tree
   deeper than the platform's path limit is refused with `ENAMETOOLONG` at the
   first path that overflows. With 1-byte components the path grows 2 bytes per
-  level, so the bound is `floor((L - base_len)/2)`, where `base_len` is the
-  length in BYTES of the base path AS IT RESOLVES on the filesystem and `L` is
-  the longest pathname the kernel accepts for the tree: measured `PATH_MAX - 1`
-  on Linux (4095, because `/tmp` is real) and `PATH_MAX` on macOS (1024). The
-  older form `floor((PATH_MAX - 1 - base_len)/2)` is exact on Linux but
-  under-predicts by one on macOS when `base_len` is EVEN (the parity is hidden
-  when every worked example has an odd base). Worked examples, each measured
-  one level above where `ENAMETOOLONG` first lands: Linux (`PATH_MAX` 4096)
-  admits depth 2047 at a 1-byte base, 2041 at a 13-byte base, and 2040 at a
-  14-byte base; macOS (`PATH_MAX` 1024) admits depth 511 at a 1-byte base, 495
-  at a 34-byte resolved base (EVEN — the old form predicts 494), and 482 at a
-  59-byte resolved base. A descriptor-relative manifest walk would lift this;
+  level, so the bound is `floor((PATH_MAX - 1 - base_len)/2)`, where `base_len`
+  is the length in BYTES of the base path AS IT RESOLVES on the filesystem: the
+  kernel accepts at most `PATH_MAX - 1` bytes for a path, on both platforms.
+  Worked examples, each measured by growing a 1-byte chain and asking
+  `canonicalize_tree` after every level: on Linux (`PATH_MAX` 4096) a 34-byte
+  resolved base admits depth 2030 — the path at that depth is 4094 bytes and
+  the next reachable length, 4096, is refused; on macOS (`PATH_MAX` 1024) a
+  72-byte resolved base admits 475, where 1022 bytes is accepted and 1024 is
+  refused. A 1-byte base is the case `floor((PATH_MAX - 2)/2)`. A
+  descriptor-relative manifest walk would lift this;
   it is not implemented, and this bullet is the statement of the real limit.
   The descriptor-relative
   REMOVAL walk (`crate::atomic::remove_dir_contents_fd`) holds one descriptor
@@ -374,7 +375,14 @@ takes responsibility for exactly this, and no more.
   pin records a REVIEW, not a proof: a pinned reference is one somebody looked at, and
   whether the mutation it performs is refused is the deny's business only if the deny
   names the symbol. (c) The funnel's OWN call counts are pinned per file and per
-  symbol, so a changed or added call inside the funnel forces review.
+  symbol, so a changed or added call inside the funnel forces review — for every
+  call the pin's derivation can RESOLVE: a direct call, an inherent or builder
+  method on a path-resolvable receiver, or a call held in an enclosing `let`. A
+  call whose receiver arrives as a FUNCTION PARAMETER, a RETURN, a STRUCT FIELD
+  or a function pointer, or one a macro emits, moves no pinned count — and inside
+  a funnel module the deny is allowed, so nothing else refuses it either.
+  `src/atomic/guard.rs`'s audit names that shape at the derivation, and the
+  review of a funnel change has to cover it.
 * **Guaranteed as an API.** Root confinement (a relative symlink target cannot leave
   the root, and neither can a mutation named by `(&RootDir, &RootedRelativePath)`), the
   atomic replace's commit points and its reported durability, lock mutual exclusion
@@ -403,8 +411,15 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings   # NOT optional
 cargo test
+STOREKIT_FULL_TESTS=1 cargo test       # NOT optional; see below
 cargo check --all-targets --target x86_64-pc-windows-msvc
+cargo test --doc
 ```
+
+`STOREKIT_FULL_TESTS=1` does not add test names: it stops three tests returning
+early — the atomic replace's sweep over EVERY pre-rename stage, the tree copy's,
+and the two slow real-`sshd` cases — so the default run covers a sampled shape
+and the widened run covers all of them.
 
 TWO clippy commands, and the second is not optional: `--all-targets` compiles the HOST
 only, and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module is
