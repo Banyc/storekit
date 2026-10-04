@@ -318,6 +318,15 @@ pub enum PreflightKind {
     /// The transport's ROOT spelling differs from the one the token was minted
     /// against, so the run would mutate a different tree.
     RemoteRootMismatch,
+    /// The remote's LOCALNESS (`Remote::is_local`) differs from the one the
+    /// token was minted against: a token minted against a LOCAL transport (a
+    /// path on this host, which states no endpoint identity) was handed to a
+    /// run whose remote is NON-LOCAL. The identity comparison cannot see this
+    /// when both state `None`, and the DESTINATION of a PULL is legitimately
+    /// local, so localness is its own axis. For a PULL the remote is the
+    /// SOURCE: without this refusal the plan read from the local source is
+    /// applied against a different, non-local source.
+    RemoteLocalnessMismatch,
     /// The token was minted for another DIRECTION, another pinned local root,
     /// or another derived destination shape, so it does not describe this run.
     RunBindingMismatch,

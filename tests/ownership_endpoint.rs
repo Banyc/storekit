@@ -594,3 +594,115 @@ fn the_endpoint_and_root_refusals_carry_distinct_typed_kinds() {
         "each distinguished condition must name its kind, never the fallback"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PULL: the token binds the SOURCE's LOCALNESS (the `None`-identity hole)
+// ---------------------------------------------------------------------------
+
+/// The `None`-IDENTITY REPRO. A token minted against a LOCAL source records no
+/// endpoint identity (a `LocalTransport` states none, exactly as a path on
+/// this host needs none) and `Prepared::matches` step 3 compared the identity
+/// only as an `Option`, so `None == None` PASSED. Step 4 derives
+/// `dest_is_local` as `remote.is_local()` for a PUSH but HARDCODES `true` for a
+/// PULL, so a LOCAL->NON-LOCAL flip of the remote was never compared on a
+/// PULL: a non-local source that states no identity and reports the same root
+/// spelling was accepted, and the plan read from the local source was applied
+/// against the non-local one.
+///
+/// MISMATCHED CONTENT: before the fix this run mutates the destination with
+/// the NON-LOCAL source's bytes and fails only afterwards on the
+/// post-transfer digest, so `preflight_reason()` is `None` and no ownership
+/// refusal ever fires. Post-fix the remote's LOCALNESS is its own recorded
+/// axis, compared for BOTH directions, and the run is REFUSED with the typed
+/// localness mismatch before anything is mutated.
+#[test]
+fn a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local() {
+    let f = fixture();
+    let local_dst = f.dir.path().join("local-dst");
+    std::fs::create_dir_all(&local_dst).expect("create the local destination");
+    // The LOCAL source the token is minted against. Its root spelling is the
+    // SHARED layout spelling, so LOCALNESS is the only axis that distinguishes
+    // it from the non-local source below.
+    std::fs::create_dir_all(&f.shared_root).expect("create the shared root");
+    std::fs::write(f.shared_root.join("x"), b"from-local").expect("seed the local source");
+    let local_source = LocalTransport::new(
+        &SysEnv::from_process(),
+        f.shared_root.clone(),
+        Layout::empty(),
+    )
+    .expect("a LocalTransport over the shared root");
+    // The non-local source the run is handed: the SAME root spelling, NO
+    // endpoint identity, and DIFFERENT data.
+    let non_local_source =
+        EndpointRemote::new(f.dir.path().join("src-b"), f.shared_root.clone(), None);
+    std::fs::write(non_local_source.data("x"), b"from-non-local")
+        .expect("seed the non-local source");
+
+    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &local_source)
+        .expect("mint a pull token against the LOCAL source");
+    let error = sync(
+        Direction::Pull,
+        &local_dst,
+        &non_local_source,
+        &ReplaceAll,
+        Extraneous::Keep,
+        token,
+    )
+    .expect_err("a pull token minted against a local source must be refused for a non-local one");
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteLocalnessMismatch),
+        "the refusal must be the typed LOCALNESS mismatch, not a post-transfer digest failure: {error:?}"
+    );
+    assert!(
+        !local_dst.join("x").exists(),
+        "the local destination must be unmutated by the refused pull"
+    );
+}
+
+/// The EQUAL-CONTENT variant of the same hole: when the two sources' content
+/// is byte-identical the post-transfer digest cannot see the substitution, so
+/// before the fix `sync` returned **`Ok`** — the plan read from the LOCAL
+/// source was applied against the non-local source silently. The localness
+/// axis is what makes this run refusable at all.
+#[test]
+fn a_pull_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip() {
+    let f = fixture();
+    let local_dst = f.dir.path().join("local-dst");
+    std::fs::create_dir_all(&local_dst).expect("create the local destination");
+    std::fs::create_dir_all(&f.shared_root).expect("create the shared root");
+    std::fs::write(f.shared_root.join("x"), b"same").expect("seed the local source");
+    let local_source = LocalTransport::new(
+        &SysEnv::from_process(),
+        f.shared_root.clone(),
+        Layout::empty(),
+    )
+    .expect("a LocalTransport over the shared root");
+    let non_local_source =
+        EndpointRemote::new(f.dir.path().join("src-b"), f.shared_root.clone(), None);
+    std::fs::write(non_local_source.data("x"), b"same").expect("seed the non-local source");
+
+    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &local_source)
+        .expect("mint a pull token against the LOCAL source");
+    let error = sync(
+        Direction::Pull,
+        &local_dst,
+        &non_local_source,
+        &ReplaceAll,
+        Extraneous::Keep,
+        token,
+    )
+    .expect_err(
+        "even EQUAL content must not hide a local->non-local source flip: returning `Ok` here \
+         means the local source's plan was applied against a different, non-local source",
+    );
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RemoteLocalnessMismatch),
+        "the refusal must be the typed LOCALNESS mismatch: {error:?}"
+    );
+    assert!(
+        !local_dst.join("x").exists(),
+        "the local destination must be unmutated by the refused pull"
+    );
+}
