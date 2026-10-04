@@ -680,7 +680,7 @@ declared CLOSED had a live instance the closure did not cover.
 | # | finding | axis | fixed by |
 |---|---|---|---|
 | 1 | The completeness device denied the free functions and the round-5 creation wrappers, but NOT the name-ADOPTING inherent and builder forms: `std::fs::File::create`, `File::create_new`, `DirBuilder::create`, `std::fs::copy` (its destination), and `OpenOptions::new().create(true)/.create_new(true)….open(p)` — where the BUILDER FLAG, not the call, decides whether a name is adopted. A new production module could therefore adopt `operation.lock` with every gate green, while the crate's own create-or-truncate primitive refuses exactly that spelling. **And the shape was already shipped:** `src/lock/unix.rs` and its Windows twin both adopt the lock-record name through `OpenOptions…create(true)…open()` with no allow and no deny — so round 5's meta-claim ("the deny list can no longer drift from the code") was false when written. The derived test could not see it either, because its own helper excluded inherent-type paths while its doc promised "the funnel's whole resolved call surface". | H, M | `opxqouknzxww` |
-| 2 | The derived check visited `syn::Item` but not `ImplItem`, so a `#[allow]`-ed METHOD's un-denied call was invisible to it (the freestanding-allow control DID fail, isolating the arm). | H | `opxqouknzxww` |
+| 2 | The derived check visited `syn::Item` but not `ImplItem`, so a `#[allow]`-ed METHOD's un-denied call was invisible to it (the freestanding-allow control DID fail, isolating the arm). **THIS ROW WAS FALSE WHEN WRITTEN and is corrected here:** it recorded `opxqouknzxww` as the fix, but that change never contained the arm — the finding was listed as dispatched and the brief omitted it. Both round-7 reviewers re-derived and caught it (one via `jj show`, one via an A/B probe); the fix actually landed in round 7 as `rxwnmspylryu`, with a four-arm regression test (impl allow, trait allow, freestanding control, no-allow negative) and a disabled-arm failure proof. | H | `rxwnmspylryu` (round 7) |
 | 3 | The completeness device was never run for the WINDOWS target: `cargo clippy --all-targets` compiles the host only and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module could call denied symbols with the gate green (measured: host run clean, Windows-target run red). | L | `opxqouknzxww` + the gate |
 | 4 | Three prose claims had drifted from the code: the README's deny-symbol ENUMERATION (stale within the round that removed enumerations), constraint #1's justification that `Residue::recover_to` "takes no path argument at all" (it takes `target: impl AsRef<Path>` and validates it), and the README's "they resolve the enumerated import routes by PARSING the sources" — only the `std::fs` audit parses; the `libc` audit is a reference scanner that does not even resolve `use libc as c`. | A | the round-6 docs commits |
 
@@ -710,3 +710,39 @@ the Windows-target one, because a lint that never compiles `#[cfg(windows)]` cod
 cannot be the completeness device for a crate that supports Windows. That is the
 same lesson as axis L, one level up: "a green gate on one platform is not evidence
 for another" applies to the DEVICES in the gate, not only to the code they check.
+
+## The adversarial review (round 7)
+
+Five findings, all fixed. The most important one is not in the code: it is that
+this log ASSERTED a fix that was never written, and only independent re-derivation
+caught it.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The derived closure was blind to `#[allow(clippy::disallowed_methods)]` on **impl and trait METHODS**, and round 6's row above recorded it as fixed by `opxqouknzxww` when no commit ever implemented it. Five production impl-method allow sites (`LocalTransport::root_dir`/`provision_layout`/`remove_file_if_inner`, `SshTransport::prepare_identity`, `LocalBackend::root_for_mutation`) were invisible, so an `#[allow]`-ed method could call a symbol neither denied nor reviewed with the closure green — while the IDENTICAL freestanding allow made it fail. Both reviewers found this independently and both verified with `jj show` that no commit adds the arm. **The defect was the orchestrator's**: the finding was listed as dispatched, the brief omitted it, and the log recorded it as done. | H, M | `rxwnmspylryu`; the round-6 row is corrected in place |
+| 2 | `std::fs::write` was a LIVE un-denied name-ADOPTING symbol: a non-funnel production `std::fs::write(p, b"x")` adopted any absent name — a reserved spelling included — with the whole gate green. It sat in `FUNNEL_SYMBOLS_NOT_DENIED`, whose own criterion is "each reviewed as unable to ADOPT a name", so its own entry violated the list's rule, and the stated reason ("every funnel use targets an already-open descriptor or a path the funnel just created") was false at the one production site it excused (`write_file_fd` is a documented create-or-truncate on a caller-named path). | H, M | `rxwnmspylryu` |
+| 3 | The libc "belt" — the assertion that makes a REVIEWED pin safe — was a 14-name hand list, so a reviewer could pin `libc::mkfifo` in the outside map and the audit passed, and a name-creating syscall was authorized by review. | H | `rxwnmspylryu` |
+| 4 | Constraint #1's enumeration had a SIXTH omission (`Remote::provision_layout`, a public trait method whose override creates the layout tree) AND existed as TWO divergent lists, each missing members the other named — precisely the form round 5's log predicted would fail again. | A, M | `rxwnmspylryu` + one marked block |
+| 5 | README claimed the two audits "run under … BOTH targets' `cargo check`"; `cargo check` compiles test targets and executes no tests. | A | the round-7 docs commit |
+
+**A log that claims a fix nobody wrote is the worst instance of this crate's own
+recurring defect.** The loop's whole premise is that a claim is a measurement; the
+orchestrator's summary of "what I briefed" was treated as a measurement of "what
+was implemented", with nothing between them, and it was wrong. Two independent
+reviewers re-deriving the property is the only reason it surfaced — which is the
+argument for the re-run step stated better than any of the previous rounds managed.
+The rule adopted here: **a log cites a change id only after the orchestrator has
+read that change's diff**, not the fix agent's summary of it.
+
+**And the derivations that rounds 5 and 6 kept promising finally exist for both
+lists.** The libc belt is no longer a list: it is the mutation family UNION a
+default-deny of every `libc::<fn>` call the tree references, minus a reviewed
+`NON_MUTATING_LIBC_CALLS`, and a test derives the 33 referenced call symbols and
+fails on any unclassified one (measured: pinning `libc::mkfifo` is now refused by
+the belt before the map comparison; removing `mkfifo` from the family fails the
+classification test). The pair-less enumeration is ONE marker-delimited block in
+`API-CONSTRAINTS.md`, checked by a test that extracts the block, resolves every
+name to a real item, and derives the 41-item public raw-path surface so each item
+must be either listed or exempted — 25 exemptions, each with a stated reason, and
+a stale exemption fails the test. A planted new public raw-path mutator fails it,
+which is the property six hand-found omissions never had.
