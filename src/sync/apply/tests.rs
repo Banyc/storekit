@@ -1182,6 +1182,14 @@ struct RecordingRemote {
     metadata_calls: AtomicUsize,
     calls: Mutex<Vec<(String, String)>>,
     set_modes: Mutex<Vec<(String, u32)>>,
+    /// The root SPELLING this double REPORTS when it must differ from the
+    /// inner transport's base. `None` reports the inner base (every ordinary
+    /// test). A root with no final component cannot be built as a real
+    /// [`LocalTransport`] ([`LocalTransport::new`] refuses `/`), so the
+    /// reported spelling is DECOUPLED from the directory the data operations
+    /// delegate to — the same shape `tests/ownership_endpoint.rs`'s
+    /// `EndpointRemote` uses.
+    reported_root: Option<PathBuf>,
 }
 
 impl RecordingRemote {
@@ -1254,6 +1262,7 @@ impl RecordingRemote {
             metadata_calls: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
             set_modes: Mutex::new(Vec::new()),
+            reported_root: None,
         }
     }
 
@@ -1278,6 +1287,14 @@ impl RecordingRemote {
     #[cfg(test)]
     fn without_endpoint_identity(mut self) -> RecordingRemote {
         self.endpoint_identity = None;
+        self
+    }
+
+    /// Report `root` from [`Remote::root`] instead of the inner transport's
+    /// base, so a test can describe a destination the real transports cannot
+    /// be constructed over (see [`Self::reported_root`]).
+    fn with_reported_root(mut self, root: impl Into<PathBuf>) -> RecordingRemote {
+        self.reported_root = Some(root.into());
         self
     }
 
@@ -1533,7 +1550,9 @@ impl RecordingRemote {
 
 impl Remote for RecordingRemote {
     fn root(&self) -> &Path {
-        self.inner.root()
+        self.reported_root
+            .as_deref()
+            .unwrap_or_else(|| self.inner.root())
     }
     fn is_local(&self) -> bool {
         self.is_local
@@ -12998,6 +13017,48 @@ fn lock_remote_refuses_a_transport_without_far_side_locking() {
         error.preflight_reason(),
         Some(PreflightKind::FarSideLockUnsupported),
         "the refusal must be the typed far-side-seam refusal: {error:?}"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap(),
+        before,
+        "the refused far-side acquisition mutated nothing"
+    );
+}
+
+/// A REMOTE destination whose `root()` names no FINAL component (the
+/// filesystem root `/`) has no parent from which a sibling operation-lock
+/// record can be derived ([`destination_lock_path`] is `None`), so
+/// [`DestinationOwnership::lock_remote`] REFUSES with the TYPED
+/// [`PreflightKind::RemoteDestinationUnlockable`] rather than acquire a
+/// record it cannot place or run the destination unowned.
+///
+/// The condition is REACHABLE only through a caller's own [`Remote`]: both
+/// crate transports reject such a root at CONSTRUCTION
+/// ([`LocalTransport::new`] refuses `/`, and `SshTransport` rejects a root
+/// with no final component), so the only way to exercise the refusal is to
+/// SUPPLY a transport whose reported root is `/` while its data operations
+/// delegate elsewhere — exactly the decoupling a third-party implementor may
+/// make. Until this test, [`PreflightKind::RemoteDestinationUnlockable`]
+/// appeared only at its definition and at the raise site, with no assertion.
+#[test]
+fn lock_remote_refuses_a_remote_destination_with_no_derivable_record() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(&dst).unwrap();
+    let before = canonicalize_tree(&dst).unwrap();
+    let remote = RecordingRemote::over(transport(&dst), false)
+        .with_endpoint_identity("test://recording-remote")
+        .with_reported_root(PathBuf::from("/"));
+    let error = match DestinationOwnership::lock_remote(Direction::Push, &src, &remote) {
+        Err(error) => error,
+        Ok(_) => panic!("a remote destination with no derivable lock record must be refused"),
+    };
+    assert_eq!(
+        error.preflight_reason(),
+        Some(PreflightKind::RemoteDestinationUnlockable),
+        "the refusal must be the typed unlockable-destination refusal: {error:?}"
     );
     assert_eq!(
         canonicalize_tree(&dst).unwrap(),
