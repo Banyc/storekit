@@ -4640,7 +4640,7 @@ mod tests {
         // * FAILURE PROPAGATION: the faulted attempt is an `Err` naming the
         //   injected stage — never a swallowed `Ok` that claims durability.
         //
-        // Bounded cases (full budget under `DEPLOY_FULL_TESTS=1`, fast
+        // Bounded cases (full budget under `STOREKIT_FULL_TESTS=1`, fast
         // default), fixed seed 0x5EED_5EED (house style), no persistence, and
         // each case drives its OWN fixture (per-fixture one-shot fault,
         // structurally isolated).

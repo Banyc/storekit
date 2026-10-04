@@ -73,6 +73,13 @@ Named, scoped, not pursued:
   or NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
   own call counts are pinned. The pin records a review, not a proof. Completeness of
   the SYMBOL SET is a review responsibility.
+- **The deny list names RESOLVED `std`/`libc` symbols**, so a Windows named-pipe
+  creator (`CreateNamedPipeW`) or a raw `CreateFileW`/`NtCreateFile` reached
+  through `windows_sys` is outside the clippy deny, and the `libc` pin is
+  libc-specific. Rust's stable `std` exposes no named-pipe creator and this
+  crate's own `windows_sys` uses are non-adopting (`GetFileInformationByHandle`,
+  `LockFileEx`/`UnlockFileEx`), so the reach is a raw Win32 creator the crate
+  would have to add; it is stated at `src/atomic/guard.rs` and in `clippy.toml`.
 - **The funnel-side pin is a SYNTACTIC derivation**, so its guarantee has a shape
   boundary: it resolves a direct call, an inherent or builder method on a
   path-resolvable receiver, and a call held in an enclosing `let`. A name-adopting

@@ -101,10 +101,14 @@ They report every spelling the crate refuses to name — the
 application lock record `operation.lock`, case aliases of any of those, crate
 temp shapes, and the Win32 trailing-dot/space aliases of a lock record (refused
 on every platform, so an id does not mean different things on different hosts).
-`is_reserved_name` / `is_reserved_path` are NARROWER: the byte-exact reserved
-MATCH the sync uses to strip reserved components, and they deliberately leave
-the application lock record and the case/trailing-dot aliases alone — they are
-NOT, on their own, the answer to "may I use this name". An unaddressable
+`is_reserved_name` / `is_reserved_path` are NARROWER — the byte-exact reserved
+MATCH, with no production caller inside this crate, present for a consumer that
+needs the byte-exact question. They deliberately leave the application lock
+record and the case/trailing-dot aliases alone, so they are NOT on their own the
+answer to "may I use this name". What the sync STRIPS with is the BROAD
+authority: `is_unaddressable_path` for the source view and `is_residue_path` for
+the destination view, at `sync::diff`'s `strip_reserved` call sites. An
+unaddressable
 spelling is refused as an identifier and is never transferred by a sync. A
 RESIDUE spelling (an unaddressable one that is not a crate temp) is also never
 destroyed by `Extraneous::Delete`: it survives every extraneous policy and is
@@ -236,11 +240,14 @@ measured exponent is PLATFORM-DEPENDENT: ≈2.0 on Linux (measured 99 / 373 /
 (measured 0.64 / 3.44 / 21.2 s at the same depths; ratios 5.4 / 6.2; the
 consumer's earlier 0.63 / 3.38 / 21.6 s agree). The single O(D^2) label was
 wrong on macOS — budget for worse than quadratic. A FRESH destination installs
-all D entries, and EACH install pays its own ancestry probe, so it is O(D^3):
-the cubic shape was verified, over the consumer's 4.855 s / 41.39 s / 582.1 s
-at the same depths. `canonicalize_tree` alone is cheap (2.76 ms / 6.53 ms /
+all D entries, and EACH install pays its own ancestry probe: one probe is O(D)
+syscalls, each resolving up to D components, so one install is O(D^2) and a
+fresh D-entry destination is O(D^3). The measured shape is AT LEAST cubic — the
+consumer's 4.855 s / 41.39 s / 582.1 s give ratios 8.5 and 14.1 for two
+doublings, where a purely cubic curve predicts 8. `canonicalize_tree` alone is
+cheap (2.76 ms / 6.53 ms /
 25.4 ms), so the engine's per-path verification is the cost, and a checkpoint
-tool that recreates its destination per snapshot should budget the CUBIC. The
+tool that recreates its destination per snapshot should budget cubic-OR-WORSE. The
 Linux and macOS incremental figures above are re-measured under the audit
 (release build, kache neutralised, load ≈0.3 Linux / ≈1.4 macOS); the
 fresh-destination and `canonicalize_tree` figures are the reviewing consumer's,
@@ -379,10 +386,12 @@ takes responsibility for exactly this, and no more.
   call the pin's derivation can RESOLVE: a direct call, an inherent or builder
   method on a path-resolvable receiver, or a call held in an enclosing `let`. A
   call whose receiver arrives as a FUNCTION PARAMETER, a RETURN, a STRUCT FIELD
-  or a function pointer, or one a macro emits, moves no pinned count — and inside
-  a funnel module the deny is allowed, so nothing else refuses it either.
-  `src/atomic/guard.rs`'s audit names that shape at the derivation, and the
-  review of a funnel change has to cover it.
+  or a function pointer moves no pinned count — and inside a funnel module the
+  deny is allowed, so nothing else refuses it either. A canonical path spelled
+  inside a `macro_rules!` body IS counted (a test pins that); an aliased or
+  non-canonical spelling there is not. `src/atomic/guard.rs`'s audit names the
+  shape it can resolve at the derivation, and the review of a funnel change has
+  to cover the rest.
 * **Guaranteed as an API.** Root confinement (a relative symlink target cannot leave
   the root, and neither can a mutation named by `(&RootDir, &RootedRelativePath)`), the
   atomic replace's commit points and its reported durability, lock mutual exclusion
@@ -416,10 +425,14 @@ cargo check --all-targets --target x86_64-pc-windows-msvc
 cargo test --doc
 ```
 
-`STOREKIT_FULL_TESTS=1` does not add test names: it stops three tests returning
-early — the atomic replace's sweep over EVERY pre-rename stage, the tree copy's,
-and the two slow real-`sshd` cases — so the default run covers a sampled shape
-and the widened run covers all of them.
+`STOREKIT_FULL_TESTS=1` does not add test names: FOUR tests consult it, measured
+with `rg -n slow_tests_enabled src`. Three return early with a printed skip
+reason — the atomic replace's sweep over EVERY pre-rename stage, the
+concurrent-controller ssh case, and the every-boundary swap case — and one
+widens its own exhaustive sweep instead
+(`valid_name_agrees_with_the_independent_characterization`). The default run
+covers sampled shapes; the widened run covers all of them. The real-`sshd`
+suites do NOT consult it and run under plain `cargo test` on Linux.
 
 TWO clippy commands, and the second is not optional: `--all-targets` compiles the HOST
 only, and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module is

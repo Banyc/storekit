@@ -7179,7 +7179,7 @@ impl Applier<'_, '_> {
             let mut unexpected: Vec<String> = Vec::new();
             for (name, _kind) in live.iter() {
                 let name_text = String::from_utf8_lossy(name);
-                if is_reserved_name(OsStr::new(name_text.as_ref())) {
+                if is_unaddressable_name(OsStr::new(name_text.as_ref())) {
                     continue;
                 }
                 if intended.contains(name) {
@@ -7245,7 +7245,7 @@ impl Applier<'_, '_> {
         let mut candidates: Vec<(String, EntryKind, Option<String>)> = Vec::new();
         for entry in &self.diff.dest.entries {
             let dir = parent_manifest(&entry.path);
-            if !self.touched_dirs.contains(&dir) || is_reserved_path(&entry.path) {
+            if !self.touched_dirs.contains(&dir) || is_unaddressable_path(&entry.path) {
                 continue;
             }
             // A path the run REMOVED (or that lies under a removed ancestor) is
@@ -7805,7 +7805,7 @@ fn aside_name() -> OsString {
 /// authority in [`crate::reserved`], which [`crate::id::valid_name`] also
 /// consults, so a spelling refused as an id is exactly a spelling this sync
 /// strips from the manifests (and therefore can never transfer or destroy).
-fn is_reserved_name(name: &OsStr) -> bool {
+fn is_unaddressable_name(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(crate::reserved::is_unaddressable_name)
 }
@@ -7814,7 +7814,7 @@ fn is_reserved_name(name: &OsStr) -> bool {
 /// reserved DIRECTORY makes every entry below it reserved too (the aside holds
 /// the whole stranded subtree). Component splitting lives in
 /// [`crate::reserved`], shared with the public predicate.
-fn is_reserved_path(path: &str) -> bool {
+fn is_unaddressable_path(path: &str) -> bool {
     crate::reserved::is_unaddressable_path(path)
 }
 
@@ -8055,7 +8055,7 @@ fn flip_ascii_case(name: &str) -> String {
 fn reserved_entries(meta: &TreeMetadata) -> Result<BTreeMap<String, EntryKind>> {
     let mut reserved = BTreeMap::new();
     for entry in &meta.entries {
-        if is_reserved_path(&entry.path) {
+        if is_unaddressable_path(&entry.path) {
             reserved.insert(entry.path.clone(), entry.entry_type);
         }
     }

@@ -562,7 +562,7 @@ fn assert_residue_present(report: &SyncReport, roots: &[&Path]) {
         let components: Vec<_> = Path::new(residue).components().collect();
         for (index, component) in components.iter().enumerate() {
             if let std::path::Component::Normal(name) = component
-                && is_reserved_name(name)
+                && is_unaddressable_name(name)
             {
                 assert_eq!(
                     index,
@@ -1766,7 +1766,7 @@ impl Remote for RecordingRemote {
         }
         if self.fail_metadata_for_reserved_after_rename
             && self.renames.load(Ordering::SeqCst) > 0
-            && is_reserved_path(&rel.to_string())
+            && is_unaddressable_path(&rel.to_string())
         {
             // A degraded session: the rename has happened and the follow-up
             // probe of the reserved aside ALSO fails, so the entry's location
@@ -5885,7 +5885,7 @@ fn a_parent_sync_never_destroys_a_held_nested_lock_record() {
 }
 
 /// F1: the crate's own `sync` must not carry the lock record over a live
-/// holder's inode. Pre-fix `is_reserved_path` consulted only the byte-exact
+/// holder's inode. Pre-fix `is_unaddressable_path` consulted only the byte-exact
 /// reserved spellings, which do NOT include the application lock record
 /// `operation.lock`, so a source entry `state/operation.lock` was neither
 /// stripped nor treated as residue and was applied as ordinary content: the
@@ -8067,13 +8067,13 @@ fn strip_reserved_recomputes_the_canonical_digest() {
     // exact metadata (entries and digest) `strip_reserved` must produce.
     let expected = canonicalize_tree(&without_aside).unwrap();
     assert!(
-        full.entries.iter().any(|e| is_reserved_path(&e.path)),
+        full.entries.iter().any(|e| is_unaddressable_path(&e.path)),
         "the fixture must actually contain a reserved entry: {full:?}"
     );
 
     // (a) Stripping the reserved entry yields the canonical metadata of the
     //     remaining tree, digest included.
-    let stripped = crate::sync::diff::strip_reserved(full.clone(), is_reserved_path);
+    let stripped = crate::sync::diff::strip_reserved(full.clone(), is_unaddressable_path);
     assert_eq!(
         stripped, expected,
         "stripping the reserved entry must yield the canonical metadata of the \
@@ -8082,7 +8082,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
 
     // (b) A manifest with NO reserved entries strips to ITSELF: the digest
     //     `canonicalize_tree` produced must survive the (identity) strip.
-    let untouched = crate::sync::diff::strip_reserved(expected.clone(), is_reserved_path);
+    let untouched = crate::sync::diff::strip_reserved(expected.clone(), is_unaddressable_path);
     assert_eq!(
         untouched.tree_sha256, expected.tree_sha256,
         "stripping a manifest with no reserved entries must leave the canonical \
@@ -8092,7 +8092,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
     // (c) Idempotence: a second strip sees a digest already equal to the
     //     canonical one and must not drift again.
     assert_eq!(
-        crate::sync::diff::strip_reserved(stripped.clone(), is_reserved_path),
+        crate::sync::diff::strip_reserved(stripped.clone(), is_unaddressable_path),
         stripped,
         "strip_reserved must be idempotent"
     );
@@ -13567,7 +13567,7 @@ fn the_sibling_record_does_not_compose_with_the_in_root_layout_lock() {
 /// and absolute destination roots.
 ///
 /// LOAD-BEARING BY MUTATION: the record used to hardcode `".operation.lock"`
-/// while `is_reserved_name` consumed `reserved::OPERATION_LOCK_SUFFIX`. Change
+/// while [`crate::reserved::is_reserved_name`] consumed `reserved::OPERATION_LOCK_SUFFIX`. Change
 /// ONLY the constant (say to `".operation.lockX"`) and the hardcoded record is
 /// no longer reserved: a parent sync destroys a held lock record (the
 /// `a_parent_sync_never_destroys_a_held_nested_lock_record` failure) and THIS
