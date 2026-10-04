@@ -598,13 +598,31 @@ gap at `deploy/src/retention/checkpoint/mod.rs` are what this closes).
 
 ## Rules for changing this crate
 
-**Mechanically enforced today.** The crate has exactly TWO source audits, both
-in `atomic::guard::tests`: `no_libc_reference_outside_the_funnel` fails on any
-new `libc` reference outside `src/atomic/unix.rs` (a mutating symbol, a
-`use libc as alias`, a braced self-alias, a re-export, a glob, or a call broken
-across a newline), and `std_fs_name_mutation_counts_are_pinned` fails when a
-production `std::fs` removal/replace/rename call count changes. Together they
-back the rule that every name mutation goes through the ONE guarded funnel.
+**Mechanically enforced today.** TWO devices with DIFFERENT jobs — neither covers
+the other, and the gate must run both.
+
+* The **resolved-symbol deny** (`clippy.toml` + `#![deny(clippy::disallowed_methods)]`
+at the crate root) makes the compiler refuse a call to any listed name-mutating
+symbol (`std::fs::{remove_file,remove_dir,remove_dir_all,rename,hard_link,set_permissions}`
+and the `libc` syscalls the funnel wraps) from any module not granted the allow.
+This is the **completeness** device: it matches the symbol the compiler RESOLVED,
+so no alias, raw identifier, cross-module re-export, glob, parenthesized or
+referenced callee, macro body, or `#[path]`-relocated module evades it — all eight
+shapes were measured against it. It runs only under `cargo clippy`, so
+`cargo clippy --all-targets -- -D warnings` is part of the gate and `cargo test`
+alone does not exercise it.
+* The **two source audits** in `atomic::guard::tests` run under `cargo test`, i.e.
+always: `no_libc_reference_outside_the_funnel` fails on a new `libc` reference
+outside the funnel, and `std_fs_name_mutation_counts_are_pinned` fails when a
+production `std::fs` removal/replace/rename call count changes. Their job is what
+the lint cannot do — notice when the funnel's OWN calls change, inside the modules
+where the deny is allowed and therefore blind — and they resolve the enumerated
+import routes by PARSING the sources, independently of the lint's symbol
+resolution.
+
+Together they back the rule that every name mutation goes through the ONE guarded
+funnel, and `clippy.toml`'s allow list (whose comments name the rule each module
+implements) IS the operative definition of the funnel's membership.
 
 **Review conventions, NOT mechanical checks.** The rest of this list is enforced
 by review: in particular "fix the class, not the instance", "an oracle must be
@@ -716,13 +734,22 @@ implied to be checked.
   can be deleted with zero coverage lost, and one test can be deleted with
   everything lost. The reconciliation table is the artifact that discharges this
   rule; a count cannot.
-- **An audit's shape is part of its guarantee.** Both source audits strip
-  `#[cfg(test)]` items AND the attribute that follows them, so
-  `#[cfg(test)] #[cfg(unix)]` is stripped while `#[cfg(all(test, unix))]` is NOT —
-  a large platform-gated test suite written the second way reads as production
-  code and trips both pins. When adding a gated test module, keep the attributes
-  separate, and state what an audit actually skips rather than what it appears to
-  skip.
+- **An audit's shape is part of its guarantee.** Exemption is by COMPILE-TIME
+  gating, and the two forms behave differently:
+  * a separate FILE is exempt iff EVERY `mod` declaration naming it is
+    `cfg`-gated on `test`, where `cfg_implies_test` understands `all(test, …)`
+    and `any(...)` — so `#[cfg(all(test, unix))] mod x;` DOES exempt `src/x.rs`.
+    An earlier version of this bullet said the opposite (that a file gated that
+    way "reads as production code and trips both pins"); that was true of the
+    filename-suffix rule it replaced and is false now.
+  * an INLINE module in a production file is stripped only when its attribute
+    run contains `#[cfg(test)]`; `#[cfg(all(test, unix))] mod x { … }` written
+    inline is NOT recognised as test-only, so its body reads as production
+    (true for the audits; the clippy deny does not parse attributes at all and
+    fires on the resolved symbol wherever it is).
+  * a file declared BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is
+    PRODUCTION: the exemption requires EVERY declaration to be test-gated,
+    because otherwise a production module can hide behind a same-named test twin.
 - **A claim is a measurement or it is a label.** Every behavioural or countable
   claim in `README.md`, `docs/API-CONSTRAINTS.md` and `docs/CONSISTENCY.md`
   either names the command, test or table that produced it, or says in the
