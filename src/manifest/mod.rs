@@ -4692,7 +4692,7 @@ mod tests {
     /// tree the LOCAL walk refuses on a name/target rule, the WIRE path (the
     /// real perl script, whose raw-byte checks are the only ones that can see a
     /// tab or a non-UTF-8 byte) must also refuse. This is the test that catches
-    /// a divergence of the round-17 class: before the far-side check a
+    /// a divergence of the local/wire parity class: before the far-side check a
     /// non-UTF-8 name was refused locally but accepted (as `U+FFFD`) over the
     /// wire. Pre-fix the local walk ACCEPTED the tab and non-UTF-8 TARGET cases
     /// and the script exited 0 for the tab NAME case, so this test FAILS

@@ -795,7 +795,7 @@ fn entry_names(dir: &Path) -> Vec<String> {
 /// `Prepared::matches` step 4 compares the remote's LOCALNESS for BOTH
 /// directions, but before this test only the PULL direction was pinned: gating
 /// step 4 on `direction == Direction::Pull` left the ENTIRE suite green, so a
-/// future edit could re-open the PUSH half of round 9's P1. A token minted
+/// future edit could re-open the PUSH half of the localness binding. A token minted
 /// against a LOCAL destination — `DestinationOwnership::lock(Direction::Push,
 /// src, &LocalTransport over P)` records `remote_is_local == true` and states
 /// no endpoint identity — is replayed against a NON-LOCAL third-party `Remote`
