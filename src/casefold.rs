@@ -1725,25 +1725,57 @@ mod tests {
         }
     }
 
-    /// The 28 `C`/`F` mappings Unicode 17.0.0 added over 16.0.0, plus the total
-    /// table length. Regenerating at the `unicode-normalization 0.1.25`
-    /// version (17.0.0) is what keeps the fold and the normalization step on
-    /// the same UCD version; this pins that regeneration.
+    /// All 28 `C`/`F` mappings Unicode 17.0.0 added over 16.0.0, asserted
+    /// individually, plus the total table length. Regenerating at the
+    /// `unicode-normalization 0.1.25` version (17.0.0) is what keeps the fold
+    /// and the normalization step on the same UCD version; this pins that
+    /// regeneration. Every added code point is checked against both its fold
+    /// and its entry in [`CASE_FOLD`], so a regeneration that drops or
+    /// mistypes any one of the 28 fails here.
     #[test]
     fn the_table_covers_the_unicode_17_additions() {
-        for (cp, expected) in [
+        const ADDED: [(u32, &str); 28] = [
             (0xA7CEu32, "\u{a7cf}"),
             (0xA7D2, "\u{a7d3}"),
             (0xA7D4, "\u{a7d5}"),
             (0x16EA0, "\u{16ebb}"),
             (0x16EA1, "\u{16ebc}"),
+            (0x16EA2, "\u{16ebd}"),
+            (0x16EA3, "\u{16ebe}"),
+            (0x16EA4, "\u{16ebf}"),
+            (0x16EA5, "\u{16ec0}"),
+            (0x16EA6, "\u{16ec1}"),
+            (0x16EA7, "\u{16ec2}"),
+            (0x16EA8, "\u{16ec3}"),
+            (0x16EA9, "\u{16ec4}"),
+            (0x16EAA, "\u{16ec5}"),
+            (0x16EAB, "\u{16ec6}"),
+            (0x16EAC, "\u{16ec7}"),
+            (0x16EAD, "\u{16ec8}"),
+            (0x16EAE, "\u{16ec9}"),
+            (0x16EAF, "\u{16eca}"),
+            (0x16EB0, "\u{16ecb}"),
+            (0x16EB1, "\u{16ecc}"),
+            (0x16EB2, "\u{16ecd}"),
+            (0x16EB3, "\u{16ece}"),
+            (0x16EB4, "\u{16ecf}"),
+            (0x16EB5, "\u{16ed0}"),
+            (0x16EB6, "\u{16ed1}"),
+            (0x16EB7, "\u{16ed2}"),
             (0x16EB8, "\u{16ed3}"),
-        ] {
+        ];
+        for (cp, expected) in ADDED {
             let s = char::from_u32(cp).unwrap().to_string();
             assert_eq!(
                 case_fold(&s),
                 expected,
                 "U+{cp:04X} must fold as 17.0.0 says"
+            );
+            assert!(
+                CASE_FOLD
+                    .binary_search_by_key(&cp, |(cp, _)| *cp)
+                    .is_ok_and(|i| CASE_FOLD[i].1 == expected),
+                "CASE_FOLD must map U+{cp:04X} to {expected:?}"
             );
         }
         assert_eq!(
