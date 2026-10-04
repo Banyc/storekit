@@ -994,6 +994,89 @@ mod tests {
         assert_eq!(decision.classify("f"), Some(EntryDiff::Same));
     }
 
+    /// The SOURCE side of [`apply_manifests`] strips with the BROAD
+    /// [`crate::reserved::is_unaddressable_path`], NOT the byte-exact
+    /// [`crate::reserved::is_reserved_path`], and this test pins that
+    /// difference. Two spellings are unaddressable but not byte-exact
+    /// reserved, so the narrow predicate lets BOTH through:
+    ///
+    /// * the application lock record `operation.lock`
+    ///   ([`crate::reserved::APPLICATION_LOCK_NAME`]);
+    /// * a crate TEMP shape — here `.a.tmp.<pid>.<n>`, minted by
+    ///   [`crate::atomic::temp_name_for`] rather than guessed — which
+    ///   [`crate::atomic::is_crate_temp_name`] recognises as only the crate's
+    ///   own atomic machinery can spell.
+    ///
+    /// Narrowing the SOURCE strip at [`apply_manifests`] to `is_reserved_path`
+    /// would leave both in the source view, so a caller diffing the stripped
+    /// primitives would replicate the crate's own lock record and a crashed
+    /// temp. The sibling fixture spelled only `.sync-aside.<pid>.<n>` cannot
+    /// tell the predicates apart, because both strip it.
+    #[test]
+    fn apply_manifests_strips_the_source_view_with_the_broad_unaddressable_authority() {
+        let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        write(&src.join("keep"), b"content");
+        write(&src.join(crate::reserved::APPLICATION_LOCK_NAME), b"");
+        let temp = crate::atomic::temp_name_for(Path::new("a"));
+        let temp = temp.file_name().unwrap().to_str().unwrap().to_owned();
+        write(&src.join(&temp), b"crashed-temp");
+        fs::create_dir_all(&dst).unwrap();
+
+        // The two authorities DISAGREE on exactly these spellings; asserting
+        // the disagreement here states why the strip assertion below is able
+        // to fail. `is_reserved_path` answers false for both, so a source
+        // strip narrowed to it would keep them.
+        for name in [crate::reserved::APPLICATION_LOCK_NAME, temp.as_str()] {
+            assert!(
+                crate::reserved::is_unaddressable_path(name),
+                "{name} is unaddressable"
+            );
+            assert!(
+                !crate::reserved::is_reserved_path(name),
+                "{name} is not byte-exact reserved, so the narrow predicate would keep it"
+            );
+        }
+
+        let src_t =
+            LocalTransport::new(&SysEnv::from_process(), src.clone(), Layout::empty()).unwrap();
+        let dst_t =
+            LocalTransport::new(&SysEnv::from_process(), dst.clone(), Layout::empty()).unwrap();
+        let source = remote_manifest(&src_t).unwrap();
+        let destination = remote_destination_manifest(&dst_t).unwrap();
+        assert!(
+            source
+                .entries
+                .iter()
+                .any(|entry| entry.path == crate::reserved::APPLICATION_LOCK_NAME),
+            "fixture: the lock record is in the raw source manifest"
+        );
+        assert!(
+            source.entries.iter().any(|entry| entry.path == temp),
+            "fixture: the crate temp is in the raw source manifest"
+        );
+
+        let (stripped, _) = apply_manifests(&source, &destination);
+        let paths: Vec<&str> = stripped
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(
+            !paths.contains(&crate::reserved::APPLICATION_LOCK_NAME),
+            "the broad source strip removes the application lock record; got {paths:?}"
+        );
+        assert!(
+            !paths.contains(&temp.as_str()),
+            "the broad source strip removes a crate temp shape; got {paths:?}"
+        );
+        assert!(
+            paths.contains(&"keep"),
+            "the source strip keeps ordinary content; got {paths:?}"
+        );
+    }
+
     /// `remote_manifest` and `remote_destination_manifest` PREPARE the
     /// transport's host identity before their first remote request, exactly as
     /// the sync entry points do. Pre-fix they did not, so a fresh
