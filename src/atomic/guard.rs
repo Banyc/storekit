@@ -741,6 +741,91 @@ mod tests {
         "umount2",
     ];
 
+    /// The NAME-MUTATION family as an INDEPENDENT LITERAL ORACLE, and the
+    /// reason each member is in the class. It is deliberately NOT derived from
+    /// [`MUTATING_LIBC_SYSCALLS`] or [`NON_MUTATING_LIBC_CALLS`]: the belt is
+    /// the device that makes a REVIEWED `.pin` outside the funnel safe, so its
+    /// property must survive a reclassification of those two lists. A member
+    /// MOVED from [`MUTATING_LIBC_SYSCALLS`] into
+    /// [`NON_MUTATING_LIBC_CALLS`] changes only this oracle's side of a set
+    /// equality, so [`the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel`]
+    /// fails — which no predicate of the form "for every member of
+    /// [`MUTATING_LIBC_SYSCALLS`], …" can, since the moved symbol is no longer
+    /// a member to iterate.
+    ///
+    /// The justification is the shared CLASS, exactly as in
+    /// [`MUTATING_LIBC_SYSCALLS`]'s doc: a member can FREE or SWAP a directory
+    /// entry, ADOPT/CREATE a name (including by `open`/`creat` with `O_CREAT`),
+    /// or change metadata attached to a NAME (mode/owner/time/xattr/flags), or
+    /// change the mount NAME SPACE. The descriptor-bound variants
+    /// (`fchmod`/`fchown`/`ftruncate`/`futimens`) are included because the code
+    /// family includes them; were they reclassified as non-mutating, both sides
+    /// of the equality and the disjointness assertion would demand the change be
+    /// stated here with a new reason.
+    const KNOWN_NAME_MUTATORS: &[&str] = &[
+        // FREE or SWAP a directory entry.
+        "unlink",
+        "unlinkat",
+        "remove",
+        "rmdir",
+        "rename",
+        "renameat",
+        "renameat2",
+        // CREATE or replace a LINK at a name.
+        "link",
+        "linkat",
+        "symlink",
+        "symlinkat",
+        // CREATE a directory entry (directory, device node, FIFO, clone).
+        "mkdir",
+        "mkdirat",
+        "mknod",
+        "mknodat",
+        "mkfifo",
+        "mkfifoat",
+        "clonefile",
+        "clonefileat",
+        // ADOPT or TRUNCATE a name through an open with O_CREAT/O_TRUNC.
+        "open",
+        "openat",
+        "open64",
+        "openat64",
+        "openat2",
+        "creat",
+        "creat64",
+        // An AF_UNIX `bind` creates the bound pathname entry.
+        "bind",
+        // Change metadata attached to a NAME.
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "chown",
+        "fchown",
+        "lchown",
+        "fchownat",
+        "truncate",
+        "ftruncate",
+        "utime",
+        "utimes",
+        "futimens",
+        "utimensat",
+        "setxattr",
+        "lsetxattr",
+        "fsetxattr",
+        "removexattr",
+        "lremovexattr",
+        "fremovexattr",
+        "chflags",
+        "fchflags",
+        "lchflags",
+        "setattrlist",
+        "exchangedata",
+        // Change the mount NAME SPACE.
+        "mount",
+        "umount",
+        "umount2",
+    ];
+
     /// The `libc::<fn>` CALL symbols the tree references that are REVIEWED as
     /// unable to ADOPT, FREE, SWAP, or re-attribute a NAME: they act on an open
     /// DESCRIPTOR, on the PROCESS, on a RESOURCE LIMIT, or only READ a name.
@@ -1381,20 +1466,93 @@ mod tests {
         })
     }
 
-    /// The FUNNEL modules: every PRODUCTION file whose module-level
-    /// `#![allow(clippy::disallowed_methods)]` makes the crate-root
-    /// resolved-symbol deny blind inside it. DERIVED from the parsed sources, so
+    /// The FUNNEL modules: every PRODUCTION file INSIDE a funnel region, i.e.
+    /// whose module is allow-bearing or is nested under a module that is. The
+    /// allow is a MODULE attribute, so Rust applies it to every item in the
+    /// module AND to every child module declared in it, including a
+    /// `mod child;` FILE. This is why `src/atomic/guard.rs` — which carries no
+    /// attribute of its own — is inside the region `src/atomic/mod.rs`
+    /// declares with its inner `#![allow(clippy::disallowed_methods)]`.
+    ///
+    /// DERIVED from the parsed sources and the parsed `mod` declarations, so
     /// the libc-surface pin in [`no_libc_reference_outside_the_funnel`] follows
-    /// the allow instead of a second, hardcoded list that could drift from the
-    /// `#[allow]`s. Item-level allows are covered separately by
-    /// [`funnel_symbol_surface`], which walks annotated items too.
+    /// the allow's reach instead of a second, hardcoded file list that could
+    /// drift from the `#[allow]`s. Item-level allows that do not sit on a
+    /// `mod` are covered separately by [`funnel_symbol_surface`], which walks
+    /// annotated items too.
     fn funnel_modules(files: &[(String, String)], gated: &BTreeSet<String>) -> BTreeSet<String> {
-        parse_crate(files, gated)
+        let parsed = parse_crate(files, gated);
+        let regions = funnel_region_modules(&parsed, gated);
+        parsed
             .iter()
             .filter(|source| !is_test_only(&source.rel, gated))
-            .filter(|source| attrs_allow_disallowed(&source.file.attrs))
+            .filter(|source| module_is_in_funnel_region(&regions, &source.module))
             .map(|source| source.rel.clone())
             .collect()
+    }
+
+    /// The module PATHS that are FUNNEL regions under Rust's attribute
+    /// INHERITANCE rule: a module whose FILE carries the inner
+    /// `#![allow(clippy::disallowed_methods)]`, or a `mod` item (inline or a
+    /// `mod child;` declaration, whose child file is a separate
+    /// [`ParsedSource`]) carrying the outer `#[allow(...)]`. Rust applies such
+    /// an allow to the module's own items and to every module nested inside it,
+    /// so the region is the set of module paths that have one of these as an
+    /// ancestor-or-self prefix.
+    ///
+    /// The old per-file predicate ([`attrs_allow_disallowed`] on one file's own
+    /// attrs) could only see a region declared IN that file, so a `mod child;`
+    /// whose PARENT module carried the allow was invisible — measured: a
+    /// non-adopting `File::options`-chain planted at the top level of
+    /// `src/atomic/guard.rs` changed nothing, while the identical call in
+    /// `src/error.rs` was a clippy error.
+    fn funnel_region_modules(
+        parsed: &[ParsedSource],
+        gated: &BTreeSet<String>,
+    ) -> BTreeSet<CanonPath> {
+        let mut regions: BTreeSet<CanonPath> = BTreeSet::new();
+        for source in parsed {
+            if is_test_only(&source.rel, gated) {
+                continue;
+            }
+            if attrs_allow_disallowed(&source.file.attrs) {
+                regions.insert(source.module.clone());
+            }
+            collect_funnel_mod_regions(&source.file.items, &source.module, &mut regions);
+        }
+        regions
+    }
+
+    /// Record the module path of every `mod` item carrying the funnel
+    /// `#[allow]`, recursively, so a `mod`-level allow reaches the child FILE
+    /// it declares (a `mod child;` has no inline items here; the child file's
+    /// own [`ParsedSource`] is matched against the recorded path by
+    /// [`module_is_in_funnel_region`]).
+    fn collect_funnel_mod_regions(
+        items: &[syn::Item],
+        module: &[String],
+        out: &mut BTreeSet<CanonPath>,
+    ) {
+        for item in items {
+            let syn::Item::Mod(module_item) = item else {
+                continue;
+            };
+            let mut child = module.to_vec();
+            child.push(unraw(&module_item.ident));
+            if item_allows_disallowed(item) {
+                out.insert(child.clone());
+            }
+            if let Some((_, inner)) = &module_item.content {
+                collect_funnel_mod_regions(inner, &child, out);
+            }
+        }
+    }
+
+    /// Whether a source file's `module` is inside a funnel region: some
+    /// ANCESTOR-OR-SELF prefix of its module path carries the allow, which is
+    /// exactly Rust's attribute-inheritance reach.
+    fn module_is_in_funnel_region(regions: &BTreeSet<CanonPath>, module: &[String]) -> bool {
+        (1..=module.len()).any(|end| regions.contains(&module[..end]))
     }
 
     /// Whether a `syn::Item` carries `#[allow(clippy::disallowed_methods)]`,
@@ -2904,66 +3062,126 @@ mod tests {
         );
     }
 
-    /// ROUND-9 ORACLE, INDEPENDENT OF THE REVIEW LIST. The `libc` belt is the
-    /// device cited to make a REVIEWED PIN outside the funnel safe, so it must
-    /// REFUSE a pinned known name-mutating syscall even if the two
-    /// classification lists are edited against each other.
+    /// ROUND-10 ORACLE, INDEPENDENT OF **BOTH** CLASSIFICATION LISTS. The
+    /// `libc` belt is the device cited to make a REVIEWED PIN outside the
+    /// funnel safe, so it must REFUSE a pinned known name-mutating syscall even
+    /// if the two lists are edited against each other. For a symbol the lint
+    /// does not deny (`libc::chmod`) the belt is the SOLE device.
     ///
-    /// Round 9's repro: `libc::unlinkat` was MOVED out of
-    /// [`MUTATING_LIBC_SYSCALLS`] into [`NON_MUTATING_LIBC_CALLS`], a
-    /// production NON-funnel `libc::unlinkat` was added, pinned in the OUTSIDE
-    /// map, and every existing test stayed green — the belt, the very device
-    /// that makes the reviewed pin safe, could not fail for the property it is
-    /// quoted to protect. `every_libc_call_symbol_the_tree_references_is_classified`
-    /// only checks membership in the UNION, so it cannot see the misfiling; the
-    /// disjointness assertion and this literal expected-mutating list can.
+    /// Round 9's oracle used a SEVEN-name literal and a predicate of the form
+    /// "for every member of MUTATING_LIBC_SYSCALLS, …". Two reviewers moved
+    /// `chmod` / `chown` / `mknodat` / `remove` / `renameat2` / `truncate` /
+    /// `fchmodat` / `utimensat` into NON_MUTATING_LIBC_CALLS and the belt went
+    /// green: the moved symbol is no longer a member to iterate, and
+    /// `every_libc_call_symbol_the_tree_references_is_classified` only tests
+    /// membership in the UNION. That oracle was LIST-shaped — it answered "is
+    /// the list the list?" instead of "is the property true?".
     ///
-    /// The list below is a LITERAL, not derived from either constant, and the
-    /// source is synthetic text, so the oracle exercises the DERIVED belt and
-    /// the audit's OWN refusal predicate
-    /// ([`libc_reference_outside_funnel_is_allowed`]) without depending on the
-    /// crate's real tree or on `NON_MUTATING_LIBC_CALLS`.
+    /// This oracle is PROPERTY-shaped. [`KNOWN_NAME_MUTATORS`] is an
+    /// independent literal with its own justification, and the test asserts
+    /// (1) SET EQUALITY with [`MUTATING_LIBC_SYSCALLS`] — a MOVE out of the code
+    /// family, an ADD, or a REMOVE changes one side and fails; (2) DISJOINTNESS
+    /// from [`NON_MUTATING_LIBC_CALLS`], checked against the LITERAL so a MOVE
+    /// fails here too; (3) every literal member is REFUSED by the belt the
+    /// audit DERIVES from a source that references it, via the audit's OWN
+    /// predicate ([`libc_reference_outside_funnel_is_allowed`]); (4) the
+    /// DEFAULT-DENY clause ALONE — a belt built with no family contribution, so
+    /// the property does not depend on [`MUTATING_LIBC_SYSCALLS`] at all — also
+    /// refuses every literal member, which is the anti-circular half, because
+    /// the only way to disarm it is the exclusion a MOVE into the non-mutating
+    /// review list would add; and (5) names a symbol the lint does NOT deny, so
+    /// the belt is the SOLE device there.
     #[test]
     fn the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel() {
-        const KNOWN_NAME_MUTATORS: &[&str] = &[
-            "unlinkat",
-            "renameat",
-            "mkdirat",
-            "symlinkat",
-            "linkat",
-            "mkfifo",
-            "openat",
-        ];
-        let overlap: Vec<&&str> = MUTATING_LIBC_SYSCALLS
+        // (1) ANTI-CIRCULAR SET EQUALITY. The literal oracle and the code's
+        // family must name the SAME symbols. This is the arm a MOVE cannot
+        // evade: removing a member from MUTATING_LIBC_SYSCALLS (into the
+        // non-mutating list or nowhere) leaves it in the literal.
+        let code_family: BTreeSet<&str> = MUTATING_LIBC_SYSCALLS.iter().copied().collect();
+        let literal_family: BTreeSet<&str> = KNOWN_NAME_MUTATORS.iter().copied().collect();
+        let missing_from_code: Vec<&&str> = literal_family.difference(&code_family).collect();
+        let missing_from_literal: Vec<&&str> = code_family.difference(&literal_family).collect();
+        assert!(
+            missing_from_code.is_empty(),
+            "these KNOWN name mutators are absent from MUTATING_LIBC_SYSCALLS, so the belt \
+             (whose family clause is that list) has stopped refusing them: {missing_from_code:?}. A \
+             MOVE of a family member into NON_MUTATING_LIBC_CALLS disarms the belt, which is the \
+             device that makes a reviewed pin outside the funnel safe; state the reclassification \
+             here with its justification or restore the member."
+        );
+        assert!(
+            missing_from_literal.is_empty(),
+            "MUTATING_LIBC_SYSCALLS names {missing_from_literal:?}, which the independent \
+             KNOWN_NAME_MUTATORS oracle does not. A new family member must be added to the literal \
+             WITH its reason, so the oracle keeps tracking the CLASS rather than the list."
+        );
+
+        // (2) DISJOINTNESS, checked against the LITERAL as well as the code
+        // list, so a member moved into the review list for non-mutating calls
+        // fails here even if it were also removed from MUTATING_LIBC_SYSCALLS.
+        let overlap: Vec<&&str> = KNOWN_NAME_MUTATORS
             .iter()
             .filter(|symbol| NON_MUTATING_LIBC_CALLS.contains(symbol))
             .collect();
         assert!(
             overlap.is_empty(),
-            "`MUTATING_LIBC_SYSCALLS` and `NON_MUTATING_LIBC_CALLS` must be DISJOINT, or moving a \
-             family member into the review list silently disarms the belt: {overlap:?}"
+            "NON_MUTATING_LIBC_CALLS claims these code-independent KNOWN name mutators, which \
+             disarms the belt by excluding them from its default-deny clause: {overlap:?}"
         );
+
+        // (3)+(4) Each literal member is refused by the DERIVED belt AND by the
+        // default-deny clause ALONE. The synthetic source makes the symbol a
+        // referenced `libc::<fn>(…)` call, exactly how the real tree puts a
+        // symbol on the belt.
         for symbol in KNOWN_NAME_MUTATORS {
+            let sources = vec![(
+                "src/prod/synthetic.rs".to_string(),
+                format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
+            )];
+            let reference = format!("libc::{symbol}");
+            let belt = mutating_libc_belt(&sources);
             assert!(
-                MUTATING_LIBC_SYSCALLS.contains(symbol),
-                "{symbol} mutates a NAME by POSIX definition and must be on the belt's family list, \
-                 whichever way the review list is edited"
+                !libc_reference_outside_funnel_is_allowed(&belt, &reference),
+                "a pinned OUTSIDE reference to the name mutator {reference} was ALLOWED by the \
+                 belt; the belt is DERIVED, so a non-funnel production reference must land on it: \
+                 {belt:?}"
+            );
+            let default_deny: BTreeSet<String> = libc_call_symbols(&code_only(&sources[0].1))
+                .into_iter()
+                .filter(|name| !NON_MUTATING_LIBC_CALLS.contains(&name.as_str()))
+                .collect();
+            assert!(
+                !libc_reference_outside_funnel_is_allowed(&default_deny, &reference),
+                "the DEFAULT-DENY clause ALONE (a belt with no family contribution) must refuse \
+                 {reference}; it did not, which means the symbol sits on NON_MUTATING_LIBC_CALLS: \
+                 {default_deny:?}"
+            );
+        }
+
+        // (5) For a symbol the clippy deny does NOT name, the belt is the SOLE
+        // device. `libc::chmod` and `libc::renameat2` are name mutators on the
+        // belt and absent from clippy.toml, so a non-funnel production
+        // reference can only be refused by this belt.
+        let denied = denied_symbols_from_clippy_toml();
+        for symbol in ["chmod", "renameat2"] {
+            assert!(
+                KNOWN_NAME_MUTATORS.contains(&symbol),
+                "{symbol} must stay on the code-independent family oracle"
             );
             assert!(
-                !NON_MUTATING_LIBC_CALLS.contains(symbol),
-                "the review list for NON-mutating calls must not claim the name mutator {symbol}"
+                !denied.contains(&format!("libc::{symbol}")),
+                "clippy.toml now denies libc::{symbol}; this arm exists to prove the BELT refuses a \
+                 symbol the lint does not, so the arm must be re-pointed at one the lint omits"
             );
             let sources = vec![(
                 "src/prod/synthetic.rs".to_string(),
                 format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
             )];
             let belt = mutating_libc_belt(&sources);
-            let reference = format!("libc::{symbol}");
             assert!(
-                !libc_reference_outside_funnel_is_allowed(&belt, &reference),
-                "a pinned OUTSIDE reference to the name mutator {reference} was ALLOWED by the \
-                 belt; the belt is DERIVED, so a non-funnel production reference must land on it: \
-                 {belt:?}"
+                !libc_reference_outside_funnel_is_allowed(&belt, &format!("libc::{symbol}")),
+                "libc::{symbol} is refused by NEITHER clippy.toml nor the belt; a non-funnel \
+                 production reference would be undefended: {belt:?}"
             );
         }
     }
@@ -3273,6 +3491,24 @@ mod tests {
                 "fn f(p: &Path) -> std::io::Result<()> { let mut o = std::fs::OpenOptions::new(); \
                  o.write(true).create_new(true); let _ = o.open(p)?; Ok(()) }",
                 "OpenOptions::create_new",
+            ),
+            (
+                "File::options (the stable OpenOptions synonym)",
+                "fn f(p: &Path) -> std::io::Result<()> { let _ = \
+                 std::fs::File::options().write(true).create(true).open(p)?; Ok(()) }",
+                "OpenOptions::create",
+            ),
+            (
+                "OpenOptions::default",
+                "fn f(p: &Path) -> std::io::Result<()> { let _ = \
+                 std::fs::OpenOptions::default().write(true).create_new(true).open(p)?; Ok(()) }",
+                "OpenOptions::create_new",
+            ),
+            (
+                "DirBuilder::default",
+                "fn f(p: &Path) -> std::io::Result<()> { std::fs::DirBuilder::default().create(p)?; \
+                 Ok(()) }",
+                "DirBuilder::create",
             ),
             (
                 "DirBuilder::create",
@@ -4113,16 +4349,39 @@ mod tests {
     }
 
     /// The `std::fs` BUILDER type (`OpenOptions` / `DirBuilder`) a canonical
-    /// path names, if it is the type itself or one of its `new` constructors:
-    /// both `std::fs::OpenOptions` and `std::fs::OpenOptions::new` bottom out
-    /// here, so the receiver of a builder chain (`OpenOptions::new().create`)
-    /// and the receiver of a split `let` binding (`let mut o =
-    /// OpenOptions::new(); o.create`) resolve to the SAME owner. `File` is
-    /// deliberately excluded: its name-mutating calls are the ASSOCIATED
-    /// functions (`File::create`) the call arm already records, while an
-    /// instance method on an open `File` (`set_permissions`, `set_len`) is
-    /// descriptor-bound and the crate's documented permitted side.
+    /// path names, if it is the type itself or one of its CONSTRUCTORS: both
+    /// `std::fs::OpenOptions` and `std::fs::OpenOptions::new` bottom out here,
+    /// so the receiver of a builder chain (`OpenOptions::new().create`) and the
+    /// receiver of a split `let` binding (`let mut o = OpenOptions::new();
+    /// o.create`) resolve to the SAME owner.
+    ///
+    /// The constructor set is the STABLE SURFACE, not an enumeration of one
+    /// spelling: `std::fs::File::options()` is the documented synonym of
+    /// `OpenOptions::new()` (both return an `OpenOptions`), and
+    /// `OpenOptions::default()` / `DirBuilder::default()` are the `Default`
+    /// builders. Before this arm they resolved to NO owner, so an adoption flag
+    /// (`create`/`create_new`) reached through `File::options().create(true)`
+    /// was invisible to BOTH the closure derivation and the count pin while the
+    /// identical `OpenOptions::new().create(true)` was counted and denied.
+    ///
+    /// `File` itself is still deliberately excluded: its name-mutating
+    /// four-segment ASSOCIATED functions (`File::create`, `File::create_new`)
+    /// are recorded by the call arm, while an instance method on an open `File`
+    /// (`set_permissions`, `set_len`) is descriptor-bound and the crate's
+    /// documented permitted side. Only `File::options` — whose result IS an
+    /// `OpenOptions` — names the builder owner.
     fn builder_type(canonical: &[String]) -> Option<String> {
+        if let [std, fs, owner, ctor] = canonical
+            && std == "std"
+            && fs == "fs"
+        {
+            if owner == "File" && ctor == "options" {
+                return Some("OpenOptions".to_string());
+            }
+            if matches!(owner.as_str(), "OpenOptions" | "DirBuilder") && ctor == "default" {
+                return Some(owner.clone());
+            }
+        }
         let owner = match canonical {
             [std, fs, owner] if std == "std" && fs == "fs" => owner,
             [std, fs, owner, ctor] if std == "std" && fs == "fs" && ctor == "new" => owner,
@@ -4356,13 +4615,19 @@ mod tests {
     }
 
     /// The union of every funnel region's resolved `std::fs`/`libc` call
-    /// targets, derived from the parsed production sources.
+    /// targets, derived from the parsed production sources. The region is
+    /// derived by [`funnel_region_modules`], so a child FILE of an
+    /// allow-bearing module (`src/atomic/guard.rs` under `src/atomic/mod.rs`)
+    /// starts inside the region exactly as an inline `mod { … }` under an
+    /// annotated item does; starting the visitor at `false` per file was the
+    /// per-file defect that hid every cross-file child.
     fn funnel_symbol_surface(
         files: &[(String, String)],
         gated: &BTreeSet<String>,
     ) -> BTreeSet<String> {
         let parsed = parse_crate(files, gated);
         let index = build_index(&parsed);
+        let regions = funnel_region_modules(&parsed, gated);
         let mut used = BTreeSet::new();
         for source in &parsed {
             if is_test_only(&source.rel, gated) {
@@ -4371,7 +4636,7 @@ mod tests {
             let mut visitor = FunnelSymbols {
                 index: &index,
                 module: source.module.clone(),
-                in_funnel: false,
+                in_funnel: module_is_in_funnel_region(&regions, &source.module),
                 used: BTreeSet::new(),
                 locals: Vec::new(),
             };
@@ -4770,6 +5035,15 @@ fn chained(p: &std::path::Path) {
     let _ = O::new().truncate(false).open(p);
 }
 
+fn stable_constructor_synonyms(p: &std::path::Path) {
+    // `File::options()` and `OpenOptions::default()` are the SAME builder as
+    // `OpenOptions::new()`, so a chain rooted at either must resolve to the
+    // same owner or its `create`/`create_new` flag would be invisible.
+    let _ = std::fs::File::options().write(true).create(true).open(p);
+    let _ = std::fs::OpenOptions::default().read(true).open(p);
+    let _ = std::fs::DirBuilder::default();
+}
+
 fn split_local() {
     // The SPLIT builder spelling: the owner rides a `let` binding.
     let mut opts = OpenOptions::new();
@@ -4798,6 +5072,15 @@ fn not_attributed(p: &std::path::Path) {
             "std::fs::OpenOptions::truncate",
             "std::fs::OpenOptions::write",
             "std::fs::OpenOptions::open",
+            // The STABLE CONSTRUCTOR synonyms, and the flag method whose
+            // adoption they expose: without the `builder_type` extension the
+            // `File::options().create(true)` spelling recorded only the
+            // constructor, never the `OpenOptions::create` flag.
+            "std::fs::File::options",
+            "std::fs::OpenOptions::default",
+            "std::fs::DirBuilder::default",
+            "std::fs::OpenOptions::create",
+            "std::fs::OpenOptions::read",
         ] {
             assert!(
                 used.contains(expected),
@@ -5004,16 +5287,22 @@ impl S {
     }
 
     /// Whether `ty` IS a raw path argument: `&Path`, `&mut Path`, `PathBuf`,
-    /// `&PathBuf`, `Box<Path>`, `Option<&Path>`, or `impl AsRef<Path>` /
-    /// `impl Into<PathBuf>` (and the same nested through `Option`/`Box`).
+    /// `&PathBuf`, or `Path`/`PathBuf` nested through a PATH-BEARING
+    /// CONTAINER — `Option`, `Box`, `Cow`, `Rc`, `Arc`, `Vec`, `Result`, a
+    /// slice/array (`&[PathBuf]`, `[PathBuf; N]`), or a tuple that has a path
+    /// element (`(PathBuf,)`) — plus `impl AsRef<Path>` / `impl Into<PathBuf>`
+    /// and a type parameter bounded the same way.
     ///
     /// OUT OF CLASS, deliberately: a bare `&str`, `String`, `&OsStr`, or
-    /// `OsString`; and any `use … as` ALIAS of `Path`/`PathBuf` (the predicate
-    /// matches the last-segment NAME, so `use std::path::Path as ZP;` leaves
-    /// `&ZP` outside the class). A string is a path SPELLING, not a path, and
-    /// the type system does not distinguish a path-spelled string from any
-    /// other string; this crate has public fns taking one for a non-path
-    /// reason. The boundary is a stated property pinned by
+    /// `OsString` (a string is a path SPELLING, not a path); a CONTAINER of
+    /// those spellings (`&[String]`, `Vec<String>`, `(String,)`,
+    /// `Result<String>`), because the type system does not distinguish a
+    /// path-spelled string from any other string and this crate has public fns
+    /// taking one for a non-path reason; any type not on the container list
+    /// above (`HashMap<_, PathBuf>`, `BTreeMap<_, PathBuf>`); and any `use … as`
+    /// ALIAS of `Path`/`PathBuf` (the predicate matches the last-segment NAME,
+    /// so `use std::path::Path as ZP;` leaves `&ZP` outside the class). The
+    /// boundary is a stated property pinned in BOTH directions by
     /// [`pair_less_derivation_boundary_is_the_syntactic_path_class`], not an
     /// implication of this list. The alias case is measured, not assumed:
     /// `audited_fns` resolves no `use … as`, so the predicate is deliberately
@@ -5023,6 +5312,9 @@ impl S {
             syn::Type::Reference(reference) => type_is_raw_path(&reference.elem),
             syn::Type::Paren(paren) => type_is_raw_path(&paren.elem),
             syn::Type::Group(group) => type_is_raw_path(&group.elem),
+            syn::Type::Slice(slice) => type_is_raw_path(&slice.elem),
+            syn::Type::Array(array) => type_is_raw_path(&array.elem),
+            syn::Type::Tuple(tuple) => tuple.elems.iter().any(type_is_raw_path),
             syn::Type::ImplTrait(impl_trait) => impl_trait.bounds.iter().any(bound_is_raw_path),
             syn::Type::TraitObject(trait_object) => {
                 trait_object.bounds.iter().any(bound_is_raw_path)
@@ -5035,7 +5327,10 @@ impl S {
                 if matches!(name.as_str(), "Path" | "PathBuf") {
                     return true;
                 }
-                if !matches!(name.as_str(), "Option" | "Box" | "Cow" | "Rc" | "Arc") {
+                if !matches!(
+                    name.as_str(),
+                    "Option" | "Box" | "Cow" | "Rc" | "Arc" | "Vec" | "Result"
+                ) {
                     return false;
                 }
                 let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
@@ -5337,22 +5632,36 @@ impl S {
         ),
     ];
 
-    /// ROUND-8 P2-B BOUNDARY. The pair-less derivation is SYNTACTIC on the
-    /// parameter type, and its class is exactly `Path`/`PathBuf` (optionally
-    /// wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`), `impl AsRef<Path>`, `impl
-    /// Into<PathBuf>`, or a type parameter bounded the same way. A bare `&str`,
-    /// `String`, `&OsStr`, and `OsString` are NOT in the class: a string is a
-    /// path SPELLING, not a path, and this crate already has public fns that
-    /// take one for non-path reasons (`is_reserved_name`, `valid_hex_digest`,
-    /// the error constructors), so extending the class would make the
-    /// derivation a superset that no longer pins path mutations. A `use … as`
-    /// ALIAS of `Path`/`PathBuf` is likewise NOT in the class: the predicate
-    /// matches the last-segment NAME, and `audited_fns` resolves no imports, so
-    /// `use std::path::Path as ZP; pub fn f(p: &ZP)` is out of class BY
-    /// CONSTRUCTION. The boundary is therefore STATED, not implied, and this
-    /// test pins that the code does what the statement says — both directions,
-    /// including the alias case — so the statement cannot rot into a false
-    /// claim about the code.
+    /// ROUND-8 P2-B / ROUND-10 P3-B BOUNDARY. The pair-less derivation is
+    /// SYNTACTIC on the parameter type, and its class is exactly
+    /// `Path`/`PathBuf`, the same nested through a PATH-BEARING CONTAINER
+    /// (`Option`/`Box`/`Cow`/`Rc`/`Arc`/`Vec`/`Result`, a slice/array, or a
+    /// tuple with a path element), `impl AsRef<Path>`, `impl Into<PathBuf>`, or
+    /// a type parameter bounded the same way. A bare `&str`, `String`,
+    /// `&OsStr`, and `OsString` are NOT in the class, and NEITHER are CONTAINERS
+    /// of those spellings (`&[String]`, `Vec<String>`, `(String,)`,
+    /// `Result<String>`): a string is a path SPELLING, not a path, and this
+    /// crate already has public fns that take one for non-path reasons
+    /// (`is_reserved_name`, `valid_hex_digest`, the error constructors), so
+    /// sweeping strings in would make the derivation a superset that no longer
+    /// pins path mutations. A type not on the container list above
+    /// (`HashMap<_, PathBuf>`) is likewise OUT. A `use … as` ALIAS of
+    /// `Path`/`PathBuf` is NOT in the class: the predicate matches the
+    /// last-segment NAME, and `audited_fns` resolves no imports, so `use
+    /// std::path::Path as ZP; pub fn f(p: &ZP)` is out of class BY CONSTRUCTION.
+    /// The boundary is therefore STATED, not implied, and this test pins that
+    /// the code does what the statement says — both directions, for the
+    /// containers, the strings-in-containers, and the alias case — so the
+    /// statement cannot rot into a false claim about the code.
+    ///
+    /// The CONTAINER extension (round 10) is the fix for a measured hole: a
+    /// `pub fn f(paths: &[PathBuf])`, `(PathBuf,)`, or `Result<PathBuf>` was
+    /// neither in the stated in-class set nor the out-of-class set, and the
+    /// derivation passed for all three while the `&Path` control failed. A
+    /// container that carries a path IS a path-bearing public surface, so the
+    /// predicate now recurses through it; the element-type recursion is pinned
+    /// in BOTH directions (`&[Path]` in, `&[String]` out) rather than only the
+    /// positive one.
     #[test]
     fn pair_less_derivation_boundary_is_the_syntactic_path_class() {
         let derived_in = |prelude: &str, param: &str| {
@@ -5366,33 +5675,56 @@ impl S {
                 .expect("the synthetic `probe` must parse")
         };
         let derived = |param: &str| derived_in("", param);
-        // IN CLASS: a raw path, so the derivation sees it.
+        // IN CLASS: a raw path, directly or through a path-bearing container.
         for param in [
             "(p: &Path)",
             "(p: PathBuf)",
             "(p: Option<&Path>)",
             "(p: Box<PathBuf>)",
+            "(p: Rc<Path>)",
+            "(p: Arc<PathBuf>)",
+            "(p: Cow<'static, Path>)",
+            "(p: Vec<PathBuf>)",
+            "(p: &[Path])",
+            "(p: &[PathBuf])",
+            "(p: [PathBuf; 1])",
+            "(p: (PathBuf,))",
+            "(p: (u32, PathBuf))",
+            "(p: Result<PathBuf>)",
+            "(p: Result<PathBuf, std::io::Error>)",
             "(p: impl AsRef<Path>)",
             "(p: impl Into<PathBuf>)",
         ] {
             assert!(
                 derived(param),
-                "{param} is a raw path and must be in the derived class"
+                "{param} is a raw path (directly or through a path-bearing container) and must be \
+                 in the derived class"
             );
         }
-        // OUT OF CLASS, the STATED boundary: a string spelling is not a path.
+        // OUT OF CLASS, the STATED boundary: a string spelling is not a path,
+        // and a CONTAINER of string spellings is not a path either.
         for param in [
             "(name: &str)",
             "(name: String)",
             "(name: &OsStr)",
             "(name: OsString)",
             "(name: &[u8])",
+            "(name: &[String])",
+            "(name: Vec<String>)",
+            "(name: (String,))",
+            "(name: Result<String>)",
+            "(name: std::collections::HashMap<String, PathBuf>)",
         ] {
             assert!(
                 !derived(param),
                 "{param} is the stated out-of-class boundary and must NOT be derived"
             );
         }
+        // ELEMENT-TYPE RECURSION, both directions: the SAME container is in
+        // class with a path element and out of class with a string element, so
+        // the IN/OUT lists above pin the recursion rather than the container
+        // NAME alone (`&[Path]`/`Vec<PathBuf>` in; `&[String]`/`Vec<String>`
+        // out).
         // OUT OF CLASS: a `use … as` ALIAS of `Path`/`PathBuf`. The predicate
         // matches the last-segment NAME, not the resolution, so an aliased
         // spelling of a raw path is out of class BY CONSTRUCTION. Both
@@ -5402,6 +5734,9 @@ impl S {
         for (prelude, param) in [
             ("use std::path::Path as ZP;", "(p: &ZP)"),
             ("use std::path::PathBuf as ZP;", "(p: ZP)"),
+            // The ALIAS inside a container is the container twin of the same
+            // boundary: the element is name-based too.
+            ("use std::path::PathBuf as ZP;", "(p: &[ZP])"),
         ] {
             assert!(
                 !derived_in(prelude, param),
@@ -5412,6 +5747,7 @@ impl S {
         for (prelude, param) in [
             ("use std::path::Path as ZP;", "(p: &Path)"),
             ("use std::path::PathBuf as ZP;", "(p: PathBuf)"),
+            ("use std::path::PathBuf as ZP;", "(p: &[PathBuf])"),
         ] {
             assert!(
                 derived_in(prelude, param),
@@ -5419,6 +5755,180 @@ impl S {
                  an alias"
             );
         }
+    }
+
+    /// The token streams of every `macro_rules!` DEFINITION in `file`, rendered
+    /// as text. `syn` does not descend into a macro's token stream (its
+    /// `visit_token_stream` hook is a no-op), so this is the only way into a
+    /// macro body; the emitted items are then inspected by
+    /// [`macro_body_public_path_fns`].
+    fn macro_rules_bodies(file: &syn::File) -> Vec<String> {
+        struct Macros(Vec<String>);
+        impl<'ast> syn::visit::Visit<'ast> for Macros {
+            fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+                if item.mac.path.is_ident("macro_rules") {
+                    self.0.push(item.mac.tokens.to_string());
+                }
+                syn::visit::visit_item_macro(self, item);
+            }
+        }
+        let mut macros = Macros(Vec::new());
+        syn::visit::Visit::visit_file(&mut macros, file);
+        macros.0
+    }
+
+    /// The index of the closer matching the group opener at `open` in a flat
+    /// token list, or `None` when unbalanced.
+    fn match_group(list: &[String], open: usize) -> Option<usize> {
+        let (open_token, close_token) = match list.get(open).map(String::as_str)? {
+            "(" => ("(", ")"),
+            "[" => ("[", "]"),
+            "{" => ("{", "}"),
+            _ => return None,
+        };
+        let mut depth = 0usize;
+        for (offset, token) in list[open..].iter().enumerate() {
+            if token == open_token {
+                depth += 1;
+            } else if token == close_token {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+        }
+        None
+    }
+
+    /// The names of `pub fn` items a macro TOKEN STREAM spells with a
+    /// `Path`/`PathBuf` token inside their parameter list. This is the
+    /// token-level backstop for [`production_macro_bodies_emitting_public_path_fns_are_refused`];
+    /// it deliberately scans TOKENS rather than parsing items, so it still sees
+    /// a `pub fn $name(p: &Path)` whose metavariable would make an item parse
+    /// fail. It is conservative: a `Path` token anywhere in a `pub fn`
+    /// parameter list is enough, so it cannot pass by accident.
+    fn macro_body_public_path_fns(tokens: impl std::fmt::Display) -> Vec<String> {
+        let list = macro_token_list(tokens);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < list.len() {
+            if list[i] != "pub" {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            if list.get(j).map(String::as_str) == Some("(") {
+                j = match_group(&list, j).map_or(j + 1, |close| close + 1);
+            }
+            while matches!(
+                list.get(j).map(String::as_str),
+                Some("async" | "unsafe" | "const" | "extern")
+            ) {
+                j += 1;
+            }
+            if list.get(j).map(String::as_str) != Some("fn") {
+                i += 1;
+                continue;
+            }
+            let mut k = j + 1;
+            if list.get(k).map(String::as_str) == Some("$") {
+                k += 1;
+            }
+            let Some(name) = list.get(k).cloned() else {
+                break;
+            };
+            if list.get(k + 1).map(String::as_str) != Some("(") {
+                i += 1;
+                continue;
+            }
+            match match_group(&list, k + 1) {
+                Some(close) => {
+                    if list[k + 2..close]
+                        .iter()
+                        .any(|token| token == "Path" || token == "PathBuf")
+                    {
+                        out.push(name);
+                    }
+                    i = close + 1;
+                }
+                None => i += 1,
+            }
+        }
+        out
+    }
+
+    /// ROUND-10 P3-A TRIPWIRE. `collect_audited_fns` walks the `syn` item
+    /// graph, and `syn` does NOT descend into a macro's token stream (its
+    /// `visit_token_stream` hook is a no-op), so a `macro_rules!` body that
+    /// emits a `pub fn` taking a raw path is NOT derived: the walk sees the
+    /// macro ITEM and stops. The measured repro was
+    ///
+    /// ```text
+    /// macro_rules! zz_make { () => { pub fn zz_macro_mutate(_p: &Path) {} }; }
+    /// zz_make!();
+    /// ```
+    ///
+    /// in production: `zz_macro_mutate` is publicly reachable, and while the
+    /// direct control `pub fn zz_direct_mutate(_p: &Path)` fails
+    /// `pair_less_mutation_enumeration_is_the_derived_public_surface`, the
+    /// macro-generated fn passed every device. The class is stated OUT-OF-CLASS
+    /// in the derivation's boundary: a macro body is a TOKEN stream, not a
+    /// `syn::Item` sequence, and it may carry metavariables, fragment
+    /// specifiers, and repetitions, so parsing it as items is unsound in
+    /// general. The existing `std::fs` token walker CANNOT be reused soundly
+    /// here: it flattens tokens into a `Vec<String>` and recognises only
+    /// canonical `::`-joined paths, so it has no notion of an ITEM, a
+    /// VISIBILITY, or a parameter TYPE and cannot recover a signature.
+    ///
+    /// Because the class is out of class, this TRIPWIRE is the control that
+    /// keeps the stated boundary honest: it fails the moment a PRODUCTION
+    /// `macro_rules!` body spells a `pub fn` whose parameter list mentions
+    /// `Path`/`PathBuf`. Adding such a macro is therefore a visible decision —
+    /// extend the derivation to expand the body, or enumerate the emitted item
+    /// — rather than a silent omission.
+    ///
+    /// RESIDUE, named: the scan is TOKEN-level, so a macro that builds a path
+    /// type out of a metavariable (`pub fn f(p: &$ty)`) or an alias
+    /// (`pub fn f(p: ZP)` under `use std::path::Path as ZP`) is not seen. The
+    /// scan is conservative in the other direction (a `Path`/`PathBuf` token
+    /// anywhere in a `pub fn` parameter list is refused), so it cannot pass by
+    /// accident.
+    #[test]
+    fn production_macro_bodies_emitting_public_path_fns_are_refused() {
+        let mut files = Vec::new();
+        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
+        let sources: Vec<(String, String)> = files
+            .iter()
+            .map(|file| {
+                (
+                    crate_relative(file),
+                    std::fs::read_to_string(file).expect("read source file"),
+                )
+            })
+            .collect();
+        let gated = test_only_gated_paths();
+        let parsed = parse_crate(&sources, &gated);
+        let mut offenders: Vec<String> = Vec::new();
+        for source in &parsed {
+            if is_test_only(&source.rel, &gated) {
+                continue;
+            }
+            for body in macro_rules_bodies(&source.file) {
+                for name in macro_body_public_path_fns(&body) {
+                    offenders.push(format!("{}: pub fn {name}", source.rel));
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "these PRODUCTION `macro_rules!` bodies emit a public fn with a `Path`/`PathBuf` \
+             parameter, and `collect_audited_fns` does NOT expand macro bodies, so the \
+             pair-less-mutation derivation is blind to them: {offenders:?}. Extend the derivation \
+             to expand the body (and prove the parse is sound for metavariables/repetitions), or \
+             enumerate the emitted item and say so at the derivation's boundary."
+        );
     }
 
     /// FIX 4: the constraint-1 enumeration is DERIVED, not enumerated. This
@@ -5433,10 +5943,14 @@ impl S {
     ///
     /// THE DERIVATION'S BOUNDARY, stated rather than implied:
     /// * it is SYNTACTIC on the parameter TYPE. IN CLASS: `Path`/`PathBuf`,
-    ///   the same wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`, `impl
-    ///   AsRef<Path>` / `impl Into<PathBuf>`, and a generic type param bounded
-    ///   the same way. OUT OF CLASS, explicitly: `&str`, `String`, `&OsStr`,
-    ///   `OsString`, `&[u8]`, and any `use … as` ALIAS of `Path`/`PathBuf`
+    ///   the same nested through a PATH-BEARING CONTAINER
+    ///   (`Option`/`Box`/`Cow`/`Rc`/`Arc`/`Vec`/`Result`, a slice/array, or a
+    ///   tuple with a path element), `impl AsRef<Path>` / `impl Into<PathBuf>`,
+    ///   and a generic type param bounded the same way. OUT OF CLASS,
+    ///   explicitly: `&str`, `String`, `&OsStr`, `OsString`, `&[u8]`, a
+    ///   CONTAINER of those spellings (`&[String]`, `Vec<String>`, `(String,)`,
+    ///   `Result<String>`), a type not on the container list
+    ///   (`HashMap<_, PathBuf>`), and any `use … as` ALIAS of `Path`/`PathBuf`
     ///   (the predicate matches the NAME, not the resolution). A STRING IS A
     ///   PATH SPELLING, NOT A PATH: the
     ///   type system does not distinguish a path-spelled string from any other
@@ -5450,6 +5964,17 @@ impl S {
     ///   reason covers `RootedRelativePath::with_file_name`'s `impl AsRef<OsStr>`
     ///   (it is a name COMPONENT, and the mutation is performed by the returned
     ///   validated type);
+    /// * a `macro_rules!` BODY is not walked, so a `pub fn` it emits is NOT
+    ///   derived: a macro body is a TOKEN stream, not a `syn::Item` sequence,
+    ///   and it may carry metavariables, fragment specifiers, and repetitions,
+    ///   so parsing it as items is unsound in general. The `std::fs` macro
+    ///   token walker cannot be reused here soundly — it flattens tokens and
+    ///   recognises canonical `::`-joined paths, with no notion of an item,
+    ///   visibility, or parameter type. This class is therefore STATED out of
+    ///   class, and its control is the TRIPWIRE
+    ///   `production_macro_bodies_emitting_public_path_fns_are_refused`,
+    ///   which fails when a production `macro_rules!` body spells a `pub fn`
+    ///   with a `Path`/`PathBuf` parameter;
     /// * a TRAIT-impl method (`impl Remote for X { fn symlink … }`) is not
     ///   counted directly, because the TRAIT DECLARATION is counted instead; a
     ///   FOREIGN trait's methods would be out of class, and this crate has
