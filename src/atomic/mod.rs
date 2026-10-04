@@ -123,9 +123,8 @@
 //!
 //! The PATH-BASED atomic replace ([`write_atomic_replace`]) takes a raw `&Path`
 //! and resolves every component by that path, so an intermediate symlink is
-//! FOLLOWED. It is the ONE mutation that does NOT take a
-//! `(&RootDir, &RootedRelativePath)` pair, so its name states the weakness and
-//! the confined [`write_atomic_replace_fd`] is the form to reach for. It is
+//! FOLLOWED. It is the one UNCONFINED replace, so its name states the weakness
+//! and the confined [`write_atomic_replace_fd`] is the form to reach for. It is
 //! PUBLIC because it is part of the interface this crate was extracted from (a
 //! consumer's port calls the path-based replace; see `docs/CONSISTENCY.md`,
 //! axis M) — a public-API name is justified by a CONSUMER's need, never by this

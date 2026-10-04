@@ -22,10 +22,12 @@
 //!   [`GuardScope`] the guard authorized. Its fields are private to THIS
 //!   module, so no other module — not [`super`] itself, not [`super::unix`] /
 //!   [`super::windows`], not `transport` / `sync` — can build one except
-//!   through [`GuardedRel::new`] or [`GuardedRel::new_for_owned_lock_record`],
-//!   each of which runs the guard. The rel-path mutators take one by value, so
-//!   a NEW primitive cannot name a multi-component mutation without first
-//!   proving it guarded.
+//!   through the THREE minting constructors [`GuardedRel::new`],
+//!   [`GuardedRel::new_for_owned_lock_record`], and
+//!   [`GuardedRel::new_for_residue`], each of which runs the ONE reserved-
+//!   spelling authority [`refuse_reserved_mutation`]. The rel-path mutators
+//!   take one by value, so a NEW primitive cannot name a multi-component
+//!   mutation without first proving it guarded.
 //!
 //! # What this does NOT cover (the honest residual)
 //!
@@ -52,7 +54,11 @@
 //!   directory entry (`remove_file` / `remove_dir` / `remove_dir_all` /
 //!   `rename` / `hard_link`) in PRODUCTION code (every `#[cfg(test)]` item is
 //!   removed first), so a new one changes a count and forces review, and a
-//!   test-only call is never counted as production.
+//!   test-only call is never counted as production. The same audit runs
+//!   `std_fs_mutation_violations`, which refuses every IMPORT route to those
+//!   five symbols — a braced or single `use std::fs::{…}`, a
+//!   `use std::fs as <alias>` / `use std::fs;` module alias, a `use std::fs::*`
+//!   glob, and the bare or aliased imported symbol.
 //!
 //! The residual holes a text audit CANNOT close, and which the claim above is
 //! scoped NOT to include: code produced by a MACRO (`macro_rules!` or a proc
@@ -61,11 +67,16 @@
 //! preserves the entry's inode (`std::fs::write`, `std::fs::copy`,
 //! `std::fs::set_permissions`, `std::fs::create_dir*`) — those cannot split a
 //! holder because the flock is attached to the unchanged inode, so they are not
-//! counted. A foreign process, or a raw `std::fs` call the caller writes
+//! counted. A raw FFI declaration — `extern "C" { fn unlinkat(…); }` followed
+//! by a call — names neither `libc` nor `std::fs`, so NEITHER text scanner sees
+//! it; its reach is one declaration the crate's own author writes, which is
+//! exactly the residue a source-matching audit carries and names rather than
+//! denies. A foreign process, or a raw `std::fs` call the caller writes
 //! itself, is outside the crate entirely and is not stopped by any of this.
 //! Together the private funnel and the audits mean the "obvious way" to add a
-//! mutation — calling the crate's own wrapper, or reaching for a raw syscall or
-//! `std::fs` removal — either presents the capability or fails a test.
+//! mutation — calling the crate's own wrapper, or reaching for a raw syscall, a
+//! `std::fs` removal, or an IMPORT ALIAS of one — either presents the
+//! capability or fails a test.
 
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
@@ -359,9 +370,11 @@ impl<'a> GuardedRel<'a> {
     /// struct-literal construction (`GuardedRel { rel, scope }`) anywhere else
     /// — including in [`super::unix`] / [`super::windows`] — is `E0451`
     /// ("field is private"), and no `unsafe`/`transmute` route exists in safe
-    /// code. This is one of only TWO functions in the crate that run the guard
-    /// (verified by the source audit), so a value of this type IS proof the
-    /// guard ran.
+    /// code. This constructor is one of the THREE minting constructors (with
+    /// [`Self::new_for_owned_lock_record`] and [`Self::new_for_residue`]), the
+    /// only minters of the capability: every one runs
+    /// [`refuse_reserved_mutation`], the ONE reserved-spelling authority, so a
+    /// value of this type IS proof the guard ran.
     pub(crate) fn new(rel: &'a Path) -> Result<Self> {
         refuse_reserved_mutation(rel, Sanction::None)?;
         Ok(Self {
@@ -608,6 +621,285 @@ mod tests {
         "rename",
         "hard_link",
     ];
+
+    /// A production route by which one of [`FS_INODE_MUTATORS`] can be reached
+    /// WITHOUT spelling `std::fs::<symbol>(`, so the exact-count pin alone
+    /// cannot see it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum FsRoute {
+        /// `use std::fs::remove_file [as x];` (single) or one entry of a
+        /// braced `use std::fs::{…}` — the bare or aliased imported symbol.
+        Imported,
+        /// `use std::fs;` / `use std::fs as f;` / `use std::fs::{self as f};`
+        /// followed by `f::remove_file(…)`.
+        ModuleAlias,
+        /// `use std::fs::*;` — the glob itself is the route, since any of the
+        /// five symbols (and a function pointer to one) comes into scope.
+        Glob,
+    }
+
+    impl FsRoute {
+        fn as_str(self) -> &'static str {
+            match self {
+                FsRoute::Imported => "imported symbol",
+                FsRoute::ModuleAlias => "module alias",
+                FsRoute::Glob => "glob import",
+            }
+        }
+    }
+
+    /// One production use of a `std::fs` inode mutator through a route the
+    /// exact-count pin does not cover.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Violation {
+        file: String,
+        symbol: &'static str,
+        route: FsRoute,
+    }
+
+    /// Every `std::fs` inode mutation in PRODUCTION code that reaches one of
+    /// [`FS_INODE_MUTATORS`] through a non-canonical route: a `use`d symbol, a
+    /// module alias, or a glob. This is the half the exact-count pin misses —
+    /// `use std::fs::remove_file; remove_file(p)` spells no `std::fs::` call,
+    /// so a pin over `std::fs::{symbol}(` stays green while the record is
+    /// unlinked. WHITESPACE-INSENSITIVE, because the code is normalized first.
+    ///
+    /// PURE over `(package-relative path, raw contents)` pairs so a unit test
+    /// can drive it with synthetic sources. Test-only files are skipped (a path
+    /// COMPONENT equal to `tests`, ending `regression.rs` / `test_support.rs`,
+    /// or under `tests/` / `benches/` / `examples/`).
+    fn std_fs_mutation_violations(files: &[(String, String)]) -> Vec<Violation> {
+        let mut out = Vec::new();
+        for (rel, raw) in files {
+            if is_test_only(rel) {
+                continue;
+            }
+            let code = normalize_ws(&production_only(&code_only(raw)));
+            out.extend(std_fs_violations_in_code(rel, &code));
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The violation scan for one already-comment/string-stripped,
+    /// `#[cfg(test)]`-free, whitespace-normalized source.
+    fn std_fs_violations_in_code(rel: &str, code: &str) -> Vec<Violation> {
+        // Local names bound to a mutator (`remove_file`, or `rm` after
+        // `remove_file as rm`) and aliases for the `std::fs` module itself
+        // (`f` after `use std::fs as f`, and `fs` after `use std::fs;`).
+        let mut imported: Vec<(String, &'static str)> = Vec::new();
+        let mut aliases: Vec<String> = Vec::new();
+        let mut glob = false;
+        for item in std_fs_use_items(code) {
+            parse_std_fs_use(&item, &mut imported, &mut aliases, &mut glob);
+        }
+
+        let mut out = Vec::new();
+        // Importing a mutating symbol into production code is itself the route
+        // (a call, a function pointer, or a re-export), so flag it even before
+        // a call appears.
+        for (_, symbol) in &imported {
+            out.push(Violation {
+                file: rel.to_string(),
+                symbol,
+                route: FsRoute::Imported,
+            });
+        }
+        for alias in &aliases {
+            for symbol in FS_INODE_MUTATORS {
+                if count_path_ref(code, alias, symbol) > 0 {
+                    out.push(Violation {
+                        file: rel.to_string(),
+                        symbol,
+                        route: FsRoute::ModuleAlias,
+                    });
+                }
+            }
+        }
+        if glob {
+            // A `use std::fs::*` glob is the route itself: any of the five
+            // symbols (and a bare function pointer to one) is in scope, so flag
+            // the import whether or not a call is visible.
+            out.push(Violation {
+                file: rel.to_string(),
+                symbol: "*",
+                route: FsRoute::Glob,
+            });
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The text of every `use` item (the text between `use` and `;`). Only
+    /// `use` ITEMS are returned, so a bare `std::fs::remove_file(…)` call is
+    /// never mistaken for an import; [`parse_std_fs_use`] decides which items
+    /// reach `std::fs`.
+    fn std_fs_use_items(code: &str) -> Vec<String> {
+        let bytes = code.as_bytes();
+        let mut items = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if !is_ident_start(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && (is_ident_start(bytes[i]) || bytes[i] == b'_') {
+                i += 1;
+            }
+            if &code[start..i] == "use" && bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+                let body_start = i;
+                let mut j = i;
+                while j < bytes.len() && bytes[j] != b';' {
+                    j += 1;
+                }
+                let body = code[body_start..j].trim();
+                items.push(body.to_string());
+                i = j;
+            }
+        }
+        items
+    }
+
+    /// Parse one `use` body (the text after `use`, before `;`) and record the
+    /// `std::fs` bindings it introduces. Recurses through `use std::{fs, …}`
+    /// so a nested import cannot hide a mutator.
+    fn parse_std_fs_use(
+        item: &str,
+        imported: &mut Vec<(String, &'static str)>,
+        aliases: &mut Vec<String>,
+        glob: &mut bool,
+    ) {
+        let item = item.trim();
+        let item = item.strip_prefix("::").unwrap_or(item);
+        // `use std::{fs, fs::remove_file, …}`: expand each entry to a
+        // `std::<entry>` path and parse it, so nesting depth is irrelevant.
+        if let Some(inner) = item
+            .strip_prefix("std::")
+            .and_then(|r| r.strip_prefix('{'))
+            .and_then(|r| r.strip_suffix('}'))
+        {
+            for entry in split_top_level_commas(inner) {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                parse_std_fs_use(&format!("std::{entry}"), imported, aliases, glob);
+            }
+            return;
+        }
+        let Some(rest) = item.strip_prefix("std::fs") else {
+            return;
+        };
+        let rest = rest.trim_start();
+        if rest.is_empty() {
+            // `use std::fs;` binds the module under its last segment, `fs`.
+            aliases.push("fs".to_string());
+            return;
+        }
+        if let Some(rest) = rest.strip_prefix("as ") {
+            let alias = rest.split_whitespace().next().unwrap_or("");
+            if !alias.is_empty() {
+                aliases.push(alias.to_string());
+            }
+            return;
+        }
+        let Some(rest) = rest.strip_prefix("::") else {
+            return;
+        };
+        let rest = rest.trim();
+        if rest == "*" {
+            *glob = true;
+            return;
+        }
+        if let Some(inner) = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+            for entry in split_top_level_commas(inner) {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                if entry == "*" {
+                    *glob = true;
+                    continue;
+                }
+                if let Some(rest) = entry.strip_prefix("self") {
+                    let rest = rest.trim();
+                    if rest.is_empty() {
+                        aliases.push("fs".to_string());
+                    } else if let Some(alias) = rest.strip_prefix("as ") {
+                        let alias = alias.trim();
+                        if !alias.is_empty() {
+                            aliases.push(alias.to_string());
+                        }
+                    }
+                    continue;
+                }
+                record_imported(entry, imported);
+            }
+            return;
+        }
+        record_imported(rest, imported);
+    }
+
+    /// Record `symbol` (or `symbol as local`) when `symbol` is one of
+    /// [`FS_INODE_MUTATORS`].
+    fn record_imported(entry: &str, imported: &mut Vec<(String, &'static str)>) {
+        let mut parts = entry.split_whitespace();
+        let symbol = parts.next().unwrap_or("");
+        let local = match parts.next() {
+            Some("as") => parts.next().unwrap_or(symbol),
+            _ => symbol,
+        };
+        if let Some(sym) = FS_INODE_MUTATORS.iter().find(|&&s| s == symbol) {
+            imported.push((local.to_string(), sym));
+        }
+    }
+
+    /// Split a braced `use` list on TOP-LEVEL commas only, so
+    /// `fs::{remove_file, rename}` is two entries, not three.
+    fn split_top_level_commas(text: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (i, c) in text.char_indices() {
+            match c {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(&text[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&text[start..]);
+        out
+    }
+
+    /// Count `qualifier::symbol` occurrences where `qualifier` is a complete
+    /// path head (so an alias `fs` does not re-count `std::fs::symbol`).
+    fn count_path_ref(code: &str, qualifier: &str, symbol: &str) -> usize {
+        let needle = format!("{qualifier}::{symbol}");
+        let bytes = code.as_bytes();
+        let mut count = 0usize;
+        let mut from = 0usize;
+        while let Some(pos) = code[from..].find(&needle) {
+            let at = from + pos;
+            let before_ok = at == 0 || {
+                let b = bytes[at - 1];
+                !(is_ident_start(b) || b == b':')
+            };
+            let after = at + needle.len();
+            let after_ok = after >= bytes.len() || !is_ident_start(bytes[after]);
+            if before_ok && after_ok {
+                count += 1;
+            }
+            from = at + needle.len();
+        }
+        count
+    }
 
     /// Walk the WHOLE crate directory (not only `src/`), skipping `target/` and
     /// hidden directories. Covers `build.rs`, `tests/**`, `benches/**`,
@@ -1189,30 +1481,69 @@ mod tests {
     /// removed first), so a unit-test module inside a production file no longer
     /// contributes — the old pin advertised production calls that had zero
     /// production occurrences and would not have moved if a production call were
-    /// replaced by a test one.
+    /// replaced by a test one. Import/alias routes are refused by
+    /// [`std_fs_mutation_violations`], called below.
     ///
-    /// SCOPE, stated exactly: the pin covers these five inode-mutating calls in
-    /// the production code of every `.rs` file under the package directory
-    /// except test-only files (a path COMPONENT equal to `tests`, ending
-    /// `regression.rs` / `test_support.rs`, or under `tests/` / `benches/` /
-    /// `examples/`). It does NOT cover a MACRO that expands to one of these
-    /// calls, an `include!`d file OUTSIDE the package, or a call made through a
-    /// function pointer / `dyn` dispatch. Inode-PRESERVING mutations
+    /// SCOPE, stated exactly: the pin covers these five inode-mutating calls
+    /// spelled `std::fs::<symbol>(` in the production code of every `.rs` file
+    /// under the package directory except test-only files (a path COMPONENT
+    /// equal to `tests`, ending `regression.rs` / `test_support.rs`, or under
+    /// `tests/` / `benches/` / `examples/`). The same audit additionally refuses
+    /// every IMPORT route to the same five symbols — a braced or single
+    /// `use std::fs::{…}`, a `use std::fs as <alias>` / `use std::fs;` module
+    /// alias, a `use std::fs::*` glob, the nested `use std::{fs::…}`, and the
+    /// bare or aliased imported symbol — because those spell no
+    /// `std::fs::<symbol>(` call and would otherwise leave the pin green while
+    /// the record was unlinked. Neither half covers a MACRO that expands to one
+    /// of these calls, an `include!`d file OUTSIDE the package, or a call made
+    /// through a function pointer / `dyn` dispatch. Inode-PRESERVING mutations
     /// (`std::fs::write`, `std::fs::copy`, `std::fs::set_permissions`,
     /// `std::fs::create_dir*`) are not pinned: they cannot split a holder
     /// because the flock stays on the unchanged inode.
+    ///
+    /// RESIDUE, named not hidden: this audit matches SOURCE TEXT, so it has a
+    /// residue — any mutation whose source never spells a `std::fs` path or
+    /// import. The sharpest instance is a raw FFI declaration,
+    /// `extern "C" { fn unlinkat(dirfd: i32, path: *const i8, flags: i32) ->
+    /// i32; }`, followed by a call: it names neither `libc` nor `std::fs`, so
+    /// NEITHER this audit nor `no_libc_reference_outside_the_funnel` sees it.
+    /// Its reach is one declaration in the crate's own source (a dependency's
+    /// or a foreign process's mutation is outside the crate entirely). This
+    /// audit closes the ordinary route — a `use` alias or a fully-qualified
+    /// call — and NAMES the exotic residue rather than implying totality.
     #[test]
     fn std_fs_name_mutation_counts_are_pinned() {
-        let mut files = Vec::new();
-        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
+        let mut paths = Vec::new();
+        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut paths);
+        let files: Vec<(String, String)> = paths
+            .iter()
+            .map(|file| {
+                (
+                    crate_relative(file),
+                    std::fs::read_to_string(file).expect("read source file"),
+                )
+            })
+            .collect();
+
+        // The import/alias routes the exact-count pin below cannot see. This is
+        // the enforcement half: `use std::fs::remove_file; remove_file(p)`
+        // spells no `std::fs::{symbol}(` call, so it must be caught HERE, or
+        // the record can be unlinked with every pin still green.
+        let violations = std_fs_mutation_violations(&files);
+        assert!(
+            violations.is_empty(),
+            "production code reaches a `std::fs` inode mutator through a route the pin does not \
+             cover — a `use`d symbol, a module alias, or a glob — so the lock record could be \
+             removed or replaced with the count pin still green; route it through the guarded \
+             funnel (src/atomic/unix.rs) instead: {violations:?}"
+        );
+
         let mut observed: BTreeMap<(String, &str), usize> = BTreeMap::new();
-        for file in &files {
-            let rel = crate_relative(file);
-            if is_test_only(&rel) {
+        for (rel, raw) in &files {
+            if is_test_only(rel) {
                 continue;
             }
-            let raw = std::fs::read_to_string(file).expect("read source file");
-            let code = production_only(&code_only(&raw));
+            let code = normalize_ws(&production_only(&code_only(raw)));
             for symbol in FS_INODE_MUTATORS {
                 let count = code.matches(&format!("std::fs::{symbol}(")).count();
                 if count > 0 {
@@ -1264,6 +1595,100 @@ mod tests {
             "the PRODUCTION `std::fs` removal/replace/rename counts changed: a new (or removed) \
              call must be reviewed for the lock-record guard — if the new call cannot name the \
              record, update this pin; test-only calls are excluded by construction"
+        );
+    }
+
+    /// Every route by which production code can reach a `std::fs` inode
+    /// mutator without spelling `std::fs::<symbol>(` is reported by
+    /// [`std_fs_mutation_violations`]: a single and a braced `use`, an aliased
+    /// symbol, a module alias (`use std::fs as f` and `use std::fs;`), a braced
+    /// self-alias, a glob, and the nested `use std::{fs::…}` form. A legitimate
+    /// call inside the guarded funnel is NOT reported, so the scanner is not
+    /// merely "report everything".
+    #[test]
+    fn the_std_fs_scanner_sees_every_import_alias_route() {
+        let fixtures: &[(&str, &str, FsRoute)] = &[
+            (
+                "src/prod/single_import.rs",
+                "use std::fs::remove_file; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }",
+                FsRoute::Imported,
+            ),
+            (
+                "src/prod/braced_import.rs",
+                "use std::fs::{remove_file, rename as mv}; fn f(a: &Path, b: &Path) -> std::io::Result<()> { mv(a, b) }",
+                FsRoute::Imported,
+            ),
+            (
+                "src/prod/aliased_import.rs",
+                "use std::fs::remove_dir_all as wipe; fn f(p: &Path) -> std::io::Result<()> { wipe(p) }",
+                FsRoute::Imported,
+            ),
+            (
+                "src/prod/module_alias.rs",
+                "use std::fs as fx; fn f(p: &Path) -> std::io::Result<()> { fx::remove_file(p) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/braced_self_alias.rs",
+                "use std::fs::{self as fx}; fn f(a: &Path, b: &Path) -> std::io::Result<()> { fx::rename(a, b) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/bare_module_import.rs",
+                "use std::fs; fn f(p: &Path) -> std::io::Result<()> { fs::remove_dir_all(p) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/glob_import.rs",
+                "use std::fs::*; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }",
+                FsRoute::Glob,
+            ),
+            (
+                "src/prod/nested_std_use.rs",
+                "use std::{fs::remove_file}; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }",
+                FsRoute::Imported,
+            ),
+            (
+                "src/prod/nested_std_alias.rs",
+                "use std::{fs as fx}; fn f(p: &Path) -> std::io::Result<()> { fx::hard_link(p, p) }",
+                FsRoute::ModuleAlias,
+            ),
+        ];
+        let files: Vec<(String, String)> = fixtures
+            .iter()
+            .map(|(rel, body, _)| ((*rel).to_string(), (*body).to_string()))
+            .collect();
+        let violations = std_fs_mutation_violations(&files);
+        for (rel, _, route) in fixtures {
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.file == *rel && v.route == *route),
+                "the scanner missed the {} route in {rel}: {violations:?}",
+                route.as_str()
+            );
+        }
+    }
+
+    /// The NEGATIVE fixture: a legitimate mutation at the guarded funnel — the
+    /// audited direct `std::fs::rename` the exact-count pin already covers — and
+    /// an inode-PRESERVING `std::fs::write` must yield NO violation, so the
+    /// scanner does not merely report every `std::fs` mention. (The direct call
+    /// is still counted by the pin; this test is about the import scanner, not
+    /// the pin.)
+    #[test]
+    fn the_std_fs_scanner_does_not_report_the_guarded_funnel() {
+        let files = vec![(
+            "src/atomic/unix.rs".to_string(),
+            "fn legit(a: &Path, b: &Path) -> std::io::Result<()> {\n    std::fs::rename(a, b)\n}\n\
+             fn keep(p: &Path) -> std::io::Result<()> { std::fs::write(p, b\"x\") }\n"
+                .to_string(),
+        )];
+        assert_eq!(
+            std_fs_mutation_violations(&files),
+            Vec::new(),
+            "a legitimate direct call at the guarded funnel and an inode-preserving write must \
+             NOT be reported as an import-route violation"
         );
     }
 }
