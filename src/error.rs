@@ -308,9 +308,10 @@ pub enum TransportKind {
 /// destination-lockability checks (a remote destination handed to the local
 /// lock constructor, a local destination handed to the far-side constructor,
 /// a root with no derivable sibling record, the composed form's requirement
-/// that the destination be local), the far-side lock seam, and the two lock
-/// record path refusals whose whole point is that the caller learns the record
-/// must not be followed. Every other preflight failure is a mechanical I/O
+/// that the destination be local), the far-side lock seam, and the three
+/// lock-record refusals (the record or its parent being a symlink, and a
+/// pre-existing entry that is not a record this crate wrote). Every other
+/// preflight failure is a mechanical I/O
 /// fault with no consumer-side branch and stays [`Self::Unclassified`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreflightKind {
@@ -368,6 +369,11 @@ pub enum PreflightKind {
     /// The lock record's PARENT directory is a symlink, so the record (and
     /// every subsequent open) could be redirected elsewhere.
     LockParentIsSymlink,
+    /// A pre-existing NON-EMPTY entry sits at the lock path and it is NOT a
+    /// record this crate wrote (its content does not begin with the record
+    /// header), so acquiring would truncate content the caller may not intend
+    /// to lose. The entry is left byte-for-byte and mode-for-mode untouched.
+    LockRecordNotRecognized,
     /// A condition with no distinction any caller branches on; the message is
     /// for a human.
     Unclassified,

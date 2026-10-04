@@ -25,8 +25,8 @@ made possible.
 - `sync::retire_destination_lock` — a lock-record removal with its own spelling and identity checks
 - `sync::Residue::recover_to` — takes a raw target path, validated at the boundary before use
 - `sync::Residue::discard` — takes NO path argument; the validated pair lives inside `Residue`
-- `lock::FileLock::acquire` — the record path the lock protocol computes
-- `lock::AdministrativeRecoveryGuard::acquire` — a record created or truncated at a caller-supplied path
+- `lock::FileLock::acquire` — a caller-supplied path, adopted as the record only when it is empty or already holds a record this crate wrote (whose first line is the record header "storekit lock record v1"); any other non-empty entry is REFUSED with the typed PreflightKind::LockRecordNotRecognized and left byte-for-byte and mode-for-mode alone, never truncated
+- `lock::AdministrativeRecoveryGuard::acquire` — a record created or adopted at a caller-supplied path, under the same refusal as `lock::FileLock::acquire`
 - `platform::chmod` — the ONE path-based mode authority (the FD-bound `File::set_permissions` is the permitted second form)
 - `platform::symlink` — the cross-platform symlink helper
 - `Remote::lock_far_side` — the far-side ownership seam (a trait method)

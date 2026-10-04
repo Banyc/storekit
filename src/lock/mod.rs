@@ -86,6 +86,23 @@ use windows as platform;
 
 pub(crate) use platform::{contended_errno, try_lock, unlock};
 
+/// The bytes every lock record this crate writes begins with. The header makes
+/// a record RECOGNIZABLE: [`FileLock::acquire`] adopts a pre-existing entry
+/// only when it is empty or begins with this header, so a caller-supplied path
+/// that names ordinary content is refused instead of truncated.
+const RECORD_HEADER: &str = "storekit lock record v1\n";
+
+/// Read at most [`RECORD_HEADER`]'s length from the start of `file` — just
+/// enough to decide whether the entry is a record this crate wrote, so a large
+/// pre-existing file (a would-be victim) is never slurped.
+fn read_record_head(file: &std::fs::File) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(RECORD_HEADER.len());
+    file.take(RECORD_HEADER.len() as u64)
+        .read_to_end(&mut head)?;
+    Ok(head)
+}
+
 /// The outcome of a platform lock attempt: acquired, contended (another
 /// holder — the caller reports the "held by" message), or a real failure.
 pub(crate) enum LockAttempt {
@@ -121,9 +138,28 @@ impl FileLock {
     /// is taken (see the durable-first-append machinery the lock path must
     /// never bypass).
     ///
-    /// The file is created with `create(true).truncate(false)`: when it
-    /// already exists (always, after the first acquisition of this path) the
-    /// SAME inode is opened, never a fresh one — the lock never swaps inodes.
+    /// The file is OPENED with `create(true).truncate(false)`: when it already
+    /// exists (always, after the first acquisition of this path) the SAME
+    /// inode is opened, never a fresh one — the lock never swaps inodes. The
+    /// open itself does not truncate; the record's CONTENT is replaced only
+    /// for an entry this crate recognizes as a record it wrote.
+    ///
+    /// # What may be adopted
+    ///
+    /// Every record this crate writes begins with `RECORD_HEADER` and then the
+    /// caller's op id. On acquisition:
+    ///
+    /// * an ABSENT path is created, and an EMPTY entry is adopted (nothing is
+    ///   lost either way), then the header and op id are written;
+    /// * a pre-existing entry that BEGINS with `RECORD_HEADER` is a record this
+    ///   crate wrote: it is adopted, its op id replaced and its inode kept;
+    /// * a pre-existing NON-EMPTY entry that does NOT begin with the header is
+    ///   refused with the typed
+    ///   [`crate::error::PreflightKind::LockRecordNotRecognized`] BEFORE the
+    ///   chmod and the write, so a caller-supplied path that happens to name
+    ///   ordinary content is left byte-for-byte and mode-for-mode untouched.
+    ///   `acquire` never truncates an entry it did not write.
+    ///
     /// The persistent file does not disturb the durable-first-append
     /// machinery: directory creation is detected by the directory-entry
     /// fsyncs in [`crate::atomic::ensure_private_dir_durable`] (which
@@ -200,15 +236,41 @@ impl FileLock {
             platform::LockAttempt::Acquired => {}
             platform::LockAttempt::Contended => {
                 let held = std::fs::read_to_string(path).unwrap_or_default();
+                // A holder this crate wrote recorded its op id after the
+                // record header; a foreign or legacy holder has no header, so
+                // its raw content is shown as-is.
+                let holder = held.strip_prefix(RECORD_HEADER).unwrap_or(&held);
                 return Err(Error::lock_contended(format!(
                     "local lock {} held by '{}'",
                     path.display(),
-                    held.trim()
+                    holder.trim()
                 )));
             }
             platform::LockAttempt::Failed(err) => {
                 return Err(Error::preflight(format!("lock {}: {err}", path.display())));
             }
+        }
+        // REFUSE a pre-existing entry this crate did not write, BEFORE the
+        // chmod below and before any truncation, so a caller-supplied path
+        // that names ordinary content is left byte-for-byte and
+        // mode-for-mode untouched. The record this crate writes begins with
+        // `RECORD_HEADER`; an EMPTY entry (a fresh creation, or a record whose
+        // write never landed) carries nothing to lose and is adopted.
+        let head = read_record_head(&file)
+            .map_err(|e| Error::preflight(format!("read lock {}: {e}", path.display())))?;
+        if !head.is_empty() && !head.starts_with(RECORD_HEADER.as_bytes()) {
+            return Err(Error::preflight_kind(
+                PreflightKind::LockRecordNotRecognized,
+                format!(
+                    "refusing to acquire the lock at {}: the path already holds a non-empty \
+                     entry that is not a lock record this crate wrote, so acquiring would \
+                     truncate content the caller may not intend to lose; a record this crate \
+                     writes begins with {:?}. Move the existing entry aside (or remove it) if it \
+                     is not wanted",
+                    path.display(),
+                    RECORD_HEADER.trim_end(),
+                ),
+            ));
         }
         // We hold the lock: make the record PRIVATE (the mode request above is
         // subject to the umask AND does not tighten a record an earlier version
@@ -221,8 +283,14 @@ impl FileLock {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|e| Error::preflight(format!("chmod lock {}: {e}", path.display())))?;
         }
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
+        // The head read moved the offset; seek back to the start so the
+        // truncate-then-write lands at byte 0 (set_len does not move the
+        // offset).
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::preflight(format!("write lock {}: {e}", path.display())))?;
         file.set_len(0)
+            .and_then(|_| file.write_all(RECORD_HEADER.as_bytes()))
             .and_then(|_| file.write_all(op_id.as_bytes()))
             .map_err(|e| Error::preflight(format!("write lock {}: {e}", path.display())))?;
         Ok(FileLock { file })
@@ -677,6 +745,80 @@ mod tests {
             !victim_dir.join("operation.lock").exists(),
             "nothing is created in the victim directory"
         );
+    }
+
+    /// The reviewer's shape, at BOTH an ordinary path and the reserved record
+    /// spelling: a pre-existing NON-EMPTY file that is not a record this crate
+    /// wrote is REFUSED with the typed
+    /// [`PreflightKind::LockRecordNotRecognized`] and left byte-for-byte and
+    /// mode-for-mode untouched. PRE-FIX `acquire` accepted the path, chmodded
+    /// it `0600`, truncated it and wrote the op id (the 51-byte
+    /// "precious data ..." became the 2-byte "op").
+    #[test]
+    fn acquire_refuses_a_pre_existing_non_record_file_without_destroying_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let before: &[u8] = b"precious data that a caller did not intend to lose";
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        for name in ["precious.txt", "operation.lock"] {
+            let victim = dir.path().join(name);
+            std::fs::write(&victim, before).unwrap();
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let err = match FileLock::acquire(&victim, "op") {
+                Err(e) => e,
+                Ok(_) => panic!("a non-record file at {name} must be refused"),
+            };
+            assert_eq!(
+                err.preflight_reason(),
+                Some(PreflightKind::LockRecordNotRecognized),
+                "the refusal must be the typed unrecognized-record condition: {err:?}"
+            );
+            assert_eq!(
+                std::fs::read(&victim).unwrap(),
+                before,
+                "the {name} bytes must be untouched"
+            );
+            assert_eq!(
+                std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+                0o640,
+                "the {name} mode must be untouched (the refusal precedes the chmod)"
+            );
+        }
+    }
+
+    /// The chosen shape keeps a legitimate record adoptable: a fresh
+    /// acquisition creates a RECOGNIZABLE record, and a re-acquisition adopts
+    /// the SAME inode and replaces the op id.
+    #[test]
+    fn acquire_adopts_a_record_this_crate_wrote_and_replaces_the_op_id() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let path = dir.path().join("operation.lock");
+        let inode_before;
+        {
+            let _guard = FileLock::acquire(&path, "op-1").expect("fresh acquisition");
+            inode_before = inode_id(&path);
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.starts_with(RECORD_HEADER),
+                "the record must be recognizable: {content:?}"
+            );
+            assert!(
+                content.ends_with("op-1"),
+                "the op id must be recorded: {content:?}"
+            );
+        }
+        let guard =
+            FileLock::acquire(&path, "op-2").expect("a record this crate wrote is adoptable");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.ends_with("op-2"),
+            "re-acquisition must replace the op id: {content:?}"
+        );
+        assert_eq!(
+            inode_before,
+            inode_id(&path),
+            "the stable inode must survive adoption"
+        );
+        drop(guard);
     }
 
     proptest::proptest! {

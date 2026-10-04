@@ -128,8 +128,9 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// families above — [`is_reserved_name`] stays byte-exact, so the sync's
 /// reserved stripping is unchanged — but it IS unaddressable as an identity:
 /// accepting it would let consumer content share a name with the crate's own
-/// lock record, which [`crate::lock::FileLock::acquire`] truncates and
-/// rewrites, and which the crate's removal guard protects.
+/// lock record, which [`crate::lock::FileLock::acquire`] rewrites (adopting an
+/// entry only when it is empty or already a record this crate wrote), and
+/// which the crate's removal guard protects.
 pub const APPLICATION_LOCK_NAME: &str = "operation.lock";
 
 /// Whether `name` is the crate's application-store lock record spelling
@@ -149,7 +150,7 @@ pub fn is_application_lock_name(name: &str) -> bool {
 /// an accepted alias could collide with the crate's own bookkeeping:
 /// `.SYNC-ASIDE.1` IS `.sync-aside.1`, and `.DESTROOT.OPERATION.LOCK` IS
 /// `.destroot.operation.lock` (the record [`crate::lock::FileLock::acquire`]
-/// truncates). Byte-exact reserved MATCHING is deliberately unaffected — this
+/// rewrites). Byte-exact reserved MATCHING is deliberately unaffected — this
 /// is about ALIASING, not about matching — so [`is_reserved_name`] keeps
 /// answering byte-exactly while the id/name rule refuses the alias.
 pub fn is_reserved_case_alias(name: &str) -> bool {
@@ -304,8 +305,9 @@ pub fn is_residue_path(path: &str) -> bool {
 /// mutating primitive the crate exposes" would be FALSE, and the residual is:
 ///
 /// * the crate's OWN lock protocol mutates a lock record on purpose.
-///   [`crate::lock::FileLock::acquire`] creates/truncates the application
-///   record, and the transport's ownership-token protocol
+///   [`crate::lock::FileLock::acquire`] creates/rewrites the application
+///   record (refusing an entry it did not write), and the transport's
+///   ownership-token protocol
 ///   ([`crate::transport::Remote::remove_file_if`], and `durable_create_new`)
 ///   compare-and-deletes / re-creates the in-root lock, serialized through the
 ///   sidecar flock. Those operations MAKE and BREAK locks by design; guarding
@@ -750,7 +752,7 @@ mod tests {
     /// the mutating guard already denied the spelling as a lock record — so a
     /// consumer could pass a name the id rule's stated purpose should have
     /// refused, and on Windows the spelling IS the very record
-    /// `FileLock::acquire` truncates. Refusing it is the fold-for-denial rule
+    /// `FileLock::acquire` rewrites. Refusing it is the fold-for-denial rule
     /// applied to the id boundary (denial may refuse more), and it is
     /// deliberately platform-INDEPENDENT so an id does not mean different
     /// things on different hosts.
