@@ -655,7 +655,7 @@ fn try_write_new_already_present_fsyncs_the_parent_portably() {
     );
 }
 
-/// DEFECT 1, THE HOLE: `fsync_tree` used `find -depth -exec perl … {} ;`, and
+/// THE HOLE: `fsync_tree` used `find -depth -exec perl … {} ;`, and
 /// `find` IGNORES the invoked command's exit status for `;`, so a tree whose
 /// EVERY far-side fsync failed still made `find` exit 0 and `fsync_tree` return
 /// `Ok(())`. The probe's fake perl exits 9 on the directory-fsync hook; the
@@ -686,7 +686,7 @@ fn fsync_tree_failure_propagates() {
     );
 }
 
-/// DEFECT 5: the old fsync primitive opened with `"<"`, which BLOCKS FOREVER
+/// The old fsync primitive opened with `"<"`, which BLOCKS FOREVER
 /// on a FIFO (a read open waits for a writer). `fsync_tree` must terminate —
 /// and, matching the LOCAL walk (which skips non-regular entries), succeed by
 /// never opening the fifo.
@@ -710,7 +710,7 @@ fn fsync_tree_over_a_fifo_terminates() {
     outcome.expect("fsync_tree skips the non-regular FIFO and succeeds");
 }
 
-/// DEFECT 3: an ABSENT directory must list EMPTY, agreeing with
+/// An ABSENT directory must list EMPTY, agreeing with
 /// `LocalTransport::list` (which deliberately treats `NotFound` as empty so an
 /// unprovisioned remote root is inspectable). The rewrite's bare
 /// `opendir … or die` made the SSH view error while the pre-fix glob (and the
@@ -730,7 +730,7 @@ fn list_absent_directory_agrees_with_local_empty() {
     );
 }
 
-/// DEFECT 2 + 3: a present-but-unreadable directory must fail the listing on
+/// A present-but-unreadable directory must fail the listing on
 /// BOTH views. A `chmod 400` directory has the READ bit (so `opendir`
 /// succeeds) but no SEARCH bit (so every `lstat` fails EACCES): pre-fix the
 /// remote script's `next unless @s` dropped every entry and returned an empty
@@ -770,7 +770,7 @@ fn list_unreadable_directory_agrees_with_local_error() {
     }
 }
 
-/// DEFECT 4, THE CROSS-VIEW PIN: the SSH listing and the LOCAL listing of the
+/// THE CROSS-VIEW PIN: the SSH listing and the LOCAL listing of the
 /// SAME tree must agree FIELD BY FIELD (`name`, `is_dir`, `is_symlink`,
 /// `size`, `mode`). Pre-fix the SSH view masked `mode` with `& 0o7777` and
 /// hardcoded `size: 0`, so for `exec.sh` it reported `755:0` where local

@@ -300,7 +300,7 @@ mod tests_hostkey {
         assert_ne!(simple_hash("a"), simple_hash("b"));
     }
 
-    // Finding 1: the configured port is propagated to ssh-keyscan, and the
+    // The configured port is propagated to ssh-keyscan, and the
     // bare host is passed (not `user@address`).
     #[test]
     fn keyscan_uses_bare_host_and_port() {

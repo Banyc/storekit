@@ -3536,7 +3536,7 @@ mod tests {
         );
     }
 
-    /// DEFECT 2 regression: test-only-ness comes from the GATING, not the NAME.
+    /// Test-only-ness comes from the GATING, not the NAME.
     /// A production `src/review_regression.rs` — a name the old suffix rule
     /// exempted — is scanned and its import route is reported. The two real
     /// gated modules stay exempt, and the exemption follows the `#[cfg]` rather
@@ -5808,7 +5808,7 @@ impl S {
         );
     }
 
-    /// FIX 4: the constraint-1 enumeration is DERIVED, not enumerated. This
+    /// The constraint-1 enumeration is DERIVED, not enumerated. This
     /// test (a) requires EXACTLY ONE marked block in `docs/API-CONSTRAINTS.md`,
     /// (b) resolves every name in it to a real fn/method in the parsed
     /// production item graph, and (c) derives every PUBLIC fn/method that takes

@@ -4165,7 +4165,7 @@ mod tests {
         folded.trim_end_matches(['.', ' ']).to_string()
     }
 
-    /// FIX evidence 2, order half: the NFD-first change only MERGES
+    /// Order half: the NFD-first change only MERGES
     /// equivalence classes. It never splits a pair the pre-fix fold already
     /// agreed on, so no pair the old fold caught is now missed; on top of that
     /// the three Greek pairs move from SPLIT (pre-fix) to MERGED (post-fix).
@@ -4255,7 +4255,7 @@ mod tests {
         );
     }
 
-    /// FIX evidence 2, host half: on the live filesystem, wherever the host
+    /// Host half: on the live filesystem, wherever the host
     /// really resolves the two spellings onto ONE entry, the crate's fold MUST
     /// merge them — an under-fold there is the escape class. The families are
     /// the ones the macOS APFS measurement pins; a family the host does not

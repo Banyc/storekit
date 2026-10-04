@@ -3446,7 +3446,7 @@ mod tests {
         );
     }
 
-    /// DEFECT 1 (local half): a directory holding a name that is not valid
+    /// A directory holding a name that is not valid
     /// UTF-8 must make `list` an ERROR, never a lossy `Ok`. Pre-fix
     /// `file_name().to_string_lossy()` mapped every non-UTF-8 name to U+FFFD,
     /// so two distinct on-disk names became one indistinguishable
@@ -3517,7 +3517,7 @@ mod tests {
         assert_eq!(names, vec![".hidden".to_string(), "a b".to_string()]);
     }
 
-    /// DEFECT 2 control (local half): the LOCAL `read_link` is raw — a target
+    /// The LOCAL `read_link` is raw — a target
     /// that leads and/or trails with whitespace comes back verbatim. The SSH
     /// side must match these exact bytes (see `parse_readlink_output_strips_`
     /// `exactly_one_newline` in the ssh suite); the pre-fix `.trim()` there
@@ -4012,7 +4012,7 @@ mod tests {
         );
     }
 
-    /// FINDING 4/5: the READS the applier verifies against are descriptor-relative
+    /// The READS the applier verifies against are descriptor-relative
     /// too. Pre-fix `read`, `read_link`, `exists`, and `metadata_opt` were
     /// PATH-based (`std::fs::read`/`read_link`/`exists`/`symlink_metadata`), so a
     /// symlink injected at a PARENT component made them FOLLOW it: a content

@@ -906,12 +906,12 @@ enum AfterWrite {
     Chmod(String, u32),
     /// Replace whatever is at `rel` with a DIRECTORY tree `rel/data/gc` holding
     /// `bytes`: a writer that swaps a regular FILE for a live DIRECTORY (the
-    /// Finding-2 kind swap).
+    /// live-kind swap).
     ReplaceWithDirTree(String, Vec<u8>),
     /// Replace whatever is at `rel` with a DIRECTORY holding `child` (a
     /// relative path below the new directory) with `bytes`: a writer that swaps
     /// a live entry's KIND under a manifest snapshot and plants an entry no
-    /// manifest spelling addresses (the Finding-1 stale-claim-kind swap).
+    /// manifest spelling addresses (the stale-claim-kind swap).
     ReplaceWithDirTreeAt(String, String, Vec<u8>),
     /// (unix only) Replace the DIRECTORY at `rel` with a SYMLINK to `outside`:
     /// a writer that turns a directory POSITION into a door out of the tree
@@ -1111,7 +1111,7 @@ struct RecordingRemote {
     /// A one-shot destination mutation applied BEFORE the FIRST trait operation
     /// the applier issues: a concurrent writer that diverges after the
     /// destination manifest was read and before any operation touches it (the
-    /// Finding-2 live-kind swap).
+    /// live-kind swap).
     mutate_before_first_op: Option<AfterWrite>,
     /// A writer on a PULL's LOCAL destination: after the Nth successful source
     /// `read` lands, apply `AfterWrite` to the stored root (the local tree).
@@ -1158,7 +1158,7 @@ struct RecordingRemote {
     fail_read_for: Option<String>,
     /// A destination mutation applied after the Nth `write` FAILS (returns
     /// `Err`): a writer that changes the destination KIND after a failed install
-    /// and before the single settle restore (the Finding-2 restore case).
+    /// and before the single settle restore (the restore case).
     mutate_after_failed_write: Option<(usize, AfterWrite)>,
     /// A destination mutation applied BEFORE the Nth DIRECTORY removal (counting
     /// `remove_dir` and `remove_dir_all` together): a writer that creates an
@@ -4702,7 +4702,7 @@ fn the_report_lists_are_mutually_exclusive_and_cover_the_diff() {
     assert_report_lists_disjoint(&report);
 }
 
-/// Item 1: a write that installs bytes but ignores the requested mode must
+/// A write that installs bytes but ignores the requested mode must
 /// fail verification AND must not be reported `applied` — `applied` requires
 /// content AND mode verified.
 #[cfg(unix)]
@@ -4750,7 +4750,7 @@ fn a_mode_ignoring_write_is_not_reported_applied() {
     );
 }
 
-/// Item 2(a): a directory whose read-only final mode was reinstated by
+/// A directory whose read-only final mode was reinstated by
 /// `finalize` must be widened AGAIN for an extraneous removal (the journal's
 /// `widened` bit is not a "currently widened" test).
 #[cfg(unix)]
@@ -4805,7 +4805,7 @@ fn extraneous_removal_after_finalize_rewidens_a_read_only_changed_parent() {
     assert_eq!(mode_of(&local.join("d")), 0o555);
 }
 
-/// Item 2(b): a source file replacing a read-only, POPULATED destination
+/// A source file replacing a read-only, POPULATED destination
 /// directory must widen the TARGET directory before the recursive removal.
 #[cfg(unix)]
 #[test]
@@ -4854,7 +4854,7 @@ fn a_file_replacing_a_read_only_populated_directory_is_sanctioned() {
     );
 }
 
-/// Item 1: a FAILED kind-changing replacement must leave the destination
+/// A FAILED kind-changing replacement must leave the destination
 /// subtree byte-identical (the stale entry is claimed aside, not removed) and
 /// leave no stray aside — push.
 #[cfg(unix)]
@@ -4890,7 +4890,7 @@ fn a_failed_file_replacement_of_a_directory_leaves_the_subtree_byte_identical() 
     );
 }
 
-/// Item 1, pull: the source read fails after the claim, so the rollback runs on
+/// Pull: the source read fails after the claim, so the rollback runs on
 /// the confined local destination. Byte-identical, no aside.
 ///
 /// SCOPE: `fail_reads` fails the SOURCE READ, which happens BEFORE any
@@ -4932,7 +4932,7 @@ fn a_failed_file_replacement_of_a_directory_leaves_the_subtree_byte_identical_on
     assert_no_aside(&local);
 }
 
-/// Item 1: a SUCCESSFUL kind-changing replacement removes the stale subtree,
+/// A SUCCESSFUL kind-changing replacement removes the stale subtree,
 /// installs the new entry, and leaves no aside — push and pull.
 #[cfg(unix)]
 #[test]
@@ -4974,7 +4974,7 @@ fn a_successful_file_replacement_of_a_directory_leaves_no_aside() {
     assert_no_aside(&local);
 }
 
-/// Item 1: a failed SYMLINK replacement of a directory rolls back.
+/// A failed SYMLINK replacement of a directory rolls back.
 #[cfg(unix)]
 #[test]
 fn a_failed_symlink_replacement_of_a_directory_leaves_the_subtree_byte_identical() {
@@ -5003,7 +5003,7 @@ fn a_failed_symlink_replacement_of_a_directory_leaves_the_subtree_byte_identical
     assert_no_aside(&dst);
 }
 
-/// Item 1: a failed DIRECTORY replacement of a file rolls back.
+/// A failed DIRECTORY replacement of a file rolls back.
 #[cfg(unix)]
 #[test]
 fn a_failed_directory_replacement_of_a_file_leaves_the_entry_byte_identical() {
@@ -5027,7 +5027,7 @@ fn a_failed_directory_replacement_of_a_file_leaves_the_entry_byte_identical() {
     assert_no_aside(&dst);
 }
 
-/// Item 1: if the ROLLBACK itself fails, the destination could not be restored
+/// If the ROLLBACK itself fails, the destination could not be restored
 /// and that failure is reported alongside the original error.
 #[cfg(unix)]
 #[test]
@@ -5192,7 +5192,7 @@ fn a_rollback_rename_that_lands_and_reports_failure_claims_no_stranded_aside() {
     assert_report_lists_disjoint(err.report());
 }
 
-/// Item 2: a source symlink replacing a populated destination directory (with
+/// A source symlink replacing a populated destination directory (with
 /// `delete_extraneous`) is reported `applied`, not dropped from every list.
 #[cfg(unix)]
 #[test]
@@ -5217,7 +5217,7 @@ fn a_symlink_replacing_a_populated_directory_is_reported_applied() {
     assert_no_aside(&dst);
 }
 
-/// Item 2: a source symlink replacing an EMPTY read-only directory (with
+/// A source symlink replacing an EMPTY read-only directory (with
 /// `delete_extraneous=false`) is likewise reported `applied`.
 #[cfg(unix)]
 #[test]
@@ -5240,7 +5240,7 @@ fn a_symlink_replacing_an_empty_read_only_directory_is_reported_applied() {
     assert_no_aside(&dst);
 }
 
-/// Item 3: if a descriptor was pinned and the path then disappears, the empty
+/// If a descriptor was pinned and the path then disappears, the empty
 /// tree must not be synthesized.
 #[test]
 fn manifest_refuses_a_pinned_root_that_disappeared() {
@@ -5255,7 +5255,7 @@ fn manifest_refuses_a_pinned_root_that_disappeared() {
     );
 }
 
-/// Item 4: the refuse rule is uniform (a refused directory is never widened);
+/// The refuse rule is uniform (a refused directory is never widened);
 /// on the confined pull side a directory not already at `0o700` blocks its
 /// children with `ParentRefused`, while one at `0o700` admits them.
 #[cfg(unix)]
@@ -5324,7 +5324,7 @@ fn the_refuse_rule_is_uniform_for_a_confined_pull() {
     );
 }
 
-/// Item 6: a `Changed` DIRECTORY child under a read-only destination parent
+/// A `Changed` DIRECTORY child under a read-only destination parent
 /// (the child replaces a file) must widen the parent to be created.
 #[cfg(unix)]
 #[test]
@@ -5373,7 +5373,7 @@ fn a_changed_directory_child_under_a_read_only_parent_is_created() {
     assert_eq!(mode_of(&local.join("d")), 0o555);
 }
 
-/// Item 6: `AppendTail` selected for a non-file (a directory, or a file over a
+/// `AppendTail` selected for a non-file (a directory, or a file over a
 /// symlink) is `AppendNotAFile`, never a destructive substitute.
 #[cfg(unix)]
 #[test]
@@ -5411,7 +5411,7 @@ fn append_tail_on_a_non_file_is_a_conflict() {
     );
 }
 
-/// Item 6: a source SYMLINK replacing a populated destination directory is
+/// A source SYMLINK replacing a populated destination directory is
 /// refused without `delete_extraneous`; the children survive.
 #[cfg(unix)]
 #[test]
@@ -5432,7 +5432,7 @@ fn a_source_symlink_replacing_a_populated_directory_conflicts() {
     assert!(report.extraneous.contains(&"p/keep".to_string()));
 }
 
-/// Item 6: pull writes must go through `crate::atomic`, which publishes by
+/// Pull writes must go through `crate::atomic`, which publishes by
 /// rename (the destination inode changes). A bare `fs::write` would truncate in
 /// place and keep the inode.
 #[cfg(unix)]
@@ -5463,7 +5463,7 @@ fn a_pull_publishes_by_atomic_rename_not_an_in_place_write() {
     );
 }
 
-/// Item 7: a non-empty destination root that appeared after the path was
+/// A non-empty destination root that appeared after the path was
 /// described as absent must not be silently adopted.
 #[test]
 fn a_racily_created_non_empty_destination_root_is_not_adopted() {
@@ -5487,7 +5487,7 @@ fn a_racily_created_non_empty_destination_root_is_not_adopted() {
     assert!(side.root_for_mutation().is_ok(), "an empty root is adopted");
 }
 
-/// Item 4: a directory blocked by ANY conflict reason (here `AppendNotAFile`)
+/// A directory blocked by ANY conflict reason (here `AppendNotAFile`)
 /// is never widened to install a child.
 #[cfg(unix)]
 #[test]
@@ -5537,7 +5537,7 @@ fn a_directory_blocked_by_an_append_conflict_is_never_widened() {
     assert_eq!(read(&dst.join("d/f")), b"abc", "the child is untouched");
 }
 
-/// Item 7: an `AppendTail` child that needs NO parent write (the source is a
+/// An `AppendTail` child that needs NO parent write (the source is a
 /// prefix of the destination) is NOT `ParentRefused` under a refused read-only
 /// parent.
 #[cfg(unix)]
@@ -6209,7 +6209,7 @@ fn a_refused_source_creates_no_destination_root_or_lock_record() {
     );
 }
 
-/// Item 5: an extraneous removal under a refused read-only ancestor reports a
+/// An extraneous removal under a refused read-only ancestor reports a
 /// `ParentRefused` conflict instead of an opaque permission error, and the
 /// entry is reported in `conflicts` (not duplicated in `extraneous`).
 #[cfg(unix)]
@@ -6325,7 +6325,7 @@ fn find_residue(root: &Path) -> String {
     panic!("no residue (.sync-aside.*) under {}", root.display());
 }
 
-/// Item 1 (HIGH, regression): a symlink destination is classified by KIND
+/// A symlink destination is classified by KIND
 /// without following it, so a pull can REPLACE it with a file. Before the fix
 /// `path_state_fd`'s `O_NOFOLLOW` open returned `ELOOP`, the claim-by-rename
 /// repair had already installed the file and leaked the aside, and
@@ -6359,7 +6359,7 @@ fn a_pull_replaces_a_symlink_destination_and_leaves_no_aside() {
     assert_no_aside(&local);
 }
 
-/// Item 1: an EXTRANEOUS symlink is removed by a pull with
+/// An EXTRANEOUS symlink is removed by a pull with
 /// `delete_extraneous` (the removal classifies the entry by kind without
 /// following it).
 #[cfg(unix)]
@@ -6390,7 +6390,7 @@ fn a_pull_removes_an_extraneous_symlink() {
     assert_no_aside(&local);
 }
 
-/// Item 1 + item 5: a FAILED pull replacement of a symlink leaves the
+/// A FAILED pull replacement of a symlink leaves the
 /// destination byte-identical, leaves NO aside, and reports the failure
 /// honestly (the rollback succeeded, so neither `restore_failures` nor
 /// `residue` claims a leftover).
@@ -6434,7 +6434,7 @@ fn a_failed_pull_replacement_of_a_symlink_leaves_it_byte_identical() {
     );
 }
 
-/// Item 2 (MED): a kind-changing replacement whose stale directory contains a
+/// A kind-changing replacement whose stale directory contains a
 /// read-only subdirectory is removed by ONE deepest-first, widening removal —
 /// push and pull. Before the fix a single-shot `remove_dir_all` failed on the
 /// nested `0555` directory AFTER installing the new entry.
@@ -6484,7 +6484,7 @@ fn a_kind_changing_replacement_removes_a_read_only_subtree() {
     assert_no_aside(&local);
 }
 
-/// Item 2 + item 5: a FAILED install in the read-only-subtree shape leaves the
+/// A FAILED install in the read-only-subtree shape leaves the
 /// destination byte-identical with NO aside.
 #[cfg(unix)]
 #[test]
@@ -6538,7 +6538,7 @@ fn a_failed_replacement_of_a_read_only_subtree_leaves_it_byte_identical() {
     assert_no_aside(&local);
 }
 
-/// Item 2 / addendum A (HIGH, data loss): a source FILE over a destination
+/// A source FILE over a destination
 /// DIRECTORY under `AppendTail` is a conflict; the conflicted directory is
 /// off-limits to DELETION mode-INDEPENDENTLY, so a WRITABLE (0o755) directory's
 /// child must survive `delete_extraneous`. An earlier test used 0o555 and so
@@ -6739,7 +6739,7 @@ fn append_tail_symlink_over_a_directory_does_not_delete_its_children() {
     assert_report_lists_disjoint(&report);
 }
 
-/// Item B (MED, crash window): a stranded aside is RESIDUE, not content. After
+/// A stranded aside is RESIDUE, not content. After
 /// a failed install AND failed rollback it must never be transferred, never
 /// deleted by `delete_extraneous`, and always reported in `residue` (and a
 /// source-side collision is a named conflict).
@@ -7084,7 +7084,7 @@ fn the_transport_recursive_removal_refuses_a_stranded_aside() {
     );
 }
 
-/// Item B: residue nested inside a destination-only directory must not be
+/// Residue nested inside a destination-only directory must not be
 /// destroyed by `delete_extraneous`; the whole guarded subtree is refused and
 /// reported as `ResidueBelow` rather than silently removed.
 #[cfg(unix)]
@@ -7333,7 +7333,7 @@ fn a_stale_temp_inside_a_claimed_subtree_is_removed_not_left_as_residue() {
     assert!(report.applied.contains(&"p".to_string()), "{report:?}");
 }
 
-/// Addendum A (HIGH, data loss): `dir_replace_is_sanctioned` scanned the
+/// `dir_replace_is_sanctioned` scanned the
 /// STRIPPED diff, so a directory whose only child is an aside looked childless
 /// and was replaced by a source file EVEN with `delete_extraneous == false`.
 /// With the RAW residue set consulted, the replacement is refused.
@@ -7364,7 +7364,7 @@ fn a_directory_holding_residue_is_never_treated_as_childless() {
     assert_residue_present(&report, &[&dst]);
 }
 
-/// Item 1 (HIGH, data loss): a reserved child must ACTUALLY survive the removal
+/// A reserved child must ACTUALLY survive the removal
 /// that is supposed to skip it. The removal recursion skips the reserved child
 /// and then must NOT hand the directory to a recursive `remove_dir_all`; it is
 /// left in place and reported. Push and pull, `delete_extraneous` false and
@@ -7500,7 +7500,7 @@ fn a_residue_mode_restore_failure_is_residue_not_a_verify_failure() {
     assert_report_lists_disjoint(err.report());
 }
 
-/// Addendum B (MED/HIGH): a FAILED rollback must report the stranded original as
+/// A FAILED rollback must report the stranded original as
 /// machine-readable residue AND name it in the message; it is not enough to say
 /// only "something went wrong".
 #[cfg(unix)]
@@ -7532,7 +7532,7 @@ fn a_failed_rollback_reports_the_stranded_aside_as_residue() {
     );
 }
 
-/// Item C (MED): a `create_dir_all` that creates the directory and THEN fails
+/// A `create_dir_all` that creates the directory and THEN fails
 /// must not strand the claimed original: the sync removes its own partial
 /// creation before renaming the aside back, so the tree stays byte-identical.
 ///
@@ -7574,7 +7574,7 @@ fn a_partially_created_directory_replacement_is_rolled_back() {
     );
 }
 
-/// Item D (MED): when `drop_claim` fails AFTER a successful install the entry
+/// When `drop_claim` fails AFTER a successful install the entry
 /// IS installed and verified, so it is reported `applied`, and the leftover
 /// aside is machine-readable `indeterminate` (its own removal was attempted and
 /// failed, so it may or may not have landed) plus a reported restore failure —
@@ -7815,7 +7815,7 @@ fn a_mode_read_failure_after_a_write_names_the_mutated_file() {
     assert_report_lists_disjoint(err.report());
 }
 
-/// Addendum C (MED): a path that becomes residue must not ALSO be reported in
+/// A path that becomes residue must not ALSO be reported in
 /// `transient_dirs`. It is recorded ABANDONED (not removed): it still exists, so
 /// the widen `drop_claim` performed on it IS restored, but it is reported in
 /// `residue` and never in `transient_dirs`.
@@ -7843,7 +7843,7 @@ fn a_leftover_aside_is_not_also_reported_transient() {
     assert_residue_present(err.report(), &[&dst]);
 }
 
-/// Addendum D (MED): the report-list invariant must hold on the FAILURE path
+/// The report-list invariant must hold on the FAILURE path
 /// too. A removal that fails after a widen used to report the directory in BOTH
 /// `extraneous` and `transient_dirs`; the transient list is now filtered to
 /// paths that are not destination-only.
@@ -7888,7 +7888,7 @@ fn the_report_lists_stay_disjoint_on_a_removal_failure() {
     assert_report_lists_disjoint(err.report());
 }
 
-/// Addendum F (LOW): a path whose content was written but whose verification
+/// A path whose content was written but whose verification
 /// failed must be machine-readable, not only present in the error string.
 #[cfg(unix)]
 #[test]
@@ -7916,7 +7916,7 @@ fn a_written_but_unverified_path_is_named_in_the_report() {
     );
 }
 
-/// Addendum G: an ORDINARY caller file whose name carries the reserved prefix on
+/// An ORDINARY caller file whose name carries the reserved prefix on
 /// the SOURCE side is a conflict, never transferred and never silently skipped.
 /// The SAME name is ALSO stranded on the destination, so the fixture would
 /// report the path in BOTH `conflicts` (source collision) and `residue`
@@ -7970,7 +7970,7 @@ fn a_source_entry_in_the_reserved_namespace_is_a_conflict() {
     assert_report_lists_disjoint(&report);
 }
 
-/// Addendum G: an ORDINARY caller file whose name carries the reserved prefix on
+/// An ORDINARY caller file whose name carries the reserved prefix on
 /// the DESTINATION side is residue: it survives `delete_extraneous` and is not
 /// reported as ordinary extraneous content.
 #[test]
@@ -7995,7 +7995,7 @@ fn a_destination_entry_in_the_reserved_namespace_is_residue() {
     assert_residue_present(&report, &[&dst]);
 }
 
-/// Addendum G: a NESTED reserved name under an ordinary directory is residue and
+/// A NESTED reserved name under an ordinary directory is residue and
 /// survives a `delete_extraneous` sync.
 #[test]
 fn a_nested_reserved_name_is_residue() {
@@ -8015,7 +8015,7 @@ fn a_nested_reserved_name_is_residue() {
     assert_residue_present(&report, &[&dst]);
 }
 
-/// Addendum G: names that merely RESEMBLE the reserved namespace are ordinary
+/// Names that merely RESEMBLE the reserved namespace are ordinary
 /// entries and must transfer normally. The prefix is anchored on the trailing
 /// dot and on the leading component.
 #[test]
@@ -8098,7 +8098,7 @@ fn strip_reserved_recomputes_the_canonical_digest() {
     );
 }
 
-/// Item 2/3: a refused WRITABLE directory admits a TRANSFERRED (`Changed`) child
+/// A refused WRITABLE directory admits a TRANSFERRED (`Changed`) child
 /// but is still off-limits to DELETION, so `delete_extraneous` must not remove
 /// its destination-only child. This is the transfer-vs-destruction distinction.
 #[cfg(unix)]
@@ -8481,7 +8481,7 @@ fn a_published_write_that_fails_stays_indeterminate_after_a_mode_restore() {
     assert_report_lists_disjoint(err.report());
 }
 
-/// Addendum B: a CHANGED symlink child under a read-only
+/// A CHANGED symlink child under a read-only
 /// manifest-entry parent. The existing `a_missing_child_under_a_read_only_-
 /// parent_is_installed_and_the_parent_restored` test exercises a `Missing`
 /// child, never a `Changed` SYMLINK — the widen-then-replace-a-symlink path.
@@ -8533,7 +8533,7 @@ fn a_changed_symlink_child_under_a_read_only_parent_is_replaced_and_the_parent_r
     assert_report_lists_disjoint(&report);
 }
 
-/// Addendum B: the "every diff entry is accounted for" clause on the
+/// The "every diff entry is accounted for" clause on the
 /// FAILURE path. The success-path version lives in
 /// `the_report_lists_are_mutually_exclusive_and_cover_the_diff`; the per-path
 /// `assert_report_names` calls elsewhere do not cover a NOVEL failure shape that
@@ -8585,7 +8585,7 @@ fn the_failure_path_report_accounts_for_every_diff_entry() {
     assert_report_lists_disjoint(err.report());
 }
 
-/// Addendum A: the destination ROOT is the one directory the widen
+/// The destination ROOT is the one directory the widen
 /// machinery does not cover, so a READ-ONLY destination root is NOT transiently
 /// widened. This is a documented limitation (see the module doc): every
 /// top-level mutation fails LOUDLY — counted and named `indeterminate` — the
@@ -8679,7 +8679,7 @@ fn a_read_only_destination_root_on_a_pull_fails_loudly_and_stays_unchanged() {
     set_mode(&local3, 0o755);
 }
 
-/// Addendum A: the same documented root limitation on the PUSH side,
+/// The same documented root limitation on the PUSH side,
 /// where the destination root is the REMOTE. A read-only destination root makes
 /// a top-level `Missing` file fail loudly; the root keeps its mode.
 #[cfg(unix)]
@@ -10327,7 +10327,7 @@ fn a_nested_unicode_case_fold_never_overwrites_a_destination_entry() {
     );
 }
 
-/// ADDENDUM A: a fold in a PARENT COMPONENT. `ς` folds onto `σ` on APFS while
+/// A fold in a PARENT COMPONENT. `ς` folds onto `σ` on APFS while
 /// `str::to_lowercase` keeps them distinct, so the parent-directory install was
 /// never refused and the run CREATED `σ/child` — a path NO report list named
 /// (only the source spelling `ς/child` was named). The per-directory gate on
@@ -10386,7 +10386,7 @@ fn a_folded_parent_component_never_mutates_an_unreported_path() {
     );
 }
 
-/// ADDENDUM B: an ABSENT destination root must not disable the up-front
+/// An ABSENT destination root must not disable the up-front
 /// case-pair refusal. The old code returned before probing when the root was
 /// missing, so a pull that creates the root moments later installed one member
 /// and reported the other as a post-transfer `verify_failure` (`Err`). The
@@ -10458,7 +10458,7 @@ fn a_case_colliding_pair_is_a_clean_conflict_not_a_verification_failure() {
     assert_eq!(read(&dst.join("Foo")), b"A");
 }
 
-/// The complement of ADDENDUM B: the conservative refusal must NOT create the
+/// The complement: the conservative refusal must NOT create the
 /// destination root when every entry is refused. This is the existing
 /// "a fully-refused pull creates nothing" property, exercised through a
 /// case-colliding pair (the case that used to need a probe).
@@ -11174,7 +11174,7 @@ fn a_transferred_directory_replaced_by_a_file_is_not_reported_applied() {
 }
 
 /// Whether a `mode 0o000` directory `read_dir` actually FAILS for THIS
-/// process. The Finding-A chmod reproduction needs the directory to become
+/// process. The chmod reproduction needs the directory to become
 /// unenumerable; root (or `CAP_DAC_READ_SEARCH`) bypasses the mode, so the
 /// premise is untestable there and the reproduction skips (loudly).
 #[cfg(unix)]
@@ -11516,7 +11516,7 @@ fn a_path_based_destination_refuses_a_directory_swapped_for_a_symlink_after_a_tr
     );
 }
 
-/// FINDING A, chmod variant: a `Skipped` path whose final
+/// The chmod variant: a `Skipped` path whose final
 /// verification COULD NOT RUN because its parent directory became unreadable
 /// must be a verification failure, never advertised `skipped`. The failure was
 /// recorded in the listing-failure branch, but `derive_report` ranked the
@@ -11556,7 +11556,7 @@ fn a_skipped_path_whose_verification_could_not_run_is_not_reported_skipped() {
     assert_report_lists_disjoint(&report);
 }
 
-/// FINDING A, raw-name variant (LINUX-ONLY): a writer adds a
+/// The raw-name variant (LINUX-ONLY): a writer adds a
 /// non-UTF-8 name under `d`, so the run cannot enumerate `d` and the `Skipped`
 /// `d/skip` verifies NOWHERE. It must be a verification failure, not `skipped`.
 #[cfg(unix)]
@@ -11597,7 +11597,7 @@ fn a_skipped_path_under_a_raw_named_directory_is_not_reported_skipped() {
     assert_report_lists_disjoint(&report);
 }
 
-/// FINDING B: an `OwnClaim` directory removal must re-establish the
+/// An `OwnClaim` directory removal must re-establish the
 /// sanction against the LIVE listing. `dst/a` is an empty directory in the
 /// manifest (so it is emptied-and-replaced by the source file) and the claim is
 /// taken then; a writer adds `a/extra` before the claim's removal, and pre-fix
@@ -11634,7 +11634,7 @@ fn an_own_claim_removal_never_destroys_a_live_unaddressed_child() {
     );
 }
 
-/// FINDING B, NESTED variant: the writer-created child is under a
+/// The NESTED variant: the writer-created child is under a
 /// NESTED directory inside the claimed tree, so the re-establishment must hold
 /// at every recursion depth, not only the claim root.
 #[cfg(unix)]
@@ -11749,7 +11749,7 @@ fn build_dest_kind(root: &Path, rel: &str, kind: EntryKind) {
     }
 }
 
-/// THE CLASS-LEVEL CAMPAIGN (Finding 1). A kind-changing replacement opens a
+/// THE CLASS-LEVEL CAMPAIGN. A kind-changing replacement opens a
 /// claim window (a source read, a remote round trip, a `make_overwritable`
 /// chmod). A concurrent writer materialises `p/wc/gc` inside that window, and
 /// the install is then forced to fail so `rollback_claim`/`discard_partial`
@@ -11824,7 +11824,7 @@ fn a_claim_window_writer_subtree_survives_every_rollback_campaign_case() {
     assert_eq!(cases, 12, "6 kind-changing pairs x 2 delete settings");
 }
 
-/// THE ACCOUNTING HALF OF FINDING 1: a rolled-back failure must not erase the
+/// THE ACCOUNTING HALF: a rolled-back failure must not erase the
 /// fact that a path was touched. Here the rollback SUCCEEDS (the sync discards
 /// its own empty partial and restores the original byte-identically), but the
 /// failed install must remain named. Pre-fix, `discard_partial`'s removal and
@@ -11912,7 +11912,7 @@ fn a_rollback_never_displaces_a_writer_entry_at_its_target() {
     assert!(result.is_err(), "the refusal is reported: {result:?}");
 }
 
-/// FINDING 2: the mode-only `Replace` short-circuit trusted the manifest
+/// The mode-only `Replace` short-circuit trusted the manifest
 /// SNAPSHOT kind. A writer that replaces a destination FILE with a live
 /// DIRECTORY before the first operation made the sync chmod the DIRECTORY to
 /// the source FILE's mode (0o600), leaving it non-traversable and NOT restored.
@@ -11961,7 +11961,7 @@ fn a_live_directory_is_never_chmodded_by_a_mode_only_file_transfer() {
     assert_residue_present(report, &[&dst]);
 }
 
-/// FINDING 3 (COVERAGE-ONLY): the `skipped` contract is SCOPED to a TOUCHED
+/// COVERAGE-ONLY: the `skipped` contract is SCOPED to a TOUCHED
 /// parent. `a/f` is `Same` and nothing under `a` transfers, so `a` is never a
 /// touched directory; a writer may change `a/f` after the manifest scan and the
 /// run neither mutates it nor re-reads it. The report names it `skipped` (it
@@ -11969,7 +11969,7 @@ fn a_live_directory_is_never_chmodded_by_a_mode_only_file_transfer() {
 /// [`SyncReport::skipped`] now documents. `b/g` DOES transfer, so `b` is
 /// touched and its children are re-confirmed.
 ///
-/// COVERAGE-ONLY: the code behaviour is unchanged by the Finding 3 resolution
+/// COVERAGE-ONLY: the code behaviour is unchanged by the skipped-contract resolution
 /// (which scopes the documented guarantee to what the code actually does), so
 /// this test passes against the pre-fix code as well; it pins the scoped
 /// contract so a future attempt to re-widen the doc fails here.
@@ -12010,7 +12010,7 @@ fn a_skipped_path_under_an_untouched_directory_is_reported_on_the_manifest_alone
     assert_report_lists_disjoint(&report);
 }
 
-/// FINDING 1, SOURCE-ADDRESSED CHILD VARIANT of the same class: the writer
+/// A SOURCE-ADDRESSED CHILD VARIANT of the same class: the writer
 /// creates a child the SOURCE manifest DOES address (`p/f`). A rule keyed only
 /// on "is the live spelling in the diff" would allow it. But the sync's own
 /// partial creation is `create_dir_all`'s EMPTY directory (or one file/symlink);
@@ -12072,7 +12072,7 @@ fn report_names_writer_subtree(report: &SyncReport, live_spelling: &str) -> bool
             .any(|path| path.starts_with(ASIDE_PREFIX))
 }
 
-/// FINDING 1 on the CONFINED-LOCAL destination (`pull` through `Side::Local`):
+/// The same class on the CONFINED-LOCAL destination (`pull` through `Side::Local`):
 /// a live subtree no manifest spelling addresses is destroyed recursively,
 /// silently, with a clean `Ok`.
 ///
@@ -12095,7 +12095,7 @@ fn a_confined_pull_live_kind_swap_is_preserved_and_named() {
     confined_pull_live_kind_swap_scenario(EntryKind::Dir);
 }
 
-/// The SYMLINK-source half of the same Finding-1 scenario. Split out so each
+/// The SYMLINK-source half of the same scenario. Split out so each
 /// variant has its own pre-fix failure proof.
 #[cfg(unix)]
 #[test]
@@ -12155,7 +12155,7 @@ fn confined_pull_live_kind_swap_scenario(src_kind: EntryKind) {
     );
 }
 
-/// THE EXTENDED CAMPAIGN (Finding 1 coverage): the confined-LOCAL destination
+/// THE EXTENDED CAMPAIGN: the confined-LOCAL destination
 /// is exercised for every kind-changing source/destination pair and both
 /// `delete_extraneous` settings, with a live-kind swap AND (where the local
 /// path has a source read inside the window) an injected operation failure.
@@ -12276,7 +12276,7 @@ fn case_leaves_claim_residue(_src_kind: EntryKind, inject_failure: bool) -> bool
     !inject_failure
 }
 
-/// FINDING 2: `restore` applied the journal's FILE-kind mode to a live
+/// `restore` applied the journal's FILE-kind mode to a live
 /// DIRECTORY.
 ///
 /// The destination file `p` (mode `0o444`) is widened by `make_overwritable`

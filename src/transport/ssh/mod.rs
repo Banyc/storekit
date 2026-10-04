@@ -3769,7 +3769,7 @@ mod tests_ssh {
         );
     }
 
-    // Finding 3: `.` and `..` are excluded, and real modes are preserved.
+    // `.` and `..` are excluded, and real modes are preserved.
     #[test]
     fn list_excludes_dot_entries_and_keeps_modes() {
         // The wire frame is NUL-terminated records of
@@ -3901,7 +3901,7 @@ mod tests_ssh {
         run_sh_stdin(&t.list_script(rel), &[])
     }
 
-    /// DEFECT 3: an ABSENT directory must list EMPTY, matching
+    /// An ABSENT directory must list EMPTY, matching
     /// `LocalTransport::list`'s deliberate `NotFound` ⇒ empty rule. Pre-fix
     /// `opendir … or die` exited 2 for a missing directory.
     #[test]
@@ -3914,7 +3914,7 @@ mod tests_ssh {
         );
     }
 
-    /// DEFECT 2 + 3: a `chmod 400` directory has the READ bit (so `opendir`
+    /// A `chmod 400` directory has the READ bit (so `opendir`
     /// succeeds) but no SEARCH bit, so every `lstat` fails EACCES. The old
     /// `next unless @s` silently dropped every entry, printing ZERO bytes and
     /// exiting 0 for a NON-EMPTY directory — `Ok(vec![])` where the local view
@@ -3956,7 +3956,7 @@ mod tests_ssh {
         }
     }
 
-    /// DEFECT 5: the fsync primitives must TERMINATE on a FIFO. The old
+    /// The fsync primitives must TERMINATE on a FIFO. The old
     /// `open my $fh, "<", $ARGV[0]` blocks forever on a fifo with no writer
     /// (proved on GNU and BSD with `timeout 3` → rc 124); `sysopen` with
     /// `O_NONBLOCK` returns immediately and the non-regular entry is refused.
@@ -3989,7 +3989,7 @@ mod tests_ssh {
         }
     }
 
-    /// DEFECT 1 (the hole): the `fsync_tree` command must exit NONZERO when a
+    /// The `fsync_tree` command must exit NONZERO when a
     /// far-side fsync fails. Pre-fix `find … -exec … {} ;` ignored the invoked
     /// command's exit status, so a fake perl that failed EVERY call still made
     /// the whole command exit 0. This runs the LITERAL command under `/bin/sh`
@@ -4021,7 +4021,7 @@ mod tests_ssh {
         );
     }
 
-    /// DEFECT 5, at the TREE level: `find -type d -o -type f` (like the local
+    /// At the TREE level: `find -type d -o -type f` (like the local
     /// walk's `symlink_metadata`) never selects a FIFO, so the tree walk
     /// terminates AND succeeds — no entry ever opens it.
     // unix-only: needs a FIFO (the mkfifo(1) utility).
@@ -4101,7 +4101,7 @@ mod tests_ssh {
         );
     }
 
-    /// DEFECT 1 (Remote half, script): the wire frame must carry a name
+    /// The wire frame must carry a name
     /// containing a TAB or a NEWLINE verbatim. Pre-fix the frame was
     /// tab/LF-delimited, so `a\tb` parsed as `a` (the tab split the fields)
     /// and `line1\nline2` split into TWO bogus entries — the listing view used
@@ -4135,7 +4135,7 @@ mod tests_ssh {
         );
     }
 
-    /// DEFECT 1 (Remote half, script): a name ending in a newline is legal and
+    /// A name ending in a newline is legal and
     /// must survive the frame. Pre-fix the script derived the name with
     /// `$(basename ...)`, and command substitution strips EVERY trailing
     /// newline, so `n\n` became `n` — a byte-exact comparison would then match
@@ -4156,7 +4156,7 @@ mod tests_ssh {
         assert_eq!(names, vec!["n\n".to_string(), "plain".to_string()]);
     }
 
-    /// DEFECT 1 (Remote half, decoder): the listing payload is decoded from
+    /// The listing payload is decoded from
     /// RAW bytes and a non-UTF-8 name is REFUSED. Pre-fix
     /// `String::from_utf8_lossy(&out.stdout)` mapped every such name to U+FFFD,
     /// so two DISTINCT on-disk names became one compared spelling. This is the
@@ -4194,7 +4194,7 @@ mod tests_ssh {
         );
     }
 
-    /// DEFECT 2: `readlink` prints the RAW target plus ONE newline. The frame
+    /// `readlink` prints the RAW target plus ONE newline. The frame
     /// must strip exactly that one byte — the pre-fix `.trim()` also deleted a
     /// leading/trailing whitespace byte that is PART OF THE TARGET, so the SSH
     /// read differed from the raw local `read_link` and a concurrent `"x"` ->
@@ -4378,7 +4378,7 @@ mod tests_ssh {
         );
     }
 
-    // Finding 4: try_write_new creates the parent directory before the
+    // try_write_new creates the parent directory before the
     // noclobber install, so a fresh remote root can host the first lock.
     #[test]
     fn try_write_new_creates_parent_dir() {
@@ -4480,7 +4480,7 @@ mod tests_ssh {
         );
     }
 
-    /// FIX A: the ControlMaster socket is keyed on the CONNECTION IDENTITY,
+    /// The ControlMaster socket is keyed on the CONNECTION IDENTITY,
     /// not only on `user@host:port`.
     ///
     /// A master is authenticated once; every later client that reuses its
