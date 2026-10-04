@@ -135,10 +135,32 @@ stays public on neither port (it is the SSH runner's kill path, so it became
 ports implement it, and a dead transport-level re-export of `kill_process_group`
 was removed outright.
 
-Verified by re-running the sweep: the unix-only and windows-only public sets in
-`atomic` are now both EMPTY. The crate's public-function total fell 186 → 174
-across this and API constraint #1 — the constraint's real product is a smaller
-surface, not a longer document.
+Verified by re-running the sweep **twice**, and the first verification was
+WRONG: it claimed the unix-only and windows-only public sets in `atomic` were
+both EMPTY, and three platform-scoped `pub` items had survived it —
+`atomic::temp_file_name` and `RootDir::as_fd` on unix, `RootDir::path` on
+windows — so a consumer calling the first two compiles on macOS and fails to
+compile for `x86_64-pc-windows-msvc` (`E0425`, `E0599`): exactly the failure this
+entry says was eliminated. The sweep was wrong because it re-checked the
+population the earlier fix had already emptied (the `pub use …::*` free-function
+sets) instead of asking each surviving `pub` item whether it exists on both
+ports. The second sweep asked a better question — does any CONSUMER need it —
+and, with `~/code/deploy` the only dependent and zero hits for all three, demoted
+them to `pub(crate)`. Measured with rustdoc JSON on both targets, the public sets
+are now IDENTICAL: 191 items each crate-wide and 11 in `atomic`, with 0 unix-only
+and 0 windows-only names.
+
+What REMAINS platform-dependent is on BOTH ports and states its MEANING rather
+than its presence, so the next sweep checks the right property:
+`atomic::COMPONENT_CONFINED` (`cfg!(unix)` — the flag a caller must consult to
+know whether the live confinement check still applies to it at all) and `RootDir`
+itself (an `OwnedFd` on unix against a `PathBuf` on windows, with a stronger
+`read`/`open` guarantee on unix that the type documents). "Both sets empty" is
+only a claim about PRESENCE; presence is now equal, and meaning is what a
+consumer must read.
+
+The crate's public-function total fell 186 → 174 across this and API constraint
+#1 — the constraint's real product is a smaller surface, not a longer document.
 
 **K — a reading taken from the wrong revision.** A `pub fn` surface count and a
 full `cargo test --lib` were both run from a checkout whose working copy was
