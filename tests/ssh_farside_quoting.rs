@@ -36,6 +36,7 @@
 //! assertions are expressed as `Remote::write` returning `Ok`, the literal
 //! destination path round-tripping its exact bytes and mode, and the
 //! destination root holding exactly the planned entries.
+#![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
 use std::collections::BTreeMap;

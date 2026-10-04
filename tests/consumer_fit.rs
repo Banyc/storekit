@@ -34,6 +34,9 @@
 //! It is fast and hermetic: no network, no sshd — everything runs through
 //! `LocalTransport` and the in-crate seams.
 
+// Test fixtures drive the same name-creating primitives the funnel guards.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 use storekit::RootedRelativePath;

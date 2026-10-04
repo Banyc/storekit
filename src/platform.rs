@@ -17,12 +17,32 @@ use std::path::Path;
 /// ACLs are the privacy mechanism). Documented weaker guarantee of the
 /// Windows port.
 ///
-/// This is the crate's ONE mode-bit authority, so the crate-root
-/// `#![deny(clippy::disallowed_methods)]` is relaxed here for that single
+/// This is the crate's ONE PATH-BASED mode authority, so the crate-root
+/// `#![deny(clippy::disallowed_methods)]` is relaxed here for this single
 /// `std::fs::set_permissions` call: `set_permissions` changes an inode's mode,
-/// never its name, so it cannot free or swap a lock record's inode, but the
-/// funnel rule keeps mode changes on this one entry point rather than letting
-/// a caller scatter raw calls.
+/// never its name, so it cannot free or swap a lock record's inode — but it
+/// RE-RESOLVES the path (and so can be redirected by a symlink at that path),
+/// which is exactly why every path-based mode change must stay on this one
+/// entry point.
+///
+/// The FD-BOUND `std::fs::File::set_permissions` method is the PERMITTED
+/// second form. It chmods an already-open descriptor and cannot re-resolve a
+/// name, so it needs no `allow` and none is granted for it. Only the
+/// PATH-taking free function [`std::fs::set_permissions`] is denied (there is
+/// no `Path::set_permissions` method; a path-based chmod outside `chmod` would
+/// have to spell that free function, which the deny catches). The production
+/// FD-bound sites are:
+/// `lock::FileLock::acquire` (the newly opened lock record);
+/// `sync::apply`'s `set_local_mode`; the `atomic::unix` fd-bound helpers
+/// (`open_verbatim_source`, `replace_core`, `write_atomic_cas_fd`,
+/// `ensure_private_dir_fd`, `ensure_private_dir_durable_fd_path`,
+/// `set_private_fd`, `create_destination_chain`, `copy_dir_recursive_fd`,
+/// `set_dir_mode_fd`); and `transport::LocalTransport`'s `write_confined` /
+/// `set_mode_confined`. Every receiver is a descriptor obtained from an
+/// `O_NOFOLLOW` `openat`/`dup`, or the newly opened lock-record [`File`].
+///
+/// [`std::fs::set_permissions`]: std::fs::set_permissions
+/// [`File`]: std::fs::File
 #[allow(clippy::disallowed_methods)]
 pub fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -71,6 +91,13 @@ pub fn metadata_mode(m: &std::fs::Metadata) -> u32 {
 /// Create a symlink — on Windows, best-effort via the platform symlink API
 /// (which requires admin/developer mode; a failure propagates). Documented
 /// weaker guarantee of the Windows port.
+///
+/// This is the crate's ONE production std-symlink site (a name CREATION), so
+/// the crate-root `#![deny(clippy::disallowed_methods)]` is relaxed here for
+/// exactly this function: the three platform-symlink wrappers below are on the
+/// deny list and this is the single reviewed entry point to them. No other
+/// production site may call them.
+#[allow(clippy::disallowed_methods)]
 pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -78,14 +105,15 @@ pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::{symlink_dir, symlink_file};
         // Best-effort: try a directory symlink first (the common case — the
         // `current`/`root` layout links point at directories), then a file
         // symlink. Both require admin/developer mode on Windows; a failure
-        // propagates.
-        match symlink_dir(target, link) {
+        // propagates. Written FULLY QUALIFIED (rather than through a `use`)
+        // so the source audit sees the canonical `std::os::windows::fs::…`
+        // spelling, not an import route.
+        match std::os::windows::fs::symlink_dir(target, link) {
             Ok(()) => Ok(()),
-            Err(_) => symlink_file(target, link),
+            Err(_) => std::os::windows::fs::symlink_file(target, link),
         }
     }
 }

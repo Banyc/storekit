@@ -99,11 +99,15 @@
 //! token scan matches the canonical token sequence only, and counts the
 //! occurrence ONCE, not once per macro expansion); a raw FFI declaration —
 //! `extern "C" { fn unlinkat(…); }` followed by a call — which names neither
-//! `libc` nor `std::fs`, so NEITHER audit sees it; and any mutation that
-//! preserves the entry's inode (`std::fs::write`, `std::fs::copy`,
-//! `std::fs::set_permissions`, `std::fs::create_dir*`), which cannot split a
-//! holder because the flock is attached to the unchanged inode, so it is not
-//! counted. The reach of a raw FFI declaration is one declaration the crate's
+//! `libc` nor `std::fs`, so NEITHER audit sees it; and an INODE-PRESERVING
+//! content mutation (`std::fs::write`, `std::fs::copy`) on a path that already
+//! exists, which cannot split a holder because the flock is attached to the
+//! unchanged inode. The mode setter (`std::fs::set_permissions`) and the name
+//! CREATORS (`std::fs::create_dir*`, the platform `symlink` wrappers) are NO
+//! LONGER in this residue: both are on `clippy.toml`'s deny list, counted by
+//! the `std::fs` pin, and covered by the cross-artifact consistency test, so an
+//! adopt-a-name or re-mode call outside the funnel fails the lint. The reach of
+//! a raw FFI declaration is one declaration the crate's
 //! own author writes — exactly the residue a source audit carries and names
 //! rather than denies. A foreign process, or a raw `std::fs` call the caller
 //! writes itself, is outside the crate entirely and is not stopped by any of
@@ -482,6 +486,7 @@ impl<'a> GuardedRel<'a> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     use super::GuardedRel;
     // `OwnedLockRecord` is exercised only by the identity/fold tests below,
     // which need a real (device, inode) pair: a Unix filesystem property.
@@ -619,10 +624,15 @@ mod tests {
         assert!(!remote.owns(Path::new("state/OPERATION.LOCK")));
     }
 
-    /// The name-mutating `libc` functions the audit tracks: BOTH the `*at`
-    /// forms and the non-`at` forms the earlier six-symbol scan missed
-    /// (`open` with `O_CREAT`/`O_TRUNC`, `rmdir`, `unlink`, `rename`,
-    /// `symlink`, `link`, `mkdir`, `remove`).
+    /// The name-mutating `libc` functions the OUTSIDE-the-funnel assertion
+    /// refuses: BOTH the `*at` forms and the non-`at` forms the earlier
+    /// six-symbol scan missed (`open` with `O_CREAT`/`O_TRUNC`, `rmdir`,
+    /// `unlink`, `rename`, `symlink`, `link`, `mkdir`, `remove`). It is the
+    /// belt to the outside map's braces: the map already closes the outside
+    /// `libc` surface exactly, and this additionally forbids a REVIEWED map
+    /// entry from being one of these known mutators. Inside the funnel the
+    /// device is the exact per-module `libc` surface pin, not this list, so a
+    /// new funnel syscall of ANY name changes the pin.
     const MUTATING_LIBC_SYSCALLS: [&str; 14] = [
         "unlinkat",
         "renameat",
@@ -640,22 +650,48 @@ mod tests {
         "remove",
     ];
 
-    /// The `std::fs` calls that can REMOVE or REPLACE an existing directory
-    /// entry — and therefore change or free a lock record's inode. Truncating
-    /// or chmodding operations (`write`, `copy`, `set_permissions`) preserve the
-    /// entry's inode, so they cannot split a holder and are deliberately NOT
-    /// counted (see the audit's scope note).
-    const FS_INODE_MUTATORS: [&str; 5] = [
-        "remove_file",
-        "remove_dir",
-        "remove_dir_all",
-        "rename",
-        "hard_link",
+    /// Every `std` symbol whose denial the funnel owns, as its CANONICAL path
+    /// (the path the crate's own name resolution produces) paired with the
+    /// short symbol name used in the pins. It is one table so the count pin,
+    /// the import-route detector, the macro-token scan, and the canonical-
+    /// spelling test cannot drift apart:
+    ///
+    /// * the inode mutators that REMOVE or REPLACE an entry (`remove_file`,
+    ///   `remove_dir`, `remove_dir_all`, `rename`, `hard_link`);
+    /// * the CREATORS that ADOPT a name (`std::fs::create_dir`,
+    ///   `std::fs::create_dir_all`, and the platform symlink creators, which
+    ///   live under `std::os::…` and are therefore keyed by their full path);
+    /// * the path-based mode setter `std::fs::set_permissions`.
+    ///
+    /// The creators are here because the guard's reserved-spelling check is
+    /// what makes a name-creating call safe: a creation bypasses that check
+    /// exactly as a removal does, so `create_dir_fd`/`symlink_fd` refuse the
+    /// reserved spellings (`operation.lock`, `.sync-aside.1`) that
+    /// `std::fs::create_dir*` and the platform symlink calls would happily
+    /// create.
+    const NAME_MUTATION_SYMBOLS: &[(&[&str], &str)] = &[
+        (&["std", "fs", "remove_file"], "remove_file"),
+        (&["std", "fs", "remove_dir"], "remove_dir"),
+        (&["std", "fs", "remove_dir_all"], "remove_dir_all"),
+        (&["std", "fs", "rename"], "rename"),
+        (&["std", "fs", "hard_link"], "hard_link"),
+        (&["std", "fs", "create_dir"], "create_dir"),
+        (&["std", "fs", "create_dir_all"], "create_dir_all"),
+        (&["std", "fs", "set_permissions"], "set_permissions"),
+        (&["std", "os", "unix", "fs", "symlink"], "symlink"),
+        (
+            &["std", "os", "windows", "fs", "symlink_file"],
+            "symlink_file",
+        ),
+        (
+            &["std", "os", "windows", "fs", "symlink_dir"],
+            "symlink_dir",
+        ),
     ];
 
-    /// A production route by which one of [`FS_INODE_MUTATORS`] can be reached
-    /// WITHOUT spelling `std::fs::<symbol>(`, so the exact-count pin alone
-    /// cannot see it.
+    /// A production route by which one of [`NAME_MUTATION_SYMBOLS`] can be
+    /// reached WITHOUT spelling its canonical path, so the exact-count pin
+    /// alone cannot see it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum FsRoute {
         /// `use std::fs::remove_file [as x];` (single) or one entry of a
@@ -732,6 +768,12 @@ mod tests {
         fn resolve_path(&self, module: &[String], segments: &[String]) -> CanonPath {
             let (mut path, mut index) = match segments.first().map(String::as_str) {
                 Some("std") => (vec!["std".to_string()], 1),
+                // `libc` is anchored like `std` so a funnel call can be
+                // resolved to its canonical `libc::<symbol>` path (the
+                // consistency test compares that surface with `clippy.toml`).
+                // No `std::fs` symbol starts with `libc`, so this cannot
+                // change the `std::fs` audit.
+                Some("libc") => (vec!["libc".to_string()], 1),
                 Some("crate") => (vec!["crate".to_string()], 1),
                 Some("self") => (module.to_vec(), 1),
                 Some("super") => {
@@ -874,15 +916,19 @@ mod tests {
         out
     }
 
-    /// The canonical path of the `std::fs` inode mutator `path` names, if any.
+    /// The canonical `std` name-mutation symbol `path` names, if any, from
+    /// [`NAME_MUTATION_SYMBOLS`]: `std::fs::remove_file`, `std::fs::create_dir`,
+    /// `std::os::unix::fs::symlink`, … — one table, so the count pin, the route
+    /// detector, and the canonical-spelling test cannot drift apart.
     fn mutator_symbol(path: &[String]) -> Option<&'static str> {
-        if path.len() == 3 && path[0] == "std" && path[1] == "fs" {
-            return FS_INODE_MUTATORS
-                .iter()
-                .find(|&&symbol| path[2] == symbol)
-                .copied();
-        }
-        None
+        NAME_MUTATION_SYMBOLS.iter().find_map(|(segments, symbol)| {
+            (path.len() == segments.len()
+                && path
+                    .iter()
+                    .zip(segments.iter())
+                    .all(|(actual, expected)| actual.as_str() == *expected))
+            .then_some(*symbol)
+        })
     }
 
     /// Whether a canonical path is a glob over `std` or `std::fs`.
@@ -899,11 +945,20 @@ mod tests {
         leaf.segments.last().map(String::as_str) == Some("*")
     }
 
-    /// Whether the WRITTEN path is already the canonical `std::fs::<symbol>`
-    /// spelling, which the exact-count pin covers, or reaches the mutator only
-    /// through an import / alias / cross-file re-export.
+    /// Whether the WRITTEN path is already the canonical spelling of
+    /// `symbol` (one of [`NAME_MUTATION_SYMBOLS`]) — `std::fs::remove_file`,
+    /// but equally `std::os::unix::fs::symlink` — which the exact-count pin
+    /// covers, or reaches the mutator only through an import / alias /
+    /// cross-file re-export.
     fn is_canonical_literal(segments: &[String], symbol: &str) -> bool {
-        segments.len() == 3 && segments[0] == "std" && segments[1] == "fs" && segments[2] == symbol
+        NAME_MUTATION_SYMBOLS.iter().any(|(path, name)| {
+            *name == symbol
+                && path.len() == segments.len()
+                && segments
+                    .iter()
+                    .zip(path.iter())
+                    .all(|(actual, expected)| actual.as_str() == *expected)
+        })
     }
 
     /// The callee path of a call, seeing through the parentheses, references,
@@ -967,36 +1022,58 @@ mod tests {
         out
     }
 
-    /// The `std::fs` inode mutators named by a macro token stream as the
-    /// CANONICAL token sequence `std :: fs :: <symbol>` (a leading `::` is
-    /// ignored and `r#std` / `r#<symbol>` are normalised). This restores the
+    /// The identifier a macro token list starts a `::`-joined path at, if one
+    /// begins at `i`: `["std","fs","create_dir"]` for
+    /// `std :: fs :: create_dir`, as a flat token list. Returns the segments
+    /// and the index just past the path, so the caller can continue scanning
+    /// after it. Raw identifiers are already stripped by [`macro_token_list`].
+    fn token_path_at(list: &[String], mut i: usize) -> Option<(Vec<String>, usize)> {
+        let first = list.get(i)?;
+        let head = first.chars().next()?;
+        if !(head.is_ascii_alphabetic() || head == '_') {
+            return None;
+        }
+        let mut segments = vec![first.clone()];
+        i += 1;
+        while list.get(i).map(String::as_str) == Some(":")
+            && list.get(i + 1).map(String::as_str) == Some(":")
+        {
+            let Some(next) = list.get(i + 2) else { break };
+            let Some(head) = next.chars().next() else {
+                break;
+            };
+            if !(head.is_ascii_alphabetic() || head == '_') {
+                break;
+            }
+            segments.push(next.clone());
+            i += 3;
+        }
+        Some((segments, i))
+    }
+
+    /// The `std` name-mutation symbols named by a macro token stream as a
+    /// canonical `::`-joined path — `std::fs::<symbol>`, `std::fs::create_dir`,
+    /// and the `std::os::…::fs::symlink*` creators alike. This restores the
     /// coverage the parse lost: the old byte count saw the literal
     /// `std::fs::<symbol>(` text inside a `macro_rules!` body, and this scan
-    /// sees that sequence again. It is deliberately NOT a general resolver — a
-    /// mutator reached inside a macro through an alias/import is not matched,
-    /// and the occurrence is counted once per macro, not once per expansion;
-    /// both are named in the audit's residue.
+    /// sees that sequence again, plus the creation family. It is deliberately
+    /// NOT a general resolver — a mutator reached inside a macro through an
+    /// alias/import is not matched, and the occurrence is counted once per
+    /// macro, not once per expansion; both are named in the audit's residue.
     fn macro_mutator_symbols(tokens: impl std::fmt::Display) -> Vec<&'static str> {
         let list = macro_token_list(tokens);
         let mut out = Vec::new();
         let mut i = 0usize;
-        while i + 6 < list.len() {
-            let window = &list[i..i + 7];
-            if window[0] == "std"
-                && window[1] == ":"
-                && window[2] == ":"
-                && window[3] == "fs"
-                && window[4] == ":"
-                && window[5] == ":"
-                && let Some(symbol) = FS_INODE_MUTATORS
-                    .iter()
-                    .find(|&&symbol| window[6] == symbol)
-            {
-                out.push(*symbol);
-                i += 7;
-                continue;
+        while i < list.len() {
+            match token_path_at(&list, i) {
+                Some((segments, next)) if next > i => {
+                    if let Some(symbol) = mutator_symbol(&segments) {
+                        out.push(symbol);
+                    }
+                    i = next;
+                }
+                _ => i += 1,
             }
-            i += 1;
         }
         out
     }
@@ -1081,6 +1158,62 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Whether an attribute list carries `#[allow(clippy::disallowed_methods)]`
+    /// (or the inner `#![allow(...)]` form). Matching on the token TEXT is
+    /// enough for the one lint path this audit cares about, and needs no
+    /// `syn` printing feature.
+    fn attrs_allow_disallowed(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("allow")
+                && matches!(
+                    &attr.meta,
+                    syn::Meta::List(list)
+                        if list
+                            .tokens
+                            .to_string()
+                            .replace(' ', "")
+                            .contains("disallowed_methods")
+                )
+        })
+    }
+
+    /// The FUNNEL modules: every PRODUCTION file whose module-level
+    /// `#![allow(clippy::disallowed_methods)]` makes the crate-root
+    /// resolved-symbol deny blind inside it. DERIVED from the parsed sources, so
+    /// the libc-surface pin in [`no_libc_reference_outside_the_funnel`] follows
+    /// the allow instead of a second, hardcoded list that could drift from the
+    /// `#[allow]`s. Item-level allows are covered separately by
+    /// [`funnel_symbol_surface`], which walks annotated items too.
+    fn funnel_modules(files: &[(String, String)], gated: &BTreeSet<String>) -> BTreeSet<String> {
+        parse_crate(files, gated)
+            .iter()
+            .filter(|source| !is_test_only(&source.rel, gated))
+            .filter(|source| attrs_allow_disallowed(&source.file.attrs))
+            .map(|source| source.rel.clone())
+            .collect()
+    }
+
+    /// Whether a `syn::Item` carries `#[allow(clippy::disallowed_methods)]`,
+    /// directly or as a module-body inner attribute. An annotated item is a
+    /// FUNNEL region: the crate-root deny does not reach inside it.
+    fn item_allows_disallowed(item: &syn::Item) -> bool {
+        let attrs = match item {
+            syn::Item::Fn(item) => &item.attrs,
+            syn::Item::Mod(item) => &item.attrs,
+            syn::Item::Impl(item) => &item.attrs,
+            syn::Item::Const(item) => &item.attrs,
+            syn::Item::Static(item) => &item.attrs,
+            syn::Item::Struct(item) => &item.attrs,
+            syn::Item::Enum(item) => &item.attrs,
+            syn::Item::Trait(item) => &item.attrs,
+            syn::Item::Union(item) => &item.attrs,
+            syn::Item::Type(item) => &item.attrs,
+            syn::Item::Use(item) => &item.attrs,
+            _ => return false,
+        };
+        attrs_allow_disallowed(attrs)
     }
 
     /// Whether a parsed production file uses a `#[path]` attribute on a `mod`
@@ -1326,7 +1459,7 @@ mod tests {
     }
 
     /// Reports a `std::fs` inode-mutating CALL or PATH in PRODUCTION code that
-    /// reaches one of [`FS_INODE_MUTATORS`] through an ENUMERATED route the
+    /// reaches one of [`NAME_MUTATION_SYMBOLS`] through an ENUMERATED route the
     /// exact-count pin does not cover: an IMPORTED symbol, a MODULE ALIAS
     /// (including a `std`-crate-ROOT alias and a cross-file `pub(crate)`
     /// re-export resolved through the module graph), or a glob. It is not a
@@ -2111,52 +2244,83 @@ mod tests {
         }
     }
 
-    /// STRUCTURAL AUDIT (libc): outside the ONE funnel module
-    /// (`src/atomic/unix.rs`), the crate's `libc` surface is CLOSED to a pinned
-    /// review list. ANY reference to `libc` — a mutating symbol, a module alias
-    /// (`use libc as c;`), a re-export, a glob, or a newline-separated call —
-    /// that is not on that list fails, and so does a mutation of the pinned
-    /// counts. This replaces the old mutating-symbol-only pattern scan, which
-    /// missed a module alias (`c::unlinkat`) that genuinely split a live holder.
+    /// STRUCTURAL AUDIT (libc): the crate's `libc` surface is CLOSED on BOTH
+    /// sides of the funnel boundary, and each side is pinned by its EXACT
+    /// reference set.
     ///
-    /// WHAT THIS FORBIDS, exactly: outside `src/atomic/unix.rs` and test-only
-    /// code, the set of `libc` references is closed — adding one, renaming one,
-    /// or removing one changes the pinned map and fails here. The pinned
-    /// entries are the crate's AUDITED, non-mutating uses (e.g. `libc::flock`,
-    /// `libc::fstatat`, `libc::O_RDONLY`); none is in
-    /// [`MUTATING_LIBC_SYSCALLS`], and that is asserted independently, so even a
-    /// reviewed pin cannot authorize a name-mutating call. The funnel's own
-    /// mutating-symbol counts are pinned as before.
+    /// * OUTSIDE the funnel modules, any reference to `libc` — a mutating
+    ///   symbol, a module alias (`use libc as c;`), a re-export, a glob, or a
+    ///   newline-separated call — must be on a pinned review list. That list
+    ///   holds only AUDITED, non-mutating uses (`libc::flock`, `libc::fstatat`,
+    ///   `libc::O_RDONLY`), and an independent assertion refuses a
+    ///   [`MUTATING_LIBC_SYSCALLS`] member even when someone pins it, so a
+    ///   reviewed pin cannot authorize a name-mutating call.
+    /// * INSIDE each funnel module, the WHOLE `libc::<symbol>` reference
+    ///   surface is pinned PER MODULE and PER REFERENCE. This is the DERIVED
+    ///   device that closes the class: a new raw syscall in the funnel changes
+    ///   this map and fails, WHATEVER the symbol — `mknod`, `mkfifo`,
+    ///   `renameat2`, `fchmod`/`fchmodat`, `remove`, `syscall`, or one not
+    ///   written yet — where the earlier per-symbol pin saw only a fixed
+    ///   14-name list and changed no count for anything else. The funnel
+    ///   modules are themselves DERIVED from the source: every production file
+    ///   carrying the module-level `#![allow(clippy::disallowed_methods)]` that
+    ///   makes the crate-root resolve-symbol deny blind inside it (see
+    ///   [`funnel_modules`]), so a new funnel module joins this pin without an
+    ///   edit.
+    ///
+    /// The `std::fs` side has the analogous derived pin in
+    /// [`std_fs_name_mutation_counts_are_pinned`], and the cross-artifact
+    /// closure (the funnel may not adopt a symbol `clippy.toml` does not deny)
+    /// is [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`].
     #[test]
     fn no_libc_reference_outside_the_funnel() {
-        const FUNNEL: &str = "src/atomic/unix.rs";
         let mut files = Vec::new();
         collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
         assert!(files.len() > 10, "the audit must see the real source tree");
         let gated = test_only_gated_paths();
+        let sources: Vec<(String, String)> = files
+            .iter()
+            .map(|file| {
+                (
+                    crate_relative(file),
+                    std::fs::read_to_string(file).expect("read source file"),
+                )
+            })
+            .collect();
+        let funnel_modules = funnel_modules(&sources, &gated);
+        for module in [
+            "src/atomic/mod.rs",
+            "src/atomic/unix.rs",
+            "src/atomic/windows.rs",
+        ] {
+            assert!(
+                funnel_modules.contains(module),
+                "the module-level `#![allow(clippy::disallowed_methods)]` funnel set lost {module}: \
+                 {funnel_modules:?}"
+            );
+        }
 
-        let mut funnel_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut funnel_surface: BTreeMap<(String, String), usize> = BTreeMap::new();
         let mut outside: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for file in &files {
-            let rel = crate_relative(file);
-            let raw = std::fs::read_to_string(file).expect("read source file");
+        for (rel, raw) in &sources {
             // Order matters: strip comments/strings FIRST, then remove
             // `#[cfg(test)]` items, so a doc comment mentioning `#[cfg(test)]`
             // is already gone. F5: `src/atomic/guard.rs` is scanned like any
             // other production file (its `#[cfg(test)]` audit code is removed
             // by `production_only`).
-            let code = normalize_ws(&production_only(&code_only(&raw)));
+            let code = normalize_ws(&production_only(&code_only(raw)));
             let refs = libc_references(&code);
-            if rel == FUNNEL {
-                for symbol in MUTATING_LIBC_SYSCALLS {
-                    let count = refs.get(&format!("libc::{symbol}")).copied().unwrap_or(0);
-                    if count > 0 {
-                        funnel_counts.insert(symbol, count);
-                    }
+            if funnel_modules.contains(rel) {
+                // DERIVED pin: the funnel's ENTIRE `libc` reference surface,
+                // per module. ANY new syscall — whatever its name — changes
+                // this map, so the funnel's own libc use cannot drift
+                // unnoticed inside the blind spot the crate-root deny has here.
+                for (reference, count) in refs {
+                    *funnel_surface.entry((rel.clone(), reference)).or_default() += count;
                 }
                 continue;
             }
-            if is_test_only(&rel, &gated) {
+            if is_test_only(rel, &gated) {
                 continue;
             }
             for (reference, count) in refs {
@@ -2166,8 +2330,8 @@ mod tests {
                         && reference != "libc::*"
                         && reference != "libc",
                     "{rel} references the mutating/aliased libc facility {reference:?}: a \
-                     name-mutating syscall may be issued only from the guarded funnel ({FUNNEL}); \
-                     a `use libc … as alias` or a re-export does not exempt it"
+                     name-mutating syscall may be issued only from the guarded funnel \
+                     ({funnel_modules:?}); a `use libc … as alias` or a re-export does not exempt it"
                 );
                 *outside.entry((rel.clone(), reference)).or_default() += count;
             }
@@ -2178,9 +2342,10 @@ mod tests {
         // new (or removed) reference to `libc` outside the funnel and fails
         // here. None of these is a name-mutating symbol (asserted above).
         let expected: &[(&str, &str, usize)] = &[
-            ("src/atomic/mod.rs", "libc::O_CLOEXEC", 1),
-            ("src/atomic/mod.rs", "libc::O_DIRECTORY", 1),
-            ("src/atomic/mod.rs", "libc::O_NOFOLLOW", 1),
+            // `src/atomic/mod.rs`'s three references MOVED to the funnel surface
+            // pin below when the funnel modules became DERIVED from the
+            // module-level allow: `atomic/mod.rs` carries that allow, so its
+            // `libc` surface is the funnel's own and is pinned per module.
             ("src/lock/unix.rs", "libc::EAGAIN", 1),
             ("src/lock/unix.rs", "libc::ELOOP", 1),
             ("src/lock/unix.rs", "libc::EWOULDBLOCK", 2),
@@ -2247,58 +2412,82 @@ mod tests {
             outside, expected,
             "the `libc` references outside the funnel changed: a new reference — a mutating \
              symbol, a module alias, a re-export, or a glob — must be moved behind the funnel \
-             (src/atomic/unix.rs); a NON-mutating one must be reviewed and pinned here"
+             ({funnel_modules:?}); a NON-mutating one must be reviewed and pinned here"
         );
 
-        for (symbol, expected) in [
-            // THREE `unlinkat` references since R6: `unlinkat_fd_io` (guarded),
-            // the `unlinkat(AT_REMOVEDIR)` rmdir wrapper, and
-            // `unlinkat_fd_owned` (the capability-gated retirement of a lock
-            // record the caller's own authority owns, reachable only through
-            // `remove_owned_lock_record_fd`). The third is the ONE deliberate
-            // bypass of the guard, reviewed and pinned here.
-            ("unlinkat", 3usize),
-            ("renameat", 1),
-            ("symlinkat", 1),
-            ("linkat", 1),
-            ("mkdirat", 3),
-            // FIVE until the copy's identity-based overlap refusal added TWO
-            // read-only component opens (`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`):
-            // one in `open_destination_anchor` (the deepest existing directory
-            // on `dst_rel`, resolved from the owned root descriptor) and one in
-            // `dir_chain_contains` (the `..` ancestry step). Neither can CREATE,
-            // REPLACE, or TRUNCATE an entry, so neither needs the lock-record
-            // guard; both are reviewed and pinned here.
-            ("openat", 7),
-            ("unlink", 0),
-            ("rename", 0),
-            ("symlink", 0),
-            ("link", 0),
-            ("mkdir", 0),
-            // CHANGED DELIBERATELY (constraint #1): the only `libc::rmdir`
-            // reference was the path-based `remove_dir_all_path`, now
-            // `#[cfg(test)]` (no production caller). No production rmdir
-            // remains; a re-added one must be reviewed and pinned here.
-            ("rmdir", 0),
-            // CHANGED DELIBERATELY (constraint #1): the only `libc::open` path
-            // reference was the path-based `remove_dir_all_path`, now
-            // `#[cfg(test)]`. Production opens all go through the guarded
-            // `openat` funnel instead.
-            ("open", 0),
-            ("remove", 0),
-        ] {
-            assert_eq!(
-                funnel_counts.get(symbol).copied().unwrap_or(0),
-                expected,
-                "the guarded funnel's libc::{symbol} reference count changed: a new raw syscall in \
-                 src/atomic/unix.rs must be reviewed for the lock-record guard"
-            );
-        }
+        // The FUNNEL side: the exact per-module, per-reference `libc` surface.
+        // A new raw syscall in a funnel module changes this map and fails, so
+        // the class is closed for EVERY symbol name rather than for an
+        // enumerated 14. A change here is a deliberate, reviewed addition.
+        let expected_funnel: &[(&str, &str, usize)] = &[
+            // src/atomic/mod.rs — the cooperative-open flags for the atomic
+            // open primitive (moved here from the outside map when the funnel
+            // modules became derived from the module-level allow).
+            ("src/atomic/mod.rs", "libc::O_CLOEXEC", 1),
+            ("src/atomic/mod.rs", "libc::O_DIRECTORY", 1),
+            ("src/atomic/mod.rs", "libc::O_NOFOLLOW", 1),
+            // src/atomic/unix.rs — the funnel's WHOLE libc surface.
+            // The name-mutating syscalls (each still individually reviewed;
+            // the point of the pin is that a NEW one changes the map):
+            ("src/atomic/unix.rs", "libc::openat", 7),
+            ("src/atomic/unix.rs", "libc::unlinkat", 3),
+            ("src/atomic/unix.rs", "libc::renameat", 1),
+            ("src/atomic/unix.rs", "libc::symlinkat", 1),
+            ("src/atomic/unix.rs", "libc::linkat", 1),
+            ("src/atomic/unix.rs", "libc::mkdirat", 3),
+            // The `openat` flag/`*at` surface (constants and flags).
+            ("src/atomic/unix.rs", "libc::AT_REMOVEDIR", 1),
+            ("src/atomic/unix.rs", "libc::AT_SYMLINK_NOFOLLOW", 4),
+            ("src/atomic/unix.rs", "libc::O_APPEND", 1),
+            ("src/atomic/unix.rs", "libc::O_CLOEXEC", 8),
+            ("src/atomic/unix.rs", "libc::O_CREAT", 5),
+            ("src/atomic/unix.rs", "libc::O_DIRECTORY", 18),
+            ("src/atomic/unix.rs", "libc::O_EXCL", 3),
+            ("src/atomic/unix.rs", "libc::O_NOFOLLOW", 8),
+            ("src/atomic/unix.rs", "libc::O_NONBLOCK", 2),
+            ("src/atomic/unix.rs", "libc::O_RDONLY", 29),
+            ("src/atomic/unix.rs", "libc::O_RDWR", 1),
+            ("src/atomic/unix.rs", "libc::O_TRUNC", 2),
+            ("src/atomic/unix.rs", "libc::O_WRONLY", 5),
+            ("src/atomic/unix.rs", "libc::PATH_MAX", 1),
+            // The mode/kind masks and the C types the syscall signatures need.
+            ("src/atomic/unix.rs", "libc::S_IFDIR", 4),
+            ("src/atomic/unix.rs", "libc::S_IFLNK", 1),
+            ("src/atomic/unix.rs", "libc::S_IFMT", 4),
+            ("src/atomic/unix.rs", "libc::S_IFREG", 1),
+            ("src/atomic/unix.rs", "libc::c_char", 3),
+            ("src/atomic/unix.rs", "libc::mode_t", 2),
+            // The READ-ONLY descriptor calls (the `stat` family and the
+            // directory-descriptor reader); none can adopt or free a name.
+            ("src/atomic/unix.rs", "libc::closedir", 1),
+            ("src/atomic/unix.rs", "libc::fcntl", 1),
+            ("src/atomic/unix.rs", "libc::fdopendir", 1),
+            ("src/atomic/unix.rs", "libc::fstat", 3),
+            ("src/atomic/unix.rs", "libc::fstatat", 4),
+            ("src/atomic/unix.rs", "libc::readdir", 1),
+            ("src/atomic/unix.rs", "libc::readlinkat", 2),
+            ("src/atomic/unix.rs", "libc::stat", 8),
+            // A macOS-only `fcntl(F_GETPATH)` read of an open descriptor.
+            ("src/atomic/unix.rs", "libc::F_GETPATH", 1),
+        ];
+        let expected_funnel: BTreeMap<(String, String), usize> = expected_funnel
+            .iter()
+            .map(|(file, reference, count)| {
+                (((*file).to_string(), (*reference).to_string()), *count)
+            })
+            .collect();
+        assert_eq!(
+            funnel_surface, expected_funnel,
+            "the guarded funnel's `libc` reference surface changed — a new raw syscall in a funnel \
+             module must be reviewed for the lock-record guard, whatever the symbol. The actual \
+             surface is on the LEFT: {funnel_surface:?}"
+        );
     }
 
-    /// STRUCTURAL AUDIT (`std::fs`): the `std::fs` calls that can REMOVE or
-    /// REPLACE a directory entry — the ones that can free or swap a lock
-    /// record's inode — are pinned PER PRODUCTION FILE and PER SYMBOL, and the
+    /// STRUCTURAL AUDIT (`std::fs`): the `std::fs`/`std::os` calls that can
+    /// REMOVE, REPLACE, or CREATE a directory entry — the ones that can free or
+    /// swap a lock record's inode, or ADOPT a name the reserved-spelling guard
+    /// must refuse — are pinned PER PRODUCTION FILE and PER SYMBOL, and the
     /// same PARSED pass REPORTS the production paths that reach one of them
     /// through an ENUMERATED route the pin does not cover. This audit is the
     /// crate's OWN-call detector and a second, independent route detector; it is
@@ -2355,10 +2544,12 @@ mod tests {
     /// `extern "C"` declaration, `extern "C" { fn unlinkat(dirfd: i32, path:
     /// *const i8, flags: i32) -> i32; }`, followed by a call: it names neither
     /// `libc` nor `std::fs`, so NEITHER this audit nor
-    /// `no_libc_reference_outside_the_funnel` sees it. Inode-PRESERVING
-    /// mutations (`std::fs::write`, `std::fs::copy`, `std::fs::set_permissions`,
-    /// `std::fs::create_dir*`) are not pinned: they cannot split a holder
-    /// because the flock stays on the unchanged inode. The audit resolves the
+    /// `no_libc_reference_outside_the_funnel` sees it. INODE-PRESERVING content
+    /// mutations (`std::fs::write`, `std::fs::copy`) are not pinned: on an
+    /// EXISTING path they cannot split a holder because the flock stays on the
+    /// unchanged inode (the one case where they adopt an absent name is named
+    /// in `FUNNEL_SYMBOLS_NOT_DENIED`). The mode setter and the name CREATORS
+    /// are pinned now, not residue. The audit resolves the
     /// ENUMERATED routes and NAMES this residue rather than implying totality;
     /// the clippy deny carries the completeness claim.
     #[test]
@@ -2421,6 +2612,37 @@ mod tests {
             ("src/transport/mod.rs", "rename", 1),
             ("src/transport/mod.rs", "hard_link", 1),
             ("src/transport/ssh/hostkey.rs", "remove_file", 1),
+            // --- The CREATION wrappers (round 5): `std::fs::create_dir*` and
+            // the platform symlink creators ADOPT a name, so they are on
+            // `clippy.toml`'s deny list and this pin tracks their production
+            // call counts too. Every site below is either a funnel module
+            // (module-level allow), an item-level allow reviewed for the
+            // creation it performs, or the ONE platform symlink helper.
+            //
+            // funnel modules: the fd-confined `create_dir_fd` +
+            // `create_dir_all` fallback, and the macOS/Windows ports.
+            ("src/atomic/unix.rs", "create_dir", 2),
+            ("src/atomic/unix.rs", "create_dir_all", 1),
+            ("src/atomic/windows.rs", "create_dir", 3),
+            ("src/atomic/windows.rs", "create_dir_all", 5),
+            // the ONE platform std-symlink helper (`platform::symlink`), which
+            // is the single reviewed allow for all three creators, plus the
+            // path-based mode authority (`platform::chmod`).
+            ("src/platform.rs", "symlink", 1),
+            ("src/platform.rs", "symlink_dir", 1),
+            ("src/platform.rs", "symlink_file", 1),
+            ("src/platform.rs", "set_permissions", 1),
+            // item-level-reviewed creation sites outside the funnel: the
+            // destination lock record's parent chain (`create_lock_parent`),
+            // the destination root itself (`root_for_mutation`), the sidecar
+            // parent chain (`ensure_operation_lock_sidecar_durable`), the
+            // local root + layout (`root_dir`/`provision_layout`), and the ssh
+            // mux directory (`prepare_identity`) / known-hosts cache
+            // (`pin_known_hosts`).
+            ("src/sync/apply.rs", "create_dir_all", 2),
+            ("src/transport/mod.rs", "create_dir_all", 5),
+            ("src/transport/ssh/hostkey.rs", "create_dir_all", 1),
+            ("src/transport/ssh/mod.rs", "create_dir_all", 1),
         ];
         let expected: BTreeMap<(String, &'static str), usize> = expected
             .iter()
@@ -2428,9 +2650,9 @@ mod tests {
             .collect();
         assert_eq!(
             observed, expected,
-            "the PRODUCTION `std::fs` removal/replace/rename counts changed: a new (or removed) \
-             call must be reviewed for the lock-record guard — if the new call cannot name the \
-             record, update this pin; test-only calls are excluded by construction"
+            "the PRODUCTION `std::fs` mutation counts changed: a new (or removed) removal, \
+             creation, or mode call must be reviewed for the lock-record guard — if the new call \
+             cannot name the record, update this pin; test-only calls are excluded by construction"
         );
     }
 
@@ -3062,6 +3284,295 @@ mod tests {
             assert!(
                 counts.is_empty(),
                 "the residue `{case}` must not be counted: {counts:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // CROSS-ARTIFACT CONSISTENCY: the funnel may not adopt a `std::fs`/`libc`
+    // call that `clippy.toml` does not deny, or the SAME call would be legal
+    // outside the funnel and the completeness device would have a hole.
+    // ---------------------------------------------------------------------
+
+    /// The `std::fs` / `libc` call targets the FUNNEL regions use that are NOT
+    /// on `clippy.toml`'s deny list, each reviewed as unable to ADOPT a name
+    /// the funnel's reserved-spelling guard must refuse, and therefore
+    /// deliberately left to the crate-root deny's blind side.
+    ///
+    /// This list is the READ-ONLY / DESCRIPTOR-BOUND side of the PARTITION that
+    /// closes the class. [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`]
+    /// derives the funnel's whole resolved call surface and insists each symbol
+    /// is HERE or DENIED; a symbol in NEITHER is a new funnel primitive that
+    /// would escape the crate-wide deny, and the test fails naming it. That is
+    /// the mechanical form of "a new funnel primitive is impossible to use
+    /// without also being denied outside the funnel": a new symbol must pass
+    /// through one of the two review doors — `clippy.toml` (name-mutating) or
+    /// this list (cannot adopt a reserved name) — because the test refuses the
+    /// third state.
+    ///
+    /// The entries are DESCRIPTOR-BOUND or NAME-PRESERVING calls:
+    /// `std::fs::read`/`read_to_string`/`write`/`metadata`/`symlink_metadata`/
+    /// `read_dir`/`read_link`/`canonicalize` act on an entry the funnel already
+    /// created or resolved; the `libc` entries (`fstatat`, `fstat`, `readlinkat`,
+    /// `readdir`, `fdopendir`, `closedir`, `fcntl`) read or manage an open
+    /// descriptor. ONE named nuance: `std::fs::write` on a path that does not
+    /// exist DOES adopt a name, and every funnel use targets an already-open
+    /// descriptor or a path the funnel itself just created, so the crate
+    /// classifies it as inode-preserving; the residual is NAMED here rather than
+    /// silently exempted.
+    ///
+    /// `libc::openat` is deliberately NOT here: it CAN adopt a name (with
+    /// `O_CREAT`), so it is on clippy.toml's deny list with the other open
+    /// spellings. Every other `libc` entry here is read-only.
+    const FUNNEL_SYMBOLS_NOT_DENIED: &[&str] = &[
+        "std::fs::read",
+        "std::fs::read_to_string",
+        "std::fs::write",
+        "std::fs::metadata",
+        "std::fs::symlink_metadata",
+        "std::fs::read_dir",
+        "std::fs::read_link",
+        "std::fs::canonicalize",
+        "libc::fstatat",
+        "libc::fstat",
+        "libc::readlinkat",
+        "libc::readdir",
+        "libc::fdopendir",
+        "libc::closedir",
+        "libc::fcntl",
+    ];
+
+    /// The canonical `std`/`libc` FUNCTION path a resolved path names, if it is
+    /// a module function this audit tracks: `std::fs::<fn>` (three segments),
+    /// a `std::os::{unix,windows}::fs::<symlink*>`, or `libc::<fn>`. An
+    /// inherent-type path (`std::fs::File::open`) is NOT a module function and
+    /// is excluded.
+    fn funnel_symbol(canonical: &[String]) -> Option<String> {
+        if canonical.len() == 3 && canonical[0] == "std" && canonical[1] == "fs" {
+            return Some(format!("std::fs::{}", canonical[2]));
+        }
+        if canonical.len() == 5
+            && canonical[0] == "std"
+            && canonical[1] == "os"
+            && (canonical[2] == "unix" || canonical[2] == "windows")
+            && canonical[3] == "fs"
+        {
+            return Some(canonical.join("::"));
+        }
+        if canonical.len() == 2 && canonical[0] == "libc" {
+            return Some(canonical.join("::"));
+        }
+        None
+    }
+
+    /// The `std`/`libc` function paths a macro token stream names as a
+    /// canonical `::`-joined path — `std::fs::<fn>`, `libc::<fn>`, and the
+    /// `std::os::…::fs::symlink*` creators. The aliased-in-a-macro form stays
+    /// the audit's named residue.
+    fn macro_call_symbols(tokens: impl std::fmt::Display) -> Vec<String> {
+        let list = macro_token_list(tokens);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < list.len() {
+            match token_path_at(&list, i) {
+                Some((segments, next)) if next > i => {
+                    if let Some(symbol) = funnel_symbol(&segments) {
+                        out.push(symbol);
+                    }
+                    i = next;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// The resolved `std::fs` / `libc` call targets of every FUNNEL region: a
+    /// module-level `#![allow(clippy::disallowed_methods)]` file, or any item
+    /// carrying the `#[allow(...)]`, together with everything nested inside
+    /// them. Resolution uses the SAME alias table the `std::fs` count pin uses,
+    /// so an imported or re-exported funnel call is the call too.
+    struct FunnelSymbols<'a> {
+        index: &'a FsIndex,
+        module: CanonPath,
+        in_funnel: bool,
+        used: BTreeSet<String>,
+    }
+
+    impl FunnelSymbols<'_> {
+        fn record(&mut self, segments: &[String]) {
+            let canonical = self.index.resolve_path(&self.module, segments);
+            if let Some(symbol) = funnel_symbol(&canonical) {
+                self.used.insert(symbol);
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for FunnelSymbols<'_> {
+        fn visit_file(&mut self, file: &'ast syn::File) {
+            if attrs_allow_disallowed(&file.attrs) {
+                self.in_funnel = true;
+            }
+            for item in &file.items {
+                self.visit_item(item);
+            }
+        }
+
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            let saved = self.in_funnel;
+            if item_allows_disallowed(item) {
+                self.in_funnel = true;
+            }
+            if let syn::Item::Mod(module) = item
+                && let Some((_, items)) = &module.content
+            {
+                let mut child = self.module.clone();
+                child.push(unraw(&module.ident));
+                let saved_module = std::mem::replace(&mut self.module, child);
+                for inner in items {
+                    self.visit_item(inner);
+                }
+                self.module = saved_module;
+                self.in_funnel = saved;
+                return;
+            }
+            syn::visit::visit_item(self, item);
+            self.in_funnel = saved;
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if self.in_funnel
+                && let Some(path) = callee_path(&call.func)
+            {
+                let segments = path_segments(path);
+                self.record(&segments);
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if self.in_funnel {
+                for symbol in macro_call_symbols(&mac.tokens) {
+                    self.used.insert(symbol);
+                }
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+
+    /// The union of every funnel region's resolved `std::fs`/`libc` call
+    /// targets, derived from the parsed production sources.
+    fn funnel_symbol_surface(
+        files: &[(String, String)],
+        gated: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let parsed = parse_crate(files, gated);
+        let index = build_index(&parsed);
+        let mut used = BTreeSet::new();
+        for source in &parsed {
+            if is_test_only(&source.rel, gated) {
+                continue;
+            }
+            let mut visitor = FunnelSymbols {
+                index: &index,
+                module: source.module.clone(),
+                in_funnel: false,
+                used: BTreeSet::new(),
+            };
+            syn::visit::Visit::visit_file(&mut visitor, &source.file);
+            used.extend(visitor.used);
+        }
+        used
+    }
+
+    /// The `path = "…"` entries of `clippy.toml`'s `disallowed-methods`, read
+    /// MECHANICALLY so the consistency test compares the file the COMPILER
+    /// reads with the funnel's resolved surface, not a hand-kept copy.
+    fn denied_symbols_from_clippy_toml() -> BTreeSet<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("clippy.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let mut out = BTreeSet::new();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("{ path = \"") else {
+                continue;
+            };
+            let Some(end) = rest.find('"') else { continue };
+            out.insert(rest[..end].to_string());
+        }
+        assert!(
+            out.len() > 15,
+            "the clippy.toml deny list must parse to the real list: {out:?}"
+        );
+        out
+    }
+
+    /// THE CLASS CLOSURE. The completeness device is the resolved-symbol deny
+    /// in `clippy.toml`, but INSIDE a funnel region that deny is blind. So the
+    /// funnel is allowed to use a `std::fs`/`libc` call only if that call is
+    /// ALSO denied crate-wide (it is name-mutating and must stay funnel-owned)
+    /// or is on the reviewed [`FUNNEL_SYMBOLS_NOT_DENIED`] list. Both sides are
+    /// derived mechanically: the deny list from `clippy.toml`, the used side
+    /// from the funnel's resolved symbol surface. Removing a symbol from
+    /// `clippy.toml` while the funnel still uses it fails this test, naming the
+    /// now-undefended symbol — which is exactly how the two artifacts stay from
+    /// drifting.
+    #[test]
+    fn every_mutation_symbol_the_funnel_uses_is_denied_crate_wide() {
+        let mut paths = Vec::new();
+        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut paths);
+        let sources: Vec<(String, String)> = paths
+            .iter()
+            .map(|file| {
+                (
+                    crate_relative(file),
+                    std::fs::read_to_string(file).expect("read source file"),
+                )
+            })
+            .collect();
+        let gated = test_only_gated_paths();
+        let used = funnel_symbol_surface(&sources, &gated);
+        let denied = denied_symbols_from_clippy_toml();
+
+        // SANITY: the derivation must see the funnel, or an empty `used` set
+        // would make the closure vacuous. `create_dir_all` is a creation
+        // wrapper added to the deny list in this change; `openat` is the
+        // funnel's canonical open.
+        assert!(
+            used.contains("std::fs::create_dir_all") && used.contains("libc::openat"),
+            "the funnel symbol derivation must see the funnel's own creation and open calls, or \
+             the closure is vacuous: {used:?}"
+        );
+
+        let mut undefended: Vec<String> = Vec::new();
+        for symbol in &used {
+            if denied.contains(symbol) || FUNNEL_SYMBOLS_NOT_DENIED.contains(&symbol.as_str()) {
+                continue;
+            }
+            undefended.push(symbol.clone());
+        }
+        assert!(
+            undefended.is_empty(),
+            "the FUNNEL uses `std::fs`/`libc` calls that clippy.toml does NOT deny, so a caller \
+             could issue the SAME call OUTSIDE the funnel with no lint error — the completeness \
+             device would have a hole: {undefended:?}. Add each symbol to clippy.toml's \
+             `disallowed-methods` (name-mutating or mode-setting calls) or to \
+             FUNNEL_SYMBOLS_NOT_DENIED (reviewed read-only / descriptor-bound calls), so the \
+             deny and the funnel cannot drift."
+        );
+
+        // The review list must not go stale in either direction.
+        for symbol in FUNNEL_SYMBOLS_NOT_DENIED {
+            assert!(
+                used.contains(*symbol),
+                "FUNNEL_SYMBOLS_NOT_DENIED names {symbol}, which the funnel no longer uses; \
+                 remove it"
+            );
+            assert!(
+                !denied.contains(*symbol),
+                "FUNNEL_SYMBOLS_NOT_DENIED names {symbol}, which clippy.toml now denies; remove it \
+                 from the review list"
             );
         }
     }

@@ -27,6 +27,7 @@
 //! merge and every view refuses. The `greek_*` tests below fail on the parent
 //! revision.
 
+#![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
 use storekit::env::SysEnv;

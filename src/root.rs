@@ -228,6 +228,7 @@ impl OwnedRoot {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)]
     // Helpers used only by `#[cfg(unix)]` tests are legitimately unused on
     // Windows; do not let them fail a `-D warnings` Windows gate.
     #![cfg_attr(not(unix), allow(dead_code))]

@@ -14,6 +14,9 @@
 //! (`atomic::write_atomic_replace`) already refused these spellings; the fix
 //! makes the sidecar helper agree with it.
 
+// Test fixtures drive the same name-creating primitives the funnel guards.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::Path;
 
 use storekit::RootedRelativePath;

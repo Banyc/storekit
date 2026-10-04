@@ -1914,6 +1914,11 @@ pub fn retire_destination_lock(dest_root: &Path) -> Result<RetireOutcome> {
 /// private mode is REQUIRED, so changing them would change every caller's
 /// on-disk modes. The behaviour is stated in the module docs, "Why the lock
 /// record is a SIBLING of the destination root".
+///
+/// Reviewed allow: this pre-creates the destination lock record's parent
+/// chain, which [`crate::atomic::ensure_private_dir_durable`] would otherwise
+/// create and narrow itself.
+#[allow(clippy::disallowed_methods)]
 fn create_lock_parent(parent: &Path) -> Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
@@ -8783,6 +8788,10 @@ impl LocalSide {
     /// since, adopting it would silently ignore its entries (they are neither
     /// reported nor removed), so a NON-EMPTY one is refused. An empty directory
     /// is exactly what this would have created, so it is adopted.
+    ///
+    /// Reviewed allow: it creates the DESTINATION root directory itself
+    /// (`self.root_path`), the one name the applier is entitled to adopt.
+    #[allow(clippy::disallowed_methods)]
     fn root_for_mutation(&self) -> Result<&crate::atomic::RootDir> {
         if self.root.get().is_none() && self.ensure {
             if self.root_path.exists() {

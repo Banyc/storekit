@@ -14,6 +14,7 @@
 //! `..._a_read`), which drove the property through application types
 //! (`LocalStore`/`TargetName`/`retention_debt`) that do not exist here.
 
+#![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};

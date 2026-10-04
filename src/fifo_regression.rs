@@ -14,6 +14,7 @@
 //! binary as a child (behind [`MODE_ENV`]) that performs the four probes, and
 //! the parent enforces a HARD WALL-CLOCK TIMEOUT: a child that does not finish
 //! is KILLED and reported, so the suite itself can never hang.
+#![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
 use std::ffi::CString;

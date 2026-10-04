@@ -26,6 +26,7 @@
 //!
 //! These tests use ONLY the public API.
 
+#![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};

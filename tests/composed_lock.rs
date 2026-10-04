@@ -28,6 +28,9 @@
 //!   destroyed;
 //! * the PLAIN form is unchanged: it never creates or holds the in-root record.
 
+// Test fixtures drive the same name-creating primitives the funnel guards.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;

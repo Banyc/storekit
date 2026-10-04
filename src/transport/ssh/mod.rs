@@ -2396,6 +2396,7 @@ impl Remote for SshTransport {
         Some(format!("ssh://{}:{}", self.target, self.port))
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn prepare_identity(&self) -> Result<()> {
         // Create the local ControlMaster socket directory (0700) before any
         // ssh op: the multiplexing sockets live here, keyed by the CONNECTION

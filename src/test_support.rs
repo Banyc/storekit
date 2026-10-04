@@ -10,6 +10,7 @@
 //! allowed here rather than letting one suite's unused helper fail another's
 //! `-D warnings` gate.
 #![allow(dead_code)]
+#![allow(clippy::disallowed_methods)]
 
 use crate::env::SysEnv;
 

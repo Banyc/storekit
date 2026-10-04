@@ -15,6 +15,7 @@
 //! the test binary re-executes itself with an exact filter and a marker
 //! variable, and the child reports through its exit status.
 
+#![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
 use storekit::env::SysEnv;

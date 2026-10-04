@@ -1200,6 +1200,11 @@ thread_local! {
 /// is not truncated), `fsync` the file and `fsync` the parent directory.
 /// The file is created once and never removed/renamed, so every
 /// participant flocks the same inode. Mode 0o644, durable.
+///
+/// Reviewed allow: the sidecar spelling is a validated [`RootedRelativePath`]
+/// whose parent chain is created here; the creation cannot name a reserved
+/// spelling.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn ensure_operation_lock_sidecar_durable(
     base: &Path,
     sidecar: &RootedRelativePath,
@@ -2290,6 +2295,7 @@ impl LocalTransport {
     /// the absent-root-enumerates-as-empty behaviour is preserved. Every
     /// COMPONENT BELOW the root is then resolved with `openat(O_NOFOLLOW)`.
     #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)]
     fn root_dir(&self, create: bool) -> Result<Option<crate::atomic::RootDir>> {
         if create && !self.base.exists() {
             std::fs::create_dir_all(&self.base)
@@ -2751,6 +2757,7 @@ impl Remote for LocalTransport {
         true
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn provision_layout(&self) -> Result<()> {
         if !self.base.exists() {
             std::fs::create_dir_all(&self.base)
