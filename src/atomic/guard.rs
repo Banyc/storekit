@@ -54,11 +54,17 @@
 //!   directory entry (`remove_file` / `remove_dir` / `remove_dir_all` /
 //!   `rename` / `hard_link`) in PRODUCTION code (every `#[cfg(test)]` item is
 //!   removed first), so a new one changes a count and forces review, and a
-//!   test-only call is never counted as production. The same audit runs
-//!   `std_fs_mutation_violations`, which refuses every IMPORT route to those
-//!   five symbols — a braced or single `use std::fs::{…}`, a
-//!   `use std::fs as <alias>` / `use std::fs;` module alias, a `use std::fs::*`
-//!   glob, and the bare or aliased imported symbol.
+//!   test-only call is never counted as production. The count is matched over
+//!   the TOKENISED path `std::fs::<symbol>(`, so whitespace before the call
+//!   paren does not evade it. The same audit runs `std_fs_mutation_violations`,
+//!   which refuses every IMPORT route to those five symbols — a braced or
+//!   single `use std::fs::{…}`, a `use std::fs as <alias>` / `use std::fs;`
+//!   module alias, a `use std::fs::*` glob, the bare or aliased imported
+//!   symbol, and the `std`-crate-ROOT aliases (`use std as s;`,
+//!   `use ::std as s;`, `use std::{self as s};`) resolved TRANSITIVELY, so
+//!   `s::fs::remove_file(…)` and `use s::fs::remove_file;` are refused too.
+//!   Test-only-ness is derived from the GATING (`#[cfg(...)]` implying `test`
+//!   on the module's `mod` declaration), never from a file NAME.
 //!
 //! The residual holes a text audit CANNOT close, and which the claim above is
 //! scoped NOT to include: code produced by a MACRO (`macro_rules!` or a proc
@@ -456,7 +462,7 @@ mod tests {
     // which need a real (device, inode) pair: a Unix filesystem property.
     #[cfg(unix)]
     use super::OwnedLockRecord;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     /// The ONE guard refuses every lock-record spelling — the application
@@ -631,7 +637,9 @@ mod tests {
         /// braced `use std::fs::{…}` — the bare or aliased imported symbol.
         Imported,
         /// `use std::fs;` / `use std::fs as f;` / `use std::fs::{self as f};`
-        /// followed by `f::remove_file(…)`.
+        /// followed by `f::remove_file(…)`, or a `std`-crate-root alias
+        /// (`use std as s;` / `use ::std as s;` / `use std::{self as s};`)
+        /// followed by `s::fs::remove_file(…)`.
         ModuleAlias,
         /// `use std::fs::*;` — the glob itself is the route, since any of the
         /// five symbols (and a function pointer to one) comes into scope.
@@ -659,19 +667,24 @@ mod tests {
 
     /// Every `std::fs` inode mutation in PRODUCTION code that reaches one of
     /// [`FS_INODE_MUTATORS`] through a non-canonical route: a `use`d symbol, a
-    /// module alias, or a glob. This is the half the exact-count pin misses —
-    /// `use std::fs::remove_file; remove_file(p)` spells no `std::fs::` call,
-    /// so a pin over `std::fs::{symbol}(` stays green while the record is
-    /// unlinked. WHITESPACE-INSENSITIVE, because the code is normalized first.
+    /// module alias (including a `std`-crate-ROOT alias such as `use std as s;`
+    /// followed by `s::fs::remove_file(…)`), or a glob. This is the half the
+    /// exact-count pin misses — `use std::fs::remove_file; remove_file(p)`
+    /// spells no `std::fs::` call, so a pin over `std::fs::{symbol}(` stays
+    /// green while the record is unlinked. WHITESPACE-INSENSITIVE, because the
+    /// code is normalized first.
     ///
     /// PURE over `(package-relative path, raw contents)` pairs so a unit test
-    /// can drive it with synthetic sources. Test-only files are skipped (a path
-    /// COMPONENT equal to `tests`, ending `regression.rs` / `test_support.rs`,
-    /// or under `tests/` / `benches/` / `examples/`).
-    fn std_fs_mutation_violations(files: &[(String, String)]) -> Vec<Violation> {
+    /// can drive it with synthetic sources. Test-only files are skipped: a path
+    /// COMPONENT equal to `tests` (the integration/bench/example roots or
+    /// `tests.rs`), or a module named in `gated` (see [`is_test_only`]).
+    fn std_fs_mutation_violations(
+        files: &[(String, String)],
+        gated: &BTreeSet<String>,
+    ) -> Vec<Violation> {
         let mut out = Vec::new();
         for (rel, raw) in files {
-            if is_test_only(rel) {
+            if is_test_only(rel, gated) {
                 continue;
             }
             let code = normalize_ws(&production_only(&code_only(raw)));
@@ -685,20 +698,26 @@ mod tests {
     /// The violation scan for one already-comment/string-stripped,
     /// `#[cfg(test)]`-free, whitespace-normalized source.
     fn std_fs_violations_in_code(rel: &str, code: &str) -> Vec<Violation> {
-        // Local names bound to a mutator (`remove_file`, or `rm` after
-        // `remove_file as rm`) and aliases for the `std::fs` module itself
-        // (`f` after `use std::fs as f`, and `fs` after `use std::fs;`).
+        // (`local name`, mutator symbol) bindings of `std::fs::<symbol>`, the
+        // `std::fs` module aliases, and the `std` crate-ROOT aliases, all
+        // resolved TRANSITIVELY; plus whether a glob names the module.
         let mut imported: Vec<(String, &'static str)> = Vec::new();
-        let mut aliases: Vec<String> = Vec::new();
+        let mut module_aliases: Vec<String> = Vec::new();
+        let mut root_aliases: Vec<String> = Vec::new();
         let mut glob = false;
-        for item in std_fs_use_items(code) {
-            parse_std_fs_use(&item, &mut imported, &mut aliases, &mut glob);
-        }
+        resolve_std_fs_bindings(
+            &std_fs_use_items(code),
+            &mut imported,
+            &mut module_aliases,
+            &mut root_aliases,
+            &mut glob,
+        );
 
         let mut out = Vec::new();
         // Importing a mutating symbol into production code is itself the route
         // (a call, a function pointer, or a re-export), so flag it even before
-        // a call appears.
+        // a call appears. This covers the second alias hop
+        // (`use std as s; use s::fs::remove_file;`).
         for (_, symbol) in &imported {
             out.push(Violation {
                 file: rel.to_string(),
@@ -706,7 +725,9 @@ mod tests {
                 route: FsRoute::Imported,
             });
         }
-        for alias in &aliases {
+        // `f::remove_file(…)` after `use std::fs as f;` (or a transitive
+        // `use s::fs as f;`).
+        for alias in &module_aliases {
             for symbol in FS_INODE_MUTATORS {
                 if count_path_ref(code, alias, symbol) > 0 {
                     out.push(Violation {
@@ -717,10 +738,24 @@ mod tests {
                 }
             }
         }
+        // `s::fs::remove_file(…)` after `use std as s;` / `use ::std as s;` /
+        // `use std::{self as s};`.
+        for alias in &root_aliases {
+            for symbol in FS_INODE_MUTATORS {
+                if count_root_fs_ref(code, alias, symbol) > 0 {
+                    out.push(Violation {
+                        file: rel.to_string(),
+                        symbol,
+                        route: FsRoute::ModuleAlias,
+                    });
+                }
+            }
+        }
         if glob {
-            // A `use std::fs::*` glob is the route itself: any of the five
-            // symbols (and a bare function pointer to one) is in scope, so flag
-            // the import whether or not a call is visible.
+            // A `use std::fs::*` / `use s::fs::*` / `use std::*` glob is the
+            // route itself: any of the five symbols (and a bare function
+            // pointer to one) is in scope, so flag the import whether or not a
+            // call is visible.
             out.push(Violation {
                 file: rel.to_string(),
                 symbol: "*",
@@ -763,98 +798,223 @@ mod tests {
         items
     }
 
-    /// Parse one `use` body (the text after `use`, before `;`) and record the
-    /// `std::fs` bindings it introduces. Recurses through `use std::{fs, …}`
-    /// so a nested import cannot hide a mutator.
-    fn parse_std_fs_use(
-        item: &str,
+    /// Resolve every `use` item to the `std` path it names. A `use std as s;`,
+    /// `use ::std as s;` or `use std::{self as s};` binds the crate ROOT under
+    /// `s`, so a later `use s::fs::remove_file;` binds the mutator to its bare
+    /// name and `s::fs::remove_file(…)` is a route. Resolution is TRANSITIVE
+    /// and iterated to a fixpoint because `use` order is insignificant in Rust:
+    /// `use s::fs::…` may legally precede `use std as s;`.
+    fn resolve_std_fs_bindings(
+        items: &[String],
         imported: &mut Vec<(String, &'static str)>,
-        aliases: &mut Vec<String>,
+        module_aliases: &mut Vec<String>,
+        root_aliases: &mut Vec<String>,
         glob: &mut bool,
     ) {
-        let item = item.trim();
-        let item = item.strip_prefix("::").unwrap_or(item);
-        // `use std::{fs, fs::remove_file, …}`: expand each entry to a
-        // `std::<entry>` path and parse it, so nesting depth is irrelevant.
-        if let Some(inner) = item
-            .strip_prefix("std::")
-            .and_then(|r| r.strip_prefix('{'))
-            .and_then(|r| r.strip_suffix('}'))
-        {
-            for entry in split_top_level_commas(inner) {
-                let entry = entry.trim();
-                if entry.is_empty() {
-                    continue;
-                }
-                parse_std_fs_use(&format!("std::{entry}"), imported, aliases, glob);
-            }
-            return;
-        }
-        let Some(rest) = item.strip_prefix("std::fs") else {
-            return;
-        };
-        let rest = rest.trim_start();
-        if rest.is_empty() {
-            // `use std::fs;` binds the module under its last segment, `fs`.
-            aliases.push("fs".to_string());
-            return;
-        }
-        if let Some(rest) = rest.strip_prefix("as ") {
-            let alias = rest.split_whitespace().next().unwrap_or("");
-            if !alias.is_empty() {
-                aliases.push(alias.to_string());
-            }
-            return;
-        }
-        let Some(rest) = rest.strip_prefix("::") else {
-            return;
-        };
-        let rest = rest.trim();
-        if rest == "*" {
-            *glob = true;
-            return;
-        }
-        if let Some(inner) = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
-            for entry in split_top_level_commas(inner) {
-                let entry = entry.trim();
-                if entry.is_empty() {
-                    continue;
-                }
-                if entry == "*" {
-                    *glob = true;
-                    continue;
-                }
-                if let Some(rest) = entry.strip_prefix("self") {
-                    let rest = rest.trim();
-                    if rest.is_empty() {
-                        aliases.push("fs".to_string());
-                    } else if let Some(alias) = rest.strip_prefix("as ") {
-                        let alias = alias.trim();
-                        if !alias.is_empty() {
-                            aliases.push(alias.to_string());
-                        }
+        let mut roots: BTreeSet<String> = BTreeSet::new();
+        let mut modules: BTreeSet<String> = BTreeSet::new();
+        let mut symbols: BTreeMap<String, &'static str> = BTreeMap::new();
+        let mut glob_found = false;
+
+        loop {
+            let mut changed = false;
+            for item in items {
+                let mut leaves = Vec::new();
+                expand_use_tree(item, &[], &mut leaves);
+                for (raw, local) in leaves {
+                    let Some(resolved) = resolve_use_path(&raw, &roots, &modules, &symbols) else {
+                        continue;
+                    };
+                    let local =
+                        local.unwrap_or_else(|| resolved.last().cloned().unwrap_or_default());
+                    if local.is_empty() {
+                        continue;
                     }
-                    continue;
+                    if path_is(&resolved, &["std"]) {
+                        // `std` is the CANONICAL root: `std::fs::symbol(` is the
+                        // pin's own spelling, not an import route, so a binding
+                        // that keeps the name `std` must not be flagged.
+                        if local != "std" {
+                            changed |= roots.insert(local);
+                        }
+                    } else if path_is(&resolved, &["std", "fs"]) {
+                        changed |= modules.insert(local);
+                    } else if (path_is(&resolved, &["std", "fs", "*"])
+                        || path_is(&resolved, &["std", "*"]))
+                        && !glob_found
+                    {
+                        glob_found = true;
+                        changed = true;
+                    } else if resolved.len() == 3
+                        && resolved[0] == "std"
+                        && resolved[1] == "fs"
+                        && let Some(&symbol) = FS_INODE_MUTATORS.iter().find(|&&s| resolved[2] == s)
+                        && !symbols.contains_key(&local)
+                    {
+                        symbols.insert(local, symbol);
+                        changed = true;
+                    }
                 }
-                record_imported(entry, imported);
             }
-            return;
+            if !changed {
+                break;
+            }
         }
-        record_imported(rest, imported);
+
+        imported.extend(symbols);
+        module_aliases.extend(modules);
+        root_aliases.extend(roots);
+        *glob = glob_found;
     }
 
-    /// Record `symbol` (or `symbol as local`) when `symbol` is one of
-    /// [`FS_INODE_MUTATORS`].
-    fn record_imported(entry: &str, imported: &mut Vec<(String, &'static str)>) {
-        let mut parts = entry.split_whitespace();
-        let symbol = parts.next().unwrap_or("");
-        let local = match parts.next() {
-            Some("as") => parts.next().unwrap_or(symbol),
-            _ => symbol,
-        };
-        if let Some(sym) = FS_INODE_MUTATORS.iter().find(|&&s| s == symbol) {
-            imported.push((local.to_string(), sym));
+    /// Whether `path` is exactly the canonical sequence `expected`.
+    fn path_is(path: &[String], expected: &[&str]) -> bool {
+        path.len() == expected.len()
+            && path
+                .iter()
+                .zip(expected)
+                .all(|(segment, want)| segment.as_str() == *want)
+    }
+
+    /// Expand one `use` body into `(raw path segments, local name)` leaves,
+    /// folding `self` against the enclosing prefix so `std::{self as s}`
+    /// becomes the path `std` bound to `s`. Nested-brace forms are recursed.
+    fn expand_use_tree(
+        item: &str,
+        prefix: &[String],
+        out: &mut Vec<(Vec<String>, Option<String>)>,
+    ) {
+        let item = item.trim();
+        if item.is_empty() {
+            return;
         }
+        if let Some(brace) = find_top_level_brace(item) {
+            let head_raw = item[..brace].trim_end_matches(':').trim();
+            let absolute = item[..brace].trim_start().starts_with("::");
+            let close = matching_brace(item, brace).unwrap_or(item.len());
+            let inner = &item[brace + 1..close];
+            let mut next_prefix: Vec<String> = if absolute {
+                Vec::new()
+            } else {
+                prefix.to_vec()
+            };
+            for segment in head_raw.split("::") {
+                let segment = segment.trim();
+                if !segment.is_empty() {
+                    next_prefix.push(segment.to_string());
+                }
+            }
+            for entry in split_top_level_commas(inner) {
+                expand_use_tree(entry, &next_prefix, out);
+            }
+            return;
+        }
+        let (path_text, local) = split_use_alias(item);
+        let path_text = path_text.trim();
+        let absolute = path_text.starts_with("::");
+        let path_text = path_text.trim_start_matches(':');
+        let mut segments: Vec<String> = if absolute {
+            Vec::new()
+        } else {
+            prefix.to_vec()
+        };
+        for segment in path_text.split("::") {
+            let segment = segment.trim();
+            if segment.is_empty() || segment == "self" {
+                continue;
+            }
+            segments.push(segment.to_string());
+        }
+        let local = local
+            .map(|alias| alias.trim().to_string())
+            .filter(|alias| !alias.is_empty());
+        out.push((segments, local));
+    }
+
+    /// Split a brace-free use tree into its path and an `as` alias, if any.
+    fn split_use_alias(item: &str) -> (&str, Option<&str>) {
+        let bytes = item.as_bytes();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                b'a' if depth == 0 && item[i..].starts_with("as") => {
+                    let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                    let after = i + 2;
+                    let after_ok = after >= bytes.len() || bytes[after].is_ascii_whitespace();
+                    if before_ok && after_ok {
+                        return (&item[..i], Some(&item[after..]));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        (item, None)
+    }
+
+    /// The first `{` at brace depth zero, if the use tree is braced.
+    fn find_top_level_brace(text: &str) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut depth = 0i32;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'{' if depth == 0 => return Some(i),
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The index of the `}` matching the `{` at `open`.
+    fn matching_brace(text: &str, open: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut depth = 0i32;
+        for (offset, &b) in bytes[open..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Canonicalize a raw use path against the aliases already known. Only the
+    /// HEAD can be an alias, because a `use` path is absolute from its root:
+    /// substitution rewrites the head to the canonical path it names (the
+    /// `std` crate, the `std::fs` module, or one mutator). `None` means the
+    /// path never reaches `std`.
+    fn resolve_use_path(
+        raw: &[String],
+        roots: &BTreeSet<String>,
+        modules: &BTreeSet<String>,
+        symbols: &BTreeMap<String, &'static str>,
+    ) -> Option<Vec<String>> {
+        let head = raw.first()?;
+        let mut out: Vec<String> = Vec::with_capacity(raw.len() + 2);
+        if head == "std" || roots.contains(head) {
+            out.push("std".to_string());
+        } else if modules.contains(head) {
+            out.push("std".to_string());
+            out.push("fs".to_string());
+        } else {
+            let symbol = symbols.get(head)?;
+            out.push("std".to_string());
+            out.push("fs".to_string());
+            out.push((*symbol).to_string());
+        }
+        out.extend(raw[1..].iter().cloned());
+        Some(out)
     }
 
     /// Split a braced `use` list on TOP-LEVEL commas only, so
@@ -878,27 +1038,94 @@ mod tests {
         out
     }
 
-    /// Count `qualifier::symbol` occurrences where `qualifier` is a complete
-    /// path head (so an alias `fs` does not re-count `std::fs::symbol`).
+    /// Count `qualifier::symbol` references where `qualifier` is a complete
+    /// path head (so a module alias `fs` does not re-count `std::fs::symbol`).
+    /// WHITESPACE-INSENSITIVE between the segments.
     fn count_path_ref(code: &str, qualifier: &str, symbol: &str) -> usize {
-        let needle = format!("{qualifier}::{symbol}");
+        count_path_segments(code, &[qualifier, symbol], None, true)
+    }
+
+    /// Count `root::fs::symbol` references for a `std`-crate-ROOT alias.
+    fn count_root_fs_ref(code: &str, root: &str, symbol: &str) -> usize {
+        count_path_segments(code, &[root, "fs", symbol], None, true)
+    }
+
+    /// Count `std::fs::symbol(` CALLS, whitespace-insensitive between `std`,
+    /// `::`, `fs`, `::`, `symbol`, and the opening `(`. This is the matcher the
+    /// exact-count pin uses, so `std::fs::rename (a, b)` cannot evade it.
+    fn count_std_fs_calls(code: &str, symbol: &str) -> usize {
+        count_path_segments(code, &["std", "fs", symbol], Some(b'('), false)
+    }
+
+    /// Count occurrences of the token sequence `segments` joined by `::`
+    /// (whitespace allowed around each `::`), optionally followed by `trailing`
+    /// (whitespace allowed before it). The first segment must be a complete
+    /// path HEAD: not preceded by an identifier character and — when
+    /// `reject_leading_colon` — not preceded by `:` either, so a module alias
+    /// `fs` does not match the `fs` in `std::fs::remove_file`.
+    fn count_path_segments(
+        code: &str,
+        segments: &[&str],
+        trailing: Option<u8>,
+        reject_leading_colon: bool,
+    ) -> usize {
         let bytes = code.as_bytes();
         let mut count = 0usize;
-        let mut from = 0usize;
-        while let Some(pos) = code[from..].find(&needle) {
-            let at = from + pos;
-            let before_ok = at == 0 || {
-                let b = bytes[at - 1];
-                !(is_ident_start(b) || b == b':')
-            };
-            let after = at + needle.len();
-            let after_ok = after >= bytes.len() || !is_ident_start(bytes[after]);
-            if before_ok && after_ok {
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if !is_ident_start(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let head_ok = i == 0
+                || (!is_ident_start(bytes[i - 1])
+                    && !(reject_leading_colon && bytes[i - 1] == b':'));
+            if !head_ok {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            let mut matched = true;
+            for (index, segment) in segments.iter().enumerate() {
+                let start = j;
+                while j < bytes.len() && is_ident_start(bytes[j]) {
+                    j += 1;
+                }
+                if &code[start..j] != *segment {
+                    matched = false;
+                    break;
+                }
+                if index + 1 < segments.len() {
+                    let after = skip_ws(bytes, j);
+                    if !(bytes.get(after) == Some(&b':') && bytes.get(after + 1) == Some(&b':')) {
+                        matched = false;
+                        break;
+                    }
+                    j = skip_ws(bytes, after + 2);
+                }
+            }
+            if matched && bytes.get(j).is_some_and(|&b| is_ident_start(b)) {
+                matched = false;
+            }
+            if matched && let Some(last) = trailing {
+                let after = skip_ws(bytes, j);
+                if bytes.get(after) != Some(&last) {
+                    matched = false;
+                }
+            }
+            if matched {
                 count += 1;
             }
-            from = at + needle.len();
+            i += 1;
         }
         count
+    }
+
+    fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
     }
 
     /// Walk the WHOLE crate directory (not only `src/`), skipping `target/` and
@@ -928,19 +1155,217 @@ mod tests {
             .replace('\\', "/")
     }
 
-    /// Test-only files are outside the production funnel: the integration-test /
-    /// bench / example trees, and unit-test-only modules. F6: the path test is a
-    /// COMPONENT check, never a substring — `src/latests/evil.rs` is a PRODUCTION
-    /// file and must be scanned (the old `rel.contains("tests")` exempted it).
-    fn is_test_only(rel: &str) -> bool {
-        let mut components = rel.split('/');
-        let first = components.next().unwrap_or("");
+    /// Test-only files are outside the production funnel. A path COMPONENT
+    /// equal to `tests` (the integration/bench/example roots, `tests.rs`, or a
+    /// `tests/` directory) decides from POSITION; a unit-test-only module is
+    /// decided from its GATING, never its NAME: `gated` is the set of
+    /// package-relative module paths whose `mod <name>;` declaration carries a
+    /// `#[cfg(...)]` that IMPLIES `test` (see [`test_only_gated_paths`]).
+    ///
+    /// NAME is not a predicate. A suffix rule (`ends_with("regression.rs")`)
+    /// is strictly BROADER than the gated set: it exempts every file of that
+    /// shape, including a production `src/review_regression.rs` compiled into
+    /// the lib, which could then issue `libc::unlinkat` with the audit green.
+    /// Deriving exemption from the GATING has exactly the gated set as its
+    /// extension — exempting a new production file requires declaring it under
+    /// `#[cfg(test)]`, which is the property being checked.
+    fn is_test_only(rel: &str, gated: &BTreeSet<String>) -> bool {
+        let first = rel.split('/').next().unwrap_or("");
         if matches!(first, "tests" | "benches" | "examples") {
             return true;
         }
-        rel.split('/').any(|c| c == "tests" || c == "tests.rs")
-            || rel.ends_with("regression.rs")
-            || rel.ends_with("test_support.rs")
+        rel.split('/').any(|c| c == "tests" || c == "tests.rs") || gated.contains(rel)
+    }
+
+    /// Every `mod <name>;` declaration in one source file, with whether the
+    /// attribute run before it has a `#[cfg(...)]` that IMPLIES `test`, in
+    /// source order. A `#[cfg(test)]` is held across visibility (`pub(crate) `)
+    /// and cleared by the `;` / `}` that ends any OTHER item, so it never leaks
+    /// onto a later plain `mod`.
+    fn mod_declarations(source: &str) -> Vec<(String, bool)> {
+        let code = code_only(source);
+        let bytes = code.as_bytes();
+        let mut declarations = Vec::new();
+        let mut pending_cfg_test = false;
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'#' && bytes.get(i + 1) == Some(&b'[') {
+                let (body, end) = attribute_body(&code, i);
+                if let Some(cfg) = cfg_predicate(&body)
+                    && cfg_implies_test(cfg)
+                {
+                    pending_cfg_test = true;
+                }
+                i = end;
+                continue;
+            }
+            match b {
+                b'{' | b'(' | b'[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b'}' | b')' | b']' => {
+                    depth -= 1;
+                    if b == b'}' && depth <= 0 {
+                        pending_cfg_test = false;
+                    }
+                    i += 1;
+                }
+                b';' => {
+                    if depth <= 0 {
+                        pending_cfg_test = false;
+                    }
+                    i += 1;
+                }
+                _ if is_ident_start(b) => {
+                    let start = i;
+                    let mut j = i;
+                    while j < bytes.len() && is_ident_start(bytes[j]) {
+                        j += 1;
+                    }
+                    if &code[start..j] == "mod" {
+                        let name_start = skip_ws(bytes, j);
+                        let mut name_end = name_start;
+                        while name_end < bytes.len() && is_ident_start(bytes[name_end]) {
+                            name_end += 1;
+                        }
+                        let name = &code[name_start..name_end];
+                        let terminator = skip_ws(bytes, name_end);
+                        if !name.is_empty() && bytes.get(terminator) == Some(&b';') {
+                            declarations.push((name.to_string(), pending_cfg_test));
+                        }
+                    }
+                    i = j;
+                }
+                _ => i += 1,
+            }
+        }
+        declarations
+    }
+
+    /// The body of the attribute group starting at `#[` (the text between the
+    /// brackets) and the index just past its closing `]`.
+    fn attribute_body(code: &str, start: usize) -> (String, usize) {
+        let bytes = code.as_bytes();
+        let begin = (start + 2).min(bytes.len());
+        let mut i = begin;
+        let mut depth = 1i32;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let end = i.min(bytes.len());
+        (code[begin..end].to_string(), (end + 1).min(bytes.len()))
+    }
+
+    /// The predicate inside a `cfg(...)` attribute body, if the body is one.
+    fn cfg_predicate(body: &str) -> Option<&str> {
+        let rest = body.trim().strip_prefix("cfg")?;
+        let rest = rest.trim_start().strip_prefix('(')?;
+        rest.strip_suffix(')')
+    }
+
+    /// Whether a `cfg(...)` predicate is satisfiable ONLY together with `test`.
+    /// `test` itself and `all(<… test …>)` qualify; `any(...)` qualifies only
+    /// when EVERY disjunct does; `not(...)`, a bare `unix`/`windows`, and a
+    /// `feature = "…"` do not. A conservative `false` only makes the audit scan
+    /// MORE files, never fewer, so it cannot exempt production code.
+    fn cfg_implies_test(cfg: &str) -> bool {
+        let cfg = cfg.trim();
+        if cfg == "test" {
+            return true;
+        }
+        for (name, all_of_them) in [("all", true), ("any", false)] {
+            let Some(inner) = cfg
+                .strip_prefix(name)
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix('('))
+                .and_then(|rest| rest.strip_suffix(')'))
+            else {
+                continue;
+            };
+            let args: Vec<&str> = split_top_level_commas(inner)
+                .into_iter()
+                .map(str::trim)
+                .filter(|arg| !arg.is_empty())
+                .collect();
+            if args.is_empty() {
+                return false;
+            }
+            return if all_of_them {
+                args.iter().any(|arg| cfg_implies_test(arg))
+            } else {
+                args.iter().all(|arg| cfg_implies_test(arg))
+            };
+        }
+        false
+    }
+
+    /// The directory (with a trailing `/`) in which a source file's CHILD
+    /// module files live: `foo.rs` uses `foo/`, while `mod.rs` / `lib.rs` /
+    /// `main.rs` use their own directory.
+    fn module_child_dir(rel: &str) -> String {
+        let (dir, name) = match rel.rfind('/') {
+            Some(pos) => (&rel[..=pos], &rel[pos + 1..]),
+            None => ("", rel),
+        };
+        match name {
+            "mod.rs" | "lib.rs" | "main.rs" => dir.to_string(),
+            _ => match name.strip_suffix(".rs") {
+                Some(stem) => format!("{dir}{stem}/"),
+                None => dir.to_string(),
+            },
+        }
+    }
+
+    /// Every package-relative module path in the crate that is gated under a
+    /// `#[cfg(...)]` implying `test`, walked TRANSITIVELY from `src/lib.rs` (so
+    /// a gated `mod` declared in a submodule — `transport/mod.rs`'s `scripted`
+    /// — is found too). This set is the production/test boundary the audits
+    /// use; it comes from the source's GATING, never from a file NAME.
+    fn test_only_gated_paths() -> BTreeSet<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut gated = BTreeSet::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        seen.insert("src/lib.rs".to_string());
+        let mut queue = vec![root.join("src/lib.rs")];
+        while let Some(file) = queue.pop() {
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let rel = crate_relative(&file);
+            let dir = module_child_dir(&rel);
+            // Walk EVERY declared child module (the walk is how a gated `mod`
+            // nested in a submodule is reached); only the `test`-gated ones are
+            // exempt, and only they are inserted into `gated`.
+            for (name, cfg_test) in mod_declarations(&source) {
+                let base = format!("{dir}{name}");
+                for candidate in [format!("{base}.rs"), format!("{base}/mod.rs")] {
+                    let path = root.join(&candidate);
+                    if !path.exists() {
+                        continue;
+                    }
+                    if cfg_test {
+                        gated.insert(candidate.clone());
+                    }
+                    if seen.insert(candidate.clone()) {
+                        queue.push(path);
+                    }
+                }
+            }
+        }
+        gated
     }
 
     fn is_ident_start(b: u8) -> bool {
@@ -1221,15 +1646,16 @@ mod tests {
     /// integration/bench/example roots) is.
     #[test]
     fn is_test_only_is_a_component_check_not_a_substring() {
-        assert!(!is_test_only("src/latests/evil.rs"));
-        assert!(!is_test_only("src/latest.rs"));
-        assert!(is_test_only("tests/push_atomicity.rs"));
-        assert!(is_test_only("src/transport/tests/foo.rs"));
-        assert!(is_test_only("src/sync/apply/tests.rs"));
-        assert!(is_test_only("src/deep_tree_regression.rs"));
-        assert!(is_test_only("src/test_support.rs"));
-        assert!(is_test_only("benches/bench.rs"));
-        assert!(is_test_only("examples/demo.rs"));
+        let gated = test_only_gated_paths();
+        assert!(!is_test_only("src/latests/evil.rs", &gated));
+        assert!(!is_test_only("src/latest.rs", &gated));
+        assert!(is_test_only("tests/push_atomicity.rs", &gated));
+        assert!(is_test_only("src/transport/tests/foo.rs", &gated));
+        assert!(is_test_only("src/sync/apply/tests.rs", &gated));
+        assert!(is_test_only("src/deep_tree_regression.rs", &gated));
+        assert!(is_test_only("src/test_support.rs", &gated));
+        assert!(is_test_only("benches/bench.rs", &gated));
+        assert!(is_test_only("examples/demo.rs", &gated));
     }
 
     /// F7 regression: string-literal and comment contents are removed before an
@@ -1312,6 +1738,7 @@ mod tests {
         let mut files = Vec::new();
         collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
         assert!(files.len() > 10, "the audit must see the real source tree");
+        let gated = test_only_gated_paths();
 
         let mut funnel_counts: BTreeMap<&str, usize> = BTreeMap::new();
         let mut outside: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -1334,7 +1761,7 @@ mod tests {
                 }
                 continue;
             }
-            if is_test_only(&rel) {
+            if is_test_only(&rel, &gated) {
                 continue;
             }
             for (reference, count) in refs {
@@ -1487,12 +1914,15 @@ mod tests {
     /// SCOPE, stated exactly: the pin covers these five inode-mutating calls
     /// spelled `std::fs::<symbol>(` in the production code of every `.rs` file
     /// under the package directory except test-only files (a path COMPONENT
-    /// equal to `tests`, ending `regression.rs` / `test_support.rs`, or under
-    /// `tests/` / `benches/` / `examples/`). The same audit additionally refuses
-    /// every IMPORT route to the same five symbols — a braced or single
-    /// `use std::fs::{…}`, a `use std::fs as <alias>` / `use std::fs;` module
-    /// alias, a `use std::fs::*` glob, the nested `use std::{fs::…}`, and the
-    /// bare or aliased imported symbol — because those spell no
+    /// equal to `tests`, or a module whose `mod` declaration is `#[cfg(...)]`-
+    /// gated on `test`). The count matcher is TOKENISED, so `std::fs::rename (…)`
+    /// is counted too. The same audit additionally refuses every IMPORT route to
+    /// the same five symbols — a braced or single `use std::fs::{…}`, a
+    /// `use std::fs as <alias>` / `use std::fs;` module alias, a `use std::fs::*`
+    /// glob, the nested `use std::{fs::…}`, the bare or aliased imported symbol,
+    /// and the `std`-crate-ROOT alias (`use std as s;` / `use ::std as s;` /
+    /// `use std::{self as s};`) resolved TRANSITIVELY (so `s::fs::remove_file(…)`
+    /// and `use s::fs::remove_file;` are both refused) — because those spell no
     /// `std::fs::<symbol>(` call and would otherwise leave the pin green while
     /// the record was unlinked. Neither half covers a MACRO that expands to one
     /// of these calls, an `include!`d file OUTSIDE the package, or a call made
@@ -1524,12 +1954,13 @@ mod tests {
                 )
             })
             .collect();
+        let gated = test_only_gated_paths();
 
         // The import/alias routes the exact-count pin below cannot see. This is
         // the enforcement half: `use std::fs::remove_file; remove_file(p)`
         // spells no `std::fs::{symbol}(` call, so it must be caught HERE, or
         // the record can be unlinked with every pin still green.
-        let violations = std_fs_mutation_violations(&files);
+        let violations = std_fs_mutation_violations(&files, &gated);
         assert!(
             violations.is_empty(),
             "production code reaches a `std::fs` inode mutator through a route the pin does not \
@@ -1540,12 +1971,12 @@ mod tests {
 
         let mut observed: BTreeMap<(String, &str), usize> = BTreeMap::new();
         for (rel, raw) in &files {
-            if is_test_only(rel) {
+            if is_test_only(rel, &gated) {
                 continue;
             }
             let code = normalize_ws(&production_only(&code_only(raw)));
             for symbol in FS_INODE_MUTATORS {
-                let count = code.matches(&format!("std::fs::{symbol}(")).count();
+                let count = count_std_fs_calls(&code, symbol);
                 if count > 0 {
                     observed.insert((rel.clone(), symbol), count);
                 }
@@ -1602,9 +2033,12 @@ mod tests {
     /// mutator without spelling `std::fs::<symbol>(` is reported by
     /// [`std_fs_mutation_violations`]: a single and a braced `use`, an aliased
     /// symbol, a module alias (`use std::fs as f` and `use std::fs;`), a braced
-    /// self-alias, a glob, and the nested `use std::{fs::…}` form. A legitimate
-    /// call inside the guarded funnel is NOT reported, so the scanner is not
-    /// merely "report everything".
+    /// self-alias, a glob, the nested `use std::{fs::…}` form, and — via the
+    /// TRANSITIVE root aliases — `use std as s;` / `use ::std as s;` /
+    /// `use std::{self as s};` followed by `s::fs::<symbol>(…)`, the second hop
+    /// `use s::fs::remove_file;` followed by the bare symbol, and a second
+    /// `s::fs as f` hop. A legitimate call inside the guarded funnel is NOT
+    /// reported, so the scanner is not merely "report everything".
     #[test]
     fn the_std_fs_scanner_sees_every_import_alias_route() {
         let fixtures: &[(&str, &str, FsRoute)] = &[
@@ -1653,12 +2087,57 @@ mod tests {
                 "use std::{fs as fx}; fn f(p: &Path) -> std::io::Result<()> { fx::hard_link(p, p) }",
                 FsRoute::ModuleAlias,
             ),
+            (
+                "src/prod/root_alias_two_step.rs",
+                "use std as s; use s::fs::remove_file; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }",
+                FsRoute::Imported,
+            ),
+            (
+                "src/prod/root_alias_import_reversed.rs",
+                "use s::fs::remove_file; use std as s; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }",
+                FsRoute::Imported,
+            ),
+            (
+                "src/prod/root_alias_direct.rs",
+                "use std as s; fn f(p: &Path) -> std::io::Result<()> { s::fs::remove_file(p) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/root_alias_leading_colons.rs",
+                "use ::std as s; fn f(a: &Path, b: &Path) -> std::io::Result<()> { s :: fs :: rename (a, b) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/root_alias_braced_self.rs",
+                "use std::{self as s}; fn f(p: &Path) -> std::io::Result<()> { s::fs::remove_dir(p) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/root_alias_second_hop_module.rs",
+                "use std as s; use s::fs as fx; fn f(p: &Path) -> std::io::Result<()> { fx::remove_dir_all(p) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/root_alias_braced_root.rs",
+                "use {std as s, std::fs}; fn f(p: &Path) -> std::io::Result<()> { fs::hard_link(p, p) }",
+                FsRoute::ModuleAlias,
+            ),
+            (
+                "src/prod/root_alias_glob.rs",
+                "use std as s; use s::fs::*; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }",
+                FsRoute::Glob,
+            ),
+            (
+                "src/prod/std_root_glob.rs",
+                "use std::*; fn f(p: &Path) -> std::io::Result<()> { fs::remove_file(p) }",
+                FsRoute::Glob,
+            ),
         ];
         let files: Vec<(String, String)> = fixtures
             .iter()
             .map(|(rel, body, _)| ((*rel).to_string(), (*body).to_string()))
             .collect();
-        let violations = std_fs_mutation_violations(&files);
+        let violations = std_fs_mutation_violations(&files, &BTreeSet::new());
         for (rel, _, route) in fixtures {
             assert!(
                 violations
@@ -1671,24 +2150,110 @@ mod tests {
     }
 
     /// The NEGATIVE fixture: a legitimate mutation at the guarded funnel — the
-    /// audited direct `std::fs::rename` the exact-count pin already covers — and
-    /// an inode-PRESERVING `std::fs::write` must yield NO violation, so the
-    /// scanner does not merely report every `std::fs` mention. (The direct call
-    /// is still counted by the pin; this test is about the import scanner, not
-    /// the pin.)
+    /// audited direct `std::fs::rename` the exact-count pin already covers — an
+    /// inode-PRESERVING `std::fs::write`, and a redundant `use std;` (which
+    /// must NOT turn the canonical `std::fs::…` spelling into an alias route)
+    /// all yield NO violation, so the scanner does not merely report every
+    /// `std::fs` mention. (The direct call is still counted by the pin; this
+    /// test is about the import scanner, not the pin.)
     #[test]
     fn the_std_fs_scanner_does_not_report_the_guarded_funnel() {
         let files = vec![(
             "src/atomic/unix.rs".to_string(),
-            "fn legit(a: &Path, b: &Path) -> std::io::Result<()> {\n    std::fs::rename(a, b)\n}\n\
+            "use std;\nfn legit(a: &Path, b: &Path) -> std::io::Result<()> {\n    std::fs::rename(a, b)\n}\n\
              fn keep(p: &Path) -> std::io::Result<()> { std::fs::write(p, b\"x\") }\n"
                 .to_string(),
         )];
         assert_eq!(
-            std_fs_mutation_violations(&files),
+            std_fs_mutation_violations(&files, &BTreeSet::new()),
             Vec::new(),
             "a legitimate direct call at the guarded funnel and an inode-preserving write must \
              NOT be reported as an import-route violation"
+        );
+    }
+
+    /// The exact-count pin's matcher is TOKENISED, so a `std::fs::rename (…)`
+    /// whose callee and paren are separated by whitespace is counted exactly as
+    /// the unspaced spelling is. (The pin's VALUES are unchanged; only the
+    /// matcher that drives them is whitespace-insensitive.)
+    #[test]
+    fn the_exact_count_pin_counts_whitespace_before_the_call() {
+        for case in [
+            "fn f(a: &Path, b: &Path) -> std::io::Result<()> { std::fs::rename(a, b) }",
+            "fn f(a: &Path, b: &Path) -> std::io::Result<()> { std::fs::rename (a, b) }",
+            "fn f(a: &Path, b: &Path) -> std::io::Result<()> { std::fs::rename\n\t(a, b) }",
+            "fn f(a: &Path, b: &Path) -> std::io::Result<()> { std :: fs :: rename (a, b) }",
+            "fn f(a: &Path, b: &Path) -> std::io::Result<()> { ::std::fs::rename(a, b) }",
+        ] {
+            let code = normalize_ws(&code_only(case));
+            assert_eq!(
+                count_std_fs_calls(&code, "rename"),
+                1,
+                "the exact-count matcher missed a spelling: {case} -> {code}"
+            );
+        }
+        // A DIFFERENT symbol and a LONGER identifier must not match.
+        let other = normalize_ws(&code_only(
+            "fn f(p: &Path) -> std::io::Result<()> { std::fs::rename_all(p) }",
+        ));
+        assert_eq!(count_std_fs_calls(&other, "rename"), 0);
+    }
+
+    /// DEFECT 2 regression: test-only-ness comes from the GATING, not the NAME.
+    /// A production `src/review_regression.rs` — a name the old suffix rule
+    /// exempted — is scanned and its import route is reported. The two real
+    /// gated modules stay exempt, and the exemption follows the `#[cfg]` rather
+    /// than the suffix: `not(test)` and a bare `unix` do NOT exempt.
+    #[test]
+    fn a_production_regression_suffixed_path_is_scanned() {
+        let gated = test_only_gated_paths();
+        assert!(
+            gated.contains("src/deep_tree_regression.rs"),
+            "lib.rs's `#[cfg(all(test, unix))] mod deep_tree_regression;` gates it: {gated:?}"
+        );
+        assert!(gated.contains("src/fifo_regression.rs"));
+        assert!(gated.contains("src/test_support.rs"));
+        assert!(
+            gated.contains("src/transport/scripted.rs"),
+            "a gated `mod` nested in a submodule is reached by walking every declaration"
+        );
+        assert!(!gated.contains("src/review_regression.rs"));
+        assert!(!is_test_only("src/review_regression.rs", &gated));
+
+        let files = vec![(
+            "src/review_regression.rs".to_string(),
+            "use std::fs::remove_file; fn f(p: &Path) -> std::io::Result<()> { remove_file(p) }"
+                .to_string(),
+        )];
+        let violations = std_fs_mutation_violations(&files, &gated);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.file == "src/review_regression.rs" && v.route == FsRoute::Imported),
+            "a production `*_regression.rs` path must be scanned: {violations:?}"
+        );
+
+        // The gate, not the name: a negative or unrelated cfg does not exempt.
+        assert!(!cfg_implies_test("not(test)"));
+        assert!(!cfg_implies_test("unix"));
+        assert!(!cfg_implies_test("feature = \"x\""));
+        assert!(!cfg_implies_test("any(test, unix)"));
+        assert!(cfg_implies_test("test"));
+        assert!(cfg_implies_test("all(test, unix)"));
+        assert!(cfg_implies_test("all(unix, all(test, windows))"));
+        assert!(cfg_implies_test("any(all(test, unix), all(test, windows))"));
+
+        let source = "#[cfg(test)] mod alpha;\n#[cfg(not(test))] mod beta;\n\
+                      #[cfg(unix)] mod gamma;\npub(crate) mod delta;\n\
+                      #[cfg(all(test, unix))] pub(crate) mod epsilon;\n";
+        let gated_names: Vec<String> = mod_declarations(source)
+            .into_iter()
+            .filter(|(_, gated)| *gated)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            gated_names,
+            vec!["alpha".to_string(), "epsilon".to_string()]
         );
     }
 }
