@@ -2256,8 +2256,9 @@ mod runner_property_tests {
     /// injected into the REAL [`SshTransport::with_runner`] entry point) must
     /// become `ExecOutcome { exit_code: -1, timeout_cause:
     /// Some(CommandStillRunning) }`. Inverting the mapping (the ssh
-    /// `RunError::Timeout` arm) makes this assertion red — the mutation proof
-    /// is in the task log.
+    /// `RunError::Timeout` arm) makes this assertion red: the fake seam injects
+    /// exactly that `RunError`, so the outcome can only come through the arm's
+    /// mapping.
     #[test]
     fn ssh_exec_maps_a_deadline_kill_to_command_still_running() {
         run_one_pair(OpKind::Exec, Stall::Hang);
@@ -2267,9 +2268,10 @@ mod runner_property_tests {
     /// `RunError::Background` (the command exited and was reaped; only its
     /// bounded post-exit drain gave up while a pipe-holding process outlived
     /// it) must become `ExecOutcome { exit_code: -1, timeout_cause:
-    /// Some(OutputDrainGaveUp) }` — never the deadline-kill cause. Inverting
-    /// the mapping (the ssh `RunError::Background` arm) makes this assertion
-    /// red — the mutation proof is in the task log.
+    /// Some(OutputDrainGaveUp) }` — never the deadline-kill cause. Inverting the
+    /// mapping (the ssh `RunError::Background` arm) makes this assertion red:
+    /// the seam injects that cause, so the outcome can only come through the
+    /// arm's mapping.
     #[test]
     fn ssh_exec_maps_a_drain_gave_up_to_output_drain_gave_up() {
         run_one_pair(OpKind::Exec, Stall::Background);

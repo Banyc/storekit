@@ -49,26 +49,44 @@ impl Tracer {
 mod tests {
     use super::*;
 
-    /// A disabled tracer is a no-op: `step` never emits (the emission path
-    /// is gated on `enabled`, so a `Tracer::new(false)` cannot print).
+    /// A disabled tracer RECORDS nothing: `step` returns before it touches the
+    /// bookkeeping, so a `Tracer::new(false)` cannot print and cannot move
+    /// `last`. Asserted on the observable it has (the bookkeeping), because a
+    /// test that only calls `step` and checks for panic cannot fail.
     #[test]
     fn disabled_tracer_is_a_noop() {
         let mut t = Tracer::new(false);
-        // Must not panic and must not print: the step body is gated on
-        // `enabled`, so this exercises the gate itself.
+        let before = t.last;
+        std::thread::sleep(std::time::Duration::from_millis(2));
         t.step("ref.parse", "token=\"@-\" -> @-");
+        assert_eq!(
+            t.last, before,
+            "a disabled tracer must not record the step (the gate returns first)"
+        );
     }
 
-    /// An enabled tracer records steps (the elapsed durations are monotonic —
-    /// each step's since-last is >= 0 and the since-start grows). The
-    /// emission itself goes to stderr; the test asserts the bookkeeping
-    /// contract, not the captured sink.
+    /// An enabled tracer RECORDS a step: `last` moves to the step's own instant,
+    /// so the elapsed time since the trace start covers the sleep before it.
+    /// This is what fails if `step` stops recording (a total no-op leaves
+    /// `last == start`), which is the property the name states.
     #[test]
     fn enabled_tracer_records_steps() {
         let mut t = Tracer::new(true);
+        std::thread::sleep(std::time::Duration::from_millis(2));
         t.step("ref.parse", "token=\"@-\" -> @-");
+        let el = t.last.duration_since(t.start);
+        assert!(
+            el >= std::time::Duration::from_millis(2),
+            "an enabled tracer must record the step AFTER the sleep: elapsed since start = {el:?}"
+        );
+        // The emission itself goes to stderr (the documented sink); the
+        // bookkeeping above is the in-process observable, and the second step
+        // must not move `last` BACKWARDS (the clock is monotonic).
+        let after_first = t.last;
         t.step("ref.resolve", "target=\"production\" expr=@-");
-        // The bookkeeping is internal; the contract is that two steps ran
-        // without panicking.
+        assert!(
+            t.last >= after_first,
+            "the step clock must not go backwards"
+        );
     }
 }
