@@ -723,3 +723,14 @@ implied to be checked.
   code and trips both pins. When adding a gated test module, keep the attributes
   separate, and state what an audit actually skips rather than what it appears to
   skip.
+- **A claim is a measurement or it is a label.** Every behavioural or countable
+  claim in `README.md`, `docs/API-CONSTRAINTS.md` and `docs/CONSISTENCY.md`
+  either names the command, test or table that produced it, or says in the
+  sentence itself that it is an assertion nobody has measured. The adversarial
+  review's first round refuted EIGHT such claims — the loudest being a paragraph
+  titled "The delta, measured" that described a strictness the code did not
+  have, and a count ("the ONE tolerated exception") that was off by seven. A
+  claim is not weaker for admitting it is unmeasured; it is checkable, which is
+  the only property that matters to the next reader. This one is a norm and not
+  a test: no text scan can tell a claim from a historical mention, so the
+  enforcement is the review.

@@ -315,3 +315,52 @@ below the doc performs exactly that second walk
 with the behaviour the code has. This is the axis-D trap the constraint is
 about in miniature: a name (and a doc) saying one thing while the value says
 another.
+
+## The adversarial review (round 1)
+
+Two independent reviewers were given a byte-identical brief and told to attack
+this crate's OWN claims — every constraint marked done, every axis closed. To
+keep the round comparable the prompt was fixed for both, and to keep it honest a
+finding needed evidence and a clean report needed a coverage list. Twelve
+findings were actionable; all twelve are fixed here. **The distribution is the
+finding.**
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | Destination RESIDUE was invisible to the result-containment check. `apply_manifests` strips residue for the DIFF (correct — it is never transferred), and the index that decides the POST-RUN verdict was built from that same stripped view, so a source link whose target walked through a stranded claim-aside symlink was permitted and the run installed a link that escaped the root. Reproduced on macOS and Linux; the report simultaneously named the component as `residue` and as an unsupported escaping symlink while installing the link. | C | `ovwlkwmxkvpu` |
+| 2 | The destination-ownership token was not bound to the TRANSPORT. `Prepared` recorded the destination's PATH (`normalize_root(remote.root())`) and never the endpoint, so a token minted against host A was accepted for a run against host B reporting the same root, and the run mutated B while holding A's record. | D | `lxxormsvvwkw` |
+| 3 | `mode_octal::deserialize` MASKED (`& 0o7777`) where three documents claimed it refused, and `from_str_radix` also accepted a sign and any length (`"10644"` loaded as `0o644` with the setuid bit dropped; `"+755"` loaded at all). The parse was non-injective, and `compute_tree_digest` hashes the VALIDATED values, so two different wire records aliased to one `tree_sha256`. | A | `upksmsssrynr` |
+| 4 | The `std::fs` mutation audit counted the literal text `std::fs::{symbol}(`, so `use std::fs::remove_file; remove_file(p)` in production left the pin GREEN. The libc half of the same audit already handled alias routes. | H | `znstvkxrwozv` |
+| 5 | Constraint #1's "ONE tolerated exception" was false: `platform::chmod`, `platform::symlink`, `sync::retire_destination_lock`, the copy primitives, `lock::FileLock::acquire`, `sync::Residue::recover_to` and `Remote::lock_far_side` are public and take raw paths. | M | `kvyywnmrxnyn` |
+| 6 | The two wrong-direction `compile_fail` doctests were bare annotations, which any compile error satisfies, while the doc claimed each failed with `E0308`. | H | `upksmsssrynr` |
+| 7 | A source doc cited a test name that does not exist. | A | `upksmsssrynr` |
+| 8 | `GuardedRel::new`'s "one of only TWO functions in the crate that run the guard (verified by the source audit)" was false — three minting constructors, ~21 direct `refuse_reserved_mutation` call sites, and no audit that counts guard callers. | A | `znstvkxrwozv` |
+| 9 | README's "an unaddressable spelling ... is never destroyed by `Extraneous::Delete`" was overbroad: a crate TEMP shape IS removed by `Delete`. | A | `kvyywnmrxnyn` |
+| 10 | `valid_name`'s injectivity claim was false on case-insensitive and trailing-dot-folding hosts. | A | `kvyywnmrxnyn`, `yvkvksnwxnor` |
+| 11 | `the_table_covers_the_unicode_17_additions` named 28 mappings and asserted 6, so corrupting an unsampled one left all five casefold tests green (the table itself was correct, verified against the UCD). | H | `ruylovrpvvvs` |
+| 12 | Constraint #5 claimed `Sanction`/`GuardedRel` were "unforgeable outside the crate" while both are `pub(crate)` — the row described no public surface at all. | A | `kvyywnmrxnyn` |
+
+**Eight of the twelve are axis A**, "a doc claim ↔ the code", and they are not
+eight unrelated slips: they are one habit, a claim ASSERTED in the confident
+register rather than MEASURED. The sharpest instance is finding 3 — its paragraph
+was titled "**The delta, measured**" and was not measured; it described a
+strictness the code did not have, and the crate's own rule ("prove the delta")
+would have caught it had the delta actually been produced. Findings 3, 5, 6, 7,
+10 and 12 all share the shape: a sentence that reads as verified with nothing
+behind it.
+
+Two axes gained a meaning they did not have. **C** now covers "a view prepared
+for ONE purpose reused for another": the destination stripped for the diff is not
+the destination as it will be after the run, and only the second decides whether
+an installed link escapes. **D** now covers a TOKEN, not only a name predicate:
+`matches` answered "same path spelling" while its callers and its own docs
+claimed "same destination".
+
+The mitigation is a rule, not a test — see README's "a claim is a measurement or
+it is a label". Axis A cannot be closed mechanically here: this round's own
+attempt to check it by scanning the docs for cited identifiers that no longer
+exist was WRONG, because the docs legitimately cite removed items in the
+historical register ("`parse_mode` was removed"), and no text scan distinguishes
+"cited as current" from "cited as removed". That instrument was discarded rather
+than shipped, and it is recorded here because a discarded instrument is the same
+mistake as the defects it was meant to catch.
