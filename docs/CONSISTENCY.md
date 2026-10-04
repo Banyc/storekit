@@ -972,3 +972,61 @@ asserted was there and was not, and a number I wrote without counting. The remed
 in the text rather than in a resolution: the round-10 paragraph now states the
 COVERAGE GAP it has (localness pinned for PULL only), and this entry carries the
 filled gap. A claim about content is a measurement like any other.
+
+## The adversarial review (round 12)
+
+Seven findings, all fixed — and the P1 is the THIRD iteration of one class, which is
+the finding: each round had tried to certify the libc belt with a better LIST.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The round-11 "independent" anchor was forced SET-EQUAL to the two co-editable family literals (the oracle asserted `anchor == family` AND `family == literal_family`), so all three had to be edited in lockstep and the anchor certified nothing. Only the 19 names in the negative-control loop were protected; for the other 52 members the round-10 evasion worked verbatim — a 3-way edit plus a non-funnel production `libc::chmod` (or `remove`) pinned outside the funnel left all six libc tests and both clippy runs green, i.e. the belt AUTHORIZED a pinned name-mutating call outside the funnel. Reproduced independently by both reviewers with different symbols. | H, M | `lvwqlvuwoxwy` |
+| 2 | `clippy.toml`'s allow-site list — which `reserved.rs` calls AUTHORITATIVE — still named `platform::symlink` after round 11 moved the attribute to the new `symlink_verbatim`, so a reader was told the wrong item was exempt. | A | `lvwqlvuwoxwy` |
+| 3 | Round 11's header said "Nine findings" while its table listed TEN. | A | the round-12 docs commits |
+| 4 | `EXTRACTION.md`'s gate list omitted the mandatory Windows-target clippy — it still showed the pre-round-6 gate that round 6 explicitly refuted. | A | the round-12 docs commits |
+| 5 | The "pinned local root" axis was test-pinned only for PUSH: gating that comparison on `Push` left the entire suite green. | H | `lvwqlvuwoxwy` |
+| 6 | The `186 → 174` public-function count stood with no counting rule, in the very paragraph that removed the 191/11 counts for exactly that reason (and no rule in the doc produces 174). | A | the round-12 docs commits |
+| 7 | `reserved.rs` said "only two production mutation families never consult the guard" while the adjacent bullet already named a third (`copy_tree_verbatim`, which by then reached the unguarded `symlink_verbatim`), and said the audits cover "`src/atomic/unix.rs`" while the funnel is a DERIVED four-file region. | A | `lvwqlvuwoxwy` |
+
+**The belt's oracle is now derived from something this crate does not edit.** The
+round-9 fix was a 7-name spot list, round 10's a 54-entry literal with set equality,
+round 11's a 71-entry "independent" anchor — all three inside `guard.rs`, all three
+co-editable, and each certificate was editable alongside what it certified. The fix
+is a checked-in artifact, `src/atomic/libc_name_mutation_surface.txt`, derived from
+the PINNED `libc` crate's own `pub fn` declaration surface across all target cfg
+branches — target-independent, with its provenance (version and `Cargo.lock`
+checksum), the command that regenerates it, a live re-derivation test that asserts
+equality against the registry source whenever present, and a membership pin (count
+plus digest). Three consequences worth recording:
+
+* The derivation found **15 members the hand-written list had missed**
+  (`chflagsat`, `setattrlistat`, `fclonfileat`, `renamex_np`, `renameatx_np`,
+  `shm_rename`, `wchmod`, `wrmdir`, `wutime`, `nmount`, `unmount`, …) — the evidence
+  that the earlier lists were incomplete in a way no amount of care had caught.
+* The anchor may now DISAGREE with the family: `family ⊇ anchor` is allowed and the
+  reverse direction requires an explicit curated entry with a reason (empty today),
+  and the review list is checked against the UNION rather than against one list.
+* The residual is stated with per-name reasons (`acl_set_file`, `acl_set_link_np`,
+  `fchmodat2`, `openat2` are declared nowhere in `libc` 0.2.189) plus the residue
+  outside any symbol surface at all (a raw `syscall`, `io_uring`, a local
+  `extern "C"`, a `windows_sys` creator) — the same residue the `libc` reference
+  surface pin and the module doc already named.
+
+And the agent corrected the brief: the verbatim 3-way `chown` edit was ALREADY red
+before the fix, because `chown` is one of the 19 negative controls — the exploitable
+members were the non-controls such as `chmod`. That is what a real reproduction is
+for, and it is why the brief's symbol choice was not taken on trust.
+
+**Three rounds, three unpinned devices — the same shape each time.** Round 10 found
+the localness axis pinned only for PULL; round 11 the transitive funnel region
+unpinned; round 12 the local-root axis pinned only for PUSH. Each was a comparison
+present in the code with a test for ONE direction or ONE arm, invisible to a
+`cargo test` that stays green when the other half is deleted. All three now have the
+missing twin, and the axis-to-test table in the round-11 entry records the pairs.
+
+**My own figures: five wrong across four rounds, each now recorded in place.** This
+round's were the round-11 count (nine for ten) and the 186 → 174 total (deleted, as
+191/11 was). The pattern is stable — a number written from memory while the correct
+value sat in a table or an output I had just produced — and the remedy is the one
+the log now applies to itself: state the command, or state the gap, but do not state
+a figure nobody measured.
