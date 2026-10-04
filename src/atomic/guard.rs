@@ -4583,8 +4583,8 @@ mod tests {
     /// derivation sees the SYNTACTIC builder spelling
     /// (`std::fs::OpenOptions::custom_flags`). [`synthetic_builder_spelling`]
     /// and [`reconciled_denied_symbols`] make the two agree, so the deny and the
-    /// closure test cannot drift — the exact failure this round found, where the
-    /// review list carried the synthetic spelling with a false "cannot adopt"
+    /// closure test cannot drift — the exact failure this test exists to catch: the
+    /// closure's own list carried the synthetic spelling with a false "cannot adopt"
     /// reason while the lint did not name the method at all.
     #[test]
     fn custom_flags_adoption_is_denied_and_reconciled_across_both_spellings() {

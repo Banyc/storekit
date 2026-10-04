@@ -86,8 +86,10 @@ residual, named AT the item with its reach).
   `atomic::COMPONENT_CONFINED`; `Remote::copy_tree`'s SSH `cp -a` asymmetry;
   `EntryPolicy::AppendTail`'s lost-update warning.
 - **R — `reserved::is_reserved_name` / `is_reserved_path`** are NARROWER than
-  `is_unaddressable_name` / `is_unaddressable_path`: byte-exact reserved MATCHING for the
-  sync's strip, not "may I use this name".
+  `is_unaddressable_name` / `is_unaddressable_path`: byte-exact reserved MATCHING, not
+  "may I use this name". The sync does NOT strip with them — it uses the BROAD pair,
+  `is_residue_path` for the destination view and `is_unaddressable_path` for the source
+  view.
 - **Out of scope — `Tracer::new(enabled: bool)`**: rule 2's boolean clause is about a
   DESTRUCTIVE choice; a tracer's `false` is the safe, side-effect-free default.
 

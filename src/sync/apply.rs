@@ -2036,6 +2036,11 @@ fn lock_destination(
 /// mirrors [`LocalSide::open`]'s `materialization` refusal for a non-directory
 /// root.
 fn require_existing_root(dest_is_local: bool, dest_root: &Path) -> Result<()> {
+    // UNREACHABLE BY CONSTRUCTION today: the composed form is the only caller and
+    // it passes `dest_is_local = true`, while a non-local destination is refused
+    // EARLIER as `PreflightKind::RemoteDestinationViaLocalLock`. The branch is kept
+    // as a defence for a future caller, and no test can reach it — stated here
+    // rather than left for a reader to discover.
     if !dest_is_local {
         return Err(Error::preflight_kind(
             PreflightKind::ComposedRequiresLocalDestination,

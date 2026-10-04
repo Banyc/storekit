@@ -13,10 +13,24 @@
 //! the failure a consumer would get, and exactly the failure no unit test in
 //! this crate can produce.
 //!
-//! The evidence each group pins is the CONSUMER's own call shape, read at
-//! `~/code/deploy` `@` = `a76da6d4` (tip `2a2af061`). It is cited by NAME, not
-//! by `file:line`: a consumer's line numbers move under it, and this crate's own
-//! rules forbid resting a claim on one.
+//! Each group below says WHICH KIND of evidence it has, measured at
+//! `~/code/deploy` `@` = `a76da6d4` (tip `2a2af061`):
+//!
+//! * a name a CURRENT consumer CALLS — `Remote::exists` (called in production),
+//!   the absolute-path replace and its `_fd` twin, `copy_dir_recursive_fd`,
+//!   `fsync_tree_recursive_fd`, `with_operation_lock_sidecar` with `SIDECAR_*`,
+//!   and the `id_newtype!` machinery;
+//! * a name the crate HOLDS for a consumer that does not use it YET — the `sync`
+//!   entry point with its ownership values, `SyncReport`, `copy_tree_verbatim`.
+//!   Measured at that revision: `deploy` contains ZERO occurrences of any of
+//!   them, so the pin is not an attestation of a current need; it is a promise
+//!   not to drop the surface the planned migration depends on, and it says so
+//!   here rather than borrowing the authority of a call site that does not
+//!   exist.
+//!
+//! Deleting any of them is a COMPILE failure here either way, which is the
+//! point. Each is cited by NAME, never by `file:line`: a consumer's line numbers
+//! move under it, and this crate's own rules forbid resting a claim on one.
 //!
 //! * `Remote::exists` — `src/remote/transport/mod.rs`, the trait method the
 //!   consumer's interface requires, `fn exists(&self, rel: &RootedRelativePath)
@@ -35,7 +49,8 @@
 //!   surfaced by the consumer audit" (c).
 //! * the ONE `sync` entry point in BOTH ownership states —
 //!   `DestinationOwnership::lock(..)` (owned) and
-//!   `DestinationOwnership::Unowned` (the explicitly weaker path).
+//!   `DestinationOwnership::Unowned` (the explicitly weaker path). HELD FOR THE
+//!   PLANNED CONSUMER: no current consumer calls `sync` (see the header).
 //!
 //! It is fast and hermetic: no network, no sshd — everything runs through
 //! `LocalTransport` and the in-crate seams.
@@ -216,12 +231,15 @@ fn tree_pair_out_of_root_source_into_confined_staging() {
     }
 }
 
-/// The two consumer-required names the migration added, exercised through the
-/// PUBLIC API only: the operation-scoped sidecar critical section (`deploy`'s
-/// `remote::helper::recover` fallback needs a blocking-with-deadline form over
-/// the already-open, read-only record) and the tolerant verbatim copy
-/// (`deploy`'s retention checkpoint clones a live base that holds
-/// `operation.lock`). A future deletion of either is a COMPILE failure here.
+/// One consumer-required name and one held for the planned consumer, both
+/// exercised through the PUBLIC API only: the operation-scoped sidecar critical
+/// section (`deploy`'s `remote::helper::recover` fallback needs a
+/// blocking-with-deadline form over the already-open, read-only record — a
+/// current CALL SITE), and the tolerant verbatim copy, which `deploy`'s
+/// retention checkpoint does NOT use (measured: its live-base clone is a
+/// test-only `std::fs::copy`) and which the crate therefore holds for the
+/// planned consumer rather than attesting. A future deletion of either is a
+/// COMPILE failure here.
 #[test]
 fn sidecar_critical_section_and_tolerant_clone_are_public() {
     let tmp = tempfile::tempdir().expect("tempdir");

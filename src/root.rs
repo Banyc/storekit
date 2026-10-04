@@ -268,7 +268,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // THE OWNERSHIP-REFUSAL PROPERTY (the review's acceptance): generate
+    // THE OWNERSHIP-REFUSAL PROPERTY: generate
     // EQUAL, NESTED (ancestor/descendant), TRAVERSAL (`..`), `/`, and
     // SYMLINK-INJECTED candidate roots against a first owned root; EVERY
     // candidate must be refused at construction, and the refusal must

@@ -365,13 +365,13 @@ token is bound to the transport that minted it: direction, pinned local root, re
 root spelling, endpoint identity, remote localness — each compared, each pinned by a
 test per direction.
 
-**(c) The fd-confined tree helpers a consumer calls are public.** `deploy` calls
+**(c) The fd-confined tree helpers are public.** `deploy` CALLS
 `copy_dir_recursive_fd` and `fsync_tree_recursive_fd` from its own store module and
-drives a staged publish through the sidecar critical section; the crate exposes those
-(`copy_tree_verbatim`, `copy_dir_recursive_fd`, `with_operation_lock_sidecar` with
-`SIDECAR_WAIT_TIMEOUT`/`SIDECAR_RETRY_INTERVAL`) rather than leaving the consumer to
-reimplement them. A public name is justified by a CONSUMER's need, never by this
-crate's own production.
+drives a staged publish through `with_operation_lock_sidecar`; `copy_tree_verbatim` is
+public for a live-base clone the migration needs but no consumer calls yet (measured:
+zero occurrences in `deploy`). A public name is justified by a CONSUMER's need — a
+current one or a stated, planned one — and never by this crate's own production; where
+the need is planned rather than present, the docs say which it is.
 
 ## The contract
 

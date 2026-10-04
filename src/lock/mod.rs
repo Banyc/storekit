@@ -465,7 +465,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // THE THREE-CONTENDER INTERLEAVING PROPERTY (the review's acceptance):
+    // THE THREE-CONTENDER INTERLEAVING PROPERTY:
     // contender A unlocks/drops, contender B tries to acquire, contender C
     // tries to acquire — at NO point may two contenders both hold the flock.
     // With the stable-inode release this is structural (there is no unlink,
