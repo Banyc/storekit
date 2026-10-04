@@ -671,3 +671,42 @@ cache). Each fix added a member. The next one should not: the population is
 derivable from the public surface, so it should be DERIVED and asserted against
 the prose, exactly as the symbol set now is — the rule is cheap to check and the
 list is not.
+
+## The adversarial review (round 6)
+
+Four findings, all fixed — and the P1 is the fifth round in a row in which a class
+declared CLOSED had a live instance the closure did not cover.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The completeness device denied the free functions and the round-5 creation wrappers, but NOT the name-ADOPTING inherent and builder forms: `std::fs::File::create`, `File::create_new`, `DirBuilder::create`, `std::fs::copy` (its destination), and `OpenOptions::new().create(true)/.create_new(true)….open(p)` — where the BUILDER FLAG, not the call, decides whether a name is adopted. A new production module could therefore adopt `operation.lock` with every gate green, while the crate's own create-or-truncate primitive refuses exactly that spelling. **And the shape was already shipped:** `src/lock/unix.rs` and its Windows twin both adopt the lock-record name through `OpenOptions…create(true)…open()` with no allow and no deny — so round 5's meta-claim ("the deny list can no longer drift from the code") was false when written. The derived test could not see it either, because its own helper excluded inherent-type paths while its doc promised "the funnel's whole resolved call surface". | H, M | `opxqouknzxww` |
+| 2 | The derived check visited `syn::Item` but not `ImplItem`, so a `#[allow]`-ed METHOD's un-denied call was invisible to it (the freestanding-allow control DID fail, isolating the arm). | H | `opxqouknzxww` |
+| 3 | The completeness device was never run for the WINDOWS target: `cargo clippy --all-targets` compiles the host only and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module could call denied symbols with the gate green (measured: host run clean, Windows-target run red). | L | `opxqouknzxww` + the gate |
+| 4 | Three prose claims had drifted from the code: the README's deny-symbol ENUMERATION (stale within the round that removed enumerations), constraint #1's justification that `Residue::recover_to` "takes no path argument at all" (it takes `target: impl AsRef<Path>` and validates it), and the README's "they resolve the enumerated import routes by PARSING the sources" — only the `std::fs` audit parses; the `libc` audit is a reference scanner that does not even resolve `use libc as c`. | A | the round-6 docs commits |
+
+**The fix is the one the pattern demands: extend the DERIVATION, not the list.**
+The deny list gained the adopting symbols (measured: each planted form went from
+exit 0 to exit 101, and the read-only/truncate-only opens stayed legal — the lint
+is name-based, so denying `OpenOptions::truncate` would have flagged harmless
+`.truncate(false)` calls and was correctly declined). But the durable half is that
+`funnel_symbol` now accepts ANY module-path depth and the visitor records
+associated-function calls, builder-method chains and block-scoped `let` builders,
+so the next un-denied form inside the funnel is NAMED BY A FAILING TEST rather
+than found by a reviewer: three planted arms (an associated call, a builder chain,
+a split `let` local) each made
+`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide` fail where all three
+had left it green. Measuring also surfaced a false attribution — `.open(p).map_err(…)`
+was being recorded as `OpenOptions::map_err` — which the fix stopped by ending the
+chain-walk at the terminal call.
+
+**A residual is stated at the test rather than left implied:** the derivation
+recognises a builder only by syntactic chain or enclosing `let`; one reached through
+a parameter, a field, a return value, a function pointer or a macro body is not
+named THERE — the crate-wide resolve-by-type deny is what refuses those, which is
+why the two devices remain complementary rather than redundant.
+
+The gate itself changed: **two** clippy commands are now required, the host one and
+the Windows-target one, because a lint that never compiles `#[cfg(windows)]` code
+cannot be the completeness device for a crate that supports Windows. That is the
+same lesson as axis L, one level up: "a green gate on one platform is not evidence
+for another" applies to the DEVICES in the gate, not only to the code they check.
