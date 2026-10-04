@@ -789,12 +789,16 @@
 //!
 //! ## Path ancestry
 //!
-//! Ancestry is always interpreted with `std::path::Path` (`parent`,
-//! `strip_prefix`, `components`), never by splitting the manifest string on a
-//! literal separator. The code is therefore correct whether the manifest
-//! spells paths with `/` (the canonicalizer) or with the platform separator,
-//! and a sibling whose name shares a prefix with a directory (`px` beside `p`)
-//! is never mistaken for a descendant.
+//! Ancestry of a MANIFEST path is always interpreted over the manifest's
+//! `/`-separated segments (`manifest_strip_prefix`, `manifest_file_name`,
+//! `parent_manifest`, `ancestor_paths`), never by handing the string to the
+//! host `std::path::Path` model: on Windows that model treats a literal `\`
+//! as a separator and would split one manifest component into two. The
+//! manifest model splits on `/` only, so a `\`-bearing name stays whole and a
+//! sibling whose name shares a prefix with a directory (`px` beside `p`) is
+//! never mistaken for a descendant. Host paths (the roots themselves) are
+//! still manipulated with `std::path::Path`, which is the right model for
+//! them.
 //!
 //! ## Manifest paths are addresses
 //!
@@ -3181,8 +3185,10 @@ impl ModeJournal {
             })
             .collect();
         plan.sort_by(|a, b| {
-            let da = Path::new(&a.0).components().count();
-            let db = Path::new(&b.0).components().count();
+            // Depth over the MANIFEST's `/`-separated segments, not the host
+            // component model (which splits a `\`-bearing name on Windows).
+            let da = a.0.split('/').count();
+            let db = b.0.split('/').count();
             db.cmp(&da).then_with(|| a.0.cmp(&b.0))
         });
         plan
@@ -3716,8 +3722,13 @@ fn run(
                 // target; a destination view adds nothing here.
                 continue;
             }
+            // The link's own path is a MANIFEST spelling: convert it through
+            // the ONE authority (split on `/`) so a `\`-bearing name is never
+            // read as a host subpath on Windows.
+            let link_rel =
+                RootedRelativePath::from_manifest(&entry.path).map_err(SyncError::from)?;
             if let Err(refusal) =
-                check_relative_symlink_target_two_views(Path::new(&entry.path), target_path, &views)
+                check_relative_symlink_target_two_views(link_rel.as_path(), target_path, &views)
             {
                 let reason = symlink_target_refusal_message(refusal, &entry.path, target);
                 return Err(SyncError::from(Error::materialization(format!(
@@ -4360,9 +4371,12 @@ impl Applier<'_, '_> {
                 .into_iter()
                 .find(|ancestor| self.aliased_dest.contains_key(ancestor))?
         };
-        Path::new(&full)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
+        let name = manifest_file_name(&full);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
     }
 
     /// Report every destination-only entry. Removal happens later, only after
@@ -4477,8 +4491,7 @@ impl Applier<'_, '_> {
             // The ancestor IS an existing directory. It blocks only when
             // installing the child would need its mode widened, which the
             // conflict forbids.
-            let immediate =
-                Path::new(path).parent().and_then(Path::to_str) == Some(ancestor.as_str());
+            let immediate = parent_manifest(path) == ancestor;
             let rel = rooted(&ancestor)?;
             let current = self.dest.mode(&rel, EntryKind::Dir)?;
             let target = widen_target(current, immediate, need, self.dest.is_confined_local());
@@ -4494,9 +4507,10 @@ impl Applier<'_, '_> {
     /// explicitly sanctioned removing extraneous entries. Every descendant of a
     /// directory the source replaces with a file/symlink is necessarily
     /// destination-only, so removing the directory would destroy entries the
-    /// caller never sanctioned. Descendants are determined with
-    /// `Path::strip_prefix` (component-wise), so a sibling whose name merely
-    /// shares a prefix is not a descendant.
+    /// caller never sanctioned. Descendants are determined component-wise over
+    /// the manifest's `/`-separated segments (`manifest_strip_prefix`), so a
+    /// sibling whose name merely shares a prefix is not a descendant and a
+    /// `\`-bearing name is never split as a host subpath.
     ///
     /// The diff's destination manifest is STRIPPED of the reserved namespace, so
     /// a directory whose only child is an aside would look childless; the RAW
@@ -5597,22 +5611,15 @@ impl Applier<'_, '_> {
     }
 
     /// Whether `path` or an ancestor was already removed this run. Ancestry is
-    /// component-wise (`Path`), never a literal-separator split.
+    /// component-wise over the MANIFEST's `/`-separated segments (never a host
+    /// `Path::parent`, whose Windows model would split a `\`-bearing name).
     fn is_already_gone(&self, path: &str) -> bool {
         if self.removed.contains(path) {
             return true;
         }
-        let mut current = Path::new(path).parent();
-        while let Some(parent) = current {
-            let Some(parent) = parent.to_str() else {
-                break;
-            };
-            if self.removed.contains(parent) {
-                return true;
-            }
-            current = Path::new(parent).parent();
-        }
-        false
+        ancestor_paths(path)
+            .into_iter()
+            .any(|ancestor| self.removed.contains(&ancestor))
     }
 
     fn transfer(&mut self) -> Result<()> {
@@ -6394,8 +6401,10 @@ impl Applier<'_, '_> {
             .into_iter()
             .collect();
         dirs.sort_by(|a, b| {
-            let da = Path::new(&a.0).components().count();
-            let db = Path::new(&b.0).components().count();
+            // Depth over the MANIFEST's `/`-separated segments, not the host
+            // component model (which splits a `\`-bearing name on Windows).
+            let da = a.0.split('/').count();
+            let db = b.0.split('/').count();
             db.cmp(&da).then_with(|| a.0.cmp(&b.0))
         });
         for (path, mode) in dirs {
@@ -6671,8 +6680,10 @@ impl Applier<'_, '_> {
             }
         }
         entries.sort_by(|a, b| {
-            let da = Path::new(&a.0).components().count();
-            let db = Path::new(&b.0).components().count();
+            // Depth over the MANIFEST's `/`-separated segments, not the host
+            // component model (which splits a `\`-bearing name on Windows).
+            let da = a.0.split('/').count();
+            let db = b.0.split('/').count();
             db.cmp(&da).then_with(|| a.0.cmp(&b.0))
         });
         // ONE parent listing for the whole pass. This is SOUND given the pass's
@@ -7535,9 +7546,7 @@ impl Applier<'_, '_> {
         // (parent, case-folded name) -> members.
         let mut source_groups: BTreeMap<(String, String), Vec<CaseMember>> = BTreeMap::new();
         for entry in &self.diff.source.entries {
-            let Some(name) = Path::new(&entry.path).file_name().and_then(OsStr::to_str) else {
-                continue;
-            };
+            let name = manifest_file_name(&entry.path);
             let member = CaseMember {
                 path: entry.path.clone(),
                 name: name.to_string(),
@@ -7554,9 +7563,7 @@ impl Applier<'_, '_> {
         }
         let mut dest_groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
         for entry in &self.diff.dest.entries {
-            let Some(name) = Path::new(&entry.path).file_name().and_then(OsStr::to_str) else {
-                continue;
-            };
+            let name = manifest_file_name(&entry.path);
             dest_groups
                 .entry((parent_manifest(&entry.path), name.to_lowercase()))
                 .or_default()
@@ -7783,22 +7790,53 @@ fn manifest_spelling(rel: &RootedRelativePath) -> String {
 }
 
 /// The manifest spelling of `path`'s parent directory, `""` for the root (a
-/// manifest does not name the root). Ancestry is component-wise via
-/// `Path::parent`, never a literal-separator split.
+/// manifest does not name the root). Ancestry is over the MANIFEST's
+/// `/`-separated segments: a literal `\` is an ordinary name byte, so
+/// `a\b`'s parent is the root, not `a` (the host `Path::parent` model would
+/// split it on Windows).
 fn parent_manifest(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .and_then(Path::to_str)
-        .unwrap_or("")
-        .to_string()
+    match path.rsplit_once('/') {
+        Some((parent, _)) => parent.to_string(),
+        None => String::new(),
+    }
+}
+
+/// The final `/`-segment of a canonical manifest path: the entry's NAME under
+/// the manifest model, where a literal `\` stays inside the name.
+fn manifest_file_name(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, name)) => name,
+        None => path,
+    }
+}
+
+/// `path` with the manifest prefix `prefix` removed, component-wise over the
+/// `/`-separated segments, or `None` when `path` is neither `prefix` nor a
+/// descendant of it. Both are canonical manifest spellings (no leading,
+/// trailing, or doubled `/`), so a byte-prefix match is a component match
+/// exactly when the remainder starts with `/`.
+fn manifest_strip_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return Some(path);
+    }
+    if path == prefix {
+        return Some("");
+    }
+    path.strip_prefix(prefix)
+        .filter(|rest| rest.starts_with('/'))
+        .map(|rest| &rest[1..])
 }
 
 /// The final component of a manifest path, as raw bytes so a byte-identical
-/// comparison against a directory listing is possible.
+/// comparison against a directory listing is possible. The split is on `/`
+/// only (the manifest model), so a `\`-bearing name stays whole.
 fn file_name_bytes(path: &str) -> Option<Vec<u8>> {
-    Path::new(path)
-        .file_name()
-        .map(|name| name.as_encoded_bytes().to_vec())
+    let name = manifest_file_name(path);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.as_bytes().to_vec())
+    }
 }
 
 /// The ONE run-level error for a destination directory the run could not
@@ -8022,13 +8060,11 @@ fn apply_precedence(
 /// it, and every caller guards with an ancestry test
 /// (`is_same_or_descendant`); when it is NOT, the failed `strip_prefix` yields
 /// an EMPTY suffix, so the result is `to` itself — the empty path joined onto
-/// `to`, NOT `path` unchanged. Ancestry is interpreted with
-/// `Path::strip_prefix`, never by splitting on a literal separator.
+/// `to`, NOT `path` unchanged. Ancestry is over the manifest's `/`-separated
+/// segments, so a `\`-bearing name is never split as a host subpath.
 fn re_root_path(to: &str, path: &str, from: &str) -> String {
-    let suffix = Path::new(path)
-        .strip_prefix(Path::new(from))
-        .unwrap_or_else(|_| Path::new(""));
-    join_manifest_path(to, suffix.as_os_str())
+    let suffix = manifest_strip_prefix(path, from).unwrap_or("");
+    join_manifest_path(to, OsStr::new(suffix))
 }
 
 /// Reduce a set of reserved paths to the TOPMOST ones: a path with a reserved
@@ -8058,14 +8094,12 @@ fn is_guarded(path: &str, guards: &BTreeSet<String>) -> bool {
 }
 
 /// Whether `path` is a STRICT descendant of `dir`, component-wise: `px` is not
-/// under `p`, and a separator is required. Uses `Path::strip_prefix`, so it is
-/// correct whether the manifest spells paths with `/` or with the platform
-/// separator — a literal-separator check makes a source file replacing a
+/// under `p`, and a separator is required. Splits on the manifest's `/` only,
+/// so it is correct on every host and a `\`-bearing name is never read as a
+/// host subpath — a literal-separator check makes a source file replacing a
 /// directory look "sanctioned" (and would delete unsanctioned children).
 fn is_strict_descendant(path: &str, dir: &str) -> bool {
-    Path::new(path)
-        .strip_prefix(Path::new(dir))
-        .is_ok_and(|rest| !rest.as_os_str().is_empty())
+    manifest_strip_prefix(path, dir).is_some_and(|rest| !rest.is_empty())
 }
 
 /// Whether `path` is `dir` itself or a strict descendant of it (component-wise).
@@ -8075,17 +8109,17 @@ fn is_same_or_descendant(path: &str, dir: &str) -> bool {
 
 /// Every ancestor directory of a canonical manifest `path`, from the top-level
 /// component down to the immediate parent. Excludes the path itself and the
-/// root (a manifest does not describe the root). Ancestry is interpreted with
-/// `Path::parent`, never by splitting on a literal separator.
+/// root (a manifest does not describe the root). Ancestry is over the
+/// manifest's `/`-separated segments, so a `\`-bearing name is one component.
 fn ancestor_paths(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut current = Path::new(path).parent();
-    while let Some(parent) = current {
-        match parent.to_str() {
-            Some(text) if !text.is_empty() => out.push(text.to_string()),
-            _ => break,
+    let mut current = path;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
         }
-        current = parent.parent();
+        out.push(parent.to_string());
+        current = parent;
     }
     out.reverse();
     out
@@ -8096,10 +8130,14 @@ fn ancestor_paths(path: &str) -> Vec<String> {
 /// manifest entry's path, or a bookkeeping key derived from one), which is
 /// already the on-disk name — NFC, UTF-8, `/`-joined — so this is a direct
 /// address, never a re-normalization (see "Manifest paths are addresses" on the
-/// module). A path the transport refuses is REPORTED (an error), not skipped
-/// silently.
+/// module). The conversion is [`RootedRelativePath::from_manifest`], the ONE
+/// authority that splits on `/` ONLY: the host path model is NOT the manifest
+/// model, and handing the string to it would fold the distinct manifest paths
+/// `a\b` and `a/b` onto the same host path on Windows. A path the transport
+/// refuses (a segment the host cannot name, or an empty/traversal segment) is
+/// REPORTED (an error), not skipped silently.
 fn rooted(path: &str) -> Result<RootedRelativePath> {
-    RootedRelativePath::parse(Path::new(path)).map_err(|e| {
+    RootedRelativePath::from_manifest(path).map_err(|e| {
         Error::path(format!(
             "manifest path {path:?} cannot address the transport: {e}"
         ))

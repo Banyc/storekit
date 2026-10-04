@@ -1050,10 +1050,14 @@ fn canonical_entry_path(rel: &Path) -> Result<String> {
 
 /// Whether every `/`-separated component of a wire path is a normal name:
 /// non-empty, and neither `.` nor `..`. These are exactly the wire analogues
-/// of requiring every OS path `Component` to be [`Component::Normal`], so a
-/// path like `../x`, `/x`, `a/../b`, `a//b`, or `a/` can never enter a
-/// manifest. A literal `\` is NOT special here: it is an ordinary character
-/// within one component.
+/// of requiring every MANIFEST SEGMENT to be a normal name, so a path like
+/// `../x`, `/x`, `a/../b`, `a//b`, or `a/` can never enter a manifest. A
+/// literal `\` is NOT special here: it is an ordinary character within one
+/// component. The host path model is NOT this model — on Windows `\` IS a
+/// separator — so converting a manifest path to a host path goes through
+/// [`crate::relpath::RootedRelativePath::from_manifest`], which splits on `/`
+/// only and REFUSES a `\`-bearing segment on Windows because the host cannot
+/// hold it as one name.
 fn has_only_normal_components(path: &str) -> bool {
     path.split('/')
         .all(|c| !c.is_empty() && c != "." && c != "..")
@@ -1584,14 +1588,27 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
                 // Already classified (and tolerated or refused) above.
                 continue;
             }
+            // The link's own path is a MANIFEST spelling: convert it through
+            // the ONE authority (split on `/`) so a `\`-bearing name is never
+            // read as a host subpath on Windows.
+            let link_rel =
+                crate::relpath::RootedRelativePath::from_manifest(&entry.path).map_err(|e| {
+                    Error::materialization_kind(
+                        MaterializationKind::UnrepresentableName,
+                        format!(
+                            "the manifest path {} cannot be represented on this host: {e}",
+                            entry.path
+                        ),
+                    )
+                })?;
             if let Err(refusal) =
-                check_relative_symlink_target_indexed(Path::new(&entry.path), target_path, &index)
+                check_relative_symlink_target_indexed(link_rel.as_path(), target_path, &index)
             {
                 // The link is DISPLAYED by the path the walk used, so the
                 // message is byte-identical to the pre-post-pass one.
                 let reason = symlink_target_refusal_message(
                     refusal,
-                    &root.join(&entry.path).display().to_string(),
+                    &root.join(link_rel.as_path()).display().to_string(),
                     target,
                 );
                 sink.tolerate(&entry.path, MaterializationKind::EscapingSymlink, reason)?;
@@ -2071,8 +2088,21 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
             // Already classified (and tolerated or refused) at the field.
             continue;
         }
+        // The link's own path is a MANIFEST spelling: convert it through the
+        // ONE authority (split on `/`) so a `\`-bearing name is never read as
+        // a host subpath on Windows.
+        let link_rel =
+            crate::relpath::RootedRelativePath::from_manifest(&entry.path).map_err(|e| {
+                Error::materialization_kind(
+                    MaterializationKind::UnrepresentableName,
+                    format!(
+                        "the manifest path {} cannot be represented on this host: {e}",
+                        entry.path
+                    ),
+                )
+            })?;
         if let Err(refusal) =
-            check_relative_symlink_target_indexed(Path::new(&entry.path), target, &index)
+            check_relative_symlink_target_indexed(link_rel.as_path(), target, &index)
         {
             let reason =
                 symlink_target_refusal_message(refusal, &entry.path, &target.to_string_lossy());
@@ -2629,6 +2659,69 @@ mod tests {
         let remote = canonicalize_remote_entries(&out, &root).unwrap();
         assert_eq!(remote.entries, meta.entries);
         assert_eq!(remote.tree_sha256, meta.tree_sha256);
+    }
+
+    /// THE MANIFEST MODEL IS HOST-INDEPENDENT: `\` is an ordinary NAME byte, so
+    /// `a\b` is ONE segment while `a/b` is TWO, and the two spellings are
+    /// DISTINCT entries that can coexist in one manifest. This is the
+    /// platform-independent evidence that they are not the same entry: both
+    /// pass the wire validator and are different strings. (On the HOST path
+    /// model the two collide on Windows — see `RootedRelativePath::from_manifest`
+    /// and its tests.)
+    #[test]
+    fn backslash_and_slash_paths_are_distinct_manifest_entries() {
+        assert_eq!(validate_entry_path(r"a\b").unwrap(), r"a\b");
+        assert_eq!(validate_entry_path("a/b").unwrap(), "a/b");
+        assert_ne!(r"a\b", "a/b");
+        // The wire validator splits on `/` only: `a\b` is one component, so a
+        // `\` never creates the empty/traversal component `a//b`/`a/../b`
+        // would.
+        assert!(has_only_normal_components(r"a\b"));
+        assert!(has_only_normal_components("a/b"));
+        assert!(!has_only_normal_components("a//b"));
+        // Both spellings are held in ONE entry list as distinct entries.
+        let entries = [
+            TreeEntry {
+                path: r"a\b".to_string(),
+                entry_type: EntryKind::File,
+                mode: 0o644,
+                content_sha256: Some("0".repeat(64)),
+                symlink_target: None,
+            },
+            TreeEntry {
+                path: "a/b".to_string(),
+                entry_type: EntryKind::File,
+                mode: 0o644,
+                content_sha256: Some("1".repeat(64)),
+                symlink_target: None,
+            },
+        ];
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec![r"a\b", "a/b"]);
+        assert_eq!(entries.len(), 2);
+    }
+
+    /// UNIX: a tree containing BOTH `a\b` (one name with a backslash) and
+    /// `a/b` (directory `a` with child `b`) canonicalizes to two DISTINCT
+    /// entries `["a", "a/b", "a\\b"]`. This is the on-disk proof that one
+    /// manifest addresses both, and that the `/`-split conversion keeps them
+    /// distinct (`a/b` -> two components, `a\b` -> one).
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_holding_both_backslash_and_slash_names_has_distinct_entries() {
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a").join("b"), b"slash").unwrap();
+        std::fs::write(root.join("a\\b"), b"backslash").unwrap();
+        let meta = canonicalize_tree(&root).unwrap();
+        let paths: Vec<&str> = meta.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["a", "a/b", "a\\b"]);
+        let slash = crate::relpath::RootedRelativePath::from_manifest("a/b").unwrap();
+        let backslash = crate::relpath::RootedRelativePath::from_manifest(r"a\b").unwrap();
+        assert_ne!(slash.as_path(), backslash.as_path());
+        assert_eq!(slash.as_path().components().count(), 2);
+        assert_eq!(backslash.as_path().components().count(), 1);
     }
 
     /// A path whose components are not all a valid-UTF-8

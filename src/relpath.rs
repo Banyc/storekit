@@ -12,12 +12,23 @@
 //! deployment root through a transport operation or a mutating primitive, and
 //! a traversal path can never be joined onto the root.
 //!
-//! The traversal/absolute decision is made with the PLATFORM's own path
-//! model ([`Path::components`]) rather than a hardcoded separator, so a `\`
-//! is a separator exactly where the platform says it is: on Windows
-//! `..\escape` is a traversal and is refused, while on Unix it is one legal
-//! filename byte and is accepted (this crate preserves the names of the
-//! trees it manages; a Unix tree may legitimately contain it).
+//! The traversal/absolute decision in [`RootedRelativePath::parse`] is made
+//! with the PLATFORM's own path model ([`Path::components`]) rather than a
+//! hardcoded separator, so a `\` is a separator exactly where the platform
+//! says it is: on Windows `..\escape` is a traversal and is refused, while on
+//! Unix it is one legal filename byte and is accepted (this crate preserves
+//! the names of the trees it manages; a Unix tree may legitimately contain
+//! it). `parse` validates a path SPELLED IN THE HOST'S OWN MODEL — a live
+//! directory entry, a lock spelling, a caller-supplied root-relative path.
+//!
+//! A MANIFEST path is a different model: it is host-INDEPENDENT and
+//! `/`-separated, and a literal `\` is an ordinary NAME byte on every
+//! platform (see [`TreeEntry::path`](crate::manifest::TreeEntry::path)). A
+//! manifest string therefore must NOT be handed to `parse`/`Path::new`, whose
+//! host model on Windows would silently split the DISTINCT manifest paths
+//! `a\b` (one component) and `a/b` (two) onto the SAME host path. The ONE
+//! conversion from a manifest string to a host path is
+//! [`RootedRelativePath::from_manifest`], which splits on `/` only.
 //!
 //! The type deliberately carries NO `Default` (an empty path would be an
 //! unrooted path constructible by anyone — the exact gap this hardening
@@ -101,11 +112,72 @@ impl RootedRelativePath {
         Ok(RootedRelativePath(p.to_path_buf()))
     }
 
+    /// Convert a canonical MANIFEST (wire) path into the validated host
+    /// relative path. This is the ONE authority for that conversion: every
+    /// place that turns a manifest entry path (or a bookkeeping key derived
+    /// from one) into a host path a mutating primitive accepts goes through
+    /// this constructor, never through [`RootedRelativePath::parse`] or
+    /// `Path::new`.
+    ///
+    /// The manifest model is host-INDEPENDENT and `/`-separated: a literal
+    /// `\` is an ordinary NAME byte, not a separator. The host path model is
+    /// NOT that model — on Windows `\` IS a separator — so handing the whole
+    /// string to the host parser maps the two DISTINCT manifest paths `a\b`
+    /// (one component) and `a/b` (two) onto the SAME host path. One source
+    /// entry could then clobber the other (and a destination entry) while the
+    /// manifest, the diff, and the digest all treat them as distinct. This
+    /// constructor splits on `/` ONLY, so the manifest's segment sequence is
+    /// exactly the host path's component sequence and the conversion is
+    /// INJECTIVE where it is defined.
+    ///
+    /// Every segment must be a single host [`Component::Normal`] carrying the
+    /// segment's own bytes. On Unix every non-empty, non-`.`/`..` segment is
+    /// representable (a `\` is an ordinary byte), so this accepts exactly the
+    /// wire validator's set and behaviour is unchanged. On Windows a segment
+    /// the host path model would split (a `\`) or read as a prefix (a drive
+    /// spelling) cannot name one entry, so it is REFUSED with a typed error
+    /// naming the path rather than silently split — the correct direction,
+    /// because a fold is a denial tool. Refusing only where the host cannot
+    /// represent the name keeps the wire validator host-independent, so a
+    /// Unix tree that legally holds `a\b` is still accepted everywhere it can
+    /// be addressed.
+    pub fn from_manifest(path: &str) -> Result<RootedRelativePath> {
+        if path.is_empty() {
+            return Err(Error::transport(format!(
+                "invalid manifest path {path:?}: the path must not be empty"
+            )));
+        }
+        let mut out = PathBuf::new();
+        for segment in path.split('/') {
+            if segment.is_empty() {
+                return Err(Error::transport(format!(
+                    "invalid manifest path {path:?}: an empty segment is not a name"
+                )));
+            }
+            if segment == "." || segment == ".." {
+                return Err(Error::transport(format!(
+                    "invalid manifest path {path:?}: traversal components (`.`/`..`) are not allowed"
+                )));
+            }
+            if !is_single_host_component(segment) {
+                return Err(Error::transport(format!(
+                    "manifest path {path:?} cannot be represented on this host: the segment \
+                     {segment:?} is not a single file name (the host path model would split it or \
+                     read a prefix out of it), so the path cannot address one entry"
+                )));
+            }
+            out.push(segment);
+        }
+        Ok(RootedRelativePath(out))
+    }
+
     /// Internal constructor for paths whose components are VALIDATED
     /// IDENTITIES (the layout builders) — the caller proves safety by
     /// construction: a validated identifier is a single safe path segment,
     /// so the built path is relative and traversal-free. Production callers
-    /// must construct through the validated [`RootedRelativePath::parse`].
+    /// must construct through the validated [`RootedRelativePath::parse`] (a
+    /// path spelled in the HOST's model) or [`RootedRelativePath::from_manifest`]
+    /// (a `/`-separated MANIFEST path).
     pub(crate) fn from_validated(p: PathBuf) -> RootedRelativePath {
         RootedRelativePath(p)
     }
@@ -157,6 +229,46 @@ impl AsRef<Path> for RootedRelativePath {
 impl std::fmt::Display for RootedRelativePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.display())
+    }
+}
+
+/// Whether `segment` is exactly ONE host path [`Component::Normal`] carrying
+/// the segment's own bytes — i.e. the host path model neither splits it nor
+/// reads a root/prefix out of it. On Unix only `/` separates, so every
+/// non-empty, non-`.`/`..` segment qualifies (a `\` is an ordinary byte). On
+/// Windows `\` is a separator and a drive spelling is a prefix, so such a
+/// segment is exactly the case this must report as NOT a single component.
+#[cfg(not(windows))]
+fn is_single_host_component(segment: &str) -> bool {
+    let mut components = Path::new(segment).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => name == std::ffi::OsStr::new(segment),
+        _ => false,
+    }
+}
+
+/// WINDOWS: a single component under the host path model is not yet a name
+/// the filesystem can hold. Windows additionally forbids these bytes in a
+/// file name, and strips a trailing space or dot — so `a.` and `a` (and `a `
+/// and `a`) would name the SAME entry, which is the same injectivity failure
+/// in a different guise. Such a segment is therefore REFUSED here too. The
+/// set is the documented Windows filename rule; reserved device names
+/// (`CON`, `NUL`, ...) are left to the filesystem, because they do not make
+/// two distinct manifest paths collide.
+#[cfg(windows)]
+fn is_single_host_component(segment: &str) -> bool {
+    const WINDOWS_FORBIDDEN: [char; 8] = ['<', '>', ':', '"', '\\', '|', '?', '*'];
+    if segment
+        .chars()
+        .any(|c| WINDOWS_FORBIDDEN.contains(&c) || c.is_control())
+        || segment.ends_with([' ', '.'])
+    {
+        return false;
+    }
+    let mut components = Path::new(segment).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => name == std::ffi::OsStr::new(segment),
+        _ => false,
     }
 }
 
@@ -449,22 +561,39 @@ mod tests {
 
     /// WINDOWS (compiled only on Windows; NOT run in this environment —
     /// Windows is type-checked only, so this is an UNVERIFIED-at-runtime
-    /// assertion, not a measured result): on Windows `\` IS a separator, so
-    /// the platform component model sees the traversal/root and `parse`
-    /// REFUSES these spellings that a hardcoded `'/'` split would miss.
+    /// assertion, not a measured result).
+    ///
+    /// FLIPPED: this test previously asserted that `parse` ACCEPTED
+    /// `a\b` and `a\b\c.json` because the Windows path model treats `\` as a
+    /// separator. That acceptance IS the defect. The manifest path `a\b` is
+    /// ONE component (a literal backslash name, legal on Unix); the host-model
+    /// parse silently maps it onto the two-component host path `a/b`, so the
+    /// DISTINCT manifest entries `a\b` and `a/b` would address the SAME file
+    /// and one could clobber the other. The manifest conversion therefore
+    /// REFUSES a backslash-bearing segment on Windows. `parse` still refuses
+    /// the genuine HOST traversals, and the ordinary manifest spellings (no
+    /// backslash) convert.
     #[cfg(windows)]
     #[test]
-    fn windows_backslash_is_a_separator_so_traversal_is_refused() {
+    fn windows_backslash_is_a_separator_so_a_manifest_segment_is_refused() {
+        // The manifest conversion refuses the host-splittable segment.
+        for bad in [r"a\b", r"a\b\c.json", r"\x"] {
+            assert!(
+                RootedRelativePath::from_manifest(bad).is_err(),
+                "{bad:?} is one manifest component a Windows host cannot name and must be refused"
+            );
+        }
+        // The host-path validator still refuses genuine host traversals.
         for bad in [r"..\x", r"\x", r"a\..\b", r".\a", r"a\."] {
             assert!(
                 RootedRelativePath::parse(Path::new(bad)).is_err(),
-                "{bad:?} must be refused on Windows"
+                "{bad:?} must be refused by the host-path validator on Windows"
             );
         }
-        // And the ordinary relative spellings still parse.
-        for ok in ["a", "a/b", r"a\b", r"a\b\c.json"] {
-            RootedRelativePath::parse(Path::new(ok))
-                .unwrap_or_else(|e| panic!("{ok:?} must parse on Windows: {e}"));
+        // The ordinary MANIFEST spellings (no backslash) convert.
+        for ok in ["a", "a/b", "a/b/c.json"] {
+            RootedRelativePath::from_manifest(ok)
+                .unwrap_or_else(|e| panic!("{ok:?} must convert on Windows: {e}"));
         }
     }
 
@@ -494,6 +623,156 @@ mod tests {
                 .collect();
             assert_eq!(entries, vec![std::ffi::OsString::from(name)], "{name:?}");
             std::fs::remove_file(&on_disk).unwrap();
+        }
+    }
+
+    /// THE DEFECT, PINNED AT THE CONVERSION. The HOST path model is not the
+    /// manifest model: it treats a byte as a separator exactly where the
+    /// platform says so. On Windows `\` IS a separator, so the two DISTINCT
+    /// manifest paths `a\b` (ONE component) and `a/b` (TWO) both join to the
+    /// same host path — the injectivity failure this fix removes. On Unix the
+    /// same two paths stay distinct, so the collision is an accident of the
+    /// host and NO Unix run can expose it. This test RUNS on both platforms
+    /// (the assertion is selected by cfg); it is the honest evidence that no
+    /// executed Unix test can catch the defect.
+    #[test]
+    fn the_host_path_model_collapses_distinct_manifest_paths_on_a_backslash_host() {
+        let backslash = Path::new(r"a\b");
+        let slash = Path::new("a/b");
+        let backslash_components = backslash.components().count();
+        let slash_components = slash.components().count();
+        let backslash_host = PathBuf::from(backslash);
+        let slash_host = PathBuf::from(slash);
+        // The raw output, kept: the host model's two results and counts.
+        println!(
+            "host path model: {:?} -> {:?} ({} components); {:?} -> {:?} ({} components)",
+            r"a\b", backslash_host, backslash_components, "a/b", slash_host, slash_components,
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                backslash_components, 2,
+                "Windows splits the backslash, so the ONE-component manifest path `a\\b` is read as two"
+            );
+            assert_eq!(
+                backslash_host, slash_host,
+                "...so the distinct manifest paths `a\\b` and `a/b` collapse onto one host path"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                backslash_components, 1,
+                "Unix keeps the backslash as an ordinary byte, so `a\\b` is ONE component"
+            );
+            assert_ne!(
+                backslash_host, slash_host,
+                "...so the host model is injective HERE and the collision is invisible to a Unix run"
+            );
+        }
+    }
+
+    /// THE FIX. `from_manifest` splits on `/` ONLY, so the manifest's segment
+    /// sequence is exactly the host path's component sequence and the
+    /// conversion is INJECTIVE: two DISTINCT manifest paths never yield the
+    /// same host path. `a/b` is TWO components; on Unix `a\b` is ONE component
+    /// with the backslash preserved verbatim (behaviour unchanged).
+    #[test]
+    fn manifest_conversion_splits_on_slash_only_and_is_injective() {
+        let two = RootedRelativePath::from_manifest("a/b").unwrap();
+        assert_eq!(two.as_path().components().count(), 2, "a/b is two segments");
+        assert_eq!(two.as_path(), Path::new("a/b"));
+
+        #[cfg(unix)]
+        {
+            let one = RootedRelativePath::from_manifest(r"a\b").unwrap();
+            assert_eq!(
+                one.as_path().components().count(),
+                1,
+                "a\\b is ONE manifest segment on Unix"
+            );
+            let only = one.as_path().components().next().unwrap();
+            assert_eq!(
+                only.as_os_str(),
+                std::ffi::OsStr::new(r"a\b"),
+                "the backslash is preserved verbatim as one name"
+            );
+        }
+
+        // Injectivity over the spellings that matter: the two host-model
+        // colliders plus neighbours that differ only by segmentation.
+        let manifest_paths = [
+            "a",
+            "a/b",
+            "a/b/c",
+            r"a\b",
+            r"a\b/c",
+            r"a/b\c",
+            r"a\b\c",
+            "ab",
+            "a/bc",
+            "a/b/c.json",
+            "generations/gen-1/assignment.json",
+        ];
+        let mut seen: std::collections::BTreeMap<PathBuf, &str> = std::collections::BTreeMap::new();
+        for text in manifest_paths {
+            // A manifest path the host cannot represent is refused, never
+            // silently folded: that is the other half of injectivity.
+            let Ok(rel) = RootedRelativePath::from_manifest(text) else {
+                #[cfg(windows)]
+                assert!(
+                    text.contains('\\'),
+                    "{text:?} must not be refused on Windows"
+                );
+                continue;
+            };
+            let key = rel.as_path().to_path_buf();
+            if let Some(previous) = seen.insert(key.clone(), text) {
+                panic!(
+                    "distinct manifest paths {previous:?} and {text:?} both convert to the host path {key:?}"
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            seen.len(),
+            manifest_paths.len(),
+            "on Unix every distinct manifest path converts to a distinct host path"
+        );
+    }
+
+    /// THE FIX refuses a manifest path the host cannot represent instead of
+    /// folding it. Platform-independent: on Unix `\` is an ordinary byte so
+    /// the path is ACCEPTED as one component; on Windows the same conversion
+    /// is REFUSED. Both directions are asserted here so the one authority's
+    /// host-dependence is explicit.
+    #[test]
+    fn a_manifest_segment_the_host_cannot_name_is_refused_not_folded() {
+        let conversion = RootedRelativePath::from_manifest(r"a\b");
+        #[cfg(unix)]
+        {
+            let rel = conversion.expect("Unix represents a backslash byte");
+            assert_eq!(rel.as_path().components().count(), 1);
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                conversion.is_err(),
+                "Windows cannot name a backslash byte, so the conversion must refuse it"
+            );
+            // The typed refusal names the path (and the offending segment).
+            let message = conversion.unwrap_err().to_string();
+            assert!(
+                message.contains(r"a\b"),
+                "the refusal must name the path: {message}"
+            );
+        }
+        // Genuinely unsafe segment shapes are refused on EVERY platform.
+        for bad in ["", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b"] {
+            assert!(
+                RootedRelativePath::from_manifest(bad).is_err(),
+                "{bad:?} is not a canonical manifest path and must be refused"
+            );
         }
     }
 }

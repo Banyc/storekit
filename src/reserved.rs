@@ -68,6 +68,9 @@
 //! breaks are the explicit [`crate::sync::Residue::discard`], the engine's own
 //! claim-aside walk, and the sanctioned rename that creates or moves an aside.
 
+// Only the tests spell a host `Path`; the production predicates split the
+// MANIFEST model on `/` directly.
+#[cfg(test)]
 use std::path::{Component, Path};
 
 /// The claim-aside namespace: any name with this prefix belongs to the
@@ -230,16 +233,12 @@ fn is_crate_temp_case_alias(name: &str) -> bool {
 /// rule and the sync's manifest-path model can never disagree about what the
 /// crate may not touch.
 ///
-/// Components are split with [`Path::components`], never a literal-separator
-/// split, so the answer is the same whether a manifest spells paths with `/`
-/// (the canonical spelling on every platform) or with the platform separator.
+/// Components are split on the MANIFEST's `/` separator only: a literal `\`
+/// is an ordinary NAME byte, never a separator, so the answer is the manifest
+/// model's on every platform (the host `Path::components` model would split a
+/// `\`-bearing name on Windows).
 pub fn is_unaddressable_path(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|component| match component {
-            Component::Normal(name) => name.to_str().is_some_and(is_unaddressable_name),
-            _ => false,
-        })
+    path.split('/').any(is_unaddressable_name)
 }
 
 /// Whether `name` is destination RESIDUE: an UNADDRESSABLE spelling
@@ -265,16 +264,11 @@ pub fn is_residue_name(name: &str) -> bool {
 /// Whether ANY component of a canonical manifest path is destination residue
 /// ([`is_residue_name`]).
 ///
-/// Components are split with [`Path::components`], never a literal-separator
-/// split, so the answer is the same whether a manifest spells paths with `/`
-/// (the canonical spelling on every platform) or with the platform separator.
+/// Components are split on the MANIFEST's `/` separator only: a literal `\`
+/// is an ordinary NAME byte, never a separator, so the answer is the manifest
+/// model's on every platform.
 pub fn is_residue_path(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|component| match component {
-            Component::Normal(name) => name.to_str().is_some_and(is_residue_name),
-            _ => false,
-        })
+    path.split('/').any(is_residue_name)
 }
 
 /// Whether `name` is a LOCK-RECORD spelling: the application lock record
@@ -409,16 +403,11 @@ fn fold_lock_record_component(name: &str) -> String {
 /// reserved too: the aside holds a stranded subtree, and the lock record is
 /// never descended into.
 ///
-/// Components are split with [`Path::components`], never a literal-separator
-/// split, so the answer is the same whether a manifest spells paths with `/`
-/// (the canonical spelling on every platform) or with the platform separator.
+/// Components are split on the MANIFEST's `/` separator only: a literal `\`
+/// is an ordinary NAME byte, never a separator, so the answer is the manifest
+/// model's on every platform.
 pub fn is_reserved_path(path: &str) -> bool {
-    Path::new(path)
-        .components()
-        .any(|component| match component {
-            Component::Normal(name) => name.to_str().is_some_and(is_reserved_name),
-            _ => false,
-        })
+    path.split('/').any(is_reserved_name)
 }
 
 #[cfg(test)]
