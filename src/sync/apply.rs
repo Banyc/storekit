@@ -1451,9 +1451,9 @@ pub struct SyncReport {
     /// destination's own name — or, when that name leaves no room under
     /// `NAME_MAX`, a byte-truncated prefix of it plus the SHA-256 of the FULL
     /// name (see [`crate::atomic::bounded_temp_trunk`], the one spelling
-    /// authority, public through [`crate::atomic::temp_name_for`] and
-    /// [`crate::atomic::temp_file_name`]). Such an entry holds NO original, so
-    /// it is reported as [`SyncReport::extraneous`] — and [`Extraneous::Keep`],
+    /// authority, public through [`crate::atomic::temp_name_for`]). Such an
+    /// entry holds NO original, so it is reported as
+    /// [`SyncReport::extraneous`] — and [`Extraneous::Keep`],
     /// the default, leaves it in place forever. Recovery is a plain removal of
     /// each `extraneous` path whose last component carries a crate temp suffix
     /// (dot-prefixed and ending `.tmp.<pid>.<n>` or `.claim.<pid>.<n>`,

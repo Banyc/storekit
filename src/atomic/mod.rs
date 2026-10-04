@@ -587,7 +587,7 @@ pub fn temp_name_for(path: &Path) -> PathBuf {
 /// (the Windows `_fd` writers use the path-based replace's own temp
 /// naming).
 #[cfg(unix)]
-pub fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
+pub(crate) fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
     std::ffi::OsString::from(temp_name_string(&file_name.to_string_lossy()))
 }
 
@@ -862,13 +862,22 @@ impl RootDir {
         }
     }
 
+    /// The pinned root descriptor. CRATE-INTERNAL: a caller outside the
+    /// crate reaches a root's contents only through the root-relative
+    /// primitives ([`crate::atomic::read_fd`], [`crate::atomic::write_file_fd`],
+    /// the `_fd` mutations), never by holding the raw descriptor — so no
+    /// consumer needs this accessor and it stays `pub(crate)`.
     #[cfg(unix)]
-    pub fn as_fd(&self) -> &OwnedFd {
+    pub(crate) fn as_fd(&self) -> &OwnedFd {
         &self.0
     }
 
+    /// The normalized root path. CRATE-INTERNAL: this port's own `_fd`-named
+    /// primitives resolve through it. It is deliberately not re-exported; a
+    /// consumer uses the `_fd`-named root-relative primitives, which exist on
+    /// BOTH ports, instead of holding the port-specific root.
     #[cfg(windows)]
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
