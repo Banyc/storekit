@@ -55,41 +55,59 @@
 //!   `#[cfg(test)]` items are removed) and pins the per-file per-symbol counts
 //!   of the RESOLVED production calls to the `std::fs` name mutators
 //!   (`remove_file` / `remove_dir` / `remove_dir_all` / `rename` / `hard_link`),
-//!   so a new production call changes a count and forces review. Because the
-//!   sources are parsed, SPELLING is not a variable: a raw identifier
-//!   (`std::fs::r#remove_file`, `use r#std as s;`), whitespace, `self`, or a
-//!   leading `::` resolves to the one symbol it names. A crate-wide alias table
-//!   maps an absolute path such as `crate::a::hidden_fs` to the canonical `std`
-//!   path it names, so a `pub(crate) use std::fs as hidden_fs;` declared in
-//!   ANOTHER MODULE is resolved at its call sites. The same parsed pass refuses
-//!   a production path that reaches one of the five through an IMPORT, a MODULE
-//!   ALIAS (including a cross-file re-export and a `std`-crate-root alias), or a
-//!   GLOB. A file is test-only iff its FIRST path component is one of the
+//!   so a new DIRECT production call, or a new canonical mutator
+//!   occurrence in a macro body, changes a count and forces review. Because the
+//!   sources are parsed, the DIRECT spelling of a path is not a variable: a raw
+//!   identifier (`std::fs::r#remove_file`, `use r#std as s;`), whitespace,
+//!   `self`, a leading `::`, and a DIRECT callee written in parentheses or
+//!   behind a reference (`(std::fs::remove_file)(p)`, `(&std::fs::rename)(a, b)`)
+//!   all resolve to the one symbol they name. A crate-wide alias table maps an
+//!   absolute path such as `crate::a::hidden_fs` to the canonical `std` path it
+//!   names, so a `pub(crate) use std::fs as hidden_fs;` declared in ANOTHER
+//!   MODULE is resolved at its call sites, and a glob over such a module
+//!   (`use crate::alias_a::*;`) propagates its aliases into the importing
+//!   module. The same parsed pass reports a production path that reaches one of
+//!   the five through an ENUMERATED route — an IMPORTED symbol, a MODULE ALIAS
+//!   (including a cross-file re-export and a `std`-crate-root alias), or a GLOB.
+//!   It does NOT claim to refuse "every IMPORT route": that completeness job is
+//!   the resolved-symbol clippy deny, not this audit. A production file that
+//!   holds a `#[path]` attribute or an `include!` invocation is REFUSED — the
+//!   audit fails closed — rather than resolved, because either decouples a
+//!   module's path from its location and defeats the location-derived alias
+//!   table. A file is test-only iff its FIRST path component is one of the
 //!   crate-root directories `tests/` / `benches/` / `examples/` (and the path
-//!   continues into it), or the module's `#[cfg(...)]` GATING implies `test` —
-//!   never a name or an interior path component, so an ungated
-//!   `src/**/tests.rs` compiled into the lib is PRODUCTION.
+//!   continues into it), or EVERY `mod` declaration that names it is
+//!   `#[cfg(...)]`-gated on `test` — never a name or an interior path component,
+//!   so an ungated `src/**/tests.rs` compiled into the lib is PRODUCTION, and a
+//!   file declared BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is
+//!   PRODUCTION, because the second declaration compiles it into the lib.
 //!
-//! The residual holes the audits CANNOT close, and which the claims above are
-//! scoped NOT to include: code produced by a MACRO (`macro_rules!` or a proc
-//! macro) or pulled in by `include!` from OUTSIDE the package directory — a
-//! macro's tokens are not parsed as an expression and an outside file is not
-//! collected; a call made through a function POINTER or `dyn` dispatch (an
-//! ALIASED `let f = fx::remove_file;` IS flagged as a route, but the audit does
-//! not carry a value across a variable or resolve a `dyn` method); a raw FFI
-//! declaration — `extern "C" { fn unlinkat(…); }` followed by a call — which
-//! names neither `libc` nor `std::fs`, so NEITHER audit sees it; and any
-//! mutation that preserves the entry's inode (`std::fs::write`, `std::fs::copy`,
+//! The COMPLETENESS device — "no mutation outside the funnel, whatever the
+//! spelling" — is a resolved-symbol clippy deny, not these audits. These audits
+//! do what a lint cannot: they notice when the funnel's OWN calls change (the
+//! per-file pinned `std::fs` counts and the funnel's pinned `libc` counts) and
+//! they resolve the enumerated import routes as a second, independent detector.
+//! Neither audit is total, and neither is offered as a spelling oracle.
+//!
+//! The residual holes these audits CANNOT close, and which no claim above is
+//! scoped to include: a proc macro that EMITS a mutator call (its expansion is
+//! not source this crate parses); a call made through a function POINTER or
+//! `dyn` dispatch — an ALIASED `let f = fx::remove_file;` IS reported as a
+//! route, but the audit does not carry a value across a variable or resolve a
+//! `dyn` method; a `std::fs` mutator reached inside a MACRO through an
+//! alias/import rather than the canonical `std::fs::<symbol>` path (the macro
+//! token scan matches the canonical token sequence only, and counts the
+//! occurrence ONCE, not once per macro expansion); a raw FFI declaration —
+//! `extern "C" { fn unlinkat(…); }` followed by a call — which names neither
+//! `libc` nor `std::fs`, so NEITHER audit sees it; and any mutation that
+//! preserves the entry's inode (`std::fs::write`, `std::fs::copy`,
 //! `std::fs::set_permissions`, `std::fs::create_dir*`), which cannot split a
 //! holder because the flock is attached to the unchanged inode, so it is not
 //! counted. The reach of a raw FFI declaration is one declaration the crate's
 //! own author writes — exactly the residue a source audit carries and names
 //! rather than denies. A foreign process, or a raw `std::fs` call the caller
 //! writes itself, is outside the crate entirely and is not stopped by any of
-//! this. Together the private funnel and the audits mean the "obvious way" to
-//! add a mutation — calling the crate's own wrapper, or reaching for a raw
-//! syscall, a `std::fs` removal, or an IMPORT ALIAS of one — either presents
-//! the capability or fails a test.
+//! this.
 
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
@@ -873,11 +891,114 @@ mod tests {
             || (path.len() == 3 && path[0] == "std" && path[1] == "fs" && path[2] == "*")
     }
 
+    /// Whether a `use` leaf is a glob (its final expanded segment is `"*"`).
+    /// The RAW leaf decides this, not the resolved canonical path: a glob over
+    /// a LOCAL re-export module resolves to `crate::a::*`, which is not a
+    /// `std::fs` glob but still carries that module's aliases.
+    fn is_glob_leaf(leaf: &UseLeaf) -> bool {
+        leaf.segments.last().map(String::as_str) == Some("*")
+    }
+
     /// Whether the WRITTEN path is already the canonical `std::fs::<symbol>`
     /// spelling, which the exact-count pin covers, or reaches the mutator only
     /// through an import / alias / cross-file re-export.
     fn is_canonical_literal(segments: &[String], symbol: &str) -> bool {
         segments.len() == 3 && segments[0] == "std" && segments[1] == "fs" && segments[2] == symbol
+    }
+
+    /// The callee path of a call, seeing through the parentheses, references,
+    /// and invisible groups that a DIRECT call can spell. `(std::fs::remove_file)(p)`
+    /// and `(&std::fs::rename)(a, b)` are the SAME resolved call as the bare
+    /// spelling, not a function-pointer residue; only a genuinely non-path
+    /// callee (a variable, a field, a closure, a `dyn` method) stays invisible
+    /// to the count and is named in the audit's residue.
+    fn callee_path(mut expr: &syn::Expr) -> Option<&syn::Path> {
+        loop {
+            match expr {
+                syn::Expr::Path(path) if path.qself.is_none() => return Some(&path.path),
+                syn::Expr::Paren(paren) => expr = &paren.expr,
+                syn::Expr::Reference(reference) => expr = &reference.expr,
+                syn::Expr::Group(group) => expr = &group.expr,
+                _ => return None,
+            }
+        }
+    }
+
+    /// The identifiers and single punctuation characters of a macro's token
+    /// stream, as a flat list. `syn` does not descend into macro tokens (its
+    /// `visit_token_stream` hook is a no-op), so a mutator written inside a
+    /// `macro_rules!` body or any macro invocation would otherwise be invisible
+    /// to the parse. `TokenStream`'s `Display` separates tokens with whitespace
+    /// but does not guarantee the spacing around punctuation, so the rendered
+    /// text is re-tokenised here into one entry per identifier or single
+    /// punctuation character. An `r#` raw prefix is stripped from an
+    /// identifier, matching [`unraw`].
+    fn macro_token_list(tokens: impl std::fmt::Display) -> Vec<String> {
+        let text = tokens.to_string();
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            if b.is_ascii_alphabetic() || b == b'_' {
+                if b == b'r'
+                    && bytes.get(i + 1) == Some(&b'#')
+                    && bytes
+                        .get(i + 2)
+                        .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+                {
+                    i += 2;
+                }
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                out.push(text[start..i].to_string());
+                continue;
+            }
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch.to_string());
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// The `std::fs` inode mutators named by a macro token stream as the
+    /// CANONICAL token sequence `std :: fs :: <symbol>` (a leading `::` is
+    /// ignored and `r#std` / `r#<symbol>` are normalised). This restores the
+    /// coverage the parse lost: the old byte count saw the literal
+    /// `std::fs::<symbol>(` text inside a `macro_rules!` body, and this scan
+    /// sees that sequence again. It is deliberately NOT a general resolver — a
+    /// mutator reached inside a macro through an alias/import is not matched,
+    /// and the occurrence is counted once per macro, not once per expansion;
+    /// both are named in the audit's residue.
+    fn macro_mutator_symbols(tokens: impl std::fmt::Display) -> Vec<&'static str> {
+        let list = macro_token_list(tokens);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 6 < list.len() {
+            let window = &list[i..i + 7];
+            if window[0] == "std"
+                && window[1] == ":"
+                && window[2] == ":"
+                && window[3] == "fs"
+                && window[4] == ":"
+                && window[5] == ":"
+                && let Some(symbol) = FS_INODE_MUTATORS
+                    .iter()
+                    .find(|&&symbol| window[6] == symbol)
+            {
+                out.push(*symbol);
+                i += 7;
+                continue;
+            }
+            i += 1;
+        }
+        out
     }
 
     /// The module path of a package-relative source file: `src/lib.rs` is the
@@ -936,6 +1057,23 @@ mod tests {
                         )
                     }
                 };
+                // FAIL CLOSED on a `#[path]`/`include!` in PRODUCTION source:
+                // either decouples a module's path from its location, which is
+                // the key the alias table is built from, so the audit cannot
+                // vouch for the file. A refusal is reviewable; resolving a
+                // wrong path is not.
+                if !is_test_only(rel, gated)
+                    && let Some(escape) = path_or_include_escape(&file)
+                {
+                    panic!(
+                        "the `std::fs` audit REFUSES {rel}: it contains {escape}, which decouples \
+                         a module's path from the file's package-relative location (a `#[path]` \
+                         attribute) or pulls in source the walk did not collect (an `include!`), \
+                         so the parsed module graph and the location-derived alias table would be \
+                         wrong. Remove the `#[path]`/`include!` (or move the file to its module's \
+                         conventional location) rather than weakening the audit."
+                    );
+                }
                 ParsedSource {
                     rel: rel.clone(),
                     module: module_path_from_rel(rel),
@@ -943,6 +1081,43 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Whether a parsed production file uses a `#[path]` attribute on a `mod`
+    /// declaration or an `include!` invocation. Both decouple a module's path
+    /// from the file's package-relative location — the key the alias table is
+    /// built from — or pull in source the file walk did not collect, so the
+    /// audit refuses the file instead of resolving a wrong module path.
+    fn path_or_include_escape(file: &syn::File) -> Option<&'static str> {
+        struct EscapeVisitor {
+            escape: Option<&'static str>,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for EscapeVisitor {
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                if self.escape.is_none()
+                    && item.attrs.iter().any(|attr| attr.path().is_ident("path"))
+                {
+                    self.escape = Some("a `#[path]` attribute");
+                }
+                syn::visit::visit_item_mod(self, item);
+            }
+
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if self.escape.is_none()
+                    && mac
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident == "include")
+                {
+                    self.escape = Some("an `include!` invocation");
+                }
+                syn::visit::visit_macro(self, mac);
+            }
+        }
+        let mut visitor = EscapeVisitor { escape: None };
+        syn::visit::Visit::visit_file(&mut visitor, file);
+        visitor.escape
     }
 
     /// Resolve every `use` alias in the parsed crate TRANSITIVELY: a leaf's
@@ -958,7 +1133,13 @@ mod tests {
             let before = index.aliases.clone();
             for per_file in &uses {
                 for (module, leaves) in per_file {
+                    // Explicit (non-glob) imports first, so a glob cannot
+                    // shadow one: Rust gives an explicit import precedence
+                    // over a glob.
                     for leaf in leaves {
+                        if is_glob_leaf(leaf) {
+                            continue;
+                        }
                         let canonical = index.resolve_path(module, &leaf.segments);
                         if is_fs_glob(&canonical) {
                             continue;
@@ -977,6 +1158,35 @@ mod tests {
                         let mut key = module.clone();
                         key.push(local);
                         index.aliases.insert(key, canonical);
+                    }
+                    // Then globs: import every alias the glob's TARGET module
+                    // holds into THIS module, so `use crate::alias_a::*;`
+                    // makes `crate::alias_a::hidden_fs` visible as
+                    // `crate::alias_b::hidden_fs` and a call through the glob
+                    // resolves. `or_insert` keeps an explicit import's
+                    // binding over a glob-propagated one.
+                    for leaf in leaves {
+                        if !is_glob_leaf(leaf) {
+                            continue;
+                        }
+                        let prefix = &leaf.segments[..leaf.segments.len() - 1];
+                        let target_module = index.resolve_path(module, prefix);
+                        let imported: Vec<(String, CanonPath)> = index
+                            .aliases
+                            .iter()
+                            .filter(|(key, _)| {
+                                key.len() == target_module.len() + 1
+                                    && key.starts_with(target_module.as_slice())
+                            })
+                            .map(|(key, target)| {
+                                (key.last().cloned().unwrap_or_default(), target.clone())
+                            })
+                            .collect();
+                        for (name, target) in imported {
+                            let mut key = module.clone();
+                            key.push(name);
+                            index.aliases.entry(key).or_insert(target);
+                        }
                     }
                 }
             }
@@ -1050,11 +1260,21 @@ mod tests {
             }
         }
 
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            // `syn::visit` does not descend into a macro's tokens, so scan them
+            // here for a canonical `std::fs::<symbol>` sequence (the spelling
+            // the old byte count saw). This counts a mutator written in a
+            // `macro_rules!` body or any macro invocation; it does NOT resolve
+            // an aliased path inside the macro, nor count once per expansion.
+            for symbol in macro_mutator_symbols(&mac.tokens) {
+                *self.calls.entry((self.file.clone(), symbol)).or_default() += 1;
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if let syn::Expr::Path(path) = &*call.func
-                && path.qself.is_none()
-            {
-                let segments = path_segments(&path.path);
+            if let Some(path) = callee_path(&call.func) {
+                let segments = path_segments(path);
                 let canonical = self.index.resolve_path(&self.module, &segments);
                 if let Some(symbol) = mutator_symbol(&canonical) {
                     *self.calls.entry((self.file.clone(), symbol)).or_default() += 1;
@@ -1105,18 +1325,23 @@ mod tests {
         (routes.into_iter().collect(), calls)
     }
 
-    /// Every `std::fs` inode-mutating CALL or PATH in PRODUCTION code that
-    /// reaches one of [`FS_INODE_MUTATORS`] through a non-canonical route: an
-    /// IMPORTED symbol, a MODULE ALIAS (including a `std`-crate-ROOT alias and
-    /// a cross-file `pub(crate)` re-export resolved through the module graph),
-    /// or a glob. This is the half the exact-count pin misses.
+    /// Reports a `std::fs` inode-mutating CALL or PATH in PRODUCTION code that
+    /// reaches one of [`FS_INODE_MUTATORS`] through an ENUMERATED route the
+    /// exact-count pin does not cover: an IMPORTED symbol, a MODULE ALIAS
+    /// (including a `std`-crate-ROOT alias and a cross-file `pub(crate)`
+    /// re-export resolved through the module graph), or a glob. It is not a
+    /// total route detector (see the audit's RESIDUE).
     ///
-    /// SPELLING IS NOT A VARIABLE: the sources are parsed, so a raw identifier
-    /// (`r#std`, `r#fx`, `r#remove_file`), whitespace, a nested brace, `self`,
-    /// or a leading `::` cannot describe a different symbol than the one it
-    /// resolves to. PURE over `(package-relative path, raw contents)` pairs so
-    /// a unit test can drive it with synthetic sources. Test-only files are
-    /// skipped by [`is_test_only`].
+    /// The sources are parsed, so for a DIRECT call or path the spelling is not
+    /// a variable: a raw identifier (`r#std`, `r#fx`, `r#remove_file`),
+    /// whitespace, a nested brace, `self`, a leading `::`, and a callee in
+    /// parentheses or behind a reference (`(fx::remove_file)(p)`) all resolve
+    /// to the symbol they name. It does NOT resolve a value carried through a
+    /// variable or a `dyn` method (see the audit's RESIDUE). PURE over
+    /// `(package-relative path, raw contents)` pairs so a unit test can drive it
+    /// with synthetic sources. Test-only files are skipped by [`is_test_only`],
+    /// and a production file holding a `#[path]`/`include!` makes the parse fail
+    /// closed.
     fn std_fs_mutation_violations(
         files: &[(String, String)],
         gated: &BTreeSet<String>,
@@ -1132,9 +1357,12 @@ mod tests {
     }
 
     /// Walk the WHOLE crate directory (not only `src/`), skipping `target/` and
-    /// hidden directories. Covers `build.rs`, `tests/**`, `benches/**`,
-    /// `examples/**`, and any `#[path]`-included file that lives inside the
-    /// package tree.
+    /// hidden directories. Covers `build.rs`, `tests/**`, `benches/**`, and
+    /// `examples/**`. A production file that reaches for a `#[path]` attribute
+    /// or an `include!` is not "covered" by resolving it — the audit REFUSES
+    /// such a file (see [`path_or_include_escape`]), because either decouples a
+    /// module's path from its package-relative location and the location-based
+    /// alias table would then be wrong.
     fn collect_crate_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read crate dir") {
             let path = entry.expect("dir entry").path();
@@ -1166,10 +1394,12 @@ mod tests {
     ///   those AND the path must continue into it, so `tests/push_atomicity.rs`
     ///   is exempt. A `tests` component anywhere ELSE (a `src/**/tests/`
     ///   directory, or a `src/**/tests.rs` FILE) is PRODUCTION: it is compiled
-    ///   into the lib unless its `mod` declaration is cfg-gated.
+    ///   into the lib unless EVERY `mod` declaration that names it is cfg-gated.
     /// * GATING, for every other file: `gated` is the set of package-relative
-    ///   module paths whose `mod <name>;` declaration carries a `#[cfg(...)]`
-    ///   that IMPLIES `test` (see [`test_only_gated_paths`]).
+    ///   module paths whose EVERY `mod <name>;` declaration carries a
+    ///   `#[cfg(...)]` that IMPLIES `test` (see [`test_only_gated_paths`] and
+    ///   [`gated_paths_from_declarations`]). A file declared BOTH
+    ///   `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is PRODUCTION.
     ///
     /// NAME is not a predicate. A suffix rule (`ends_with("regression.rs")`)
     /// or a bare `tests.rs` component is strictly BROADER than the gated set:
@@ -1368,7 +1598,7 @@ mod tests {
     /// use; it comes from the source's GATING, never from a file NAME.
     fn test_only_gated_paths() -> BTreeSet<String> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut gated = BTreeSet::new();
+        let mut declarations: Vec<(String, bool)> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         seen.insert("src/lib.rs".to_string());
         let mut queue = vec![root.join("src/lib.rs")];
@@ -1379,8 +1609,10 @@ mod tests {
             let rel = crate_relative(&file);
             let dir = module_child_dir(&rel);
             // Walk EVERY declared child module (the walk is how a gated `mod`
-            // nested in a submodule is reached); only the `test`-gated ones are
-            // exempt, and only they are inserted into `gated`.
+            // nested in a submodule is reached). EVERY declaration is recorded
+            // — including a second declaration of the same file — so the fold
+            // can see that one of them is production; `seen` only gates the
+            // walk, not the recording.
             for (name, cfg_test) in mod_declarations(&source) {
                 let base = format!("{dir}{name}");
                 for candidate in [format!("{base}.rs"), format!("{base}/mod.rs")] {
@@ -1388,16 +1620,41 @@ mod tests {
                     if !path.exists() {
                         continue;
                     }
-                    if cfg_test {
-                        gated.insert(candidate.clone());
-                    }
+                    declarations.push((candidate.clone(), cfg_test));
                     if seen.insert(candidate.clone()) {
                         queue.push(path);
                     }
                 }
             }
         }
-        gated
+        gated_paths_from_declarations(declarations)
+    }
+
+    /// Fold every `mod <name>;` declaration seen across the crate into the set
+    /// of files the audits may skip. A file is exempt only when EVERY
+    /// declaration that names it is gated on `test`: `test_gated` collects a
+    /// file named by a test-implying declaration, `production_declared`
+    /// collects a file named by a declaration that does NOT imply `test`, and
+    /// the result is their DIFFERENCE. A file declared BOTH `#[cfg(test)] mod
+    /// x;` and `#[cfg(not(test))] mod x;` is therefore PRODUCTION — the second
+    /// declaration compiles it into the lib, so the test-implying declaration
+    /// cannot exempt it.
+    fn gated_paths_from_declarations(
+        declarations: impl IntoIterator<Item = (String, bool)>,
+    ) -> BTreeSet<String> {
+        let mut test_gated: BTreeSet<String> = BTreeSet::new();
+        let mut production_declared: BTreeSet<String> = BTreeSet::new();
+        for (file, implies_test) in declarations {
+            if implies_test {
+                test_gated.insert(file);
+            } else {
+                production_declared.insert(file);
+            }
+        }
+        test_gated
+            .difference(&production_declared)
+            .cloned()
+            .collect()
     }
 
     fn is_ident_start(b: u8) -> bool {
@@ -1681,27 +1938,52 @@ mod tests {
         code.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
+    /// Read an identifier at `*i`, honouring an `r#` raw-identifier prefix, and
+    /// return its LOCAL spelling (the prefix stripped) with `*i` advanced past
+    /// it. `None` when no identifier starts there. A raw identifier names the
+    /// same item as its plain spelling, so `r#rmdir` must not be recorded as
+    /// the distinct key `r`.
+    fn read_ident(code: &str, i: &mut usize) -> Option<String> {
+        let bytes = code.as_bytes();
+        if !bytes.get(*i).copied().is_some_and(is_ident_start) {
+            return None;
+        }
+        if bytes.get(*i) == Some(&b'r')
+            && bytes.get(*i + 1) == Some(&b'#')
+            && bytes
+                .get(*i + 2)
+                .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+        {
+            *i += 2;
+        }
+        let start = *i;
+        while *i < bytes.len() && is_ident_start(bytes[*i]) {
+            *i += 1;
+        }
+        Some(code[start..*i].to_string())
+    }
+
     /// Every reference to `libc` in code form, as a map from the reference
     /// spelling to its count: `libc::<symbol>` for a path, `libc::*` for a glob,
     /// and bare `libc` for a module alias / re-export (`use libc as c;`,
     /// `use libc::{self as c};`). WHITESPACE-INSENSITIVE, so `libc :: unlinkat`
-    /// and a newline before `(` are both seen. This is ONE rule instead of a
-    /// list of mutating-symbol patterns, so a module alias or a cross-file
-    /// re-export cannot slip past it.
+    /// and a newline before `(` are both seen, and RAW-IDENTIFIER-INSENSITIVE,
+    /// so `libc::r#rmdir` is the SAME key as `libc::rmdir` (a raw identifier
+    /// names the same item; without the `r#` strip it was recorded as the
+    /// distinct key `libc::r`, which the funnel's exact `libc::<symbol>` pin did
+    /// not see). This is ONE rule instead of a list of mutating-symbol
+    /// patterns, so a module alias or a cross-file re-export cannot slip past
+    /// it.
     fn libc_references(code: &str) -> BTreeMap<String, usize> {
         let bytes = code.as_bytes();
         let mut map: BTreeMap<String, usize> = BTreeMap::new();
         let mut i = 0usize;
         while i < bytes.len() {
-            if !is_ident_start(bytes[i]) {
+            let Some(name) = read_ident(code, &mut i) else {
                 i += 1;
                 continue;
-            }
-            let start = i;
-            while i < bytes.len() && (is_ident_start(bytes[i]) || bytes[i] == b'_') {
-                i += 1;
-            }
-            if &code[start..i] != "libc" {
+            };
+            if name != "libc" {
                 continue;
             }
             let mut j = i;
@@ -1715,14 +1997,16 @@ mod tests {
                 }
                 if bytes.get(j) == Some(&b'*') {
                     *map.entry("libc::*".to_string()).or_default() += 1;
-                } else if j < bytes.len() && is_ident_start(bytes[j]) {
-                    let s = j;
-                    while j < bytes.len() && (is_ident_start(bytes[j]) || bytes[j] == b'_') {
-                        j += 1;
-                    }
-                    *map.entry(format!("libc::{}", &code[s..j])).or_default() += 1;
                 } else {
-                    *map.entry("libc".to_string()).or_default() += 1;
+                    let mut symbol_at = j;
+                    match read_ident(code, &mut symbol_at) {
+                        Some(symbol) => {
+                            *map.entry(format!("libc::{symbol}")).or_default() += 1;
+                        }
+                        None => {
+                            *map.entry("libc".to_string()).or_default() += 1;
+                        }
+                    }
                 }
             } else {
                 *map.entry("libc".to_string()).or_default() += 1;
@@ -1733,7 +2017,8 @@ mod tests {
 
     /// Exemption follows the crate-root DIRECTORY or the GATING, never a name
     /// and never an interior component. A file under `src/**/tests.rs` or
-    /// `src/**/tests/` is PRODUCTION unless its `mod` declaration is gated.
+    /// `src/**/tests/` is PRODUCTION unless EVERY `mod` declaration that names
+    /// it is gated.
     #[test]
     fn is_test_only_follows_crate_root_position_or_gating() {
         let gated = test_only_gated_paths();
@@ -2014,52 +2299,68 @@ mod tests {
     /// STRUCTURAL AUDIT (`std::fs`): the `std::fs` calls that can REMOVE or
     /// REPLACE a directory entry — the ones that can free or swap a lock
     /// record's inode — are pinned PER PRODUCTION FILE and PER SYMBOL, and the
-    /// same PARSED pass refuses every non-canonical route to one.
+    /// same PARSED pass REPORTS the production paths that reach one of them
+    /// through an ENUMERATED route the pin does not cover. This audit is the
+    /// crate's OWN-call detector and a second, independent route detector; it is
+    /// NOT the completeness device (that is the resolved-symbol clippy deny).
     ///
     /// MECHANISM: every `.rs` file under the package directory is parsed with
     /// `syn` after `#[cfg(test)]` items are removed, so the audit sees SYMBOLS,
-    /// not bytes: a raw identifier (`std::fs::r#remove_file`, `use r#std as
-    /// s;`), whitespace, a nested brace, `self`, or a leading `::` cannot name a
-    /// different symbol than the one it resolves to. A crate-wide alias table,
-    /// built by walking every `use` tree (with inline `mod` blocks advancing the
-    /// module path) to a fixpoint, maps an absolute path such as
+    /// not bytes: for a DIRECT call or path, a raw identifier
+    /// (`std::fs::r#remove_file`, `use r#std as s;`), whitespace, a nested
+    /// brace, `self`, a leading `::`, or a callee in parentheses/behind a
+    /// reference cannot name a different symbol than the one it resolves to. A
+    /// crate-wide alias table, built by walking every `use` tree (with inline
+    /// `mod` blocks advancing the module path and glob imports propagating a
+    /// local module's aliases) to a fixpoint, maps an absolute path such as
     /// `crate::a::hidden_fs` to the canonical `std` path it names, so a
-    /// `pub(crate) use std::fs as hidden_fs;` in ANOTHER FILE is resolved at its
-    /// call sites.
+    /// `pub(crate) use std::fs as hidden_fs;` in ANOTHER FILE is resolved at
+    /// its call sites, including through `use crate::a::*;`. A production file
+    /// that holds a `#[path]` attribute or an `include!` invocation is REFUSED
+    /// (the parse fails closed), because either decouples a module path from
+    /// the file's location and the location-derived alias table would be wrong.
     ///
     /// COUNT METHOD: a resolved production CALL — an `ExprCall` whose callee
-    /// path resolves to `std::fs::<symbol>`, through any import, alias, raw
-    /// spelling, or cross-file re-export — is one occurrence for that file and
-    /// symbol. This is a SUPERSET of the old byte count, which saw only the
-    /// literal `std::fs::<symbol>(` text, so adding ANY production call changes
-    /// a count and forces review. Every current production call is canonical, so
-    /// the pinned values are unchanged; a change here is a deliberate, reviewed
-    /// addition recorded at the pin.
+    /// path resolves to `std::fs::<symbol>` — is one occurrence for that file
+    /// and symbol, and a canonical `std::fs::<symbol>` token sequence inside a
+    /// macro's tokens is one more. This is a SUPERSET of the old byte count,
+    /// which saw only the literal `std::fs::<symbol>(` text: every occurrence
+    /// the byte count saw — including one inside a `macro_rules!` body — is
+    /// seen here too, plus resolved aliases and parenthesized/referenced direct
+    /// callees. It is NOT a superset of every possible call: a mutator reached
+    /// inside a macro through an alias, or a call through a function-pointer
+    /// variable, is not counted (see RESIDUE), so adding such a call does not
+    /// change a count. Every current production call is canonical or in an
+    /// ordinary macro body, so the pinned values are unchanged; a change here is
+    /// a deliberate, reviewed addition recorded at the pin.
     ///
     /// EXEMPTION: a file is test-only iff its FIRST path component is one of the
     /// crate-root directories `tests/` / `benches/` / `examples/` (and the path
-    /// continues into it), or its `mod` declaration is `#[cfg(...)]`-gated on
-    /// `test` (see [`is_test_only`] / [`test_only_gated_paths`]). A file under
-    /// `src/**/tests.rs` or `src/**/tests/` is PRODUCTION unless gated; a name
-    /// or an interior path component never exempts.
+    /// continues into it), or EVERY `mod` declaration that names it is
+    /// `#[cfg(...)]`-gated on `test` (see [`is_test_only`] /
+    /// [`gated_paths_from_declarations`]). A file declared BOTH
+    /// `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is PRODUCTION. A
+    /// file under `src/**/tests.rs` or `src/**/tests/` is PRODUCTION unless
+    /// gated; a name or an interior path component never exempts.
     ///
-    /// RESIDUE a PARSE cannot see, named not hidden: (1) a call INSIDE a macro
-    /// (`macro_rules!` or a proc macro) or an `include!`d file OUTSIDE the
-    /// package, because a macro's tokens are not parsed as an expression and the
-    /// included file is not a collected `.rs`; (2) a call made through a
-    /// function POINTER or `dyn` dispatch — an ALIASED `let f = fx::remove_file;`
-    /// IS flagged as a route, but the audit does not carry a value across a
-    /// variable or resolve a `dyn` method; (3) a raw `extern "C"`
-    /// declaration, `extern "C" { fn unlinkat(dirfd: i32, path: *const i8,
-    /// flags: i32) -> i32; }`, followed by a call: it names neither `libc` nor
-    /// `std::fs`, so NEITHER this audit nor
+    /// RESIDUE a PARSE cannot see, named not hidden: (1) a proc macro that
+    /// EMITS a mutator call, or a `std::fs` mutator reached inside a macro
+    /// through an alias/import rather than the canonical path (the macro token
+    /// scan matches the canonical `std::fs::<symbol>` sequence only, and counts
+    /// the occurrence once per macro, not once per expansion); (2) a call made
+    /// through a function POINTER or `dyn` dispatch — an ALIASED
+    /// `let f = fx::remove_file;` IS flagged as a route, but the audit does not
+    /// carry a value across a variable or resolve a `dyn` method, so `let f =
+    /// std::fs::remove_file; f(p)` is neither counted nor reported; (3) a raw
+    /// `extern "C"` declaration, `extern "C" { fn unlinkat(dirfd: i32, path:
+    /// *const i8, flags: i32) -> i32; }`, followed by a call: it names neither
+    /// `libc` nor `std::fs`, so NEITHER this audit nor
     /// `no_libc_reference_outside_the_funnel` sees it. Inode-PRESERVING
     /// mutations (`std::fs::write`, `std::fs::copy`, `std::fs::set_permissions`,
     /// `std::fs::create_dir*`) are not pinned: they cannot split a holder
-    /// because the flock stays on the unchanged inode. The audit closes the
-    /// ordinary route — a `use` alias, a fully-qualified call, a raw spelling,
-    /// or a cross-file re-export — and NAMES this residue rather than implying
-    /// totality.
+    /// because the flock stays on the unchanged inode. The audit resolves the
+    /// ENUMERATED routes and NAMES this residue rather than implying totality;
+    /// the clippy deny carries the completeness claim.
     #[test]
     fn std_fs_name_mutation_counts_are_pinned() {
         let mut paths = Vec::new();
@@ -2515,5 +2816,253 @@ mod tests {
             gated_names,
             vec!["alpha".to_string(), "epsilon".to_string()]
         );
+    }
+
+    /// DEFECT (exemption): a file declared BOTH `#[cfg(test)] mod trick;` and
+    /// `#[cfg(not(test))] mod trick;` is compiled into the non-test library, so
+    /// the test-implying declaration must NOT exempt it from either audit. The
+    /// fold keeps `test_gated` and `production_declared` apart and subtracts the
+    /// latter, so only a file whose EVERY declaration implies `test` is exempt.
+    #[test]
+    fn a_file_declared_both_test_and_production_is_not_exempt() {
+        // CONTROL: declared ONLY under a test-implying cfg -> exempt.
+        assert!(
+            gated_paths_from_declarations([("src/trick.rs".to_string(), true)])
+                .contains("src/trick.rs")
+        );
+        // CONTROL: declared only in production -> not exempt.
+        assert!(
+            !gated_paths_from_declarations([("src/trick.rs".to_string(), false)])
+                .contains("src/trick.rs")
+        );
+        // THE HOLE: BOTH declarations. The production arm compiles the file into
+        // the lib, so the test arm cannot exempt it.
+        let gated = gated_paths_from_declarations([
+            ("src/trick.rs".to_string(), true),
+            ("src/trick.rs".to_string(), false),
+        ]);
+        assert!(
+            !gated.contains("src/trick.rs"),
+            "both declarations must be PRODUCTION: {gated:?}"
+        );
+        assert!(!is_test_only("src/trick.rs", &gated));
+    }
+
+    /// DEFECT (non-path callee): `(std::fs::remove_file)(p)` and
+    /// `(&std::fs::rename)(a, b)` are DIRECT calls, not function-pointer
+    /// residue, but a visitor that matched only `Expr::Path` callees saw
+    /// neither. The callee is unwrapped through parentheses, references, and
+    /// invisible groups before counting. The function-pointer-through-a-VARIABLE
+    /// form stays uncounted, asserted here as the named residue.
+    #[test]
+    fn the_parsed_pin_sees_through_a_parenthesized_or_referenced_callee() {
+        for (label, case, symbol) in [
+            (
+                "parenthesized canonical",
+                "fn f(p: &Path) -> std::io::Result<()> { (std::fs::remove_file)(p) }",
+                "remove_file",
+            ),
+            (
+                "referenced canonical",
+                "fn f(a: &Path, b: &Path) -> std::io::Result<()> { (&std::fs::rename)(a, b) }",
+                "rename",
+            ),
+            (
+                "parenthesized alias",
+                "use std::fs as fx; fn f(p: &Path) -> std::io::Result<()> { (fx::remove_dir_all)(p) }",
+                "remove_dir_all",
+            ),
+            // CONTROL: the bare canonical spelling.
+            (
+                "bare canonical",
+                "fn f(a: &Path, b: &Path) -> std::io::Result<()> { std::fs::hard_link(a, b) }",
+                "hard_link",
+            ),
+        ] {
+            let files = vec![("src/prod/count.rs".to_string(), case.to_string())];
+            let (_, counts) = std_fs_audit(&files, &BTreeSet::new());
+            assert_eq!(
+                counts
+                    .get(&("src/prod/count.rs".to_string(), symbol))
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "{label} was not counted: {case} -> {counts:?}"
+            );
+        }
+        // RESIDUE: a value carried through a VARIABLE is neither counted nor
+        // reported (the callee is an `Expr::Path` to the local, not the
+        // mutator).
+        let files = vec![(
+            "src/prod/count.rs".to_string(),
+            "fn f(p: &Path) -> std::io::Result<()> { let g = std::fs::remove_file; g(p) }"
+                .to_string(),
+        )];
+        let (routes, counts) = std_fs_audit(&files, &BTreeSet::new());
+        assert!(
+            counts.is_empty() && routes.is_empty(),
+            "the function-pointer-through-a-variable residue is named, not closed: \
+             {routes:?} {counts:?}"
+        );
+    }
+
+    /// DEFECT (glob over a local re-export): `src/alias_a.rs` re-exports
+    /// `std::fs as hidden_fs`, and `src/alias_b.rs` pulls it in with
+    /// `use crate::alias_a::*;`. The alias table skipped glob leaves, so
+    /// `hidden_fs::remove_file(p)` in `alias_b` resolved to nothing. The glob
+    /// now propagates the target module's aliases into the importing module.
+    #[test]
+    fn a_glob_over_a_local_reexport_module_propagates_its_aliases() {
+        let files: Vec<(String, String)> = [
+            ("src/alias_a.rs", "pub(crate) use std::fs as hidden_fs;"),
+            (
+                "src/alias_b.rs",
+                "use crate::alias_a::*;\npub(crate) fn f(p: &Path) { let _ = hidden_fs::remove_file(p); }",
+            ),
+            // CONTROL: the same alias reached through the module path directly.
+            (
+                "src/control.rs",
+                "pub(crate) fn f(p: &Path) { let _ = crate::alias_a::hidden_fs::remove_file(p); }",
+            ),
+        ]
+        .iter()
+        .map(|(rel, body)| ((*rel).to_string(), (*body).to_string()))
+        .collect();
+        let (routes, counts) = std_fs_audit(&files, &BTreeSet::new());
+        for file in ["src/alias_b.rs", "src/control.rs"] {
+            assert!(
+                routes.iter().any(|v| v.file == file
+                    && v.symbol == "remove_file"
+                    && v.route == FsRoute::ModuleAlias),
+                "the {file} glob/alias route was missed: {routes:?}"
+            );
+            assert_eq!(
+                counts
+                    .get(&(file.to_string(), "remove_file"))
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "the {file} glob/alias call was not counted: {counts:?}"
+            );
+        }
+    }
+
+    /// DEFECT (raw-identifier libc symbol): `libc::r#rmdir` tokenised to the
+    /// key `libc::r`, which the funnel's exact `libc::<symbol>` pin never
+    /// looked up, so a raw-identifier spelling of a funnel call changed no
+    /// count. The `r#` prefix is now stripped, so the key is `libc::rmdir`.
+    #[test]
+    fn the_libc_scanner_normalises_a_raw_identifier_symbol() {
+        let refs = libc_references(&normalize_ws(&code_only("libc::r#rmdir(p);")));
+        assert_eq!(refs.get("libc::rmdir").copied(), Some(1), "{refs:?}");
+        assert_eq!(
+            refs.get("libc::r").copied(),
+            None,
+            "the raw spelling must not survive as its own key: {refs:?}"
+        );
+        // A raw `libc` root and a raw symbol together.
+        let refs = libc_references(&normalize_ws(&code_only("r#libc::r#unlinkat(0, 0, 0);")));
+        assert_eq!(refs.get("libc::unlinkat").copied(), Some(1), "{refs:?}");
+        // CONTROL: the plain spelling maps to the same key.
+        let refs = libc_references(&normalize_ws(&code_only("libc::rmdir(p);")));
+        assert_eq!(refs.get("libc::rmdir").copied(), Some(1), "{refs:?}");
+    }
+
+    /// DEFECT (`#[path]`/`include!`): a `#[path]` attribute makes a file's
+    /// module path differ from its package-relative location, which is the key
+    /// the alias table is built from, so `crate::aliased_mod::hidden_fs` never
+    /// resolved; an `include!` pulls in source the walk did not collect. The
+    /// audit now FAILS CLOSED on either in production source.
+    #[test]
+    #[should_panic(expected = "REFUSES")]
+    fn a_path_attribute_in_production_source_is_refused() {
+        let files = vec![(
+            "src/prod/aliased_mod.rs".to_string(),
+            "#[path = \"foo_alias.rs\"] mod aliased_mod;\n\
+             pub(crate) fn f(p: &Path) { let _ = crate::aliased_mod::hidden_fs::remove_file(p); }"
+                .to_string(),
+        )];
+        let _ = std_fs_mutation_violations(&files, &BTreeSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "REFUSES")]
+    fn an_include_in_production_source_is_refused() {
+        let files = vec![(
+            "src/prod/includes.rs".to_string(),
+            "include!(\"generated.rs\");\n".to_string(),
+        )];
+        let _ = std_fs_mutation_violations(&files, &BTreeSet::new());
+    }
+
+    /// CONTROL: a production file with neither `#[path]` nor `include!` is not
+    /// refused, so the refusal is specific to the two escapes.
+    #[test]
+    fn a_plain_production_file_is_not_refused() {
+        let files = vec![(
+            "src/prod/plain.rs".to_string(),
+            "pub(crate) fn f(p: &Path) { let _ = std::fs::read(p); }".to_string(),
+        )];
+        assert_eq!(
+            std_fs_mutation_violations(&files, &BTreeSet::new()),
+            Vec::new()
+        );
+    }
+
+    /// DEFECT (macro tokens): the old byte count saw a `macro_rules!` body's
+    /// literal `std::fs::<symbol>(`; the parse could not, because `syn` does
+    /// not descend into a macro's token stream. The macro token scan restores
+    /// that coverage for the CANONICAL sequence — the spelling the byte count
+    /// saw — in a `macro_rules!` definition and in any macro invocation. An
+    /// aliased mutator inside a macro stays a named residue.
+    #[test]
+    fn the_parsed_pin_counts_a_mutator_inside_a_macro_token_stream() {
+        for (label, case, symbol) in [
+            (
+                "macro_rules body",
+                "macro_rules! wipe { ($p:expr) => { std::fs::remove_file($p) } }",
+                "remove_file",
+            ),
+            (
+                "macro invocation",
+                "fn f() { let _ = vec![std::fs::remove_dir_all(p)]; }",
+                "remove_dir_all",
+            ),
+            (
+                "raw symbol in macro",
+                "macro_rules! wipe { ($p:expr) => { std::fs::r#rename($p, $p) } }",
+                "rename",
+            ),
+            // CONTROL: the same call as ordinary code is still counted once.
+            (
+                "direct call",
+                "fn f(p: &Path) { let _ = std::fs::remove_file(p); }",
+                "remove_file",
+            ),
+        ] {
+            let files = vec![("src/prod/count.rs".to_string(), case.to_string())];
+            let (_, counts) = std_fs_audit(&files, &BTreeSet::new());
+            assert_eq!(
+                counts
+                    .get(&("src/prod/count.rs".to_string(), symbol))
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "{label} was not counted exactly once: {case} -> {counts:?}"
+            );
+        }
+        // NEGATIVE / residue: a DIFFERENT symbol and an aliased mutator inside
+        // a macro are not counted.
+        for case in [
+            "macro_rules! m { ($p:expr) => { std::fs::remove_file_extra($p) } }",
+            "use std::fs as fx; macro_rules! m { ($p:expr) => { fx::remove_file($p) } }",
+        ] {
+            let files = vec![("src/prod/count.rs".to_string(), case.to_string())];
+            let (_, counts) = std_fs_audit(&files, &BTreeSet::new());
+            assert!(
+                counts.is_empty(),
+                "the residue `{case}` must not be counted: {counts:?}"
+            );
+        }
     }
 }
