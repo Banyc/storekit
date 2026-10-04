@@ -620,8 +620,10 @@ compiled, so the gate is TWO clippy commands and one of them is not optional:
 Windows-only code — `cargo check --target …` does NOT substitute, because rustc
 does not run lints (measured: a `#[cfg(windows)]` module calling denied symbols is
 invisible to the host run and red under the Windows one). The Windows run reports
-nine config-time "does not refer to a reachable function" warnings for entries
-whose Unix libc symbols do not exist on that target; they are correct for the host
+13 config-time "does not refer to a reachable function" warnings for entries whose
+symbols do not resolve on that target (an earlier version of this sentence said
+"nine" — a count transcribed from a report instead of measured, which is the
+exact habit this file's rules exist to break); they are correct for the host
 and do not fail the run. `cargo test` alone exercises neither clippy command.
 * The **two source audits** in `atomic::guard::tests` run under `cargo test`, i.e.
 always: `no_libc_reference_outside_the_funnel`

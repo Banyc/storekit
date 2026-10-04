@@ -743,6 +743,6 @@ the belt before the map comparison; removing `mkfifo` from the family fails the
 classification test). The pair-less enumeration is ONE marker-delimited block in
 `API-CONSTRAINTS.md`, checked by a test that extracts the block, resolves every
 name to a real item, and derives the 41-item public raw-path surface so each item
-must be either listed or exempted — 25 exemptions, each with a stated reason, and
+must be either listed or exempted — 26 exemptions, each with a stated reason, and
 a stale exemption fails the test. A planted new public raw-path mutator fails it,
 which is the property six hand-found omissions never had.
