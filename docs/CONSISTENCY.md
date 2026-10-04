@@ -792,3 +792,48 @@ once more. The rule is now mechanical: a count, and any claim that a change clos
 a finding, is measured or diffed before it enters a document — and where a number
 was already wrong, the document says so rather than presenting a silently edited
 digit.
+
+## The adversarial review (round 9)
+
+Eight findings, all fixed. One is a P1 runtime defect that only ONE of the two
+reviewers found — and the other reviewer reported, in writing, that it could not
+break the behaviour at all.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | The ownership token was not bound to the remote's LOCALNESS. `Prepared` recorded only `remote_identity: Option<String>`, so `None == None` passed, and the localness derivation hardcoded `true` for `Pull`. A token minted against a LOCAL source was therefore accepted for a run whose live source was a different NON-LOCAL transport stating no identity: source A's plan was applied against source B and B's bytes reached the destination — with a digest failure afterwards when the content differed, and **silently (`Ok`) when it matched**. This is round 1/2's "apply R1's plan to R2" re-opened through the one `None`-identity path, the documented third-party extension point. **Only B found it; A explicitly reported the behaviour held.** | D | `voqovystpzns` |
+| 2 | Round 8's "derived from `clippy.toml`" reader was not a TOML reader: it accepted only a line beginning exactly `{ path = "`, so a valid TOML reformatting made the DENY and the PIN disagree — clippy refused a non-funnel call while the pin silently lost the symbol (round 8's exact failure mode, re-introduced by round 8's own fix). | M, H | `xurptntxropu` |
+| 3 | The libc belt could be silently disarmed by moving one symbol from `MUTATING_LIBC_SYSCALLS` into the reviewed `NON_MUTATING_LIBC_CALLS`: the classification test checked only UNION membership, so the device cited to make a reviewed pin safe could not fail for the property it is quoted to protect (repro: `unlinkat` misfiled + a pinned non-funnel `libc::unlinkat` → all green). | H | `xurptntxropu` |
+| 4 | The funnel closure's NAMED RESIDUAL claimed the crate-wide deny "still refuses the call everywhere" — false inside a funnel region, the one place the closure is the device of record. | A | `xurptntxropu` |
+| 5 | A test arm was a TAUTOLOGY: it asserted the symbol table contained what the function that BUILT the table had put there, so it could not fail. It is now a genuine cross-check against an independent raw read of `clippy.toml`. | H | `xurptntxropu` |
+| 6 | `clippy.toml`'s allow-site list — designated AUTHORITATIVE by `reserved.rs` — omitted a production item allow (`transport::open_verify_local`) and its "every OTHER is test-only" sentence was false. | A | `xurptntxropu` |
+| 7 | The pair-less derivation's stated class boundary omitted `use … as` ALIASES of `Path`/`PathBuf`, so an alias-spelled public raw-path mutator was neither in the stated in-class set nor the out-of-class set. | A | `xurptntxropu` |
+| 8 | Two "the TWO `GuardedRel` constructors" claims survived round 1's fix for that EXACT error (the code has three, and the third — `new_for_residue`, which waives the residue authority — is the one the security argument turns on). | A | `xurptntxropu` |
+
+**One class, five instances: a device's CLAIM outran its MECHANISM.** A reader that
+does not parse; a belt disarmable by a one-line misfiling; a residual whose
+mitigation is false exactly where it counts; a boundary that omits aliases; a test
+arm that compares a value to its own producer. Findings 2–6 are not five unrelated
+slips — they are the same overreach five earlier rounds found in the CRATE's
+guarantees, now located inside the enforcement apparatus itself, and the remedy is
+the same one that worked on the mechanism: **make each device falsifiable**. The
+libc belt gained an oracle that does not consult the review list and refuses a
+known name mutator pinned outside the funnel (proved failing under the reviewer's
+exact misfiling); the pin's reader now parses TOML and cross-checks its output
+against an independent raw scan (proved failing when a path-shaped string is not
+classified); the tautological arm now compares against that same raw read (proved
+failing when the table drops an entry); the boundary test pins the alias case in
+BOTH directions.
+
+**And the round's most important fact is an asymmetry.** Reviewer A could not break
+the crate's behaviour and said so; reviewer B found a P1 in the ownership binding.
+A single-reviewer round would have advanced believing the runtime was clean, and
+the P1 would have survived into the next round or beyond — which is the argument
+for two INDEPENDENT reviewers stated as evidence rather than as doctrine.
+
+**My own figures are now handled by construction, not by care.** The Windows
+config-warning count had been written as 9, then 13, then 16 across three rounds,
+every figure transcribed from a report: the README now states the COMMAND that
+produces it and says the number moves. The same treatment applies to the six
+hand-found omission rounds, now attributed correctly (1, 2, 3, 4, 5, 7 — round 6
+corrected a REASON and round 8 found a class boundary, neither added a member).
