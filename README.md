@@ -375,7 +375,10 @@ takes responsibility for exactly this, and no more.
 * **Enforced.** (a) The mutation symbols THIS crate funnels — including the `libc`
   symbols its wrappers call — are denied by the compiler, on BOTH targets, in every
   module that does not carry the allow, so no spelling, alias or module route reaches
-  them (`clippy.toml`; the list names what the funnel uses). (b) Every production
+  them (`clippy.toml`: the symbols the funnel uses, plus a reviewed set around
+  them — the list is deliberately WIDER than the funnel, and naming a symbol the
+  funnel never calls is how a route it could acquire later is refused in
+  advance). (b) Every production
   `libc` reference is either inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`)
   or NAMED in the audit's pin, by file, symbol and count; the map of references NOT on
   the pin is asserted EMPTY, so an unreviewed `libc` reference is a failing test. The
