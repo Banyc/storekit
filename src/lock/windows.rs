@@ -14,6 +14,19 @@ use std::os::windows::io::AsRawHandle;
 /// reparse point is opened itself (`FILE_FLAG_OPEN_REPARSE_POINT`) and then
 /// REFUSED by inspecting the opened handle, so the `set_len`/write below can
 /// never be redirected through the link into an arbitrary victim file (A2).
+//
+// The LOCK PROTOCOL's own record open: this is the ONE function that may ADOPT
+// the lock record's name (its `create(true)` flag), at the path
+// [`crate::lock::FileLock::acquire`] passes from the protocol — never a
+// caller's store-relative name. What makes it safe is
+// `FILE_FLAG_OPEN_REPARSE_POINT` plus the handle inspection below together with
+// `truncate(false)`: a reparse point at the spelling is opened ITSELF and then
+// refused before any `set_len`/write, and an existing record is opened, never
+// replaced. The reserved-spelling guard points the OTHER way (it stops a caller
+// from unlinking/replacing/truncating the holder's inode), so it has no
+// jurisdiction here and the crate-root deny is relaxed for exactly this
+// function.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{

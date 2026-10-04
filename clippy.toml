@@ -33,6 +33,14 @@
 #       transport::durable_create_new, transport::remove_file_if_inner;
 #   * `platform::chmod` (the ONE PATH-BASED mode authority) and
 #     `platform::symlink` (the ONE std-symlink site);
+#   * `lock::unix::open_lock_file` and `lock::windows::open_lock_file` — the
+#     LOCK PROTOCOL's own record open. Each is the ONE function the crate's
+#     lock acquisition uses to open (creating on first use) the lock record at
+#     a path the PROTOCOL computes, and each refuses a symlink/reparse point at
+#     the record's own spelling (`O_NOFOLLOW` / `FILE_FLAG_OPEN_REPARSE_POINT`
+#     plus a handle check) and never truncates. The reserved-spelling guard has
+#     no jurisdiction here (it exists to stop OTHER paths from mutating the
+#     record); the no-follow open is what protects this one.
 #   * `transport::ssh::hostkey::pin_known_hosts`, a REVIEWED exception: it
 #     mutates only the transport's own private cache directory (never a
 #     caller-supplied store-relative name), so it cannot name a lock record;
@@ -56,7 +64,12 @@
 # list says. What this list must satisfy is the consistency property:
 # `atomic::guard::tests::every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`
 # derives this file's list and the funnel's resolved call targets and fails if
-# the funnel adopts a `std::fs`/`libc` call this file does not deny.
+# the funnel adopts a `std::fs`/`libc` call this file does not deny. That
+# derivation learns a call from its path at ANY depth — a free function, an
+# inherent associated function (`std::fs::File::create`), and a builder METHOD
+# call whose receiver resolves to an `OpenOptions`/`DirBuilder` chain or local
+# (`std::fs::OpenOptions::create_new`) — so the INHERENT and BUILDER entries
+# below are covered by the derived test, not just by a hand-kept list.
 disallowed-methods = [
   # std::fs — the removal/replacement/rename/link calls that FREE or SWAP an
   # entry's inode, plus the CREATION calls that ADOPT a name (the guard's
@@ -71,6 +84,32 @@ disallowed-methods = [
   { path = "std::fs::create_dir", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "std::fs::create_dir_all", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "std::fs::set_permissions", reason = "mode-bit authority is funnel-owned; call platform::chmod instead" },
+  # std::fs — the INHERENT/ASSOCIATED and BUILDER spellings of the SAME
+  # adoption. A free-function-only list is NOT complete: the compiler resolves
+  # `std::fs::File::create(p)` and `std::fs::copy(src, dst)` to different
+  # symbols than `std::fs::create_dir`, and an `OpenOptions` builder adopts a
+  # name through its `create`/`create_new` FLAG, not through the terminal
+  # `open`. `File::create`/`File::create_new` are `create(true)`/`create_new(true)`,
+  # `DirBuilder::create` adopts a directory name, and `std::fs::copy`'s
+  # DESTINATION adopts a name.
+  #
+  # The FLAG methods are denied rather than the terminal `std::fs::OpenOptions::open`
+  # ON PURPOSE: the flag is what decides adoption, so denying it leaves a
+  # read-only `OpenOptions::new().read(true).open(p)` legal (a caller who wants
+  # to open read-only must not need an allow), while `open` on every builder is
+  # an allow. `std::fs::OpenOptions::truncate` is deliberately NOT here:
+  # `truncate(true)` cannot ADOPT a name (only `create`/`create_new` can), it is
+  # the content-mutation class the crate already leaves to `std::fs::write`
+  # (a `FUNNEL_SYMBOLS_NOT_DENIED` residual), and the lint matches the method
+  # NAME, so a deny would fire on the harmless `.truncate(false)` that the
+  # lock's own open and read-only opens spell explicitly — none of which is an
+  # adoption.
+  { path = "std::fs::File::create", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::File::create_new", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::OpenOptions::create", reason = "the create flag decides name adoption; call the guarded atomic primitive instead" },
+  { path = "std::fs::OpenOptions::create_new", reason = "the create_new flag decides name adoption; call the guarded atomic primitive instead" },
+  { path = "std::fs::DirBuilder::create", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "std::fs::copy", reason = "the copy DESTINATION adopts a name; call the guarded atomic primitive instead" },
   # std::os — the platform symlink creators, the `std::fs`-shaped creation
   # wrappers that do not live under `std::fs`. `platform::symlink` is the ONE
   # production site; every other site is an error.

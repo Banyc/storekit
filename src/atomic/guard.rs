@@ -3324,6 +3324,19 @@ mod tests {
     /// `libc::openat` is deliberately NOT here: it CAN adopt a name (with
     /// `O_CREAT`), so it is on clippy.toml's deny list with the other open
     /// spellings. Every other `libc` entry here is read-only.
+    ///
+    /// TWO more families joined this list when the surface derivation learned
+    /// to see inherent forms. The `OpenOptions` BUILDER surface
+    /// (`new`/`read`/`write`/`custom_flags`/`share_mode`/`open`) is here because
+    /// the ADOPTION decision is the `create`/`create_new` FLAG, which IS denied
+    /// (`std::fs::OpenOptions::create`, `.create_new`); the constructor, the
+    /// configuration setters, and the terminal `open` cannot adopt a name on
+    /// their own, and a read-only open must stay legal everywhere, so denying
+    /// the terminal call would be the wrong device. The ASSOCIATED/CONVERSION
+    /// surface (`std::fs::File::open` — read-only;
+    /// `std::fs::File::from` — an `OwnedFd`→`File` conversion;
+    /// `std::fs::Permissions::from_mode` — a mode-VALUE construction) touches no
+    /// name at all.
     const FUNNEL_SYMBOLS_NOT_DENIED: &[&str] = &[
         "std::fs::read",
         "std::fs::read_to_string",
@@ -3333,6 +3346,29 @@ mod tests {
         "std::fs::read_dir",
         "std::fs::read_link",
         "std::fs::canonicalize",
+        // The `OpenOptions` builder surface (see the doc above): the adoption
+        // flags are denied, these are not and cannot adopt.
+        "std::fs::OpenOptions::new",
+        "std::fs::OpenOptions::read",
+        "std::fs::OpenOptions::write",
+        "std::fs::OpenOptions::custom_flags",
+        "std::fs::OpenOptions::share_mode",
+        "std::fs::OpenOptions::open",
+        // `std::os::unix::fs::OpenOptionsExt::mode` and `OpenOptions::truncate`,
+        // used by the reviewed `lock::unix::open_lock_file` exception (now a
+        // funnel region because it carries the `#[allow]`). Both are set on a
+        // builder that is about to `open`; NEITHER can adopt a name (`create`
+        // and `create_new` are the adoption flags and both ARE denied), and the
+        // lock's own open spells `.truncate(false)` explicitly, which is exactly
+        // why `OpenOptions::truncate` is reviewed here rather than denied
+        // crate-wide (a deny matches the METHOD NAME and would false-positive on
+        // every read-only `.truncate(false)`).
+        "std::fs::OpenOptions::truncate",
+        "std::fs::OpenOptions::mode",
+        // Read-only / conversion associated calls: no name is touched.
+        "std::fs::File::open",
+        "std::fs::File::from",
+        "std::fs::Permissions::from_mode",
         "libc::fstatat",
         "libc::fstat",
         "libc::readlinkat",
@@ -3342,16 +3378,25 @@ mod tests {
         "libc::fcntl",
     ];
 
-    /// The canonical `std`/`libc` FUNCTION path a resolved path names, if it is
-    /// a module function this audit tracks: `std::fs::<fn>` (three segments),
-    /// a `std::os::{unix,windows}::fs::<symlink*>`, or `libc::<fn>`. An
-    /// inherent-type path (`std::fs::File::open`) is NOT a module function and
-    /// is excluded.
+    /// The canonical `std`/`libc` path a resolved path names, if it is a CALL
+    /// TARGET this audit tracks: any `std::fs::…` path — the free functions
+    /// (`std::fs::remove_file`), the inherent ASSOCIATED functions
+    /// (`std::fs::File::create`, `std::fs::OpenOptions::new`), and the builder
+    /// methods the [`FunnelSymbols`] method arm records as
+    /// `std::fs::OpenOptions::create` — a
+    /// `std::os::{unix,windows}::fs::<symlink*>` creator, or a `libc::<fn>`.
+    ///
+    /// The segment count of the `std::fs` arm is deliberately NOT pinned to
+    /// three: the completeness device's escaping spellings are the INHERENT
+    /// forms (`File::create`, `OpenOptions::create`), whose canonical paths
+    /// are four segments, so a length filter would exclude exactly the class
+    /// this arm must see. The `std::os` arm keeps its `unix`/`windows` gate so
+    /// a deeper unrelated `std::os` path cannot be mistaken for a creator.
     fn funnel_symbol(canonical: &[String]) -> Option<String> {
-        if canonical.len() == 3 && canonical[0] == "std" && canonical[1] == "fs" {
-            return Some(format!("std::fs::{}", canonical[2]));
+        if canonical.len() >= 3 && canonical[0] == "std" && canonical[1] == "fs" {
+            return Some(canonical.join("::"));
         }
-        if canonical.len() == 5
+        if canonical.len() >= 5
             && canonical[0] == "std"
             && canonical[1] == "os"
             && (canonical[2] == "unix" || canonical[2] == "windows")
@@ -3363,6 +3408,48 @@ mod tests {
             return Some(canonical.join("::"));
         }
         None
+    }
+
+    /// Whether `method` is an `OpenOptions`/`DirBuilder` CONFIGURATION call —
+    /// one that returns the builder (or `&mut` to it) and so keeps a chain ON
+    /// the builder. The TERMINAL calls (`OpenOptions::open`, `DirBuilder::create`)
+    /// are deliberately not included: they end the chain, so a method called on
+    /// their RESULT (`…open(p).map_err(…)`) must not be attributed to the
+    /// builder. `create` IS a configuration call for `OpenOptions` (its terminal
+    /// is `open`), so it stays.
+    fn is_builder_config_method(method: &str) -> bool {
+        matches!(
+            method,
+            "read"
+                | "write"
+                | "append"
+                | "truncate"
+                | "create"
+                | "create_new"
+                | "mode"
+                | "custom_flags"
+                | "share_mode"
+                | "recursive"
+        )
+    }
+
+    /// The `std::fs` BUILDER type (`OpenOptions` / `DirBuilder`) a canonical
+    /// path names, if it is the type itself or one of its `new` constructors:
+    /// both `std::fs::OpenOptions` and `std::fs::OpenOptions::new` bottom out
+    /// here, so the receiver of a builder chain (`OpenOptions::new().create`)
+    /// and the receiver of a split `let` binding (`let mut o =
+    /// OpenOptions::new(); o.create`) resolve to the SAME owner. `File` is
+    /// deliberately excluded: its name-mutating calls are the ASSOCIATED
+    /// functions (`File::create`) the call arm already records, while an
+    /// instance method on an open `File` (`set_permissions`, `set_len`) is
+    /// descriptor-bound and the crate's documented permitted side.
+    fn builder_type(canonical: &[String]) -> Option<String> {
+        let owner = match canonical {
+            [std, fs, owner] if std == "std" && fs == "fs" => owner,
+            [std, fs, owner, ctor] if std == "std" && fs == "fs" && ctor == "new" => owner,
+            _ => return None,
+        };
+        matches!(owner.as_str(), "OpenOptions" | "DirBuilder").then(|| owner.clone())
     }
 
     /// The `std`/`libc` function paths a macro token stream names as a
@@ -3392,11 +3479,26 @@ mod tests {
     /// carrying the `#[allow(...)]`, together with everything nested inside
     /// them. Resolution uses the SAME alias table the `std::fs` count pin uses,
     /// so an imported or re-exported funnel call is the call too.
+    ///
+    /// The surface is the union of three arms, because a name-adopting call has
+    /// three spellings and each one has to be SEEN:
+    ///
+    /// * `visit_expr_call` records a path-callee call (`std::fs::File::create`,
+    ///   `std::fs::OpenOptions::new`, `std::fs::copy`) at any path depth;
+    /// * `visit_expr_method_call` records a builder method
+    ///   (`std::fs::OpenOptions::create`) when [`Self::builder_owner`] resolves
+    ///   the receiver to an `OpenOptions`/`DirBuilder` builder;
+    /// * `visit_macro` records the canonical paths a macro body spells.
+    ///
+    /// [`Self::locals`] carries the per-block `let` bindings that make the SPLIT
+    /// builder spelling (`let mut o = OpenOptions::new(); o.create(true)`) resolve
+    /// to the same owner as the chained one, so neither spelling is a hole.
     struct FunnelSymbols<'a> {
         index: &'a FsIndex,
         module: CanonPath,
         in_funnel: bool,
         used: BTreeSet<String>,
+        locals: Vec<BTreeMap<String, String>>,
     }
 
     impl FunnelSymbols<'_> {
@@ -3404,6 +3506,38 @@ mod tests {
             let canonical = self.index.resolve_path(&self.module, segments);
             if let Some(symbol) = funnel_symbol(&canonical) {
                 self.used.insert(symbol);
+            }
+        }
+
+        /// The `std::fs` builder owner (`OpenOptions` / `DirBuilder`) of a
+        /// receiver expression, if any. It walks a method/call chain down to
+        /// its root and resolves that root through the alias table OR the
+        /// enclosing blocks' `let` bindings, so a builder reached through a
+        /// local (`let mut o = OpenOptions::new();`) is the same owner as one
+        /// reached through a chain (`OpenOptions::new().create(true)`).
+        fn builder_owner(&self, expr: &syn::Expr) -> Option<String> {
+            match expr {
+                syn::Expr::MethodCall(inner) => is_builder_config_method(&unraw(&inner.method))
+                    .then(|| self.builder_owner(&inner.receiver))
+                    .flatten(),
+                syn::Expr::Call(call) => {
+                    let path = callee_path(&call.func)?;
+                    let canonical = self.index.resolve_path(&self.module, &path_segments(path));
+                    builder_type(&canonical)
+                }
+                syn::Expr::Path(path) if path.qself.is_none() => {
+                    let segments = path_segments(&path.path);
+                    if segments.len() == 1 {
+                        for scope in self.locals.iter().rev() {
+                            if let Some(owner) = scope.get(&segments[0]) {
+                                return Some(owner.clone());
+                            }
+                        }
+                    }
+                    let canonical = self.index.resolve_path(&self.module, &segments);
+                    builder_type(&canonical)
+                }
+                _ => None,
             }
         }
     }
@@ -3440,6 +3574,27 @@ mod tests {
             self.in_funnel = saved;
         }
 
+        /// A fresh `let`-binding scope per block: a binding recorded by
+        /// [`Self::visit_local`] is visible only inside the block it is
+        /// declared in, so a same-named local in a sibling function cannot
+        /// mis-attribute an unrelated `create`/`truncate` call.
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.locals.push(BTreeMap::new());
+            syn::visit::visit_block(self, block);
+            self.locals.pop();
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let Some(init) = &local.init
+                && let syn::Pat::Ident(pat) = &local.pat
+                && let Some(owner) = self.builder_owner(&init.expr)
+                && let Some(scope) = self.locals.last_mut()
+            {
+                scope.insert(unraw(&pat.ident), owner);
+            }
+            syn::visit::visit_local(self, local);
+        }
+
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             if self.in_funnel
                 && let Some(path) = callee_path(&call.func)
@@ -3448,6 +3603,16 @@ mod tests {
                 self.record(&segments);
             }
             syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if self.in_funnel
+                && let Some(owner) = self.builder_owner(&call.receiver)
+            {
+                let symbol = format!("std::fs::{owner}::{}", unraw(&call.method));
+                self.used.insert(symbol);
+            }
+            syn::visit::visit_expr_method_call(self, call);
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -3478,6 +3643,7 @@ mod tests {
                 module: source.module.clone(),
                 in_funnel: false,
                 used: BTreeSet::new(),
+                locals: Vec::new(),
             };
             syn::visit::Visit::visit_file(&mut visitor, &source.file);
             used.extend(visitor.used);
@@ -3518,6 +3684,28 @@ mod tests {
     /// `clippy.toml` while the funnel still uses it fails this test, naming the
     /// now-undefended symbol — which is exactly how the two artifacts stay from
     /// drifting.
+    ///
+    /// The USED side sees three spellings of a name-adopting call (see
+    /// [`FunnelSymbols`]): a path-callee call at any depth (`std::fs::File::create`,
+    /// `std::fs::copy`), a builder METHOD call whose receiver chain or enclosing
+    /// `let` binding resolves to an `OpenOptions`/`DirBuilder`
+    /// (`std::fs::OpenOptions::create_new`), and a canonical path spelled in a
+    /// macro body.
+    ///
+    /// NAMED RESIDUALS of the DERIVATION (not of the deny, whose resolution is
+    /// type-based and therefore still catches every one of them): the visitor
+    /// recognises a builder by its SYNTACTIC chain or by a `let` binding in an
+    /// ENCLOSING block, so a builder that reaches a method through a FUNCTION
+    /// PARAMETER or a STRUCT FIELD (`fn f(o: &mut OpenOptions) { o.create(true) }`),
+    /// through a FUNCTION RETURN (`make_opts().create(true)`), through a
+    /// FUNCTION-POINTER binding (`let c = std::fs::File::create; c(p)`), or whose
+    /// method call sits inside a macro body (`o.create(true)`) is not recorded
+    /// in `used`. The residual's only consequence is that if such a call were
+    /// the funnel's ONLY use of the symbol, this derivation would not name it;
+    /// the crate-wide deny still refuses the call everywhere, which is why the
+    /// residual is stated rather than claimed covered. A new funnel primitive
+    /// should spell the call directly or as a local binding, both of which the
+    /// arms above see.
     #[test]
     fn every_mutation_symbol_the_funnel_uses_is_denied_crate_wide() {
         let mut paths = Vec::new();
@@ -3537,12 +3725,20 @@ mod tests {
 
         // SANITY: the derivation must see the funnel, or an empty `used` set
         // would make the closure vacuous. `create_dir_all` is a creation
-        // wrapper added to the deny list in this change; `openat` is the
-        // funnel's canonical open.
+        // wrapper; `openat` is the funnel's canonical open. The two INHERENT
+        // arms are what this change added: `std::fs::File::from`/`File::open`
+        // are ASSOCIATED calls (four-segment paths the old three-segment filter
+        // dropped) and `std::fs::OpenOptions::create_new`/`open` are BUILDER
+        // METHOD calls, so a regression that stopped seeing either would leave
+        // the closure silently blind to exactly the escaping spellings.
         assert!(
-            used.contains("std::fs::create_dir_all") && used.contains("libc::openat"),
-            "the funnel symbol derivation must see the funnel's own creation and open calls, or \
-             the closure is vacuous: {used:?}"
+            used.contains("std::fs::create_dir_all")
+                && used.contains("libc::openat")
+                && used.contains("std::fs::File::from")
+                && used.contains("std::fs::OpenOptions::create_new")
+                && used.contains("std::fs::OpenOptions::open"),
+            "the funnel symbol derivation must see the funnel's own creation, open, associated, \
+             and builder-method calls, or the closure is vacuous: {used:?}"
         );
 
         let mut undefended: Vec<String> = Vec::new();
@@ -3575,5 +3771,86 @@ mod tests {
                  from the review list"
             );
         }
+    }
+
+    /// The surface derivation must SEE each spelling a name-ADOPTING call can
+    /// take inside the funnel — a four-segment ASSOCIATED call, a builder
+    /// METHOD on a syntactic chain, and a builder carried by a `let` binding
+    /// (including through a `use … as` alias) — or `clippy.toml`'s list could
+    /// drift from the code without
+    /// [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`]
+    /// noticing. This is the round-6 finding's regression guard: the old
+    /// three-segment filter and path-callee-only visitor saw NEITHER the
+    /// inherent nor the builder form.
+    #[test]
+    fn funnel_symbol_surface_sees_associated_builder_and_local_arms() {
+        let funnel = r##"#![allow(clippy::disallowed_methods)]
+use std::fs::OpenOptions;
+use std::fs::OpenOptions as O;
+
+fn associated(p: &std::path::Path) {
+    // 4-segment ASSOCIATED calls: the old 3-segment filter dropped these.
+    let _ = std::fs::DirBuilder::new();
+    let _ = std::fs::File::from(p);
+    let _ = std::fs::File::create_new(p);
+}
+
+fn chained(p: &std::path::Path) {
+    // The BUILDER form: the flag method is what decides adoption.
+    let _ = std::fs::OpenOptions::new().write(true).create_new(true).open(p);
+    let _ = OpenOptions::new().append(true).open(p);
+    let _ = O::new().truncate(false).open(p);
+}
+
+fn split_local() {
+    // The SPLIT builder spelling: the owner rides a `let` binding.
+    let mut opts = OpenOptions::new();
+    opts.append(true);
+}
+
+fn not_attributed(p: &std::path::Path) {
+    // CONTROLS: a method on the `open` RESULT, and a method on an unrelated
+    // local, must NOT be attributed to the builder.
+    let _ = OpenOptions::new().write(true).open(p).map_err(|e| e);
+    let mut v = Vec::new();
+    v.push(1u8);
+}
+"##;
+        let files = vec![("src/prod/arms.rs".to_string(), funnel.to_string())];
+        let used = funnel_symbol_surface(&files, &BTreeSet::new());
+
+        for expected in [
+            "std::fs::DirBuilder::new",
+            "std::fs::File::from",
+            "std::fs::File::create_new",
+            "std::fs::OpenOptions::create_new",
+            "std::fs::OpenOptions::append",
+            // The aliased `O::new().truncate(…)` chain must resolve through the
+            // alias table to the same `OpenOptions` owner as the bare spelling.
+            "std::fs::OpenOptions::truncate",
+            "std::fs::OpenOptions::write",
+            "std::fs::OpenOptions::open",
+        ] {
+            assert!(
+                used.contains(expected),
+                "the derivation must SEE the inherent/builder spelling {expected}: {used:?}"
+            );
+        }
+        assert!(
+            !used.contains("std::fs::OpenOptions::map_err")
+                && !used.contains("std::fs::OpenOptions::push"),
+            "a method on the `open` result / an unrelated local must NOT be attributed to the \
+             builder: {used:?}"
+        );
+
+        // The arms are gated on the `#[allow]`: a NON-funnel file contributes
+        // nothing, so the surface is the funnel's, not the crate's.
+        let outside = r#"fn a(p: &std::path::Path) { let _ = std::fs::File::create(p); }"#;
+        let files = vec![("src/prod/outside.rs".to_string(), outside.to_string())];
+        let used = funnel_symbol_surface(&files, &BTreeSet::new());
+        assert!(
+            used.is_empty(),
+            "a non-funnel file must contribute no funnel symbols: {used:?}"
+        );
     }
 }
