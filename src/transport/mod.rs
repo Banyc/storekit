@@ -1261,6 +1261,20 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(
 ///   is opened `read(true)`; it is never opened writable), so acquisition
 ///   cannot mutate the record.
 ///
+/// # The reserved-spelling refusal, at the PUBLIC entry
+///
+/// `sidecar` is CALLER-CHOSEN, and this helper would otherwise be the ONE
+/// public CREATE path that reaches the filesystem without the crate's
+/// reserved-spelling gate: a caller could name the crate's own bookkeeping
+/// (`operation.lock`, a `.sync-aside.*` residue, or the sibling record
+/// `.<name>.operation.lock`) and create it. So [`refuse_reserved_mutation`]
+/// runs with [`Sanction::None`] BEFORE the depth check and before anything is
+/// created: a lock-record or residue spelling is refused TYPED ([`Error::Conflict`]
+/// / [`Error::Reserved`]`{ResidueBelow}`) exactly as every guarded primitive
+/// refuses it, and no parent chain or record is created. The crate's own
+/// default [`Layout::lock_sidecar`] (`state/operation.lock.mutex`) is neither
+/// spelling, so the transport's own mutations are unaffected.
+///
 /// # The wait, and the typed timeout
 ///
 /// Acquisition is NON-BLOCKING (`flock(LOCK_EX|LOCK_NB)` / `LockFileEx` with
@@ -1306,6 +1320,11 @@ pub fn with_operation_lock_sidecar<R>(
     sidecar: &RootedRelativePath,
     f: impl FnOnce() -> Result<R>,
 ) -> Result<R> {
+    // The sidecar spelling is CALLER-CHOSEN; run the crate's ONE
+    // reserved-spelling gate at the PUBLIC entry, before the depth check and
+    // before anything is created, so this helper cannot create a lock record
+    // or a residue a guarded primitive would refuse.
+    crate::atomic::refuse_reserved_mutation(sidecar.as_path(), crate::atomic::Sanction::None)?;
     let depth = SIDECAR_DEPTH.with(|c| c.get());
     if depth > 0 {
         return f();
