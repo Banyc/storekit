@@ -72,7 +72,7 @@
 //! # The reserved-spelling guard is STRUCTURAL, not a list of call sites
 //!
 //! The single-holder guarantee rests on the lock record's inode never
-//! changing. Four earlier passes each fixed the call sites they could find
+//! changing. Earlier passes each fixed the call sites they could find
 //! and missed one, so the guard is no longer applied by enumeration. The SAME
 //! shape now also protects a stranded ORIGINAL (destination residue): a
 //! primitive that carried the lock authority and skipped the residue authority

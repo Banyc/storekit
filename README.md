@@ -385,10 +385,13 @@ takes responsibility for exactly this, and no more.
   them (`clippy.toml`: the symbols the funnel uses, plus a reviewed set around
   them — the list is deliberately WIDER than the funnel, and naming a symbol the
   funnel never calls is how a route it could acquire later is refused in
-  advance). The deny's reach is per SYMBOL and per TARGET: a `libc` symbol does not
-  resolve on Windows at all, so those entries are inert there — the crate uses no
-  `libc` on that target, and the deny bites on every target that exports the
-  symbol. (b) Every production
+  advance). The deny's reach is per SYMBOL and per TARGET: an entry is inert only on a
+  target that does not export the symbol. On Windows the six `libc::…at` symbols the
+  Unix wrappers call do not resolve, while FIFTEEN other `libc` entries (`open`,
+  `unlink`, `rename`, `chmod`, `mkdir`, `rmdir`, `creat`, `fopen`, `freopen`, `remove`,
+  `bind`, `wchmod`, `wopen`, `wrmdir`, `wutime`) DO resolve and are live denies there —
+  the crate calls none of them on that target, which is the advance protection working.
+  (b) Every production
   `libc` reference is either inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`)
   or NAMED in the audit's pin, by file, symbol and count; the map of references NOT on
   the pin is asserted EMPTY, so an unreviewed `libc` reference is a failing test. The

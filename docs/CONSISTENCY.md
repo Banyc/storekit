@@ -84,8 +84,10 @@ Named, scoped, not pursued:
   boundary: it resolves a direct call, an inherent or builder method on a
   path-resolvable receiver, and a call held in an enclosing `let`. A name-adopting
   call whose receiver arrives as a FUNCTION PARAMETER, a RETURN, a STRUCT FIELD or a
-  function pointer — or one a macro emits — moves no pinned count, and inside a
-  funnel module the deny is allowed there, so nothing else refuses it either. That
+  function pointer moves no pinned count, and inside a funnel module the deny is allowed
+  there, so nothing else refuses it either. A CANONICAL path spelled inside a
+  `macro_rules!` body IS counted (a test pins that); an ALIASED or non-canonical
+  spelling there is not. That
   shape is outside the pin's guarantee rather than a hole in a promise, and the
   contract's clause (c) says so.
 - **No deny entry is checked for RESOLUTION.** `clippy.toml` is a list of resolved
@@ -94,9 +96,10 @@ Named, scoped, not pursued:
   diagnostic that the gate's `-D warnings` does not cover, so it can rot silently; a
   symbol the funnel DOES use is caught only by the closure test, which checks the LIST,
   not the resolution (`cargo clippy --all-targets --target x86_64-pc-windows-msvc` exits
-  0 while naming six funnel-used `libc::…at` symbols). On Windows every `libc` entry is
-  inert in that sense — the crate uses no `libc` there and the symbols do not resolve —
-  and some wider-set entries name symbols no supported target exports at all
+  0 while naming the six funnel-used `libc::…at` symbols and 77 other entries). On
+  Windows those six do not resolve, so those entries are inert there; FIFTEEN other
+  `libc` entries DO resolve and are live denies (the crate calls none of them on that
+  target). Some wider-set entries name symbols no supported target exports at all
   (`libc::shm_rename` is FreeBSD-only). The entries are kept as the reviewed record
   rather than pruned, and the deny bites on each target that DOES export the symbol.
 - **The far-side root of an `SshTransport` destination is unresolvable from here.**
@@ -109,12 +112,14 @@ Named, scoped, not pursued:
 - **The count pins pin CALL COUNTS, not arguments.** A change to an argument at a
   call site inside a reviewed allow region moves no `std::fs` count, and the deny is
   allowed there. The boundary is precise, and narrower than "no device notices it": an
-  argument that introduces a NEW `libc` symbol IS noticed, because the `libc` pin counts
-  references and every funnel `custom_flags` site spells its flags as `libc::…` —
-  measured, `custom_flags(libc::O_NONBLOCK | libc::O_CREAT)` fails the pin on
-  `libc::O_CREAT`. An argument change that introduces no newly counted symbol (a
-  constant, a length, a bit already spelled) is a review responsibility. The contract's
-  clause (c) is about a changed or ADDED call.
+  argument that introduces a NEW counted symbol IS noticed — measured,
+  `custom_flags(libc::O_NONBLOCK | libc::O_CREAT)` fails the libc pin on `libc::O_CREAT`,
+  because the four UNIX funnel sites spell their flags as `libc::…`. On Windows the
+  three funnel `custom_flags` sites spell `windows_sys` constants
+  (`FILE_FLAG_OPEN_REPARSE_POINT`, `FILE_FLAG_BACKUP_SEMANTICS`), which the libc pin does
+  not count, so an added flag IS invisible there. An argument change that introduces no
+  newly counted symbol (a constant, a length, a bit already spelled) is a review
+  responsibility. The contract's clause (c) is about a changed or ADDED call.
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde

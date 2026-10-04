@@ -7,7 +7,7 @@
 //! unlinks, replaces, renames, or truncates the record breaks that, so the
 //! crate must have no reachable path to such a mutation.
 //!
-//! Four earlier passes each enumerated the call sites they could find and
+//! Earlier passes each enumerated the call sites they could find and
 //! missed one (a second symlink implementation, the raw rename primitive
 //! under the guarded rename, a raw truncating open, and the Windows
 //! transport's direct `std::fs` seams). Enumeration is the wrong shape.
@@ -62,9 +62,12 @@
 //! * `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` PARSES every
 //!   crate `.rs` file into the crate's module graph with `syn` (after
 //!   `#[cfg(test)]` items are removed) and pins the per-file per-symbol counts
-//!   of the RESOLVED production calls to the `std::fs` name mutators
-//!   (`remove_file` / `remove_dir` / `remove_dir_all` / `rename` / `hard_link`),
-//!   so a new DIRECT production call, or a new canonical mutator
+//!   of the RESOLVED production calls to every name mutator on `clippy.toml`'s deny
+//!   list — a DERIVED set, not a hand-kept list: the removal/replace family
+//!   (`remove_file` / `remove_dir` / `remove_dir_all` / `rename` / `hard_link`), the
+//!   name CREATORS (`create_dir`, `create_dir_all`, `symlink*`, `set_permissions`,
+//!   `OpenOptions::create`, `OpenOptions::create_new`, `OpenOptions::custom_flags`,
+//!   `write`) — so a new DIRECT production call, or a new canonical mutator
 //!   occurrence in a macro body, changes a count and forces review. Because the
 //!   sources are parsed, the DIRECT spelling of a path is not a variable: a raw
 //!   identifier (`std::fs::r#remove_file`, `use r#std as s;`), whitespace,
@@ -76,7 +79,7 @@
 //!   MODULE is resolved at its call sites, and a glob over such a module
 //!   (`use crate::alias_a::*;`) propagates its aliases into the importing
 //!   module. The same parsed pass reports a production path that reaches one of
-//!   the five through an ENUMERATED route — an IMPORTED symbol, a MODULE ALIAS
+//!   THAT set through an ENUMERATED route — an IMPORTED symbol, a MODULE ALIAS
 //!   (including a cross-file re-export and a `std`-crate-root alias), or a GLOB.
 //!   It does NOT claim to refuse "every IMPORT route": that completeness job is
 //!   the resolved-symbol clippy deny, not this audit. A production file that
@@ -5813,7 +5816,7 @@ impl S {
     /// (b) resolves every name in it to a real fn/method in the parsed
     /// production item graph, and (c) derives every PUBLIC fn/method that takes
     /// a raw path argument and requires each to be named in the block or in the
-    /// reviewed [`PAIR_LESS_EXEMPTIONS`] list. A SIXTH omission is therefore a
+    /// reviewed [`PAIR_LESS_EXEMPTIONS`] list. Any omission is therefore a
     /// failing test rather than a reviewer's find: adding a new public
     /// raw-path mutating fn makes `uncovered` non-empty until the block (or an
     /// exemption with a reason) names it.
@@ -5984,7 +5987,7 @@ impl S {
         assert!(
             uncovered.is_empty(),
             "these PUBLIC fns/methods take a raw path argument and are in NEITHER the \
-             docs/API-CONSTRAINTS.md block NOR the reviewed PAIR_LESS_EXEMPTIONS list, so a SIXTH \
+             docs/API-CONSTRAINTS.md block NOR the reviewed PAIR_LESS_EXEMPTIONS list, so an \
              enumeration omission would not be caught: {uncovered:?}"
         );
 
