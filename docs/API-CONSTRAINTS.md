@@ -95,12 +95,16 @@ named AT the item with its reach).
   and `atomic::copy_dir_recursive_fd` (copy primitives whose role includes an
   out-of-root source), `sync::retire_destination_lock` (a lock-record removal
   with its own spelling and identity checks), `sync::Residue::recover_to` AND
-  `sync::Residue::discard` (the sweep's target and the discard; both hold a
+  `sync::Residue::discard` (the sweep's target and the discard; each holds a
   validated `(&RootDir, &RootedRelativePath)` pair INSIDE `Residue`, so they meet
-  the rule's SPIRIT — the validated type is the input — and are listed only
-  because this enumeration is about the SIGNATURE, and a proof-carrying method
-  takes no path argument at all; `discard` is the FOURTH member this enumeration
-  missed), `lock::FileLock::acquire` (the record path the lock
+  the rule's SPIRIT — the validated type is the input — and they are listed
+  because this enumeration is about the SIGNATURE, and NEITHER takes that pair as
+  an ARGUMENT. They differ in one way an earlier version of this paragraph got
+  wrong: `recover_to` DOES take a caller-supplied path
+  (`target: impl AsRef<Path>`), which it validates at the boundary before use,
+  while `discard` takes no path argument at all; the sentence once said "a
+  proof-carrying method takes no path argument at all" of BOTH, which is false for
+  `recover_to`. `discard` is the FOURTH member this enumeration missed), `lock::FileLock::acquire` (the record path the lock
   protocol computes), `platform::chmod` / `platform::symlink` (the platform
   primitives), and the `Remote` trait's path-taking seam `lock_far_side`. The
   READ-ONLY primitives that also take a `&Path` (`platform::file_mode`,

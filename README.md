@@ -625,9 +625,16 @@ count changes (removal, replacement, creation or mode). The funnel's membership 
 DERIVED from the source (the modules carrying the module-level allow), so neither
 audit's prose restates it. Their job is what
 the lint cannot do — notice when the funnel's OWN calls change, inside the modules
-where the deny is allowed and therefore blind — and they resolve the enumerated
-import routes by PARSING the sources, independently of the lint's symbol
-resolution.
+where the deny is allowed and therefore blind — and they are INDEPENDENT of the
+lint's symbol resolution. They are NOT the same kind of device, and an earlier
+version of this sentence said BOTH "resolve the enumerated import routes by
+PARSING the sources": only `std_fs_name_mutation_counts_are_pinned` parses (with
+`syn`, which is what retires the spelling class);
+`no_libc_reference_outside_the_funnel` is a REFERENCE SCANNER over comment- and
+string-stripped text — it does not parse, and it does NOT resolve an alias (`use
+libc as c; c::unlinkat(...)` records a bare `libc`, which its own doc states).
+Aliased and re-exported `libc` spellings are caught by the resolved-symbol deny
+and by the exact per-module reference pin, not by that scanner.
 
 Together they back the rule that every name mutation goes through the ONE guarded
 funnel, and the operative definition of that membership is the set of
