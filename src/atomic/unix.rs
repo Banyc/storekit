@@ -3718,13 +3718,13 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 mod tests {
     use super::{
         Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, RootedRelativePath, Sanction,
-        copy_dir_recursive_fd, copy_tree_verbatim, fsync_tree_recursive_fd, openat_no_follow,
-        parent_fd_of, path_kind_fd, read_dir_fd, read_fd, read_link_fd, read_root_dir_fd,
-        remove_dir_all_fd, remove_dir_all_path, remove_dir_fd, remove_file_fd,
-        remove_owned_lock_record_fd, remove_residue_dir_all_fd, remove_residue_file_fd,
-        rename_residue_paths, renameat_fd, renameat_paths, replace_order_probe, set_private_fd,
-        symlink_fd, write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd,
-        write_file_fd,
+        copy_dir_recursive_fd, copy_tree_verbatim, ensure_private_dir_durable,
+        fsync_tree_recursive_fd, openat_no_follow, parent_fd_of, path_kind_fd, read_dir_fd,
+        read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_dir_all_path,
+        remove_dir_fd, remove_file_fd, remove_owned_lock_record_fd, remove_residue_dir_all_fd,
+        remove_residue_file_fd, rename_residue_paths, renameat_fd, renameat_paths,
+        replace_order_probe, set_private, set_private_fd, symlink_fd, write_atomic_cas_fd,
+        write_atomic_replace, write_atomic_replace_fd, write_file_fd,
     };
     use crate::error::{ReservedKind, StoreKind};
     use std::os::unix::ffi::OsStrExt;
@@ -4885,6 +4885,58 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(file_mode, 0o600, "a regular file is narrowed to 0o600");
+    }
+
+    /// The PATH-BASED `set_private` consults the ONE guard on the FULL path.
+    /// Its descriptor-relative twin runs its OWN guard, so
+    /// `set_private_fd_refuses_the_lock_record` stays green when this line is
+    /// deleted — this test is what notices the path-based guard. Pre-fix the
+    /// chmod narrowed the record to 0o600 and returned `Ok(())`. The guard's
+    /// lock-record refusal is `Error::Conflict`, not a message substring.
+    #[test]
+    fn set_private_refuses_the_lock_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("operation.lock");
+        std::fs::write(&record, b"HELD").unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err =
+            set_private(&record).expect_err("the path-based chmod must refuse the lock record");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the lock authority's refusal is the TYPED conflict, got: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            b"HELD".to_vec(),
+            "the record's content must be untouched"
+        );
+        let mode = std::fs::metadata(&record).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o644,
+            "the refused chmod must leave the record's mode untouched"
+        );
+    }
+
+    /// The PATH-BASED `ensure_private_dir_durable` runs the guard with
+    /// [`Sanction::Residue`], which skips the RESIDUE authority but still runs
+    /// the LOCK authority — so a residue spelling is permitted here while a
+    /// lock-record spelling is refused, with the TYPED `Error::Conflict`. Its
+    /// Unix callers all passed an already-guarded full path, so deleting this
+    /// line left the suite green; this test is what notices it. Pre-fix the
+    /// call created the directory and returned `Ok(true)`.
+    #[test]
+    fn ensure_private_dir_durable_refuses_the_lock_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("operation.lock");
+        let err = ensure_private_dir_durable(&record)
+            .expect_err("the path-based mkdir chain must refuse the lock record");
+        assert!(
+            matches!(err, Error::Conflict(_)),
+            "the lock authority still runs under Sanction::Residue, so the refusal is the TYPED \
+             conflict, got: {err:?}"
+        );
+        assert!(!record.exists(), "the refused call must create nothing");
     }
 
     /// The descriptor-relative `set_private_fd` consults the SAME guard as
