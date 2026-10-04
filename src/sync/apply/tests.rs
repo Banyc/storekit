@@ -13229,6 +13229,88 @@ fn a_destination_ownership_token_is_bound_to_its_local_root() {
     );
 }
 
+/// The token is bound to the DIRECTION as well as to the roots. A token
+/// minted for a PUSH whose destination root spelling EQUALS the local source
+/// root leaves EVERY other compared axis identical — the pinned local root,
+/// the transport's root spelling, identity, and localness all match — so only
+/// the direction axis can refuse the swap.
+#[test]
+fn a_destination_ownership_token_is_bound_to_its_direction() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path().join("root");
+    write(&root.join("f"), b"payload");
+    let before = canonicalize_tree(&root).unwrap();
+
+    // The PUSH token's destination root spelling is the local root itself, so
+    // the PULL run's derived destination (the local root) is the SAME and
+    // cannot distinguish the swap.
+    let ownership = DestinationOwnership::lock(Direction::Push, &root, &transport(&root))
+        .expect("minting a PUSH token whose destination root equals the local root");
+
+    let err = sync(
+        Direction::Pull,
+        &root,
+        &transport(&root),
+        &ReplaceAll,
+        Keep,
+        ownership,
+    )
+    .expect_err("a PUSH token must be refused for a PULL run");
+    assert_eq!(
+        err.error().preflight_reason(),
+        Some(PreflightKind::RunBindingMismatch),
+        "the refusal must be the typed run-binding mismatch: {err:?}"
+    );
+    assert_eq!(
+        canonicalize_tree(&root).unwrap(),
+        before,
+        "the refused direction swap must mutate nothing"
+    );
+}
+
+/// The "derived destination shape" the token's documentation once claimed as
+/// its own axis is refused by an axis that actually exists: a PUSH token whose
+/// destination root differs from the local source root is REFUSED when handed
+/// to a PULL run (whose destination IS that local root), with the typed
+/// RUN-BINDING mismatch, and neither tree is mutated.
+#[test]
+fn a_destination_ownership_token_refuses_a_derived_destination_shape_swap() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(&dst).unwrap();
+    let src_before = canonicalize_tree(&src).unwrap();
+    let dst_before = canonicalize_tree(&dst).unwrap();
+
+    let ownership = DestinationOwnership::lock(Direction::Push, &src, &transport(&dst))
+        .expect("minting a PUSH token for the destination");
+    let err = sync(
+        Direction::Pull,
+        &src,
+        &transport(&dst),
+        &ReplaceAll,
+        Keep,
+        ownership,
+    )
+    .expect_err("a PUSH token must be refused for a PULL run");
+    assert_eq!(
+        err.error().preflight_reason(),
+        Some(PreflightKind::RunBindingMismatch),
+        "the refusal must be the typed run-binding mismatch: {err:?}"
+    );
+    assert_eq!(
+        canonicalize_tree(&src).unwrap(),
+        src_before,
+        "the refused swap must not mutate the local root"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst).unwrap(),
+        dst_before,
+        "the refused swap must not mutate the transport root"
+    );
+}
+
 /// F1: every sync entry point that reaches the transport runs
 /// [`Remote::prepare_identity`] BEFORE its first remote request.
 ///

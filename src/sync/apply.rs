@@ -2283,9 +2283,9 @@ pub fn sync(
 ) -> SyncResult {
     // The token is BOUND to the run it was acquired for: a token acquired for
     // another direction, another local root, another transport PATH spelling,
-    // or another transport ENDPOINT is refused rather than used, so a caller
-    // cannot take the lock on one destination (or read a plan from one source)
-    // and mutate another.
+    // another transport ENDPOINT, or another transport LOCALNESS is refused
+    // rather than used, so a caller cannot take the lock on one destination
+    // (or read a plan from one source) and mutate another.
     //
     // The FAR-SIDE session lives HERE, in this stack frame, for the whole run
     // (exactly as `HeldLocks` does for the local records), so it is dropped
@@ -2770,17 +2770,30 @@ impl DestinationOwnership {
 /// What a run determines BEFORE the destination lock is taken, so a refusal
 /// leaves no residue and the lock is held only for a run that will proceed.
 ///
-/// The TRANSPORT BINDING is three fields, not one: [`Self::remote_root`] is
-/// the transport's PATH spelling, [`Self::remote_identity`] is its ENDPOINT
-/// (host/port/account), and [`Self::remote_is_local`] is its LOCALNESS. All
-/// three are recorded at acquisition and re-checked against the run's own
-/// transport before anything is mutated, so a token minted against one
-/// transport cannot be replayed against another: a different host is refused
-/// by the root or identity axis, and a NON-LOCAL transport that states NO
-/// identity is refused by the localness axis (the identity comparison alone
-/// cannot see it, because `None` compares equal to `None`). The remote's
-/// localness is a DIFFERENT axis from [`Self::dest_is_local`], which describes
-/// the DESTINATION and is legitimately `true` for a PULL.
+/// [`Prepared::matches`] compares exactly FIVE axes before the run mutates
+/// anything: the DIRECTION, the pinned LOCAL root, and the TRANSPORT BINDING's
+/// three fields — the PATH spelling ([`Self::remote_root`]), the ENDPOINT
+/// ([`Self::remote_identity`]), and the LOCALNESS
+/// ([`Self::remote_is_local`]). The three transport axes are compared for BOTH
+/// directions. The TRANSPORT BINDING is three fields, not one: a different
+/// host is refused by the root or identity axis, and a NON-LOCAL transport
+/// that states NO identity is refused by the localness axis (the identity
+/// comparison alone cannot see it, because `None` compares equal to `None`).
+///
+/// [`Self::dest_root`] and [`Self::dest_is_local`] are the DERIVED
+/// DESTINATION SHAPE. They are recorded at acquisition and read by the locking
+/// and provisioning paths ([`DestinationOwnership::lock`],
+/// [`DestinationOwnership::lock_remote`],
+/// [`DestinationOwnership::lock_with_in_root_lock`], [`lock_destination`],
+/// and [`require_existing_root`]); they are NOT a compared axis of
+/// [`Prepared::matches`]. A replay cannot change the derived destination shape
+/// without changing one of the five compared axes: a PUSH's shape IS the
+/// transport's root spelling and localness (already compared as
+/// [`Self::remote_root`] and [`Self::remote_is_local`]), and a PULL's shape IS
+/// the pinned local root and `true` (already compared as the token's own
+/// [`Self::local`] root). The remote's localness is therefore a DIFFERENT
+/// field from [`Self::dest_is_local`], which describes the DESTINATION and is
+/// legitimately `true` for a PULL.
 struct Prepared {
     direction: Direction,
     local: LocalSide,
@@ -2861,11 +2874,10 @@ impl Prepared {
             ));
         }
         // (4) The transport's LOCALNESS, for BOTH directions. The identity
-        // check above cannot see this when BOTH transports state `None`, and
-        // the derived-destination check below is direction-gated (a PULL's
-        // destination is always local), so this is the ONE axis that keeps a
-        // token minted against a LOCAL source distinct from a NON-LOCAL source
-        // that reports the same root and no identity. This is the token's
+        // check above cannot see this when BOTH transports state `None`, so
+        // this is the ONE axis that keeps a token minted against a LOCAL
+        // source distinct from a NON-LOCAL source that reports the same root
+        // and no identity. This is the token's
         // authority for the binding; the mint-time [`require_endpoint_identity`]
         // stays the authority for "a NON-LOCAL transport must state an identity
         // to MINT at all", so no second check is needed on the run paths.
@@ -2884,30 +2896,6 @@ impl Prepared {
                     } else {
                         "a non-local endpoint"
                     },
-                ),
-            ));
-        }
-        // (5) The derived destination shape: its ROOT, plus its LOCALNESS for
-        // a PUSH (which the check above already covers for the remote). It
-        // remains for the derived ROOT and for the shape recorded at
-        // acquisition.
-        let dest_root = match direction {
-            Direction::Push => remote_root,
-            Direction::Pull => self.local.root_path.clone(),
-        };
-        let dest_is_local = match direction {
-            Direction::Push => remote.is_local(),
-            Direction::Pull => true,
-        };
-        if dest_root != self.dest_root || dest_is_local != self.dest_is_local {
-            return Err(Error::preflight_kind(
-                PreflightKind::RunBindingMismatch,
-                format!(
-                    "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
-                    self.direction,
-                    self.local.root_path.display(),
-                    self.dest_root.display(),
-                    direction
                 ),
             ));
         }

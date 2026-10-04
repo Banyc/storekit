@@ -327,8 +327,13 @@ pub enum PreflightKind {
     /// SOURCE: without this refusal the plan read from the local source is
     /// applied against a different, non-local source.
     RemoteLocalnessMismatch,
-    /// The token was minted for another DIRECTION, another pinned local root,
-    /// or another derived destination shape, so it does not describe this run.
+    /// The token was minted for another DIRECTION or another pinned local
+    /// root, so it does not describe this run. These are the token's two
+    /// non-transport axes. The destination's DERIVED shape is not a separate
+    /// axis: a PUSH's derived destination IS the transport, so its root and
+    /// localness are covered by [`Self::RemoteRootMismatch`] and
+    /// [`Self::RemoteLocalnessMismatch`], and a PULL's derived destination IS
+    /// the pinned local root, covered by this kind.
     RunBindingMismatch,
     /// A REMOTE destination was handed to `DestinationOwnership::lock`, whose
     /// record is a LOCAL sibling file; the far-side constructor
