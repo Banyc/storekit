@@ -105,6 +105,11 @@ Named, scoped, not pursued:
   refusal is computed there and none is implied: a caller that co-locates the two on
   one filesystem enforces disjointness itself. Stated at `src/sync/apply.rs`'s module
   docs.
+- **The count pins pin CALL COUNTS, not arguments.** A change to an argument at a
+  call site inside a reviewed allow region — adding an adoption flag to a
+  `custom_flags` call in a funnel function, say — moves no pinned count, and the
+  deny is allowed there, so no device notices it. The contract's clause (c) is
+  about a changed or ADDED call; an argument change is a review responsibility.
 - **The `std::fs` audit parses the crate's sources.** A value carried across a variable,
   `dyn` dispatch, an `extern "C"` declaration, or a proc-macro expansion is not seen.
 - **Identity injectivity on folding hosts.** The reserved-spelling bookkeeping folds

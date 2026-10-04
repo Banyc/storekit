@@ -158,6 +158,7 @@ refused), not a plain mirror of one tree into another; the substrate's `sync`
 engine cannot express its placement or rendering, so the answer to the step-4
 question for this file is **do not adopt `sync`**.
 
+## How each step was validated
 
 - the crate's gate on BOTH platforms, plus `tests/consumer_fit.rs`, which fails
   to COMPILE if a consumer-required name is removed;
