@@ -29,7 +29,11 @@
 #
 #   * the three MODULE-level funnel modules, each carrying an inner
 #     `#![allow(clippy::disallowed_methods)]`:
-#       src/atomic/unix.rs, src/atomic/mod.rs, src/atomic/windows.rs;
+#       src/atomic/unix.rs, src/atomic/mod.rs, src/atomic/windows.rs.
+#     `src/atomic/guard.rs` does NOT carry its own attribute but is a CHILD of
+#     `src/atomic/mod.rs`, so that module-level allow covers it too (verified:
+#     a `std::fs::write` planted at the top level of guard.rs is not linted);
+#     the atomic module is the funnel and guard.rs is one of its files;
 #   * two ITEM-level capability-gated workers, each reachable only with a
 #     `crate::atomic::GuardedRel<'_>` proof that the reserved-spelling guard ran:
 #       transport::durable_create_new, transport::remove_file_if_inner;
@@ -127,6 +131,50 @@ disallowed-methods = [
   { path = "std::os::unix::fs::symlink", reason = "name creation is funnel-owned; call platform::symlink instead" },
   { path = "std::os::windows::fs::symlink_file", reason = "name creation is funnel-owned; call platform::symlink instead" },
   { path = "std::os::windows::fs::symlink_dir", reason = "name creation is funnel-owned; call platform::symlink instead" },
+  # std::os — the `custom_flags` ADOPTION. On UNIX `custom_flags` forwards
+  # ARBITRARY bits to `open(2)`, and `O_CREAT` through it CREATES a name:
+  # `OpenOptions::new().write(true).custom_flags(O_CREAT).open(p)` adopts `p`
+  # exactly as `.create(true)` does (measured: macOS `O_CREAT` = 512, Linux
+  # x86_64 = 64; both created the name through `custom_flags` alone). On WINDOWS
+  # `custom_flags` forwards ARBITRARY `dwFlagsAndAttributes` bits to
+  # `CreateFileW`, and the creation DISPOSITION is a SEPARATE argument that the
+  # create/create_new/access_mode flags decide — so the Windows form cannot adopt
+  # a name by itself. It is denied for PARITY and defence in depth: the same
+  # builder spelling must not be an unreviewed door to an arbitrary flag class on
+  # a name-taking API, and the two platform forms of one method must not have
+  # different authority.
+  #
+  # It is a TRAIT method, so clippy must be told the RESOLVED trait path; the
+  # crate's surface derivation records the SYNTACTIC builder spelling
+  # `std::fs::OpenOptions::custom_flags`, so
+  # `atomic::guard::tests::reconciled_denied_symbols` maps the two spellings
+  # together and the closure test and the deny agree. A reviewed open that sets
+  # only NON-adopting bits (`O_NOFOLLOW`/`O_CLOEXEC`/`O_NONBLOCK`/
+  # `O_DIRECTORY`/`FILE_FLAG_OPEN_REPARSE_POINT`/
+  # `FILE_FLAG_BACKUP_SEMANTICS`) carries an item-level `#[allow]` (or sits
+  # inside the `atomic` funnel module, whose allow covers it).
+  { path = "std::os::unix::fs::OpenOptionsExt::custom_flags", reason = "custom_flags forwards arbitrary open(2) bits; O_CREAT through it adopts a name — call the guarded atomic primitive instead" },
+  { path = "std::os::windows::fs::OpenOptionsExt::custom_flags", reason = "custom_flags forwards arbitrary CreateFile flag bits on a name-taking API; denied for parity with the Unix adoption form" },
+  # std::os — the PATHNAME-SOCKET binds. `bind` on a Unix-domain listener or
+  # datagram creates a directory entry at the bound path, so it is a name
+  # ADOPTION in the same class as `create_dir`/`symlink`; a production module
+  # could otherwise bind a socket at a reserved spelling with every device green.
+  # There is no stable `std` pathname-socket creator on Windows (named pipes are
+  # raw `windows_sys`/`winapi` calls), which is stated as a NAMED RESIDUAL below.
+  { path = "std::os::unix::net::UnixListener::bind", reason = "a pathname-socket bind creates a directory entry; call the guarded atomic primitive instead" },
+  { path = "std::os::unix::net::UnixDatagram::bind", reason = "a pathname-socket bind creates a directory entry; call the guarded atomic primitive instead" },
+  #
+  # NAMED RESIDUAL OF THE COMPLETENESS CLAIM (round 8, P2-A): the deny list is a
+  # list of RESOLVED `std`/`libc` symbols. A Windows named-pipe creator
+  # (`CreateNamedPipeW`) or a raw `CreateFileW`/`NtCreateFile` reached through
+  # `windows_sys` is NOT a `std` symbol, so this lint does not name it and the
+  # `libc` belt (which is libc-specific) does not either. The crate's own
+  # `windows_sys` uses today are non-adopting (`GetFileInformationByHandle`,
+  # `LockFileEx`/`UnlockFileEx`), and Rust's stable `std` exposes no named-pipe
+  # creator, so the reach is "a raw Win32 creator the crate would have to add" —
+  # the same reach as the raw `extern "C"` declaration residue in
+  # `src/atomic/guard.rs`'s module docs. It is named here rather than left
+  # unmentioned.
   # libc — the POSIX name-mutation syscalls the funnel wraps as `*at` calls.
   { path = "libc::unlink", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::unlinkat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },

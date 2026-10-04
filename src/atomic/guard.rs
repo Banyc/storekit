@@ -117,6 +117,24 @@
 //! rather than denies. A foreign process, or a raw `std::fs` call the caller
 //! writes itself, is outside the crate entirely and is not stopped by any of
 //! this.
+//!
+//! TWO name-ADOPTING forms joined the deny list in round 8 and are NOT residue:
+//! `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags` (on Unix it
+//! forwards ARBITRARY `open(2)` bits and `O_CREAT` through it creates a name;
+//! on Windows it forwards `dwFlagsAndAttributes`, where the creation
+//! disposition is a separate argument, so the Windows form is denied for parity
+//! rather than adoption) and `std::os::unix::net::{UnixListener,UnixDatagram}::bind`
+//! (a pathname-socket bind creates a directory entry). One NAMED RESIDUAL remains,
+//! stated rather than implied: the deny list names RESOLVED `std`/`libc`
+//! symbols, so a Windows named-pipe creator (`CreateNamedPipeW`) or a raw
+//! `CreateFileW`/`NtCreateFile` reached through `windows_sys` is outside the
+//! clippy deny (and the `libc` belt is libc-specific). Rust's stable `std`
+//! exposes no named-pipe creator, and the crate's own `windows_sys` uses today
+//! are non-adopting (`GetFileInformationByHandle`, `LockFileEx`/`UnlockFileEx`),
+//! so the reach is "a raw Win32 creator the crate would have to add" — the same
+//! reach as the raw `extern "C"` declaration above. The residual is repeated at
+//! the deny list in `clippy.toml` so the completeness claim and the lint agree
+//! about what they do not cover.
 
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
@@ -146,6 +164,14 @@ pub(crate) fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentit
     }
 }
 
+// NON-ADOPTING `custom_flags` SITE, inside the FUNNEL: the flags are
+// `FILE_FLAG_OPEN_REPARSE_POINT` on a READ-ONLY open (`read(true)` +
+// `share_mode`, no `create`/`create_new`), so no name is created and no
+// creation flag is among the forwarded bits. This file is a CHILD of
+// `atomic/mod.rs`, whose module-level `#![allow(clippy::disallowed_methods)]`
+// already covers every item here, so no item-level attribute is needed (and
+// adding one would be dead weight); a move of this function OUT of the module
+// would leave it correctly un-allowed.
 #[cfg(windows)]
 pub(crate) fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -674,6 +700,14 @@ mod tests {
         "mkfifoat",
         "clonefile",
         "clonefileat",
+        // `bind` on an `AF_UNIX` pathname socket CREATES a directory entry at
+        // the bound path (the raw-syscall twin of
+        // `std::os::unix::net::UnixListener::bind`, which `clippy.toml` denies).
+        // For an `AF_INET` bind no name is created, so the belt's refusal
+        // outside the funnel is CONSERVATIVE (it refuses the symbol, not the
+        // address family) — the safe direction, and the crate references no
+        // `libc::bind` today.
+        "bind",
         // NAME-ATTACHED METADATA
         "chmod",
         "fchmod",
@@ -741,18 +775,74 @@ mod tests {
         "getgroups",
     ];
 
+    /// The namespace-relative KEY the pin uses for a resolved CALL target, and
+    /// the membership test that decides whether the pin's syntactic resolver is
+    /// allowed to attribute a call to a `clippy.toml` entry at all.
+    ///
+    /// The namespaces are exactly the ones the resolver produces:
+    ///
+    /// * `std::fs::…` — the free functions (`std::fs::remove_file`), the
+    ///   inherent ASSOCIATED functions (`std::fs::File::create`), and the
+    ///   BUILDER methods the method arm attributes to an
+    ///   `OpenOptions`/`DirBuilder` owner (`std::fs::OpenOptions::create`);
+    ///   the key is the path after `std::fs::`;
+    /// * `std::os::{unix,windows}::fs::symlink*` — the platform symlink
+    ///   creators, whose key is the bare symbol (`symlink`, `symlink_file`,
+    ///   `symlink_dir`);
+    /// * `std::os::{unix,windows}::net::{UnixListener,UnixDatagram}::bind` —
+    ///   the pathname-socket binds, whose key is `UnixListener::bind` /
+    ///   `UnixDatagram::bind`.
+    ///
+    /// An entry OUTSIDE these namespaces is not attributable by the syntactic
+    /// resolver and is deliberately EXCLUDED from the pin. `libc::…` is the one
+    /// such family, and it has its OWN device — the per-module surface pin
+    /// [`no_libc_reference_outside_the_funnel`] plus the derived belt — so a
+    /// `libc` entry is not double-counted here.
+    fn pin_key_for(segments: &[String]) -> Option<String> {
+        let skip = match segments {
+            [std, fs, ..] if std == "std" && fs == "fs" => 2,
+            [std, os, unix_or_windows, fs, ..]
+                if std == "std"
+                    && os == "os"
+                    && (unix_or_windows == "unix" || unix_or_windows == "windows")
+                    && fs == "fs" =>
+            {
+                match segments.last().map(String::as_str) {
+                    Some("symlink" | "symlink_file" | "symlink_dir") => 4,
+                    _ => return None,
+                }
+            }
+            [std, os, unix_or_windows, net, kind, bind]
+                if std == "std"
+                    && os == "os"
+                    && (unix_or_windows == "unix" || unix_or_windows == "windows")
+                    && net == "net"
+                    && (kind == "UnixListener" || kind == "UnixDatagram")
+                    && bind == "bind" =>
+            {
+                4
+            }
+            _ => return None,
+        };
+        Some(segments[skip..].join("::"))
+    }
+
     /// Every `std` symbol whose denial the funnel owns, as its CANONICAL path
     /// (the path the crate's own name resolution produces) paired with the
-    /// short symbol name used in the pins. It is one table so the count pin,
-    /// the import-route detector, the macro-token scan, and the canonical-
+    /// namespace-relative KEY used in the pins. It is one table so the count
+    /// pin, the import-route detector, the macro-token scan, and the canonical-
     /// spelling test cannot drift apart:
     ///
     /// * the inode mutators that REMOVE or REPLACE an entry (`remove_file`,
     ///   `remove_dir`, `remove_dir_all`, `rename`, `hard_link`);
     /// * the CREATORS that ADOPT a name (`std::fs::create_dir`,
-    ///   `std::fs::create_dir_all`, and the platform symlink creators, which
-    ///   live under `std::os::…` and are therefore keyed by their full path);
-    /// * the path-based mode setter `std::fs::set_permissions`.
+    ///   `std::fs::create_dir_all`, the platform symlink creators, which live
+    ///   under `std::os::…`, and the pathname-socket binds);
+    /// * the path-based mode setter `std::fs::set_permissions`;
+    /// * the INHERENT/ASSOCIATED and BUILDER spellings of the same adoption
+    ///   (`std::fs::File::create`/`create_new`, `std::fs::OpenOptions::create`/
+    ///   `create_new`, `std::fs::DirBuilder::create`, `std::fs::copy`,
+    ///   `std::fs::write`).
     ///
     /// The creators are here because the guard's reserved-spelling check is
     /// what makes a name-creating call safe: a creation bypasses that check
@@ -760,27 +850,45 @@ mod tests {
     /// reserved spellings (`operation.lock`, `.sync-aside.1`) that
     /// `std::fs::create_dir*` and the platform symlink calls would happily
     /// create.
-    const NAME_MUTATION_SYMBOLS: &[(&[&str], &str)] = &[
-        (&["std", "fs", "remove_file"], "remove_file"),
-        (&["std", "fs", "remove_dir"], "remove_dir"),
-        (&["std", "fs", "remove_dir_all"], "remove_dir_all"),
-        (&["std", "fs", "rename"], "rename"),
-        (&["std", "fs", "hard_link"], "hard_link"),
-        (&["std", "fs", "create_dir"], "create_dir"),
-        (&["std", "fs", "create_dir_all"], "create_dir_all"),
-        (&["std", "fs", "set_permissions"], "set_permissions"),
-        (&["std", "os", "unix", "fs", "symlink"], "symlink"),
-        (
-            &["std", "os", "windows", "fs", "symlink_file"],
-            "symlink_file",
-        ),
-        (
-            &["std", "os", "windows", "fs", "symlink_dir"],
-            "symlink_dir",
-        ),
-    ];
+    ///
+    /// DERIVED, NOT HAND-KEPT. The set is read out of `clippy.toml`'s
+    /// `disallowed-methods` list by [`reconciled_denied_symbols`] — the same
+    /// file the compiler reads — through [`pin_key_for`]. A name-mutating entry
+    /// added to `clippy.toml` therefore enters the pin AUTOMATICALLY, so the
+    /// cross-artifact completeness device and the count pin cannot drift: the
+    /// failure mode this replaces was seven adopting symbols the lint denied
+    /// but the pin did not count.
+    fn name_mutation_symbols() -> &'static BTreeMap<&'static str, Vec<String>> {
+        static TABLE: std::sync::OnceLock<BTreeMap<&'static str, Vec<String>>> =
+            std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            let mut table: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+            for path in reconciled_denied_symbols() {
+                let segments: Vec<String> = path.split("::").map(str::to_string).collect();
+                let Some(key) = pin_key_for(&segments) else {
+                    continue;
+                };
+                let key: &'static str = Box::leak(key.into_boxed_str());
+                if let Some(previous) = table.insert(key, segments.clone()) {
+                    panic!(
+                        "the derived name-mutation table maps {key:?} to BOTH {previous:?} and \
+                         {segments:?}; the pin keys must be unique, or a count would merge two \
+                         distinct symbols"
+                    );
+                }
+            }
+            assert!(
+                table.contains_key("remove_file")
+                    && table.contains_key("File::create")
+                    && table.contains_key("write"),
+                "the derived name-mutation table must cover the removal, the inherent-adoption, \
+                 and the free-adoption families: {table:?}"
+            );
+            table
+        })
+    }
 
-    /// A production route by which one of [`NAME_MUTATION_SYMBOLS`] can be
+    /// A production route by which one of [`name_mutation_symbols`] can be
     /// reached WITHOUT spelling its canonical path, so the exact-count pin
     /// alone cannot see it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1008,17 +1116,19 @@ mod tests {
     }
 
     /// The canonical `std` name-mutation symbol `path` names, if any, from
-    /// [`NAME_MUTATION_SYMBOLS`]: `std::fs::remove_file`, `std::fs::create_dir`,
-    /// `std::os::unix::fs::symlink`, … — one table, so the count pin, the route
-    /// detector, and the canonical-spelling test cannot drift apart.
+    /// [`name_mutation_symbols`]: `std::fs::remove_file`, `std::fs::create_dir`,
+    /// `std::os::unix::fs::symlink`, …, but equally the adopting spellings the
+    /// pin used to miss (`std::fs::File::create`, `std::fs::write`). The table
+    /// is DERIVED from `clippy.toml`, so the count pin, the route detector, the
+    /// canonical-spelling test, and the deny list cannot drift apart.
     fn mutator_symbol(path: &[String]) -> Option<&'static str> {
-        NAME_MUTATION_SYMBOLS.iter().find_map(|(segments, symbol)| {
-            (path.len() == segments.len()
-                && path
+        name_mutation_symbols().iter().find_map(|(key, canonical)| {
+            (canonical.len() == path.len()
+                && canonical
                     .iter()
-                    .zip(segments.iter())
-                    .all(|(actual, expected)| actual.as_str() == *expected))
-            .then_some(*symbol)
+                    .zip(path.iter())
+                    .all(|(expected, actual)| expected == actual))
+            .then_some(*key)
         })
     }
 
@@ -1037,18 +1147,17 @@ mod tests {
     }
 
     /// Whether the WRITTEN path is already the canonical spelling of
-    /// `symbol` (one of [`NAME_MUTATION_SYMBOLS`]) — `std::fs::remove_file`,
+    /// `symbol` (one of [`name_mutation_symbols`]) — `std::fs::remove_file`,
     /// but equally `std::os::unix::fs::symlink` — which the exact-count pin
     /// covers, or reaches the mutator only through an import / alias /
     /// cross-file re-export.
     fn is_canonical_literal(segments: &[String], symbol: &str) -> bool {
-        NAME_MUTATION_SYMBOLS.iter().any(|(path, name)| {
-            *name == symbol
-                && path.len() == segments.len()
+        name_mutation_symbols().get(symbol).is_some_and(|path| {
+            path.len() == segments.len()
                 && segments
                     .iter()
                     .zip(path.iter())
-                    .all(|(actual, expected)| actual.as_str() == *expected)
+                    .all(|(actual, expected)| actual == expected)
         })
     }
 
@@ -1462,6 +1571,12 @@ mod tests {
         index: &'a FsIndex,
         file: String,
         module: CanonPath,
+        /// Per-block `let` bindings that resolve to an `OpenOptions`/`DirBuilder`
+        /// builder, so a SPLIT builder spelling (`let mut o =
+        /// OpenOptions::new(); o.create(true)`) is attributed to the same owner
+        /// as a chained one — the same machinery the closure derivation uses,
+        /// via [`builder_owner`].
+        locals: Vec<BTreeMap<String, String>>,
         calls: BTreeMap<(String, &'static str), usize>,
         routes: BTreeSet<Violation>,
     }
@@ -1472,6 +1587,7 @@ mod tests {
                 index,
                 file: file.to_string(),
                 module,
+                locals: Vec::new(),
                 calls: BTreeMap::new(),
                 routes: BTreeSet::new(),
             }
@@ -1538,6 +1654,45 @@ mod tests {
             syn::visit::visit_expr_call(self, call);
         }
 
+        /// The BUILDER-METHOD arm of the count pin: the ADOPTION decision of
+        /// `OpenOptions::create`/`create_new` (and the `custom_flags` bit that
+        /// can forward `O_CREAT`) is a METHOD on the builder, not a path callee,
+        /// so [`Self::visit_expr_call`] cannot see it. The owner comes from
+        /// [`builder_owner`], the SAME resolver the closure derivation uses, so
+        /// the closure and the pin cannot disagree about which method a symbol
+        /// is. A generic `OpenOptions::new()` symbol is NOT a mutator and is not
+        /// counted; only a member of the DERIVED table is.
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if let Some(owner) =
+                builder_owner(self.index, &self.module, &self.locals, &call.receiver)
+            {
+                let segments: Vec<String> =
+                    ["std", "fs", owner.as_str(), unraw(&call.method).as_str()]
+                        .iter()
+                        .map(|segment| (*segment).to_string())
+                        .collect();
+                if let Some(symbol) = mutator_symbol(&segments) {
+                    *self.calls.entry((self.file.clone(), symbol)).or_default() += 1;
+                }
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+
+        /// A fresh `let`-binding scope per block, matching the closure
+        /// derivation: a binding recorded by [`Self::visit_local`] is visible
+        /// only inside its block, so a sibling function's same-named local
+        /// cannot mis-attribute a `create`/`custom_flags` call.
+        fn visit_block(&mut self, block: &'ast syn::Block) {
+            self.locals.push(BTreeMap::new());
+            syn::visit::visit_block(self, block);
+            self.locals.pop();
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            record_builder_local(self.index, &self.module, &mut self.locals, local);
+            syn::visit::visit_local(self, local);
+        }
+
         fn visit_path(&mut self, path: &'ast syn::Path) {
             let segments = path_segments(path);
             let canonical = self.index.resolve_path(&self.module, &segments);
@@ -1581,7 +1736,7 @@ mod tests {
     }
 
     /// Reports a `std::fs` inode-mutating CALL or PATH in PRODUCTION code that
-    /// reaches one of [`NAME_MUTATION_SYMBOLS`] through an ENUMERATED route the
+    /// reaches one of [`name_mutation_symbols`] through an ENUMERATED route the
     /// exact-count pin does not cover: an IMPORTED symbol, a MODULE ALIAS
     /// (including a `std`-crate-ROOT alias and a cross-file `pub(crate)`
     /// re-export resolved through the module graph), or a glob. It is not a
@@ -2762,18 +2917,29 @@ mod tests {
     /// the file's location and the location-derived alias table would be wrong.
     ///
     /// COUNT METHOD: a resolved production CALL — an `ExprCall` whose callee
-    /// path resolves to `std::fs::<symbol>` — is one occurrence for that file
-    /// and symbol, and a canonical `std::fs::<symbol>` token sequence inside a
-    /// macro's tokens is one more. This is a SUPERSET of the old byte count,
-    /// which saw only the literal `std::fs::<symbol>(` text: every occurrence
-    /// the byte count saw — including one inside a `macro_rules!` body — is
-    /// seen here too, plus resolved aliases and parenthesized/referenced direct
-    /// callees. It is NOT a superset of every possible call: a mutator reached
-    /// inside a macro through an alias, or a call through a function-pointer
-    /// variable, is not counted (see RESIDUE), so adding such a call does not
-    /// change a count. Every current production call is canonical or in an
-    /// ordinary macro body, so the pinned values are unchanged; a change here is
-    /// a deliberate, reviewed addition recorded at the pin.
+    /// path resolves to a pinned symbol — is one occurrence for that file and
+    /// symbol; a canonical `std::fs::<symbol>` token sequence inside a macro's
+    /// tokens is one more; and a BUILDER METHOD call (`OpenOptions::create`,
+    /// `DirBuilder::create`, `custom_flags`) whose receiver chain or enclosing
+    /// `let` binding resolves to an `OpenOptions`/`DirBuilder` owner is one
+    /// more, attributed by the SAME [`builder_owner`] the closure derivation
+    /// uses. This is a SUPERSET of the old byte count, which saw only the
+    /// literal `std::fs::<symbol>(` text: every occurrence the byte count saw —
+    /// including one inside a `macro_rules!` body — is seen here too, plus
+    /// resolved aliases, parenthesized/referenced direct callees, and the
+    /// inherent/builder adoption forms. It is NOT a superset of every possible
+    /// call: a mutator reached inside a macro through an alias, or a call
+    /// through a function-pointer variable, is not counted (see RESIDUE), so
+    /// adding such a call does not change a count.
+    ///
+    /// SYMBOL SET: DERIVED from `clippy.toml` ([`name_mutation_symbols`]), not
+    /// hand-kept — the round-8 finding was seven ADOPTING symbols the lint
+    /// denied but a hand-kept table did not count, so a funnel-module call to
+    /// one left this pin green. A new deny entry now changes this pin
+    /// automatically. The pinned VALUES changed in round 8 for exactly that
+    /// reason (`create_new`, `create`, `custom_flags`, and `write` calls that
+    /// were always there are now counted); each new value is a deliberate,
+    /// reviewed entry recorded at the pin with its reason.
     ///
     /// EXEMPTION: a file is test-only iff its FIRST path component is one of the
     /// crate-root directories `tests/` / `benches/` / `examples/` (and the path
@@ -2896,6 +3062,55 @@ mod tests {
             ("src/transport/mod.rs", "create_dir_all", 5),
             ("src/transport/ssh/hostkey.rs", "create_dir_all", 1),
             ("src/transport/ssh/mod.rs", "create_dir_all", 1),
+            // --- The ADOPTION family the pin MISSED before round 8 (P1-A).
+            // These symbols were on `clippy.toml`'s deny list but NOT in the
+            // hand-kept pin table, so a call to one INSIDE a funnel module —
+            // where the module-level `#[allow]` blinds the lint — left the count
+            // pin green. The pin's table is now DERIVED from `clippy.toml`
+            // ([`name_mutation_symbols`] -> [`reconciled_denied_symbols`] ->
+            // [`denied_symbols_from_clippy_toml`]), so these entries appear
+            // automatically and every future deny entry does too. Each site is
+            // either a funnel module (module-level allow) or an item-level
+            // allow reviewed for the creation it performs. (`File::create` and
+            // `std::fs::copy` are in the derived set but have NO production
+            // call, so they are absent here by construction — the pin lists
+            // nonzero counts only.)
+            //
+            // `create_new` (O_EXCL creation — "create a name, FAIL if it
+            // exists"): the temp create in `write_atomic_replace` (unix +
+            // windows), `copy_tree_verbatim`'s destination create (unix +
+            // windows), windows' `write_file_new_fd`, the transport's
+            // `durable_create_new` + its own temp create, and the known-hosts
+            // pin. All run inside the funnel or under an item-level allow.
+            ("src/atomic/unix.rs", "OpenOptions::create_new", 2),
+            ("src/atomic/windows.rs", "OpenOptions::create_new", 4),
+            ("src/transport/mod.rs", "OpenOptions::create_new", 2),
+            ("src/transport/ssh/hostkey.rs", "OpenOptions::create_new", 1),
+            // `OpenOptions::create`: the LOCK PROTOCOL's own record open
+            // (creating the record on first use), item-level allowed in each
+            // port and refusing a symlink/reparse point at the record spelling.
+            ("src/lock/unix.rs", "OpenOptions::create", 1),
+            ("src/lock/windows.rs", "OpenOptions::create", 1),
+            // `custom_flags`: the reviewed NON-ADOPTING opens that forward only
+            // no-create bits (`O_NOFOLLOW`/`O_CLOEXEC`/`O_NONBLOCK`/
+            // `O_DIRECTORY`/`FILE_FLAG_OPEN_REPARSE_POINT`/
+            // `FILE_FLAG_BACKUP_SEMANTICS`) — the same reviewed sites that carry
+            // the item-level allow for the crate-wide deny. The ADOPTING
+            // `custom_flags(O_CREAT)` form is what round 8 (P1-B) proved was
+            // reachable with every gate green.
+            ("src/atomic/guard.rs", "OpenOptions::custom_flags", 1),
+            ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
+            ("src/atomic/unix.rs", "OpenOptions::custom_flags", 1),
+            ("src/atomic/windows.rs", "OpenOptions::custom_flags", 1),
+            ("src/lock/unix.rs", "OpenOptions::custom_flags", 1),
+            ("src/lock/windows.rs", "OpenOptions::custom_flags", 1),
+            ("src/transport/mod.rs", "OpenOptions::custom_flags", 1),
+            // `std::fs::write` (create-or-truncate, which ADOPTS an absent
+            // name): the Windows `write_file_fd`, which runs
+            // `refuse_reserved_mutation` first and preserves the inode of an
+            // EXISTING entry. Unix's `write_file_fd` writes through the
+            // descriptor, so it has no `std::fs::write` and does not appear.
+            ("src/atomic/windows.rs", "write", 1),
         ];
         let expected: BTreeMap<(String, &'static str), usize> = expected
             .iter()
@@ -2906,6 +3121,104 @@ mod tests {
             "the PRODUCTION `std::fs` mutation counts changed: a new (or removed) removal, \
              creation, or mode call must be reviewed for the lock-record guard — if the new call \
              cannot name the record, update this pin; test-only calls are excluded by construction"
+        );
+    }
+
+    /// ROUND-8 P1-A REGRESSION: the count pin's symbol set is DERIVED from
+    /// `clippy.toml`, so every ADOPTING symbol the lint denies is counted even
+    /// inside a funnel module, where the module-level `#[allow]` blinds the
+    /// lint. Before this arm, seven adopting symbols were denied by the lint but
+    /// absent from the hand-kept pin table: a funnel-module call to one changed
+    /// no count. The CONTROL is a read-only symbol the deny list does NOT name —
+    /// it must change no count, so this is not merely "count every `std::fs`
+    /// call".
+    #[test]
+    fn the_count_pin_sees_every_adopting_symbol_the_deny_names() {
+        // (1) The two devices cannot drift: every pin-attributable `clippy.toml`
+        // deny entry is in the derived table, mapped to its canonical path.
+        let table = name_mutation_symbols();
+        for path in reconciled_denied_symbols() {
+            let segments: Vec<String> = path.split("::").map(str::to_string).collect();
+            if let Some(key) = pin_key_for(&segments) {
+                assert_eq!(
+                    table.get(key.as_str()),
+                    Some(&segments),
+                    "clippy.toml denies {path} but the derived pin table does not map {key:?} to \
+                     it: {table:?}"
+                );
+            }
+        }
+        assert!(
+            !table.contains_key("read"),
+            "a read-only symbol the deny list does not name must NOT enter the pin: {table:?}"
+        );
+
+        // (2) Each adopting spelling planted in a FUNNEL module (module-level
+        // `#[allow]`) is counted — the exact configuration the lint cannot see.
+        let funnel = |body: &str| {
+            let files = vec![(
+                "src/prod/funnel.rs".to_string(),
+                format!("#![allow(clippy::disallowed_methods)]\n{body}"),
+            )];
+            std_fs_audit(&files, &BTreeSet::new()).1
+        };
+        for (label, body, key) in [
+            (
+                "File::create",
+                "fn f(p: &Path) -> std::io::Result<()> { let _ = std::fs::File::create(p)?; Ok(()) }",
+                "File::create",
+            ),
+            (
+                "File::create_new",
+                "fn f(p: &Path) -> std::io::Result<()> { let _ = std::fs::File::create_new(p)?; \
+                 Ok(()) }",
+                "File::create_new",
+            ),
+            (
+                "OpenOptions::create (chain)",
+                "fn f(p: &Path) -> std::io::Result<()> { let _ = \
+                 std::fs::OpenOptions::new().write(true).create(true).open(p)?; Ok(()) }",
+                "OpenOptions::create",
+            ),
+            (
+                "OpenOptions::create_new (split local)",
+                "fn f(p: &Path) -> std::io::Result<()> { let mut o = std::fs::OpenOptions::new(); \
+                 o.write(true).create_new(true); let _ = o.open(p)?; Ok(()) }",
+                "OpenOptions::create_new",
+            ),
+            (
+                "DirBuilder::create",
+                "fn f(p: &Path) -> std::io::Result<()> { std::fs::DirBuilder::new().create(p)?; \
+                 Ok(()) }",
+                "DirBuilder::create",
+            ),
+            (
+                "std::fs::copy",
+                "fn f(a: &Path, b: &Path) -> std::io::Result<()> { std::fs::copy(a, b)?; Ok(()) }",
+                "copy",
+            ),
+            (
+                "std::fs::write",
+                "fn f(p: &Path) -> std::io::Result<()> { std::fs::write(p, b\"x\")?; Ok(()) }",
+                "write",
+            ),
+        ] {
+            let counts = funnel(body);
+            assert_eq!(
+                counts
+                    .get(&("src/prod/funnel.rs".to_string(), key))
+                    .copied(),
+                Some(1),
+                "the count pin must see {label} planted in a funnel module: {counts:?}"
+            );
+        }
+
+        // (3) CONTROL: a read-only call changes no count.
+        let counts =
+            funnel("fn f(p: &Path) -> std::io::Result<()> { let _ = std::fs::read(p)?; Ok(()) }");
+        assert!(
+            counts.is_empty(),
+            "a read-only `std::fs::read` must not be counted: {counts:?}"
         );
     }
 
@@ -3582,7 +3895,7 @@ mod tests {
     ///
     /// TWO more families joined this list when the surface derivation learned
     /// to see inherent forms. The `OpenOptions` BUILDER surface
-    /// (`new`/`read`/`write`/`custom_flags`/`share_mode`/`open`) is here because
+    /// (`new`/`read`/`write`/`share_mode`/`open`) is here because
     /// the ADOPTION decision is the `create`/`create_new` FLAG, which IS denied
     /// (`std::fs::OpenOptions::create`, `.create_new`); the constructor, the
     /// configuration setters, and the terminal `open` cannot adopt a name on
@@ -3592,6 +3905,15 @@ mod tests {
     /// `std::fs::File::from` — an `OwnedFd`→`File` conversion;
     /// `std::fs::Permissions::from_mode` — a mode-VALUE construction) touches no
     /// name at all.
+    ///
+    /// `std::fs::OpenOptions::custom_flags` is deliberately NOT here. It
+    /// forwards ARBITRARY bits to `open(2)`/`CreateFile`, and `O_CREAT` through
+    /// it ADOPTS a name, so it is DENIED crate-wide as the resolved trait
+    /// methods `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`. The
+    /// round-8 finding was that this list carried the synthetic spelling with a
+    /// comment claiming the method "cannot adopt": both the entry and the
+    /// reason were false. Reviewed non-adopting sites now carry an item-level
+    /// `#[allow]` instead, exactly as `set_permissions` does.
     const FUNNEL_SYMBOLS_NOT_DENIED: &[&str] = &[
         "std::fs::read",
         "std::fs::read_to_string",
@@ -3605,7 +3927,6 @@ mod tests {
         "std::fs::OpenOptions::new",
         "std::fs::OpenOptions::read",
         "std::fs::OpenOptions::write",
-        "std::fs::OpenOptions::custom_flags",
         "std::fs::OpenOptions::share_mode",
         "std::fs::OpenOptions::open",
         // `std::os::unix::fs::OpenOptionsExt::mode` and `OpenOptions::truncate`,
@@ -3638,14 +3959,17 @@ mod tests {
     /// (`std::fs::File::create`, `std::fs::OpenOptions::new`), and the builder
     /// methods the [`FunnelSymbols`] method arm records as
     /// `std::fs::OpenOptions::create` — a
-    /// `std::os::{unix,windows}::fs::<symlink*>` creator, or a `libc::<fn>`.
+    /// `std::os::{unix,windows}::fs::<symlink*>` creator, a
+    /// `std::os::{unix,windows}::net::{UnixListener,UnixDatagram}::bind`
+    /// pathname-socket creator, or a `libc::<fn>`.
     ///
     /// The segment count of the `std::fs` arm is deliberately NOT pinned to
     /// three: the completeness device's escaping spellings are the INHERENT
     /// forms (`File::create`, `OpenOptions::create`), whose canonical paths
     /// are four segments, so a length filter would exclude exactly the class
-    /// this arm must see. The `std::os` arm keeps its `unix`/`windows` gate so
-    /// a deeper unrelated `std::os` path cannot be mistaken for a creator.
+    /// this arm must see. The `std::os` arms keep their `unix`/`windows` gate
+    /// and their `fs`/`net` discriminator, so a deeper unrelated `std::os`
+    /// path cannot be mistaken for a creator.
     fn funnel_symbol(canonical: &[String]) -> Option<String> {
         if canonical.len() >= 3 && canonical[0] == "std" && canonical[1] == "fs" {
             return Some(canonical.join("::"));
@@ -3655,6 +3979,19 @@ mod tests {
             && canonical[1] == "os"
             && (canonical[2] == "unix" || canonical[2] == "windows")
             && canonical[3] == "fs"
+        {
+            return Some(canonical.join("::"));
+        }
+        // The pathname-socket bind: a `net` creator that ADOPTS a directory
+        // entry, so the closure MUST be able to see it if the funnel ever
+        // spells one (round 8, P2-A).
+        if canonical.len() == 6
+            && canonical[0] == "std"
+            && canonical[1] == "os"
+            && (canonical[2] == "unix" || canonical[2] == "windows")
+            && canonical[3] == "net"
+            && (canonical[4] == "UnixListener" || canonical[4] == "UnixDatagram")
+            && canonical[5] == "bind"
         {
             return Some(canonical.join("::"));
         }
@@ -3755,43 +4092,72 @@ mod tests {
         locals: Vec<BTreeMap<String, String>>,
     }
 
+    /// The `std::fs` builder owner (`OpenOptions` / `DirBuilder`) of a
+    /// receiver expression, if any. It walks a method/call chain down to its
+    /// root and resolves that root through the alias table OR the enclosing
+    /// blocks' `let` bindings, so a builder reached through a local (`let mut o
+    /// = OpenOptions::new();`) is the same owner as one reached through a chain
+    /// (`OpenOptions::new().create(true)`).
+    ///
+    /// SHARED by the closure derivation ([`FunnelSymbols`]) and the count pin
+    /// ([`FsVisitor`]): both must attribute a builder METHOD to the same owner,
+    /// or the closure and the pin would see different symbol sets for one
+    /// spelling.
+    fn builder_owner(
+        index: &FsIndex,
+        module: &[String],
+        locals: &[BTreeMap<String, String>],
+        expr: &syn::Expr,
+    ) -> Option<String> {
+        match expr {
+            syn::Expr::MethodCall(inner) => is_builder_config_method(&unraw(&inner.method))
+                .then(|| builder_owner(index, module, locals, &inner.receiver))
+                .flatten(),
+            syn::Expr::Call(call) => {
+                let path = callee_path(&call.func)?;
+                let canonical = index.resolve_path(module, &path_segments(path));
+                builder_type(&canonical)
+            }
+            syn::Expr::Path(path) if path.qself.is_none() => {
+                let segments = path_segments(&path.path);
+                if segments.len() == 1 {
+                    for scope in locals.iter().rev() {
+                        if let Some(owner) = scope.get(&segments[0]) {
+                            return Some(owner.clone());
+                        }
+                    }
+                }
+                let canonical = index.resolve_path(module, &segments);
+                builder_type(&canonical)
+            }
+            _ => None,
+        }
+    }
+
+    /// Record `local`'s `let` binding as a builder local if its initializer
+    /// resolves to an `OpenOptions`/`DirBuilder` chain. Shared by
+    /// [`FunnelSymbols`] and [`FsVisitor`] for the same reason as
+    /// [`builder_owner`].
+    fn record_builder_local(
+        index: &FsIndex,
+        module: &[String],
+        locals: &mut [BTreeMap<String, String>],
+        local: &syn::Local,
+    ) {
+        if let Some(init) = &local.init
+            && let syn::Pat::Ident(pat) = &local.pat
+            && let Some(owner) = builder_owner(index, module, locals, &init.expr)
+            && let Some(scope) = locals.last_mut()
+        {
+            scope.insert(unraw(&pat.ident), owner);
+        }
+    }
+
     impl FunnelSymbols<'_> {
         fn record(&mut self, segments: &[String]) {
             let canonical = self.index.resolve_path(&self.module, segments);
             if let Some(symbol) = funnel_symbol(&canonical) {
                 self.used.insert(symbol);
-            }
-        }
-
-        /// The `std::fs` builder owner (`OpenOptions` / `DirBuilder`) of a
-        /// receiver expression, if any. It walks a method/call chain down to
-        /// its root and resolves that root through the alias table OR the
-        /// enclosing blocks' `let` bindings, so a builder reached through a
-        /// local (`let mut o = OpenOptions::new();`) is the same owner as one
-        /// reached through a chain (`OpenOptions::new().create(true)`).
-        fn builder_owner(&self, expr: &syn::Expr) -> Option<String> {
-            match expr {
-                syn::Expr::MethodCall(inner) => is_builder_config_method(&unraw(&inner.method))
-                    .then(|| self.builder_owner(&inner.receiver))
-                    .flatten(),
-                syn::Expr::Call(call) => {
-                    let path = callee_path(&call.func)?;
-                    let canonical = self.index.resolve_path(&self.module, &path_segments(path));
-                    builder_type(&canonical)
-                }
-                syn::Expr::Path(path) if path.qself.is_none() => {
-                    let segments = path_segments(&path.path);
-                    if segments.len() == 1 {
-                        for scope in self.locals.iter().rev() {
-                            if let Some(owner) = scope.get(&segments[0]) {
-                                return Some(owner.clone());
-                            }
-                        }
-                    }
-                    let canonical = self.index.resolve_path(&self.module, &segments);
-                    builder_type(&canonical)
-                }
-                _ => None,
             }
         }
     }
@@ -3866,13 +4232,7 @@ mod tests {
         }
 
         fn visit_local(&mut self, local: &'ast syn::Local) {
-            if let Some(init) = &local.init
-                && let syn::Pat::Ident(pat) = &local.pat
-                && let Some(owner) = self.builder_owner(&init.expr)
-                && let Some(scope) = self.locals.last_mut()
-            {
-                scope.insert(unraw(&pat.ident), owner);
-            }
+            record_builder_local(self.index, &self.module, &mut self.locals, local);
             syn::visit::visit_local(self, local);
         }
 
@@ -3888,7 +4248,8 @@ mod tests {
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
             if self.in_funnel
-                && let Some(owner) = self.builder_owner(&call.receiver)
+                && let Some(owner) =
+                    builder_owner(self.index, &self.module, &self.locals, &call.receiver)
             {
                 let symbol = format!("std::fs::{owner}::{}", unraw(&call.method));
                 self.used.insert(symbol);
@@ -3955,6 +4316,55 @@ mod tests {
         out
     }
 
+    /// The SYNTACTIC spelling of a denied TRAIT method whose call form on a
+    /// `std::fs` builder is a METHOD call the resolver attributes to the
+    /// builder's owner. `clippy.toml` must name the RESOLVED trait path
+    /// (`std::os::unix::fs::OpenOptionsExt::custom_flags`), because that is
+    /// what the compiler resolves; the surface derivation and the count pin
+    /// see the SYNTACTIC builder method (`std::fs::OpenOptions::custom_flags`),
+    /// because `syn` has no type information. Mapping one to the other keeps
+    /// the closure test and the deny from silently disagreeing — the round-8
+    /// finding where the closure's review list carried a symbol the deny list
+    /// did not name.
+    fn synthetic_builder_spelling(path: &str) -> Option<String> {
+        let segments: Vec<&str> = path.split("::").collect();
+        let [std, os, unix_or_windows, fs, owner, method] = segments.as_slice() else {
+            return None;
+        };
+        if *std != "std"
+            || *os != "os"
+            || (*unix_or_windows != "unix" && *unix_or_windows != "windows")
+            || *fs != "fs"
+        {
+            return None;
+        }
+        let owner = match *owner {
+            "OpenOptionsExt" => "OpenOptions",
+            "DirBuilderExt" => "DirBuilder",
+            _ => return None,
+        };
+        Some(format!("std::fs::{owner}::{method}"))
+    }
+
+    /// `clippy.toml`'s deny list AS THE SURFACE DERIVATION AND THE COUNT PIN SEE
+    /// IT: every raw `path = "…"` entry, PLUS the SYNTACTIC builder spelling of
+    /// each denied trait method ([`synthetic_builder_spelling`]).
+    ///
+    /// [`denied_symbols_from_clippy_toml`] stays the literal file read; this is
+    /// the reconciled view the closure test consumes (so a denied `custom_flags`
+    /// cannot be simultaneously "denied" per the lint and "undefended" per the
+    /// derivation) and [`name_mutation_symbols`] derives the count pin from it,
+    /// so the pin counts the same symbol the closure defends.
+    fn reconciled_denied_symbols() -> BTreeSet<String> {
+        let mut out = denied_symbols_from_clippy_toml();
+        let extras: Vec<String> = out
+            .iter()
+            .filter_map(|path| synthetic_builder_spelling(path))
+            .collect();
+        out.extend(extras);
+        out
+    }
+
     /// THE CLASS CLOSURE. The completeness device is the resolved-symbol deny
     /// in `clippy.toml`, but INSIDE a funnel region that deny is blind. So the
     /// funnel is allowed to use a `std::fs`/`libc` call only if that call is
@@ -4002,7 +4412,11 @@ mod tests {
             .collect();
         let gated = test_only_gated_paths();
         let used = funnel_symbol_surface(&sources, &gated);
-        let denied = denied_symbols_from_clippy_toml();
+        // The RECONCILED view: raw clippy.toml entries plus the syntactic
+        // builder spelling of a denied trait method, so a `custom_flags` the
+        // deny names under `std::os::…::OpenOptionsExt` is defended under the
+        // `std::fs::OpenOptions::custom_flags` spelling the derivation records.
+        let denied = reconciled_denied_symbols();
 
         // SANITY: the derivation must see the funnel, or an empty `used` set
         // would make the closure vacuous. `create_dir_all` is a creation
@@ -4052,6 +4466,109 @@ mod tests {
                  from the review list"
             );
         }
+    }
+
+    /// ROUND-8 P1-B RECONCILIATION. `OpenOptionsExt::custom_flags` forwards
+    /// ARBITRARY bits to `open(2)`, and `O_CREAT` through it ADOPTS a name. The
+    /// lint must name the RESOLVED trait path
+    /// (`std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`); the surface
+    /// derivation sees the SYNTACTIC builder spelling
+    /// (`std::fs::OpenOptions::custom_flags`). [`synthetic_builder_spelling`]
+    /// and [`reconciled_denied_symbols`] make the two agree, so the deny and the
+    /// closure test cannot drift — the exact failure this round found, where the
+    /// review list carried the synthetic spelling with a false "cannot adopt"
+    /// reason while the lint did not name the method at all.
+    #[test]
+    fn custom_flags_adoption_is_denied_and_reconciled_across_both_spellings() {
+        let raw = denied_symbols_from_clippy_toml();
+        for trait_path in [
+            "std::os::unix::fs::OpenOptionsExt::custom_flags",
+            "std::os::windows::fs::OpenOptionsExt::custom_flags",
+        ] {
+            assert!(
+                raw.contains(trait_path),
+                "clippy.toml must deny the RESOLVED trait path {trait_path}: {raw:?}"
+            );
+        }
+        let reconciled = reconciled_denied_symbols();
+        assert!(
+            reconciled.contains("std::fs::OpenOptions::custom_flags"),
+            "the reconciled deny view must carry the SYNTACTIC builder spelling the derivation \
+             records: {reconciled:?}"
+        );
+        assert_eq!(
+            synthetic_builder_spelling("std::os::unix::fs::OpenOptionsExt::custom_flags")
+                .as_deref(),
+            Some("std::fs::OpenOptions::custom_flags")
+        );
+        assert_eq!(
+            synthetic_builder_spelling("std::os::windows::fs::OpenOptionsExt::custom_flags")
+                .as_deref(),
+            Some("std::fs::OpenOptions::custom_flags")
+        );
+        // The false review entry is GONE, and the synthetic spelling is now a
+        // DENIED symbol, so the closure defends it instead of excusing it.
+        assert!(
+            !FUNNEL_SYMBOLS_NOT_DENIED.contains(&"std::fs::OpenOptions::custom_flags"),
+            "the review list must not excuse a symbol the deny list names"
+        );
+        // The count pin counts the method too, because its table derives from
+        // the SAME reconciled view.
+        assert_eq!(
+            name_mutation_symbols().get("OpenOptions::custom_flags"),
+            Some(&vec![
+                "std".to_string(),
+                "fs".to_string(),
+                "OpenOptions".to_string(),
+                "custom_flags".to_string(),
+            ])
+        );
+    }
+
+    /// ROUND-8 P2-A REGRESSION: a pathname-socket `bind` CREATES a directory
+    /// entry — a name ADOPTION in the same class as `create_dir`/`symlink` — so
+    /// it is denied crate-wide for both `UnixListener` and `UnixDatagram`, the
+    /// surface derivation can SEE it if the funnel ever uses one, the count pin
+    /// counts it, and the raw `libc::bind` syscall is on the `libc` belt. The
+    /// Windows named-pipe creator has no stable `std` path and is stated as a
+    /// NAMED RESIDUAL in `clippy.toml` rather than left unmentioned.
+    #[test]
+    fn pathname_socket_binds_are_denied_counted_and_on_the_libc_belt() {
+        let raw = denied_symbols_from_clippy_toml();
+        for bind in [
+            "std::os::unix::net::UnixListener::bind",
+            "std::os::unix::net::UnixDatagram::bind",
+        ] {
+            assert!(raw.contains(bind), "clippy.toml must deny {bind}: {raw:?}");
+            let segments: Vec<String> = bind.split("::").map(str::to_string).collect();
+            assert_eq!(
+                funnel_symbol(&segments).as_deref(),
+                Some(bind),
+                "the surface derivation must SEE {bind}"
+            );
+            assert!(
+                name_mutation_symbols().contains_key(pin_key_for(&segments).unwrap().as_str()),
+                "the pin must count {bind}"
+            );
+        }
+        let files = vec![(
+            "src/prod/bind.rs".to_string(),
+            "#![allow(clippy::disallowed_methods)]\nfn f(p: &Path) { let _ = \
+             std::os::unix::net::UnixListener::bind(p); }"
+                .to_string(),
+        )];
+        let counts = std_fs_audit(&files, &BTreeSet::new()).1;
+        assert_eq!(
+            counts
+                .get(&("src/prod/bind.rs".to_string(), "UnixListener::bind"))
+                .copied(),
+            Some(1),
+            "the pin must count a pathname-socket bind: {counts:?}"
+        );
+        // The raw syscall is on the belt, so a `libc::bind` reference outside
+        // the funnel is refused by `no_libc_reference_outside_the_funnel`.
+        assert!(MUTATING_LIBC_SYSCALLS.contains(&"bind"));
+        assert!(mutating_libc_belt(&[]).contains("bind"));
     }
 
     /// The surface derivation must SEE each spelling a name-ADOPTING call can
@@ -4230,7 +4747,7 @@ impl S {
         // `every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`: the
         // symbol is IN the derived surface and OUTSIDE both review doors, so
         // the closure test would name it `undefended`.
-        let denied = denied_symbols_from_clippy_toml();
+        let denied = reconciled_denied_symbols();
         assert!(
             !denied.contains(SYMBOL) && !FUNNEL_SYMBOLS_NOT_DENIED.contains(&SYMBOL),
             "{SYMBOL} must stay outside both review doors for this arm to prove the closure test \
@@ -4319,6 +4836,14 @@ impl S {
     /// Whether `ty` IS a raw path argument: `&Path`, `&mut Path`, `PathBuf`,
     /// `&PathBuf`, `Box<Path>`, `Option<&Path>`, or `impl AsRef<Path>` /
     /// `impl Into<PathBuf>` (and the same nested through `Option`/`Box`).
+    ///
+    /// OUT OF CLASS, deliberately: a bare `&str`, `String`, `&OsStr`, or
+    /// `OsString`. A string is a path SPELLING, not a path, and the type system
+    /// does not distinguish a path-spelled string from any other string; this
+    /// crate has public fns taking one for a non-path reason. The boundary is a
+    /// stated property pinned by
+    /// [`pair_less_derivation_boundary_is_the_syntactic_path_class`], not an
+    /// implication of this list.
     fn type_is_raw_path(ty: &syn::Type) -> bool {
         match ty {
             syn::Type::Reference(reference) => type_is_raw_path(&reference.elem),
@@ -4638,6 +5163,60 @@ impl S {
         ),
     ];
 
+    /// ROUND-8 P2-B BOUNDARY. The pair-less derivation is SYNTACTIC on the
+    /// parameter type, and its class is exactly `Path`/`PathBuf` (optionally
+    /// wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`), `impl AsRef<Path>`, `impl
+    /// Into<PathBuf>`, or a type parameter bounded the same way. A bare `&str`,
+    /// `String`, `&OsStr`, and `OsString` are NOT in the class: a string is a
+    /// path SPELLING, not a path, and this crate already has public fns that
+    /// take one for non-path reasons (`is_reserved_name`, `valid_hex_digest`,
+    /// the error constructors), so extending the class would make the
+    /// derivation a superset that no longer pins path mutations. The boundary is
+    /// therefore STATED, not implied: a `pub fn f(name: &str)` that builds
+    /// `Path::new(name)` is out of class BY CONSTRUCTION, and this test pins that
+    /// the code does what the statement says — both directions, so the statement
+    /// cannot rot into a false claim about the code.
+    #[test]
+    fn pair_less_derivation_boundary_is_the_syntactic_path_class() {
+        let derived = |param: &str| {
+            let source = format!("pub fn probe{param} {{}}");
+            let files = vec![("src/prod/boundary.rs".to_string(), source)];
+            let parsed = parse_crate(&files, &BTreeSet::new());
+            let fns = audited_fns(&parsed, &BTreeSet::new());
+            fns.into_iter()
+                .find(|collected| collected.item.name == "probe")
+                .map(|collected| collected.takes_raw_path)
+                .expect("the synthetic `probe` must parse")
+        };
+        // IN CLASS: a raw path, so the derivation sees it.
+        for param in [
+            "(p: &Path)",
+            "(p: PathBuf)",
+            "(p: Option<&Path>)",
+            "(p: Box<PathBuf>)",
+            "(p: impl AsRef<Path>)",
+            "(p: impl Into<PathBuf>)",
+        ] {
+            assert!(
+                derived(param),
+                "{param} is a raw path and must be in the derived class"
+            );
+        }
+        // OUT OF CLASS, the STATED boundary: a string spelling is not a path.
+        for param in [
+            "(name: &str)",
+            "(name: String)",
+            "(name: &OsStr)",
+            "(name: OsString)",
+            "(name: &[u8])",
+        ] {
+            assert!(
+                !derived(param),
+                "{param} is the stated out-of-class boundary and must NOT be derived"
+            );
+        }
+    }
+
     /// FIX 4: the constraint-1 enumeration is DERIVED, not enumerated. This
     /// test (a) requires EXACTLY ONE marked block in `docs/API-CONSTRAINTS.md`,
     /// (b) resolves every name in it to a real fn/method in the parsed
@@ -4649,11 +5228,22 @@ impl S {
     /// exemption with a reason) names it.
     ///
     /// THE DERIVATION'S BOUNDARY, stated rather than implied:
-    /// * it is SYNTACTIC on the parameter TYPE (`Path`/`PathBuf`, the same
-    ///   wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`, or `impl AsRef<Path>` /
-    ///   `impl Into<PathBuf>` / a generic type param bounded the same way), so
-    ///   an `&OsStr` component (`RootedRelativePath::with_file_name`) is NOT a
-    ///   raw path and is out of class;
+    /// * it is SYNTACTIC on the parameter TYPE. IN CLASS: `Path`/`PathBuf`,
+    ///   the same wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`, `impl
+    ///   AsRef<Path>` / `impl Into<PathBuf>`, and a generic type param bounded
+    ///   the same way. OUT OF CLASS, explicitly: `&str`, `String`, `&OsStr`,
+    ///   `OsString`, and `&[u8]`. A STRING IS A PATH SPELLING, NOT A PATH: the
+    ///   type system does not distinguish a path-spelled string from any other
+    ///   string, this crate already has public fns taking a string for a
+    ///   non-path reason (`is_reserved_name`, `valid_hex_digest`, the error
+    ///   constructors), and extending the class would make the derivation a
+    ///   SUPERSET that no longer pins path mutations. A `pub fn f(name: &str)`
+    ///   that builds `Path::new(name)` and mutates is therefore out of class BY
+    ///   CONSTRUCTION; `pair_less_derivation_boundary_is_the_syntactic_path_class`
+    ///   pins both directions of that statement against the code. The same
+    ///   reason covers `RootedRelativePath::with_file_name`'s `impl AsRef<OsStr>`
+    ///   (it is a name COMPONENT, and the mutation is performed by the returned
+    ///   validated type);
     /// * a TRAIT-impl method (`impl Remote for X { fn symlink … }`) is not
     ///   counted directly, because the TRAIT DECLARATION is counted instead; a
     ///   FOREIGN trait's methods would be out of class, and this crate has

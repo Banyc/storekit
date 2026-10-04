@@ -2099,6 +2099,12 @@ impl VerifySwap {
 /// keeps the open from blocking on a fifo/device (the entry is then
 /// classified by its `fstat` type, never read). A swap at the path AFTER the
 /// open is irrelevant — the descriptor pins the inode.
+// NON-ADOPTING `custom_flags` SITE: the flags are `O_NOFOLLOW | O_NONBLOCK` on
+// a READ-ONLY open (`opts.read(true)`, no `create`/`create_new`), so no name is
+// created and `O_CREAT` is not among the bits. The crate-wide deny of
+// `OpenOptionsExt::custom_flags` is relaxed for exactly this descriptor-bound
+// sequence, the way `platform::chmod` relaxes `set_permissions`.
+#[allow(clippy::disallowed_methods)]
 fn open_verify_local(p: &Path, #[cfg(test)] swap: Option<&VerifySwap>) -> Result<OpenedExisting> {
     use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
