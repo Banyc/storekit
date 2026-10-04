@@ -837,3 +837,53 @@ every figure transcribed from a report: the README now states the COMMAND that
 produces it and says the number moves. The same treatment applies to the six
 hand-found omission rounds, now attributed correctly (1, 2, 3, 4, 5, 7 — round 6
 corrected a REASON and round 8 found a class boundary, neither added a member).
+
+## The adversarial review (round 10)
+
+Seven findings, all fixed, plus one NON-finding that was investigated to a measured
+conclusion. The P1 is once again in the audit's own module.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | **The funnel region was derived PER-FILE, not by Rust attribute inheritance.** `FunnelSymbols::visit_file` read only the file's own `#![allow]`, so `src/atomic/guard.rs` — a CHILD of the allow-bearing `src/atomic/mod.rs`, and therefore inside the funnel — was treated as OUTSIDE by the closure. Combined with `builder_type` not recognising the stable synonym `File::options()`, a production adopting call in `guard.rs` was invisible to the closure AND to the count pin, while clippy is inherited-allowed there: the reviewer measured closure **ok**, pin **ok**, source audit **ok**, host clippy **0**, full suite **green** — where the identical call in `src/error.rs` is a hard clippy error. The audit's own module was the last place the closure looked the other way, and it took TWO mechanisms failing at once. | M, H | `mzvotpqsozup` |
+| 2 | The libc belt's round-9 "oracle" covered **7 of ~50** family members, so the belt stayed silently disarmable for the rest: moving `chmod`/`chown`/`mknodat`/… into `NON_MUTATING_LIBC_CALLS` left all six libc tests green, and for symbols absent from `clippy.toml` (e.g. `libc::chmod`) the belt is the SOLE device. Found independently by both reviewers with different symbols. | H | `mzvotpqsozup` |
+| 3 | `Prepared::matches` step (5) was DEAD CODE: after steps (1)–(4) passed, its condition was algebraically unenterable, so the "derived destination shape" axis the docs presented could never refuse anything. | H | `zmlnqmkrkunq` |
+| 4 | The DIRECTION axis had no failing test: removing just that sub-clause left the whole suite green (the derived-shape check only catches a direction swap when the roots differ). | H | `zmlnqmkrkunq` |
+| 5 | The pair-less derivation was blind to `macro_rules!`-generated public fns, so "a SEVENTH omission is a failing test" was false for that class, which the stated boundary did not mention. | A | `mzvotpqsozup` |
+| 6 | The pair-less boundary omitted CONTAINER types (`&[PathBuf]`, tuples, `Result<PathBuf>`) — neither in the stated in-class set nor the out-of-class set. | A | `mzvotpqsozup` |
+| 7 | Constraint #3's "Verified: all three views build `SymlinkContainmentIndex` from `live_entry_kinds`" named one constructor for all three; the two canonicalizers use `from_entries` (measured; the substantive property holds). | A | the round-10 docs commit |
+
+**Every fix again made the device falsifiable rather than merely correct.** The belt
+oracle is now a 54-entry independent literal with SET EQUALITY against the family,
+a disjointness assertion, and an ANTI-CIRCULAR half (a default-deny-only belt), with
+the misfiling proved for two different symbols; the funnel region is derived by
+transitive attribute reach and both P1 halves have a pre/post measurement; the dead
+check is deleted and every surviving token axis has a remove-and-test entry (a
+table naming the tests that fail when each comparison is removed); the direction
+axis has the test that notices its removal; the macro class is STATED with a
+tripwire (expansion is unsound — metavariables and repetitions), and the container
+class is extended with the boundary test pinned in both directions.
+
+**The non-finding became a finding by being measured.** Reviewer B reported one
+unreproduced failure in
+transport::ssh::runner::runner_property_tests::every_outcome_leaves_zero_live_waiters_and_a_reaped_child
+and explicitly did NOT assert it. Chasing it produced: the production invariant IS
+guaranteed (all five return paths in `SshRunner::run` join the wait thread, cited at
+file:line); the flake is REAL (macOS 12/1000 and Linux 5/1000 at 40-way concurrency,
+always the same case and assertion); and the cause is the TEST's premise — its
+`AfterReap` placement ordered the post-reap block against the deadline but not the
+reap itself, so under load the runner CORRECTLY took its documented kill path and
+returned `Timeout` while the test had asserted a scheduling accident as a premise.
+The fix is test-only and STRENGTHENS the property: the fake arms `reaped` before
+`spawn` returns for those cases, and a green run now additionally asserts NO kill
+occurred, so it proves the reaped path was taken rather than that a race was won.
+Measured after: 0/1000 on Linux under the same 40-way load (0/3680 macOS).
+
+**An honest note about what these rounds are converging on.** Rounds 8–10 each
+found defects in the DEVICES rather than in what the crate does, and the last three
+have all been the same shape: a claim whose mechanism cannot actually fail for it —
+an oracle covering 13% of what it certifies, a check that cannot be entered, an axis
+no test notices. The runtime itself has now survived several rounds of attack,
+including a reviewer's algebraic audit of every `matches` axis; that is evidence,
+but it is evidence about the SHAPE of the remaining risk (self-audit overreach), not
+a claim that no defect remains.
