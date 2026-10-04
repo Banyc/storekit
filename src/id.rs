@@ -253,6 +253,11 @@ impl AsRef<std::path::Path> for Identifier {
 
 #[cfg(test)]
 mod tests {
+    // Test-only fixtures write files the identifier rules then inspect; exempt
+    // from the production name-mutation rule exactly as the other test modules
+    // are (`std::fs::write` CREATES on an absent path, so the crate-root deny
+    // covers it).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;

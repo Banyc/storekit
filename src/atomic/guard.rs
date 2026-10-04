@@ -100,13 +100,18 @@
 //! occurrence ONCE, not once per macro expansion); a raw FFI declaration —
 //! `extern "C" { fn unlinkat(…); }` followed by a call — which names neither
 //! `libc` nor `std::fs`, so NEITHER audit sees it; and an INODE-PRESERVING
-//! content mutation (`std::fs::write`, `std::fs::copy`) on a path that already
-//! exists, which cannot split a holder because the flock is attached to the
-//! unchanged inode. The mode setter (`std::fs::set_permissions`) and the name
-//! CREATORS (`std::fs::create_dir*`, the platform `symlink` wrappers) are NO
-//! LONGER in this residue: both are on `clippy.toml`'s deny list, counted by
-//! the `std::fs` pin, and covered by the cross-artifact consistency test, so an
-//! adopt-a-name or re-mode call outside the funnel fails the lint. The reach of
+//! content mutation on an ALREADY-EXISTING path through a call that stays legal
+//! outside the funnel, which cannot split a holder because the flock is
+//! attached to the unchanged inode. The mode setter
+//! (`std::fs::set_permissions`), the name CREATORS (`std::fs::create_dir*`, the
+//! platform `symlink` wrappers), and `std::fs::write` — whose create-on-absent
+//! path ADOPTS a name — are NO LONGER in this residue: all are on
+//! `clippy.toml`'s deny list, counted by the `std::fs` pin where applicable,
+//! and covered by the cross-artifact consistency test, so an adopt-a-name or
+//! re-mode call outside the funnel fails the lint. The only `std::fs::write`
+//! left in production is the funnel's own `write_file_fd`, which calls
+//! [`refuse_reserved_mutation`] first and preserves the inode of an EXISTING
+//! entry. The reach of
 //! a raw FFI declaration is one declaration the crate's
 //! own author writes — exactly the residue a source audit carries and names
 //! rather than denies. A foreign process, or a raw `std::fs` call the caller
@@ -624,30 +629,116 @@ mod tests {
         assert!(!remote.owns(Path::new("state/OPERATION.LOCK")));
     }
 
-    /// The name-mutating `libc` functions the OUTSIDE-the-funnel assertion
-    /// refuses: BOTH the `*at` forms and the non-`at` forms the earlier
-    /// six-symbol scan missed (`open` with `O_CREAT`/`O_TRUNC`, `rmdir`,
-    /// `unlink`, `rename`, `symlink`, `link`, `mkdir`, `remove`). It is the
-    /// belt to the outside map's braces: the map already closes the outside
-    /// `libc` surface exactly, and this additionally forbids a REVIEWED map
-    /// entry from being one of these known mutators. Inside the funnel the
-    /// device is the exact per-module `libc` surface pin, not this list, so a
-    /// new funnel syscall of ANY name changes the pin.
-    const MUTATING_LIBC_SYSCALLS: [&str; 14] = [
-        "unlinkat",
-        "renameat",
-        "symlinkat",
-        "linkat",
-        "mkdirat",
-        "openat",
+    /// The curated NAME-MUTATION family of `libc` syscalls: functions that can
+    /// ADOPT a directory entry, FREE or SWAP one, or change the mode /
+    /// ownership / xattrs / timestamps attached to a NAME. The `*at` forms, the
+    /// plain forms, and the descriptor-bound setters are all present.
+    ///
+    /// This list is the FAMILY half of the belt; it is NOT the belt. The belt
+    /// [`no_libc_reference_outside_the_funnel`] refuses is DERIVED by
+    /// [`mutating_libc_belt`], which unions this family with every `libc::<fn>`
+    /// CALL the tree references that is not on the reviewed
+    /// [`NON_MUTATING_LIBC_CALLS`] list. The family catches a symbol the tree
+    /// does not itself reference (a reviewer pinning `libc::mkfifo`,
+    /// `libc::mknod`, or `libc::renameat2` in the outside map); the derived
+    /// clause catches an unclassified NEW reference. The two are checked
+    /// against each other by
+    /// `every_libc_call_symbol_the_tree_references_is_classified`, so neither
+    /// the family nor the tree's references can silently lag the other.
+    const MUTATING_LIBC_SYSCALLS: &[&str] = &[
+        // REMOVE / REPLACE / LINK
         "unlink",
-        "rename",
-        "symlink",
-        "link",
-        "mkdir",
-        "rmdir",
-        "open",
+        "unlinkat",
         "remove",
+        "rmdir",
+        "rename",
+        "renameat",
+        "renameat2",
+        "link",
+        "linkat",
+        "symlink",
+        "symlinkat",
+        // CREATE a name
+        "mkdir",
+        "mkdirat",
+        "open",
+        "openat",
+        "open64",
+        "openat64",
+        "openat2",
+        "creat",
+        "creat64",
+        "mknod",
+        "mknodat",
+        "mkfifo",
+        "mkfifoat",
+        "clonefile",
+        "clonefileat",
+        // NAME-ATTACHED METADATA
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "chown",
+        "fchown",
+        "lchown",
+        "fchownat",
+        "truncate",
+        "ftruncate",
+        "utime",
+        "utimes",
+        "futimens",
+        "utimensat",
+        "setxattr",
+        "lsetxattr",
+        "fsetxattr",
+        "removexattr",
+        "lremovexattr",
+        "fremovexattr",
+        "chflags",
+        "fchflags",
+        "lchflags",
+        "setattrlist",
+        "exchangedata",
+        // FILESYSTEM MOUNTS
+        "mount",
+        "umount",
+        "umount2",
+    ];
+
+    /// The `libc::<fn>` CALL symbols the tree references that are REVIEWED as
+    /// unable to ADOPT, FREE, SWAP, or re-attribute a NAME: they act on an open
+    /// DESCRIPTOR, on the PROCESS, on a RESOURCE LIMIT, or only READ a name.
+    /// [`every_libc_call_symbol_the_tree_references_is_classified`] derives the
+    /// tree's `libc::<fn>(…)` call symbols and fails on any that is in neither
+    /// this list nor [`MUTATING_LIBC_SYSCALLS`], so the classification cannot
+    /// silently lag a new syscall reference.
+    const NON_MUTATING_LIBC_CALLS: &[&str] = &[
+        // READ side of a name
+        "fstatat",
+        "fstat",
+        "readlinkat",
+        "getxattr",
+        // Directory-descriptor reader
+        "readdir",
+        "fdopendir",
+        "closedir",
+        // Descriptor management / content write on an OPEN descriptor
+        "fcntl",
+        "flock",
+        "close",
+        "write",
+        "poll",
+        // Process, limit, and system control
+        "kill",
+        "killpg",
+        "signal",
+        "waitid",
+        "pipe",
+        "sysctl",
+        "getrlimit",
+        "setrlimit",
+        "getegid",
+        "getgroups",
     ];
 
     /// Every `std` symbol whose denial the funnel owns, as its CANONICAL path
@@ -1211,6 +1302,37 @@ mod tests {
             syn::Item::Union(item) => &item.attrs,
             syn::Item::Type(item) => &item.attrs,
             syn::Item::Use(item) => &item.attrs,
+            _ => return false,
+        };
+        attrs_allow_disallowed(attrs)
+    }
+
+    /// Whether a `syn::ImplItem` — a method, const, type, or macro inside an
+    /// `impl` block — carries `#[allow(clippy::disallowed_methods)]`. The
+    /// `syn::Item` arm above CANNOT see these: an `impl`'s children are
+    /// `ImplItem`s, not `Item`s, so before this arm existed an `#[allow]` on a
+    /// METHOD was invisible to the surface derivation (round 6 claimed the arm;
+    /// it did not exist).
+    fn impl_item_allows_disallowed(item: &syn::ImplItem) -> bool {
+        let attrs = match item {
+            syn::ImplItem::Const(item) => &item.attrs,
+            syn::ImplItem::Fn(item) => &item.attrs,
+            syn::ImplItem::Type(item) => &item.attrs,
+            syn::ImplItem::Macro(item) => &item.attrs,
+            _ => return false,
+        };
+        attrs_allow_disallowed(attrs)
+    }
+
+    /// The `syn::TraitItem` twin of [`impl_item_allows_disallowed`]: a trait
+    /// method's `#[allow]` is a different `syn` node from both an `Item` and an
+    /// `ImplItem`, so it needs its own arm.
+    fn trait_item_allows_disallowed(item: &syn::TraitItem) -> bool {
+        let attrs = match item {
+            syn::TraitItem::Const(item) => &item.attrs,
+            syn::TraitItem::Fn(item) => &item.attrs,
+            syn::TraitItem::Type(item) => &item.attrs,
+            syn::TraitItem::Macro(item) => &item.attrs,
             _ => return false,
         };
         attrs_allow_disallowed(attrs)
@@ -2148,6 +2270,81 @@ mod tests {
         map
     }
 
+    /// The `libc::<symbol>` CALL spellings in `code`: a `libc` ident, `::`, a
+    /// symbol ident, optional whitespace, then `(`. Comments and string
+    /// literals must already be removed (callers pass [`code_only`] output), so
+    /// a mention in prose is not a call. This is the DERIVATION the libc belt
+    /// is built from and the candidate set
+    /// `every_libc_call_symbol_the_tree_references_is_classified` checks.
+    fn libc_call_symbols(code: &str) -> BTreeSet<String> {
+        let bytes = code.as_bytes();
+        let mut out = BTreeSet::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let Some(name) = read_ident(code, &mut i) else {
+                i += 1;
+                continue;
+            };
+            if name != "libc" {
+                continue;
+            }
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if !(bytes.get(j) == Some(&b':') && bytes.get(j + 1) == Some(&b':')) {
+                continue;
+            }
+            j += 2;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let mut symbol_at = j;
+            let Some(symbol) = read_ident(code, &mut symbol_at) else {
+                continue;
+            };
+            let mut k = symbol_at;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if bytes.get(k) == Some(&b'(') {
+                out.insert(symbol);
+            }
+        }
+        out
+    }
+
+    /// The DERIVED `libc` name-mutation belt the OUTSIDE-the-funnel assertion
+    /// refuses: the union of
+    ///
+    /// (a) the curated [`MUTATING_LIBC_SYSCALLS`] family (POSIX/BSD/macOS name
+    ///     CREATORS, REPLACERS, REMOVERS, and name-attribute setters), and
+    /// (b) DEFAULT-DENY: every `libc::<fn>` CALL the crate's own tree
+    ///     references that is not on the reviewed [`NON_MUTATING_LIBC_CALLS`]
+    ///     list.
+    ///
+    /// Clause (b) is what makes the belt DERIVED rather than a hand-kept list:
+    /// a reference to an unclassified syscall is refused outside the funnel
+    /// even before a reviewer names it. Clause (a) is still required for a
+    /// symbol the tree does not reference at all — a reviewer can PIN
+    /// `libc::mkfifo` in the outside map without any source reference existing.
+    /// The classification test forces every referenced call symbol into (a) or
+    /// [`NON_MUTATING_LIBC_CALLS`], so the two cannot drift.
+    fn mutating_libc_belt(sources: &[(String, String)]) -> BTreeSet<String> {
+        let mut belt: BTreeSet<String> = MUTATING_LIBC_SYSCALLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for (_, raw) in sources {
+            for symbol in libc_call_symbols(&code_only(raw)) {
+                if !NON_MUTATING_LIBC_CALLS.contains(&symbol.as_str()) {
+                    belt.insert(symbol);
+                }
+            }
+        }
+        belt
+    }
+
     /// Exemption follows the crate-root DIRECTORY or the GATING, never a name
     /// and never an interior component. A file under `src/**/tests.rs` or
     /// `src/**/tests/` is PRODUCTION unless EVERY `mod` declaration that names
@@ -2302,6 +2499,10 @@ mod tests {
 
         let mut funnel_surface: BTreeMap<(String, String), usize> = BTreeMap::new();
         let mut outside: BTreeMap<(String, String), usize> = BTreeMap::new();
+        // THE BELT IS DERIVED, not enumerated: the curated name-mutation family
+        // unioned with the default-deny of every unclassified `libc::<fn>` CALL
+        // the tree references. See [`mutating_libc_belt`].
+        let belt = mutating_libc_belt(&sources);
         for (rel, raw) in &sources {
             // Order matters: strip comments/strings FIRST, then remove
             // `#[cfg(test)]` items, so a doc comment mentioning `#[cfg(test)]`
@@ -2326,9 +2527,7 @@ mod tests {
             for (reference, count) in refs {
                 let symbol = reference.strip_prefix("libc::").unwrap_or("");
                 assert!(
-                    !MUTATING_LIBC_SYSCALLS.contains(&symbol)
-                        && reference != "libc::*"
-                        && reference != "libc",
+                    !belt.contains(symbol) && reference != "libc::*" && reference != "libc",
                     "{rel} references the mutating/aliased libc facility {reference:?}: a \
                      name-mutating syscall may be issued only from the guarded funnel \
                      ({funnel_modules:?}); a `use libc … as alias` or a re-export does not exempt it"
@@ -2484,6 +2683,59 @@ mod tests {
         );
     }
 
+    /// ROUND-7 REGRESSION ARM: the `libc` belt is DERIVED, not a hand-kept list
+    /// that can lag the tree. The candidate set is the `libc::<fn>` CALL symbols
+    /// the crate's own sources reference; every one must be classified as
+    /// name-mutating ([`MUTATING_LIBC_SYSCALLS`], and therefore refused as a
+    /// pinned OUTSIDE entry by [`no_libc_reference_outside_the_funnel`]) or as
+    /// reviewed non-mutating ([`NON_MUTATING_LIBC_CALLS`]).
+    ///
+    /// The reviewer's round-7 repro was a pinned `libc::mkfifo` in the OUTSIDE
+    /// map that the old 14-name list did not refuse. The tree already references
+    /// `libc::mkfifo` (test FIFO fixtures), so this derivation forces it onto
+    /// the belt; REMOVING `mkfifo` from [`MUTATING_LIBC_SYSCALLS`] fails this
+    /// test, and the belt's default-deny clause refuses it outside regardless.
+    #[test]
+    fn every_libc_call_symbol_the_tree_references_is_classified() {
+        let mut files = Vec::new();
+        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut files);
+        let mut calls: BTreeSet<String> = BTreeSet::new();
+        for file in &files {
+            let raw = std::fs::read_to_string(file).expect("read source file");
+            calls.extend(libc_call_symbols(&code_only(&raw)));
+        }
+        assert!(
+            calls.len() > 5 && calls.contains("openat") && calls.contains("mkfifo"),
+            "the derivation must see the tree's real `libc` call surface: {calls:?}"
+        );
+
+        let mut unclassified: Vec<String> = Vec::new();
+        for symbol in &calls {
+            if !MUTATING_LIBC_SYSCALLS.contains(&symbol.as_str())
+                && !NON_MUTATING_LIBC_CALLS.contains(&symbol.as_str())
+            {
+                unclassified.push(symbol.clone());
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "these `libc::<fn>` CALL symbols are referenced by the crate but classified as NEITHER \
+             name-mutating (`MUTATING_LIBC_SYSCALLS`) nor reviewed non-mutating \
+             (`NON_MUTATING_LIBC_CALLS`): {unclassified:?}. A name-mutating syscall MUST go on the \
+             belt so a pinned OUTSIDE reference is refused by \
+             `no_libc_reference_outside_the_funnel`."
+        );
+
+        // The anchor of the reviewer's repro: `libc::mkfifo` creates a name,
+        // the tree references it, and the DERIVED belt (family + default-deny)
+        // refuses it outside the funnel.
+        assert!(
+            MUTATING_LIBC_SYSCALLS.contains(&"mkfifo")
+                && mutating_libc_belt(&[]).contains("mkfifo"),
+            "`libc::mkfifo` creates a name and the tree references it; it MUST be on the belt"
+        );
+    }
+
     /// STRUCTURAL AUDIT (`std::fs`): the `std::fs`/`std::os` calls that can
     /// REMOVE, REPLACE, or CREATE a directory entry — the ones that can free or
     /// swap a lock record's inode, or ADOPT a name the reserved-spelling guard
@@ -2544,12 +2796,13 @@ mod tests {
     /// `extern "C"` declaration, `extern "C" { fn unlinkat(dirfd: i32, path:
     /// *const i8, flags: i32) -> i32; }`, followed by a call: it names neither
     /// `libc` nor `std::fs`, so NEITHER this audit nor
-    /// `no_libc_reference_outside_the_funnel` sees it. INODE-PRESERVING content
-    /// mutations (`std::fs::write`, `std::fs::copy`) are not pinned: on an
-    /// EXISTING path they cannot split a holder because the flock stays on the
-    /// unchanged inode (the one case where they adopt an absent name is named
-    /// in `FUNNEL_SYMBOLS_NOT_DENIED`). The mode setter and the name CREATORS
-    /// are pinned now, not residue. The audit resolves the
+    /// `no_libc_reference_outside_the_funnel` sees it. An INODE-PRESERVING
+    /// content mutation on an ALREADY-EXISTING path through a call that is
+    /// legal outside the funnel is not pinned: it cannot split a holder because
+    /// the flock stays on the unchanged inode. The mode setter, the name
+    /// CREATORS, and `std::fs::write` (create-or-truncate, and therefore an
+    /// ADOPTION when the path is absent) are DENIED now, not residue. The audit
+    /// resolves the
     /// ENUMERATED routes and NAMES this residue rather than implying totality;
     /// the clippy deny carries the completeness claim.
     #[test]
@@ -2920,8 +3173,9 @@ mod tests {
     }
 
     /// The NEGATIVE fixture: a legitimate mutation at the guarded funnel — the
-    /// audited direct `std::fs::rename` the exact-count pin already covers — an
-    /// inode-PRESERVING `std::fs::write`, and a redundant `use std;` (which
+    /// audited direct `std::fs::rename` the exact-count pin already covers — a
+    /// `std::fs::write` inside the funnel (a DENIED symbol whose allowed sites
+    /// all carry the allow), and a redundant `use std;` (which
     /// must NOT turn the canonical `std::fs::…` spelling into an alias route)
     /// all yield NO violation, so the scanner does not merely report every
     /// `std::fs` mention. (The direct call is still counted by the pin; this
@@ -2937,8 +3191,8 @@ mod tests {
         assert_eq!(
             std_fs_mutation_violations(&files, &BTreeSet::new()),
             Vec::new(),
-            "a legitimate direct call at the guarded funnel and an inode-preserving write must \
-             NOT be reported as an import-route violation"
+            "a legitimate direct call at the guarded funnel and a write inside it must NOT be \
+             reported as an import-route violation"
         );
     }
 
@@ -3311,15 +3565,16 @@ mod tests {
     /// third state.
     ///
     /// The entries are DESCRIPTOR-BOUND or NAME-PRESERVING calls:
-    /// `std::fs::read`/`read_to_string`/`write`/`metadata`/`symlink_metadata`/
+    /// `std::fs::read`/`read_to_string`/`metadata`/`symlink_metadata`/
     /// `read_dir`/`read_link`/`canonicalize` act on an entry the funnel already
     /// created or resolved; the `libc` entries (`fstatat`, `fstat`, `readlinkat`,
     /// `readdir`, `fdopendir`, `closedir`, `fcntl`) read or manage an open
-    /// descriptor. ONE named nuance: `std::fs::write` on a path that does not
-    /// exist DOES adopt a name, and every funnel use targets an already-open
-    /// descriptor or a path the funnel itself just created, so the crate
-    /// classifies it as inode-preserving; the residual is NAMED here rather than
-    /// silently exempted.
+    /// descriptor. `std::fs::write` is deliberately NOT here: it CREATES on an
+    /// absent path, so it can ADOPT a name and is on `clippy.toml`'s deny list.
+    /// The funnel's one production site (`atomic::windows::write_file_fd`)
+    /// carries the module-level allow and runs `refuse_reserved_mutation`
+    /// FIRST, and the inode of an existing entry is preserved, so its only
+    /// adoption is of a name the guard has already cleared.
     ///
     /// `libc::openat` is deliberately NOT here: it CAN adopt a name (with
     /// `O_CREAT`), so it is on clippy.toml's deny list with the other open
@@ -3340,7 +3595,6 @@ mod tests {
     const FUNNEL_SYMBOLS_NOT_DENIED: &[&str] = &[
         "std::fs::read",
         "std::fs::read_to_string",
-        "std::fs::write",
         "std::fs::metadata",
         "std::fs::symlink_metadata",
         "std::fs::read_dir",
@@ -3571,6 +3825,33 @@ mod tests {
                 return;
             }
             syn::visit::visit_item(self, item);
+            self.in_funnel = saved;
+        }
+
+        /// An `#[allow]` on an IMPL METHOD is a funnel region exactly as one on
+        /// a freestanding `fn` is. `visit_item` cannot see it: an impl method
+        /// is a `syn::ImplItem`, which the `Item` arm never reaches with its
+        /// own attribute check, so before this override the derived surface
+        /// missed every item-level-allow impl method — including the five
+        /// PRODUCTION `std::fs::create_dir_all` sites this crate ships.
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            let saved = self.in_funnel;
+            if impl_item_allows_disallowed(item) {
+                self.in_funnel = true;
+            }
+            syn::visit::visit_impl_item(self, item);
+            self.in_funnel = saved;
+        }
+
+        /// The trait-method twin of [`Self::visit_impl_item`]: a default or
+        /// required method's `#[allow]` is a `syn::TraitItem`, a third node
+        /// shape the `Item` arm cannot reach.
+        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+            let saved = self.in_funnel;
+            if trait_item_allows_disallowed(item) {
+                self.in_funnel = true;
+            }
+            syn::visit::visit_trait_item(self, item);
             self.in_funnel = saved;
         }
 
@@ -3851,6 +4132,687 @@ fn not_attributed(p: &std::path::Path) {
         assert!(
             used.is_empty(),
             "a non-funnel file must contribute no funnel symbols: {used:?}"
+        );
+    }
+
+    /// ROUND-6 REGRESSION ARM (the round whose log CLAIMED this arm): the
+    /// surface derivation must see an `#[allow(clippy::disallowed_methods)]`
+    /// on an IMPL METHOD and on a TRAIT METHOD exactly as it sees one on a
+    /// freestanding `fn`. The impl/trait forms are `syn::ImplItem` /
+    /// `syn::TraitItem`, which `visit_item` never reaches, so before the
+    /// `visit_impl_item`/`visit_trait_item` overrides the A and B arms below
+    /// contributed NOTHING and
+    /// `every_mutation_symbol_the_funnel_uses_is_denied_crate_wide` was blind
+    /// to their bodies — including the five PRODUCTION create-only impl-method
+    /// sites this crate already ships.
+    ///
+    /// The symbol each body calls — `std::fs::DirBuilder::new` — is neither on
+    /// `clippy.toml`'s deny list nor on `FUNNEL_SYMBOLS_NOT_DENIED`, so if it
+    /// were reached in the REAL funnel the closure test's `undefended`
+    /// assertion would fail. The assertion at the end states those two facts,
+    /// which is what makes A/B load-bearing rather than decorative.
+    #[test]
+    fn funnel_symbol_surface_sees_item_level_allow_on_impl_and_trait_methods() {
+        const SYMBOL: &str = "std::fs::DirBuilder::new";
+        let surface = |body: &str| {
+            let files = vec![("src/prod/item_allow.rs".to_string(), body.to_string())];
+            funnel_symbol_surface(&files, &BTreeSet::new())
+        };
+
+        // A — an `#[allow]`-ed IMPL METHOD. No module-level allow exists, so
+        // this item is the ONLY funnel region in the file.
+        let impl_method = r##"
+struct S;
+impl S {
+    #[allow(clippy::disallowed_methods)]
+    fn adopt(p: &std::path::Path) {
+        let _ = std::fs::DirBuilder::new();
+        let _ = p;
+    }
+}
+"##;
+        assert!(
+            surface(impl_method).contains(SYMBOL),
+            "the derivation must see an `#[allow]`-ed impl method's body, or the closure test is \
+             blind to every item-level-allow impl method"
+        );
+
+        // B — the paired TRAIT-METHOD form: the same `#[allow]` on a different
+        // `syn` node shape.
+        let trait_method = r##"
+trait T {
+    #[allow(clippy::disallowed_methods)]
+    fn adopt(p: &std::path::Path) {
+        let _ = std::fs::DirBuilder::new();
+        let _ = p;
+    }
+}
+"##;
+        assert!(
+            surface(trait_method).contains(SYMBOL),
+            "the derivation must see an `#[allow]`-ed trait method's body"
+        );
+
+        // C — the CONTROL the reviewers used: the freestanding `#[allow]`
+        // form. It was already seen before the fix, so it isolates the
+        // impl/trait arms rather than proving the whole file is parsed.
+        let freestanding = r##"
+#[allow(clippy::disallowed_methods)]
+fn adopt(p: &std::path::Path) {
+    let _ = std::fs::DirBuilder::new();
+    let _ = p;
+}
+"##;
+        assert!(
+            surface(freestanding).contains(SYMBOL),
+            "the freestanding `#[allow]` control must be seen (it was, before the fix)"
+        );
+
+        // D — NEGATIVE CONTROL: the SAME impl method with NO `#[allow]` is not
+        // a funnel region, so its body must contribute nothing. Without this,
+        // a derivation that treated every method as a funnel would pass A/B
+        // vacuously.
+        let unallowed_impl_method = r##"
+struct S;
+impl S {
+    fn adopt(p: &std::path::Path) {
+        let _ = std::fs::DirBuilder::new();
+        let _ = p;
+    }
+}
+"##;
+        assert!(
+            !surface(unallowed_impl_method).contains(SYMBOL),
+            "an impl method with NO `#[allow]` is not a funnel region and must contribute nothing"
+        );
+
+        // The two facts that make A/B load-bearing for
+        // `every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`: the
+        // symbol is IN the derived surface and OUTSIDE both review doors, so
+        // the closure test would name it `undefended`.
+        let denied = denied_symbols_from_clippy_toml();
+        assert!(
+            !denied.contains(SYMBOL) && !FUNNEL_SYMBOLS_NOT_DENIED.contains(&SYMBOL),
+            "{SYMBOL} must stay outside both review doors for this arm to prove the closure test \
+             would fail on a reached item-level-allow method"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // CONSTRAINT #1 (docs/API-CONSTRAINTS.md): the pair-less mutation
+    // enumeration is DERIVED from the public surface, not enumerated by hand.
+    // ---------------------------------------------------------------------
+
+    /// The marker pair the ONE machine-readable block in
+    /// `docs/API-CONSTRAINTS.md` uses.
+    const PAIR_LESS_BEGIN: &str = "<!-- PAIR-LESS-MUTATIONS:BEGIN -->";
+    const PAIR_LESS_END: &str = "<!-- PAIR-LESS-MUTATIONS:END -->";
+
+    /// A fn or method keyed by the triple a `module::[Owner::]name` path names,
+    /// so a curated block name resolves to the ITEM it names rather than being
+    /// matched by string.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct AuditedFn {
+        module: Vec<String>,
+        owner: Option<String>,
+        name: String,
+    }
+
+    impl AuditedFn {
+        fn rendered(&self) -> String {
+            let mut out = self.module.join("::");
+            if let Some(owner) = &self.owner {
+                if !out.is_empty() {
+                    out.push_str("::");
+                }
+                out.push_str(owner);
+            }
+            if !out.is_empty() {
+                out.push_str("::");
+            }
+            out.push_str(&self.name);
+            out
+        }
+    }
+
+    /// One production fn/method plus the two facts the derivation needs.
+    #[derive(Debug, Clone)]
+    struct CollectedFn {
+        item: AuditedFn,
+        public: bool,
+        takes_raw_path: bool,
+    }
+
+    fn type_last_segment(ty: &syn::Type) -> Option<String> {
+        match ty {
+            syn::Type::Path(type_path) => type_path
+                .path
+                .segments
+                .last()
+                .map(|segment| unraw(&segment.ident)),
+            syn::Type::Reference(reference) => type_last_segment(&reference.elem),
+            syn::Type::Paren(paren) => type_last_segment(&paren.elem),
+            syn::Type::Group(group) => type_last_segment(&group.elem),
+            _ => None,
+        }
+    }
+
+    fn bound_is_raw_path(bound: &syn::TypeParamBound) -> bool {
+        let syn::TypeParamBound::Trait(trait_bound) = bound else {
+            return false;
+        };
+        let Some(last) = trait_bound.path.segments.last() else {
+            return false;
+        };
+        if !matches!(unraw(&last.ident).as_str(), "AsRef" | "Into") {
+            return false;
+        }
+        let syn::PathArguments::AngleBracketed(arguments) = &last.arguments else {
+            return false;
+        };
+        arguments.args.iter().any(|argument| match argument {
+            syn::GenericArgument::Type(ty) => type_is_raw_path(ty),
+            _ => false,
+        })
+    }
+
+    /// Whether `ty` IS a raw path argument: `&Path`, `&mut Path`, `PathBuf`,
+    /// `&PathBuf`, `Box<Path>`, `Option<&Path>`, or `impl AsRef<Path>` /
+    /// `impl Into<PathBuf>` (and the same nested through `Option`/`Box`).
+    fn type_is_raw_path(ty: &syn::Type) -> bool {
+        match ty {
+            syn::Type::Reference(reference) => type_is_raw_path(&reference.elem),
+            syn::Type::Paren(paren) => type_is_raw_path(&paren.elem),
+            syn::Type::Group(group) => type_is_raw_path(&group.elem),
+            syn::Type::ImplTrait(impl_trait) => impl_trait.bounds.iter().any(bound_is_raw_path),
+            syn::Type::TraitObject(trait_object) => {
+                trait_object.bounds.iter().any(bound_is_raw_path)
+            }
+            syn::Type::Path(type_path) => {
+                let Some(segment) = type_path.path.segments.last() else {
+                    return false;
+                };
+                let name = unraw(&segment.ident);
+                if matches!(name.as_str(), "Path" | "PathBuf") {
+                    return true;
+                }
+                if !matches!(name.as_str(), "Option" | "Box" | "Cow" | "Rc" | "Arc") {
+                    return false;
+                }
+                let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                    return false;
+                };
+                arguments.args.iter().any(|argument| match argument {
+                    syn::GenericArgument::Type(inner) => type_is_raw_path(inner),
+                    _ => false,
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn sig_takes_raw_path(signature: &syn::Signature) -> bool {
+        let path_type_params = path_bounded_type_params(signature);
+        signature.inputs.iter().any(|argument| match argument {
+            syn::FnArg::Typed(pat_type) => {
+                type_is_raw_path(&pat_type.ty)
+                    || matches!(
+                        &*pat_type.ty,
+                        syn::Type::Path(type_path)
+                            if type_path.qself.is_none()
+                                && type_path.path.segments.len() == 1
+                                && path_type_params
+                                    .contains(&unraw(&type_path.path.segments[0].ident))
+                    )
+            }
+            syn::FnArg::Receiver(_) => false,
+        })
+    }
+
+    /// Type parameters bounded by `AsRef<Path>`/`Into<PathBuf>`, in the generic
+    /// list or the `where` clause, so a param written `p: P where P: AsRef<Path>`
+    /// is a raw path argument too.
+    fn path_bounded_type_params(signature: &syn::Signature) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for param in &signature.generics.params {
+            if let syn::GenericParam::Type(type_param) = param
+                && type_param.bounds.iter().any(bound_is_raw_path)
+            {
+                names.insert(unraw(&type_param.ident));
+            }
+        }
+        if let Some(where_clause) = &signature.generics.where_clause {
+            for predicate in &where_clause.predicates {
+                if let syn::WherePredicate::Type(predicate_type) = predicate
+                    && let syn::Type::Path(type_path) = &predicate_type.bounded_ty
+                    && let Some(segment) = type_path.path.segments.last()
+                    && predicate_type.bounds.iter().any(bound_is_raw_path)
+                {
+                    names.insert(unraw(&segment.ident));
+                }
+            }
+        }
+        names
+    }
+
+    fn collect_audited_fns(items: &[syn::Item], module: &[String], out: &mut Vec<CollectedFn>) {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) => out.push(CollectedFn {
+                    item: AuditedFn {
+                        module: module.to_vec(),
+                        owner: None,
+                        name: unraw(&function.sig.ident),
+                    },
+                    public: matches!(function.vis, syn::Visibility::Public(_)),
+                    takes_raw_path: sig_takes_raw_path(&function.sig),
+                }),
+                syn::Item::Mod(module_item) => {
+                    if let Some((_, inner)) = &module_item.content {
+                        let mut child = module.to_vec();
+                        child.push(unraw(&module_item.ident));
+                        collect_audited_fns(inner, &child, out);
+                    }
+                }
+                syn::Item::Impl(impl_item) => {
+                    let owner = type_last_segment(&impl_item.self_ty);
+                    for impl_child in &impl_item.items {
+                        if let syn::ImplItem::Fn(function) = impl_child {
+                            out.push(CollectedFn {
+                                item: AuditedFn {
+                                    module: module.to_vec(),
+                                    owner: owner.clone(),
+                                    name: unraw(&function.sig.ident),
+                                },
+                                // A TRAIT impl's methods are the TRAIT
+                                // declaration's; that declaration is walked
+                                // separately, so counting these public would
+                                // double-count the same API item.
+                                public: impl_item.trait_.is_none()
+                                    && matches!(function.vis, syn::Visibility::Public(_)),
+                                takes_raw_path: sig_takes_raw_path(&function.sig),
+                            });
+                        }
+                    }
+                }
+                syn::Item::Trait(trait_item) => {
+                    let public = matches!(trait_item.vis, syn::Visibility::Public(_));
+                    let owner = unraw(&trait_item.ident);
+                    for trait_child in &trait_item.items {
+                        if let syn::TraitItem::Fn(function) = trait_child {
+                            out.push(CollectedFn {
+                                item: AuditedFn {
+                                    module: module.to_vec(),
+                                    owner: Some(owner.clone()),
+                                    name: unraw(&function.sig.ident),
+                                },
+                                public,
+                                takes_raw_path: sig_takes_raw_path(&function.sig),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn audited_fns(parsed: &[ParsedSource], gated: &BTreeSet<String>) -> Vec<CollectedFn> {
+        let mut out = Vec::new();
+        for source in parsed {
+            if is_test_only(&source.rel, gated) {
+                continue;
+            }
+            // `module_path_from_rel` anchors every `src/**` module at `crate`;
+            // the block and exemption names are written without that root, so
+            // strip it here and compare like for like.
+            let mut module = source.module.clone();
+            if module.first().map(String::as_str) == Some("crate") {
+                module.remove(0);
+            }
+            collect_audited_fns(&source.file.items, &module, &mut out);
+        }
+        out
+    }
+
+    /// Resolve a `module::[Owner::]name` block/exemption name to the parsed
+    /// items it names. The OWNER is the last segment before the fn name when it
+    /// starts uppercase (`Residue::recover_to`, `Remote::lock_far_side`); the
+    /// MODULE PREFIX is everything before that, and a name resolves when the
+    /// item's source module STARTS WITH that prefix (so `sync::Residue::…`
+    /// finds the `Residue` in `sync::residue`, its public re-export path).
+    fn resolve_audited_name(name: &str, all: &[CollectedFn]) -> Vec<AuditedFn> {
+        let segments: Vec<&str> = name
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let Some((fn_name, rest)) = segments.split_last() else {
+            return Vec::new();
+        };
+        let (module_prefix, owner): (Vec<String>, Option<String>) = match rest.split_last() {
+            Some((last, head))
+                if last
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_ascii_uppercase()) =>
+            {
+                (
+                    head.iter().map(|segment| (*segment).to_string()).collect(),
+                    Some((*last).to_string()),
+                )
+            }
+            _ => (
+                rest.iter().map(|segment| (*segment).to_string()).collect(),
+                None,
+            ),
+        };
+        all.iter()
+            .filter(|collected| {
+                collected.item.name == *fn_name
+                    && collected.item.owner == owner
+                    && collected.item.module.len() >= module_prefix.len()
+                    && collected
+                        .item
+                        .module
+                        .iter()
+                        .zip(module_prefix.iter())
+                        .all(|(actual, expected)| actual == expected)
+            })
+            .map(|collected| collected.item.clone())
+            .collect()
+    }
+
+    /// The REVIEWED exemptions: public raw-path fns/methods that are
+    /// deliberately NOT pair-less mutations, each with its reason. The
+    /// derivation below requires the block to cover every OTHER public
+    /// raw-path item, so this list is the residue a reviewer checks one entry
+    /// at a time.
+    const PAIR_LESS_EXEMPTIONS: &[(&str, &str)] = &[
+        (
+            "atomic::path_state",
+            "lstat-style state read; no mutation (round 3)",
+        ),
+        (
+            "atomic::temp_name_for",
+            "derives a temp SPELLING; issues no syscall (round 3)",
+        ),
+        (
+            "RootDir::open",
+            "opens/validates the ROOT directory; creates nothing",
+        ),
+        (
+            "atomic::symlink_fd",
+            "the raw `&Path` is the symlink TARGET (content); the mutated NAME is the \
+             `&RootedRelativePath`",
+        ),
+        (
+            "manifest::canonicalize_tree",
+            "read-only walk/hash of a source root",
+        ),
+        (
+            "manifest::canonicalize_tree_destination",
+            "read-only walk/hash of a destination root",
+        ),
+        (
+            "manifest::canonicalize_remote_entries_checked",
+            "assembles a manifest from already-collected far-side output; read-only",
+        ),
+        (
+            "manifest::canonicalize_remote_entries_destination_checked",
+            "the destination twin of the above; read-only",
+        ),
+        (
+            "manifest::verify_tree_metadata",
+            "read-only verification of a stored manifest",
+        ),
+        (
+            "platform::file_mode",
+            "reads an entry's mode; no mutation (round 3)",
+        ),
+        (
+            "relpath::RootedRelativePath::parse",
+            "parses a spelling into the validated type; issues no syscall",
+        ),
+        (
+            "relpath::RootedRelativePath::join",
+            "path algebra on the validated type; issues no syscall",
+        ),
+        (
+            "OwnedRoot::parse",
+            "parses an endpoint + path; issues no syscall",
+        ),
+        (
+            "sync::apply::destination_lock_path",
+            "COMPUTES the sibling record path; creates nothing",
+        ),
+        (
+            "sync::diff::local_manifest",
+            "read-only walk/hash of a source root (round 3)",
+        ),
+        (
+            "sync::Residue::detect",
+            "read-only detection of a stranded residue",
+        ),
+        (
+            "sync::sync",
+            "OPERATION ENTRY POINT: takes the LOCAL ROOT path, not a name inside it; every \
+             mutation goes through the pair-based primitives internally",
+        ),
+        (
+            "DestinationOwnership::lock",
+            "OPERATION ENTRY POINT: takes the LOCAL ROOT path and mints the ownership token; \
+             delegates every name mutation to the pair-based primitives",
+        ),
+        (
+            "DestinationOwnership::lock_remote",
+            "the far-side twin of `DestinationOwnership::lock`",
+        ),
+        (
+            "DestinationOwnership::lock_with_in_root_lock",
+            "the composed twin of `DestinationOwnership::lock`",
+        ),
+        (
+            "transport::LocalTransport::new",
+            "constructor that STORES the base path; issues no mutation",
+        ),
+        (
+            "transport::LocalTransport::with_exec",
+            "constructor that STORES the base path and the exec seam; issues no mutation",
+        ),
+        (
+            "ChildRunner::new",
+            "constructor that STORES a cwd; issues no mutation",
+        ),
+        (
+            "transport::ssh::SshTransport::new",
+            "constructor that STORES the deploy dir and known-hosts paths; issues no mutation",
+        ),
+        (
+            "SshTransport::with_identity_file",
+            "builder that STORES an identity path; issues no mutation",
+        ),
+        (
+            "Remote::symlink",
+            "the raw `&Path` is the symlink TARGET (content); the mutated NAME is the \
+             `&RootedRelativePath`",
+        ),
+    ];
+
+    /// FIX 4: the constraint-1 enumeration is DERIVED, not enumerated. This
+    /// test (a) requires EXACTLY ONE marked block in `docs/API-CONSTRAINTS.md`,
+    /// (b) resolves every name in it to a real fn/method in the parsed
+    /// production item graph, and (c) derives every PUBLIC fn/method that takes
+    /// a raw path argument and requires each to be named in the block or in the
+    /// reviewed [`PAIR_LESS_EXEMPTIONS`] list. A SIXTH omission is therefore a
+    /// failing test rather than a reviewer's find: adding a new public
+    /// raw-path mutating fn makes `uncovered` non-empty until the block (or an
+    /// exemption with a reason) names it.
+    ///
+    /// THE DERIVATION'S BOUNDARY, stated rather than implied:
+    /// * it is SYNTACTIC on the parameter TYPE (`Path`/`PathBuf`, the same
+    ///   wrapped in `Option`/`Box`/`Cow`/`Rc`/`Arc`, or `impl AsRef<Path>` /
+    ///   `impl Into<PathBuf>` / a generic type param bounded the same way), so
+    ///   an `&OsStr` component (`RootedRelativePath::with_file_name`) is NOT a
+    ///   raw path and is out of class;
+    /// * a TRAIT-impl method (`impl Remote for X { fn symlink … }`) is not
+    ///   counted directly, because the TRAIT DECLARATION is counted instead; a
+    ///   FOREIGN trait's methods would be out of class, and this crate has
+    ///   none;
+    /// * a `mod` nested inside a fn BODY is not walked; this crate has none.
+    ///
+    /// A member of any of those classes is added to
+    /// [`PAIR_LESS_EXEMPTIONS`] with its reason rather than left implicit.
+    #[test]
+    fn pair_less_mutation_enumeration_is_the_derived_public_surface() {
+        // (a) EXACTLY ONE marked block.
+        let doc_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/API-CONSTRAINTS.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", doc_path.display()));
+        let begins = doc.matches(PAIR_LESS_BEGIN).count();
+        let ends = doc.matches(PAIR_LESS_END).count();
+        assert_eq!(
+            begins, 1,
+            "docs/API-CONSTRAINTS.md must carry EXACTLY ONE {PAIR_LESS_BEGIN}; found {begins}"
+        );
+        assert_eq!(
+            ends, 1,
+            "docs/API-CONSTRAINTS.md must carry EXACTLY ONE {PAIR_LESS_END}; found {ends}"
+        );
+        let start = doc.find(PAIR_LESS_BEGIN).unwrap() + PAIR_LESS_BEGIN.len();
+        let end = doc.find(PAIR_LESS_END).unwrap();
+        assert!(
+            start < end,
+            "the pair-less-mutation markers are out of order"
+        );
+        let block = &doc[start..end];
+
+        // Each entry is `- \`item::path\` — reason`.
+        let mut block_names: Vec<String> = Vec::new();
+        for line in block.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("- `") else {
+                continue;
+            };
+            let Some(close) = rest.find('`') else {
+                panic!("a pair-less-mutation block entry has an unclosed backtick: {line:?}");
+            };
+            block_names.push(rest[..close].to_string());
+        }
+        assert!(
+            !block_names.is_empty(),
+            "the marked block must name at least one mutation"
+        );
+
+        // (b)+(c) the parsed production item graph.
+        let mut paths = Vec::new();
+        collect_crate_rs_files(Path::new(env!("CARGO_MANIFEST_DIR")), &mut paths);
+        let sources: Vec<(String, String)> = paths
+            .iter()
+            .map(|file| {
+                (
+                    crate_relative(file),
+                    std::fs::read_to_string(file).expect("read source file"),
+                )
+            })
+            .collect();
+        let gated = test_only_gated_paths();
+        let parsed = parse_crate(&sources, &gated);
+        let all = audited_fns(&parsed, &gated);
+        let is_public_key = |key: &AuditedFn| {
+            all.iter()
+                .any(|collected| &collected.item == key && collected.public)
+        };
+
+        // (b) every block name RESOLVES to a real fn/method.
+        let mut block_keys: BTreeSet<AuditedFn> = BTreeSet::new();
+        for name in &block_names {
+            let resolved = resolve_audited_name(name, &all);
+            assert!(
+                !resolved.is_empty(),
+                "the pair-less-mutation block names {name:?}, which does NOT resolve to any fn or \
+                 method in the parsed production item graph; a stale member must fail"
+            );
+            assert!(
+                resolved.iter().any(is_public_key)
+                    || name == "transport::ssh::hostkey::pin_known_hosts",
+                "the block names {name:?}, which resolves only to NON-public items; the block is \
+                 the crate's public mutation inventory, and \
+                 `transport::ssh::hostkey::pin_known_hosts` (pub(crate) in a private module) is the \
+                 ONE named non-public residual"
+            );
+            block_keys.extend(resolved);
+        }
+
+        let mut exempt_keys: BTreeSet<AuditedFn> = BTreeSet::new();
+        for (name, reason) in PAIR_LESS_EXEMPTIONS {
+            assert!(
+                !reason.trim().is_empty(),
+                "the exemption {name:?} must state its reason"
+            );
+            let resolved = resolve_audited_name(name, &all);
+            assert!(
+                !resolved.is_empty(),
+                "the exemption {name:?} does NOT resolve to any fn or method in the parsed \
+                 production item graph"
+            );
+            assert!(
+                resolved.iter().any(is_public_key),
+                "the exemption {name:?} resolves only to NON-public items"
+            );
+            exempt_keys.extend(resolved);
+        }
+
+        // (c) the derived PUBLIC raw-path population.
+        let derived: Vec<AuditedFn> = all
+            .iter()
+            .filter(|collected| collected.public && collected.takes_raw_path)
+            .map(|collected| collected.item.clone())
+            .collect();
+        assert!(
+            derived.len() >= 15,
+            "the derivation must see the crate's public raw-path surface, not a near-empty set: \
+             {derived:?}"
+        );
+
+        let mut uncovered: Vec<String> = derived
+            .iter()
+            .filter(|item| !block_keys.contains(*item) && !exempt_keys.contains(*item))
+            .map(AuditedFn::rendered)
+            .collect();
+        uncovered.sort();
+        uncovered.dedup();
+        assert!(
+            uncovered.is_empty(),
+            "these PUBLIC fns/methods take a raw path argument and are in NEITHER the \
+             docs/API-CONSTRAINTS.md block NOR the reviewed PAIR_LESS_EXEMPTIONS list, so a SIXTH \
+             enumeration omission would not be caught: {uncovered:?}"
+        );
+
+        // No stale exemptions: each must cover at least one derived item.
+        for (name, _) in PAIR_LESS_EXEMPTIONS {
+            let covers = resolve_audited_name(name, &all)
+                .iter()
+                .any(|key| derived.contains(key));
+            assert!(
+                covers,
+                "the exemption {name:?} covers no derived public raw-path item; remove it"
+            );
+        }
+
+        // The block must still cover real derived mutations (a block that named
+        // only non-path items would not be the enumeration this test guards).
+        let block_covered = block_names
+            .iter()
+            .filter(|name| {
+                resolve_audited_name(name, &all)
+                    .iter()
+                    .any(|key| derived.contains(key))
+            })
+            .count();
+        assert!(
+            block_covered >= 3,
+            "the block must cover real public raw-path mutations; only {block_covered} of {} do",
+            block_names.len()
         );
     }
 }

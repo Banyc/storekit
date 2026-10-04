@@ -19,10 +19,12 @@
 # blind — while this lint notices a call anywhere ELSE. Neither device covers
 # the other; both stay.
 #
-# The symbols below are the inode-NAME mutators (plus the mode-bit setter) whose
-# authority the funnel owns. A production call may appear only in an item or
-# module annotated with `#[allow(clippy::disallowed_methods)]` — there is NO
-# allow list in this file; the allows are `#[allow]` attributes in the source.
+# The symbols below are the name mutators and REPLACERS (the inode mutators, the
+# mode-bit setter, and `std::fs::write`, whose create-on-absent path ADOPTS a
+# name) whose authority the funnel owns. A production call may appear only in an
+# item or module annotated with `#[allow(clippy::disallowed_methods)]` — there
+# is NO allow list in this file; the allows are `#[allow]` attributes in the
+# source.
 # The CURRENT allow sites are:
 #
 #   * the three MODULE-level funnel modules, each carrying an inner
@@ -99,8 +101,9 @@ disallowed-methods = [
   # to open read-only must not need an allow), while `open` on every builder is
   # an allow. `std::fs::OpenOptions::truncate` is deliberately NOT here:
   # `truncate(true)` cannot ADOPT a name (only `create`/`create_new` can), it is
-  # the content-mutation class the crate already leaves to `std::fs::write`
-  # (a `FUNNEL_SYMBOLS_NOT_DENIED` residual), and the lint matches the method
+  # the content-mutation class the crate leaves to `std::fs::write` — which the
+  # deny below now covers because `std::fs::write` CREATES on an absent path —,
+  # and the lint matches the method
   # NAME, so a deny would fire on the harmless `.truncate(false)` that the
   # lock's own open and read-only opens spell explicitly — none of which is an
   # adoption.
@@ -110,6 +113,14 @@ disallowed-methods = [
   { path = "std::fs::OpenOptions::create_new", reason = "the create_new flag decides name adoption; call the guarded atomic primitive instead" },
   { path = "std::fs::DirBuilder::create", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "std::fs::copy", reason = "the copy DESTINATION adopts a name; call the guarded atomic primitive instead" },
+  # `std::fs::write` CREATES a file at an absent path, so a non-funnel call
+  # ADOPTS any absent name — including a reserved spelling — exactly as
+  # `create_dir` does. It is therefore a name mutation, not merely content:
+  # the guarded replacement is `atomic::write_atomic_replace` (the name-owning
+  # replace), and the funnel's `write_file_fd` runs `refuse_reserved_mutation`
+  # first and preserves the inode of an EXISTING entry, so its only adoption is
+  # of a name the guard has already cleared.
+  { path = "std::fs::write", reason = "create-or-truncate ADOPTS an absent name; call the guarded atomic primitive instead" },
   # std::os — the platform symlink creators, the `std::fs`-shaped creation
   # wrappers that do not live under `std::fs`. `platform::symlink` is the ONE
   # production site; every other site is an error.
@@ -130,4 +141,17 @@ disallowed-methods = [
   { path = "libc::mkdirat", reason = "name mutation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::open", reason = "name creation/truncation is funnel-owned; call the guarded atomic primitive instead" },
   { path = "libc::openat", reason = "name creation/truncation is funnel-owned; call the guarded atomic primitive instead" },
+  # libc — the remaining pure name CREATORS. The belt test
+  # (`every_libc_call_symbol_the_tree_references_is_classified`) derives every
+  # `libc::<fn>` call the tree references and forces a classification, so a
+  # creator the funnel does not itself use is DENIED here rather than left to
+  # the belt alone: `libc::mkfifo` in particular creates a directory entry at a
+  # name, exactly as `libc::mkdir` does. The crate's live uses of these are all
+  # `#[cfg(test)]` and carry the standard test allow; there is no production
+  # call.
+  { path = "libc::mkfifo", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::mkfifoat", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::mknod", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::mknodat", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
+  { path = "libc::creat", reason = "name creation is funnel-owned; call the guarded atomic primitive instead" },
 ]

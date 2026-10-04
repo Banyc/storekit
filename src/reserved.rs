@@ -425,6 +425,11 @@ pub fn is_reserved_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Test-only fixtures write files the predicate then inspects; exempt from
+    // the production name-mutation rule exactly as the other test modules are
+    // (`std::fs::write` CREATES on an absent path, so the crate-root deny covers
+    // it).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// The predicate accepts exactly the two reserved families and leaves

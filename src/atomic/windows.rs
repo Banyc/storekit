@@ -1355,7 +1355,13 @@ pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> R
     }
 }
 
-/// Path-based plain file write (create-or-truncate).
+/// Path-based plain file write (create-or-truncate), the Windows twin of
+/// `unix::write_file_fd`. `std::fs::write` DOES adopt a name when the path is
+/// absent, which is why it is denied crate-wide and why this site carries the
+/// module-level allow AND calls [`refuse_reserved_mutation`] BEFORE it: the only
+/// adoption it can perform is of a name the reserved-spelling guard has already
+/// cleared. When the entry already exists the write truncates and refills it in
+/// place, preserving its inode, so a live lock holder's identity cannot change.
 pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> Result<()> {
     let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
