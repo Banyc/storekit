@@ -13384,6 +13384,53 @@ fn a_destination_ownership_token_is_bound_to_its_direction() {
     );
 }
 
+/// The OTHER half of the direction axis. A token minted for a PULL whose
+/// LOCAL root spelling EQUALS the transport's root leaves EVERY other compared
+/// axis identical — the pinned local root, the transport's root spelling,
+/// identity, and localness all match — so only the direction axis can refuse
+/// the swap. The PUSH run's destination (the transport root) and the PULL
+/// token's derived destination (its local root) are the SAME tree, so no other
+/// axis can distinguish the two runs.
+///
+/// This is the mirror of `a_destination_ownership_token_is_bound_to_its_direction`,
+/// which pins the PUSH-minted half. Gating the direction comparison on
+/// `self.direction == Direction::Push` leaves that half green and turns THIS
+/// test RED; gating it on `self.direction == Direction::Pull` leaves THIS half
+/// green and turns that test RED.
+#[test]
+fn a_pull_destination_ownership_token_is_bound_to_its_direction() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path().join("root");
+    write(&root.join("f"), b"payload");
+    let before = canonicalize_tree(&root).unwrap();
+
+    // The PULL token's derived destination is its local root, which is ALSO
+    // the PUSH run's destination spelling, so both directions name the same
+    // tree and only the direction can distinguish them.
+    let ownership = DestinationOwnership::lock(Direction::Pull, &root, &transport(&root))
+        .expect("minting a PULL token whose local root equals the transport root");
+
+    let err = sync(
+        Direction::Push,
+        &root,
+        &transport(&root),
+        &ReplaceAll,
+        Keep,
+        ownership,
+    )
+    .expect_err("a PULL token must be refused for a PUSH run");
+    assert_eq!(
+        err.error().preflight_reason(),
+        Some(PreflightKind::RunBindingMismatch),
+        "the refusal must be the typed run-binding mismatch: {err:?}"
+    );
+    assert_eq!(
+        canonicalize_tree(&root).unwrap(),
+        before,
+        "the refused direction swap must mutate nothing"
+    );
+}
+
 /// The "derived destination shape" the token's documentation once claimed as
 /// its own axis is refused by an axis that actually exists: a PUSH token whose
 /// destination root differs from the local source root is REFUSED when handed
