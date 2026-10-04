@@ -816,8 +816,23 @@ impl<'a> KindIndex<'a> {
 /// * both views hold a non-symlink kind, but DIFFERENT kinds — refuse (which
 ///   kind survives is decided by whether the replacement lands, which is the
 ///   plan);
-/// * only the destination supplies `C` — refuse (whether it survives is the
-///   plan's `Extraneous`/conflict decision);
+/// * only the destination supplies `C` — refuse. The rule is
+///   POLICY-INDEPENDENT BY CONSTRUCTION: it consults neither
+///   [`crate::sync::Extraneous`] nor any per-entry [`crate::sync::EntryPolicy`],
+///   because the applier's actual post-run set is not a FUNCTION of the
+///   `Extraneous` value. The same value yields different sets depending on
+///   conflicts, alias guards and residue guards, and an install can be refused,
+///   so consulting the policy here would trade this sound refusal for a second,
+///   weaker authority on what the run does. COST, made explicit: the same
+///   destination-only component is refused under BOTH of the crate's
+///   `Extraneous` values (2 of 2), so a `Keep` (default) run refuses a component
+///   `remove_extraneous` would never have touched; the suite records 3 such
+///   `Keep` refusals the previous rule permitted (the two residue components and
+///   the real destination directory). That over-refusal
+///   is the SANCTIONED direction: the fold is a denial tool, never a permission
+///   tool. The caller's remedies are to remove that destination component
+///   first, change the source link, or use a destination that does not supply
+///   it.
 /// * only the source supplies `C` — permit (it is installed; if the install is
 ///   refused it stays absent, and a dangling link does not escape);
 /// * neither supplies `C` — permit (the unchanged dangling-link behaviour);

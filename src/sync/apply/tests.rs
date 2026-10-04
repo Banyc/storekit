@@ -2193,12 +2193,16 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
 
     // CONTROL A (FLIPPED, P0): the SAME source, with `dir/sub` a REAL
     // destination directory the source does NOT supply, is now REFUSED. The
-    // component is DESTINATION-SUPPLIED, so whether it still exists after the
-    // run is the run's own plan decision (a refused replacement, a prohibited
-    // removal); the plan-free rule refuses rather than guess even though a
-    // real directory redirects nothing. The old expectation ("a real
-    // destination directory at the traversed component is lawful") encoded
-    // the plan-dependent permission this P0 fixed.
+    // component is DESTINATION-SUPPLIED, and the rule is POLICY-INDEPENDENT BY
+    // CONSTRUCTION: it does not consult the `Extraneous` value, because the
+    // applier's post-run set is not a function of it. See
+    // [`crate::manifest::ContainmentViews`] for the property and the explicit
+    // over-refusal cost. Under `Keep` (this test's policy) `remove_extraneous`
+    // is never called and the directory would in fact have been left untouched,
+    // so the refusal is the sanctioned over-refusal rather than a removal
+    // decision — even though a real directory redirects nothing. The old
+    // expectation ("a real destination directory at the traversed component is
+    // lawful") encoded the plan-dependent permission this P0 fixed.
     let dst_real = dir.path().join("dst-real");
     fs::create_dir_all(dst_real.join("dir/sub")).unwrap();
     fs::create_dir_all(dst_real.join("dir/other")).unwrap();
@@ -2466,12 +2470,16 @@ fn extraneous_delete_removes_a_crate_temp_symlink_component_and_permits_the_link
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the crate-temp counterpart under `Keep`. FLIPPED JUSTIFICATION (P0):
-/// the run still REFUSES, but not because "the temp survives under `Keep`";
-/// it refuses because the component is DESTINATION-SUPPLIED (the source holds
-/// no entry at `temp`), so whether it survives is the run's plan decision and
-/// the plan-free rule refuses under BOTH `Keep` and `Delete`. The assertions
-/// are unchanged.
+/// G2, the crate-temp counterpart under `Keep`. JUSTIFICATION CORRECTED (P0):
+/// the run REFUSES because the component is DESTINATION-SUPPLIED (the source
+/// holds no entry at `temp`). The rule is POLICY-INDEPENDENT BY CONSTRUCTION:
+/// it does not consult the `Extraneous` value at all, because the applier's
+/// post-run set is not a function of it. See
+/// [`crate::manifest::ContainmentViews`] for the property and the explicit
+/// over-refusal cost. This is NOT a `Delete`-side removal: under `Keep`
+/// `remove_extraneous` is never called, and the component would in fact have
+/// been left untouched — the refusal is the sanctioned over-refusal, not a
+/// removal decision. The assertions are unchanged.
 #[cfg(unix)]
 #[test]
 fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
@@ -2498,12 +2506,15 @@ fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
 }
 
 /// G2. FLIPPED (P0): a destination residue entry is DESTINATION-SUPPLIED (the
-/// source holds no entry at `.sync-aside.1.2`), so whether it still exists
-/// after the run is the plan's decision (residue survives even
-/// `Extraneous::Delete`, but a conflict or an alias can also leave a removable
-/// entry behind), and the plan-free rule refuses the destination-only
-/// component rather than guess. The old expectation — install the link through
-/// the in-root residue directory — is therefore inverted.
+/// source holds no entry at `.sync-aside.1.2`), and the rule is
+/// POLICY-INDEPENDENT BY CONSTRUCTION: it does not consult the `Extraneous`
+/// value, because the applier's post-run set is not a function of it. See
+/// [`crate::manifest::ContainmentViews`] for the property and the explicit
+/// over-refusal cost. Under `Keep` (this test's policy) `remove_extraneous` is
+/// never called and the residue would in fact have been left untouched, so the
+/// refusal is the sanctioned over-refusal rather than a removal decision. The
+/// old expectation — install the link through the in-root residue directory —
+/// is therefore inverted.
 #[cfg(unix)]
 #[test]
 fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
@@ -2533,10 +2544,14 @@ fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
 
 /// G2. FLIPPED (P0): the same with a residue REGULAR FILE. The component
 /// `.sync-aside.3.4` is DESTINATION-SUPPLIED (the source holds no entry
-/// there), so its post-run existence is the run's plan decision and the
-/// plan-free rule refuses rather than guess. The old "the component is not a
-/// symlink so the link must be installed" expectation encoded the
-/// plan-dependent permission this P0 fixed.
+/// there), and the rule is POLICY-INDEPENDENT BY CONSTRUCTION: it does not
+/// consult the `Extraneous` value, because the applier's post-run set is not a
+/// function of it. See [`crate::manifest::ContainmentViews`] for the property
+/// and the explicit over-refusal cost. Under `Keep` (this test's policy)
+/// `remove_extraneous` is never called and the residue would in fact have been
+/// left untouched, so the refusal is the sanctioned over-refusal. The old "the
+/// component is not a symlink so the link must be installed" expectation
+/// encoded the plan-dependent permission this P0 fixed.
 #[cfg(unix)]
 #[test]
 fn a_destination_residue_file_does_not_break_a_legitimate_link() {
@@ -2667,7 +2682,10 @@ fn a_destination_supplied_component_under_an_append_refusal_cannot_be_escaped_th
 /// pre-fix (a destination-only entry is not skipped from the result view under
 /// `Keep`), which pins the hole to the index's `Delete`/source-shadow skips
 /// rather than to the walk itself. The plan-free rule refuses under `Keep`
-/// too, for the plan-free reason.
+/// too, because the component is DESTINATION-SUPPLIED and the rule is
+/// POLICY-INDEPENDENT BY CONSTRUCTION (see
+/// [`crate::manifest::ContainmentViews`] for the property and its explicit
+/// over-refusal cost); `remove_extraneous` is never called under `Keep`.
 #[cfg(unix)]
 #[test]
 fn a_destination_supplied_component_under_a_refused_replacement_is_refused_under_keep() {

@@ -3654,13 +3654,13 @@ fn run(
     // target walk reaches (the FINAL one included, because the kernel follows
     // it) it refuses unless BOTH observations describe the component with the
     // SAME non-symlink kind. A component a redirector occupies, one only the
-    // destination supplies (its post-run existence is the plan's decision), or
-    // one the two views describe with different kinds (which kind lands is the
-    // plan's decision) is refused rather than guessed; a component only the
-    // SOURCE supplies stays permitted, because a refused install leaves it
-    // absent and a dangling link does not escape. See
-    // [`crate::manifest::ContainmentViews`] for the full table and
-    // [`crate::manifest::check_relative_symlink_target_two_views`] for the one
+    // destination supplies, or one the two views describe with different kinds
+    // is refused rather than guessed; a component only the SOURCE supplies
+    // stays permitted, because a refused install leaves it absent and a
+    // dangling link does not escape. The rule, its policy-independence, and its
+    // over-refusal cost are stated ONCE in
+    // [`crate::manifest::ContainmentViews`], with
+    // [`crate::manifest::check_relative_symlink_target_two_views`] as the one
     // entry point.
     //
     // The DESTINATION observation is the RAW entries, BEFORE the residue strip.
