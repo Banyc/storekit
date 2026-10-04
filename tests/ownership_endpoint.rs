@@ -465,6 +465,67 @@ fn a_pull_token_is_refused_against_a_different_source_root() {
     );
 }
 
+/// The LOCAL-ROOT axis for a PULL, through the PUBLIC API. `Prepared::matches`
+/// step 1 combines the direction check with the local-root comparison; the
+/// PUSH half is pinned by
+/// `sync::apply::tests::a_destination_ownership_token_is_bound_to_its_local_root`
+/// and the PULL half by its twin there. This is the public-API twin: a token
+/// minted for destination root A, replayed with destination root B and the
+/// SAME source transport, is refused with the typed RUN-BINDING mismatch and
+/// neither root is mutated.
+///
+/// DIRECTION GATE. Gating the ROOT half of step 1 on
+/// `direction == Direction::Push` leaves the whole suite green without this
+/// test. The impact is BOUNDED and stated: the run uses the TOKEN's
+/// `prepared.local` (A), so the `local_root` argument (B) is a silently IGNORED
+/// argument, not a containment breach; A is the root the un-pinned run would
+/// mutate.
+#[test]
+fn a_pull_token_is_refused_against_a_different_local_destination_root() {
+    let f = fixture();
+    let local_dst_a = f.dir.path().join("local-dst-a");
+    let local_dst_b = f.dir.path().join("local-dst-b");
+    std::fs::create_dir_all(&local_dst_a).expect("create the local destination A");
+    std::fs::create_dir_all(&local_dst_b).expect("create the local destination B");
+    std::fs::write(local_dst_a.join("f"), b"destination-a").expect("seed destination A");
+    std::fs::write(local_dst_b.join("f"), b"destination-b").expect("seed destination B");
+
+    let source = EndpointRemote::new(
+        f.dir.path().join("src-a"),
+        f.shared_root.clone(),
+        Some("ssh://source:22"),
+    );
+    std::fs::write(source.data("f"), b"from-source").expect("seed the source");
+
+    let token = DestinationOwnership::lock(Direction::Pull, &local_dst_a, &source)
+        .expect("mint a pull token for destination A");
+    let error = sync(
+        Direction::Pull,
+        &local_dst_b,
+        &source,
+        &ReplaceAll,
+        Extraneous::Keep,
+        token,
+    )
+    .expect_err("a pull token minted for destination A must be refused for destination B");
+    assert_eq!(
+        error.error().preflight_reason(),
+        Some(PreflightKind::RunBindingMismatch),
+        "the refusal must be the typed RUN-BINDING mismatch, not a source root or endpoint \
+         mismatch: {error:?}"
+    );
+    assert_eq!(
+        std::fs::read(local_dst_a.join("f")).expect("read destination A"),
+        b"destination-a",
+        "the token's OWN destination root (A) must be unmutated by the refused pull"
+    );
+    assert_eq!(
+        std::fs::read(local_dst_b.join("f")).expect("read destination B"),
+        b"destination-b",
+        "the destination root named on the call (B) must be unmutated"
+    );
+}
+
 /// The LEGITIMATE PULL case still works: the source that minted the token is
 /// accepted and its content is copied into the local destination.
 #[test]

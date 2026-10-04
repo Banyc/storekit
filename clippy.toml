@@ -38,7 +38,10 @@
 #     `crate::atomic::GuardedRel<'_>` proof that the reserved-spelling guard ran:
 #       transport::durable_create_new, transport::remove_file_if_inner;
 #   * `platform::chmod` (the ONE PATH-BASED mode authority) and
-#     `platform::symlink` (the ONE std-symlink site);
+#     `platform::symlink_verbatim` (the ONE std-symlink site; the ATTRIBUTE sits
+#     on this unguarded creator, while the guarded `platform::symlink` wrapper
+#     that runs `refuse_reserved_mutation` first carries no attribute of its
+#     own — naming the wrapper would point a reader at an item with no allow);
 #   * `lock::unix::open_lock_file` and `lock::windows::open_lock_file` — the
 #     LOCK PROTOCOL's own record open. Each is the ONE function the crate's
 #     lock acquisition uses to open (creating on first use) the lock record at

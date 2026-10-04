@@ -771,6 +771,26 @@ mod tests {
         "mount",
         "umount",
         "umount2",
+        "nmount",
+        "unmount",
+        "cygwin_umount",
+        // ROUND-12 EXTERNAL-SURFACE MEMBERS. These are `libc` name mutators the
+        // pinned crate EXPORTS that the round-11 hand family missed. The
+        // generated surface (`src/atomic/libc_name_mutation_surface.txt`)
+        // named them from the `libc` crate's own source, so they are
+        // classified here rather than left to the belt's default-deny alone.
+        "chflagsat",
+        "fsetattrlist",
+        "setattrlistat",
+        "fclonefileat",
+        "truncate64",
+        "ftruncate64",
+        "renamex_np",
+        "renameatx_np",
+        "shm_rename",
+        "wchmod",
+        "wrmdir",
+        "wutime",
     ];
 
     /// The NAME-MUTATION family as a LITERAL, kept in step with the belt's
@@ -879,6 +899,22 @@ mod tests {
         "mount",
         "umount",
         "umount2",
+        "nmount",
+        "unmount",
+        "cygwin_umount",
+        // ROUND-12 EXTERNAL-SURFACE MEMBERS (see MUTATING_LIBC_SYSCALLS).
+        "chflagsat",
+        "fsetattrlist",
+        "setattrlistat",
+        "fclonefileat",
+        "truncate64",
+        "ftruncate64",
+        "renamex_np",
+        "renameatx_np",
+        "shm_rename",
+        "wchmod",
+        "wrmdir",
+        "wutime",
     ];
 
     /// The CLOSED set of name-mutation CLASSES an anchor entry may claim. The
@@ -893,42 +929,53 @@ mod tests {
         "adopt-or-truncate-through-an-open",
         "bind-a-pathname-socket",
         "create-or-remove-a-posix-ipc-name",
+        "rename-a-posix-ipc-name",
         "create-a-name-through-a-temp-template",
         "change-metadata-attached-to-a-name",
         "change-the-mount-name-space",
     ];
 
-    /// THE INDEPENDENTLY-SPECIFIED ANCHOR, and the per-symbol class + reason
-    /// that justifies membership. This is the artifact the belt oracle
-    /// ITERATES; it is not compared to another list of its own kind. Every
-    /// member must (1) be on [`MUTATING_LIBC_SYSCALLS`], because clause (a) of
-    /// the derived belt is the only device that refuses a symbol the tree does
-    /// not reference, (2) be ABSENT from [`NON_MUTATING_LIBC_CALLS`], and (3)
-    /// be REFUSED by the DEFAULT-DENY half of the belt when a source references
-    /// it, so the anchor is not circular through the family. The set is
-    /// strictly LARGER than the 54-member family round 10 shipped: `lutimes`,
-    /// `futimes`/`futimesat`, `fchmodat2`, the POSIX IPC names
+    /// THE REVIEWED CLASS + REASON TABLE, and the belt family's justification.
+    /// Every member must (1) be on [`MUTATING_LIBC_SYSCALLS`], because clause
+    /// (a) of the derived belt is the only device that refuses a symbol the
+    /// tree does not reference, (2) be ABSENT from [`NON_MUTATING_LIBC_CALLS`],
+    /// and (3) be REFUSED by the DEFAULT-DENY half of the belt when a source
+    /// references it, so the review is not circular through the family. The set
+    /// is strictly LARGER than the 54-member family round 10 shipped:
+    /// `lutimes`, `futimes`/`futimesat`, `fchmodat2`, the POSIX IPC names
     /// (`mq_open`/`sem_open`/`shm_open` and their `*_unlink` twins), the
     /// template temp-name creators (`mkstemp`/`mkostemp`/`mkstemps`/
     /// `mkostemps`/`mkdtemp`), and the ACL setters were in NEITHER hand list,
-    /// and they are named in the oracle as negative controls so the anchor
-    /// cannot be silently narrowed back.
+    /// and they are named in the oracle as negative controls so the table
+    /// cannot be silently narrowed back. Round 12 added the members the DERIVED
+    /// surface ([`LIBC_NAME_MUTATION_SURFACE`]) named that the hand family
+    /// missed (`chflagsat`, `fsetattrlist`, `setattrlistat`, `fclonefileat`,
+    /// `truncate64`, `ftruncate64`, `renamex_np`, `renameatx_np`, `shm_rename`,
+    /// `wchmod`, `wrmdir`, `wutime`, `nmount`, `unmount`, `cygwin_umount`).
     ///
-    /// THE ANCHOR'S OWN BOUNDARY — IT IS A LIST TOO. It covers the
-    /// POSIX.1-2017, Linux, and BSD/macOS `libc` name-mutation surface: the
-    /// remove/replace/link entry calls, the entry creators (directory, node,
-    /// FIFO, clone, template temp names), the adopt/truncate open family, the
-    /// pathname-socket bind, the POSIX IPC name API, the name-attached metadata
-    /// setters (mode/owner/time/xattr/flags/ACL), and the mount name space. It
-    /// does NOT cover, and a mutator OUTSIDE it is a STATED RESIDUAL: (a) a raw
-    /// syscall reached by NUMBER or by a local `extern "C"` declaration
+    /// THIS IS NOT THE ORACLE'S INDEPENDENT SET. It lives in this file beside
+    /// the two family literals, so all three can be edited in lockstep; the
+    /// oracle's independent anchor is the DERIVED, externally-generated
+    /// [`LIBC_NAME_MUTATION_SURFACE`]. This table's job is to justify every belt
+    /// member, and `FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY` is the only way a
+    /// belt member may lack an entry here.
+    ///
+    /// THE TABLE'S OWN BOUNDARY. It covers the POSIX.1-2017, Linux, and
+    /// BSD/macOS `libc` name-mutation surface: the remove/replace/link entry
+    /// calls, the entry creators (directory, node, FIFO, clone, template temp
+    /// names), the adopt/truncate open family, the pathname-socket bind, the
+    /// POSIX IPC name API, the name-attached metadata setters
+    /// (mode/owner/time/xattr/flags/ACL), and the mount name space. It does NOT
+    /// cover, and a mutator OUTSIDE it is a STATED RESIDUAL: (a) a raw syscall
+    /// reached by NUMBER or by a local `extern "C"` declaration
     /// (`syscall(SYS_…)`, an `io_uring` submission, a `windows_sys` creator),
-    /// which has no `libc::<name>` symbol for this anchor to key on — those are
-    /// refused, not enumerated, by the `libc`-reference surface pin in
-    /// [`no_libc_reference_outside_the_funnel`] and by the raw-`extern "C"`
-    /// residue named in this module's docs; and (b) a `libc` name this anchor
+    /// which has no `libc::<name>` symbol for the derived surface to key on —
+    /// those are refused, not enumerated, by the `libc`-reference surface pin
+    /// in [`no_libc_reference_outside_the_funnel`] and by the raw-`extern "C"`
+    /// residue named in this module's docs; and (b) a `libc` name this table
     /// does not list, which is admitted only by ADDING it here with a class and
-    /// a reason — the act that reviews it.
+    /// a reason — the act that reviews it, and now also a mutation of the
+    /// generated surface (a second, deliberate edit).
     const INDEPENDENT_KNOWN_NAME_MUTATORS: &[(&str, &str, &str)] = &[
         // free-or-swap-a-directory-entry
         (
@@ -1285,6 +1332,80 @@ mod tests {
             "umount2",
             "change-the-mount-name-space",
             "the flag-taking twin of umount",
+        ),
+        (
+            "nmount",
+            "change-the-mount-name-space",
+            "the FreeBSD flag-taking mount",
+        ),
+        ("unmount", "change-the-mount-name-space", "the BSD umount"),
+        (
+            "cygwin_umount",
+            "change-the-mount-name-space",
+            "Cygwin's umount",
+        ),
+        // The members named by the DERIVED surface
+        // (`src/atomic/libc_name_mutation_surface.txt`) that the round-11 hand
+        // family missed. Each is an individual class + reason, not a bare add.
+        (
+            "chflagsat",
+            "change-metadata-attached-to-a-name",
+            "dirfd-relative chflags; changes a name's file flags",
+        ),
+        (
+            "fsetattrlist",
+            "change-metadata-attached-to-a-name",
+            "descriptor-relative setattrlist",
+        ),
+        (
+            "setattrlistat",
+            "change-metadata-attached-to-a-name",
+            "dirfd-relative setattrlist",
+        ),
+        (
+            "fclonefileat",
+            "create-a-directory-entry",
+            "dirfd-relative clonefile; creates a new name",
+        ),
+        (
+            "truncate64",
+            "change-metadata-attached-to-a-name",
+            "the large-file-offset spelling of truncate",
+        ),
+        (
+            "ftruncate64",
+            "change-metadata-attached-to-a-name",
+            "the large-file-offset spelling of ftruncate",
+        ),
+        (
+            "renamex_np",
+            "free-or-swap-a-directory-entry",
+            "rename with flags; can swap two names (macOS)",
+        ),
+        (
+            "renameatx_np",
+            "free-or-swap-a-directory-entry",
+            "the dirfd-relative twin of renamex_np",
+        ),
+        (
+            "shm_rename",
+            "rename-a-posix-ipc-name",
+            "renames a POSIX shared-memory name",
+        ),
+        (
+            "wchmod",
+            "change-metadata-attached-to-a-name",
+            "the wide-character chmod on a Windows name",
+        ),
+        (
+            "wrmdir",
+            "free-or-swap-a-directory-entry",
+            "the wide-character rmdir; removes a directory name",
+        ),
+        (
+            "wutime",
+            "change-metadata-attached-to-a-name",
+            "the wide-character utime on a Windows name",
         ),
     ];
 
@@ -3621,36 +3742,358 @@ mod tests {
         );
     }
 
-    /// ROUND-11 ANCHOR ORACLE. The `libc` belt is the device cited to make a
+    /// The CHECKED-IN generated `libc` name-mutation surface. Its header states
+    /// the provenance (the `libc` version `Cargo.lock` pins) and the command
+    /// that regenerates it.
+    const LIBC_NAME_MUTATION_SURFACE: &str = include_str!("libc_name_mutation_surface.txt");
+
+    /// The size [`LIBC_NAME_MUTATION_SURFACE`] must have, and an FNV-1a 64
+    /// digest over its sorted newline-joined names. Any edit to the file — an
+    /// added, removed, or reordered member — changes one of these, so a hand
+    /// edit is a deliberate second edit rather than a silent drift.
+    const LIBC_NAME_MUTATION_SURFACE_COUNT: usize = 82;
+    const LIBC_NAME_MUTATION_SURFACE_FNV1A64: u64 = 0x3fd0_9cc6_c727_3259;
+
+    /// The EXPLICIT curated allow for a `MUTATING_LIBC_SYSCALLS` member that is
+    /// deliberately absent from [`INDEPENDENT_KNOWN_NAME_MUTATORS`], with the
+    /// reason. It is empty today; the mechanism exists so the family may
+    /// DISAGREE with the hand anchor without the disagreement being silent. A
+    /// member that is neither justified in the anchor nor listed here fails the
+    /// oracle.
+    const FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY: &[(&str, &str)] = &[];
+
+    /// The NAMED NEGATIVE CONTROLS: the members that were in NEITHER round-10
+    /// hand list, so removing one is the narrowing the oracle must fail on. They
+    /// are ONE list so the two loops that use them cannot drift apart.
+    const NAMED_NEGATIVE_CONTROLS: &[&str] = &[
+        "chown",
+        "mknodat",
+        "lutimes",
+        "futimes",
+        "futimesat",
+        "fchmodat2",
+        "mq_open",
+        "mq_unlink",
+        "sem_open",
+        "sem_unlink",
+        "shm_open",
+        "shm_unlink",
+        "mkstemp",
+        "mkostemp",
+        "mkstemps",
+        "mkostemps",
+        "mkdtemp",
+        "acl_set_file",
+        "acl_set_link_np",
+    ];
+
+    /// The STATED RESIDUAL of the DERIVED surface: reviewed family members the
+    /// pinned `libc` crate declares NOWHERE, so no `libc::<name>` symbol exists
+    /// for the surface to key on. Each carries the reason it has no symbol.
+    const SURFACE_RESIDUAL: &[(&str, &str)] = &[
+        (
+            "acl_set_file",
+            "macOS ACL setter; libc 0.2.189 does not declare it",
+        ),
+        (
+            "acl_set_link_np",
+            "macOS symlink ACL setter; libc 0.2.189 does not declare it",
+        ),
+        (
+            "fchmodat2",
+            "Linux fchmodat-with-flags; reached through `syscall(SYS_fchmodat2)`, not declared",
+        ),
+        (
+            "openat2",
+            "Linux openat2; reached through `syscall(SYS_openat2)`, not declared",
+        ),
+    ];
+
+    /// The names of [`LIBC_NAME_MUTATION_SURFACE`], skipping the `#` header.
+    fn libc_name_mutation_surface() -> BTreeSet<String> {
+        LIBC_NAME_MUTATION_SURFACE
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// FNV-1a 64 over `bytes`, so the surface pin is a plain, stable checksum
+    /// that needs no digest dependency.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// The digest [`LIBC_NAME_MUTATION_SURFACE_FNV1A64`] pins. Deliberately over
+    /// the SORTED, newline-joined names, so it does not depend on the file's
+    /// line ending or the order the generator happened to emit.
+    fn surface_digest(names: &BTreeSet<String>) -> u64 {
+        let joined = names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fnv1a_64(joined.as_bytes())
+    }
+
+    /// The `pub fn` NAME in `line`, for each `pub`/`pub unsafe`/`pub unsafe
+    /// extern "C" fn` declaration on it. `pub(crate)` and `pub(super)` are not
+    /// the exported surface, so they are skipped.
+    fn pub_fn_names_in_line(line: &str) -> Vec<String> {
+        fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            i
+        }
+        fn ident_cont(byte: Option<&u8>) -> bool {
+            byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        }
+        fn word_at(bytes: &[u8], i: usize, word: &[u8]) -> bool {
+            bytes.get(i..i + word.len()) == Some(word) && !ident_cont(bytes.get(i + word.len()))
+        }
+        let bytes = line.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 3 <= bytes.len() {
+            if !(bytes[i] == b'p' && bytes[i + 1] == b'u' && bytes[i + 2] == b'b')
+                || ident_cont(if i == 0 { None } else { bytes.get(i - 1) })
+            {
+                i += 1;
+                continue;
+            }
+            let mut j = skip_ws(bytes, i + 3);
+            if word_at(bytes, j, b"unsafe") {
+                j = skip_ws(bytes, j + 6);
+            }
+            if word_at(bytes, j, b"extern") {
+                j = skip_ws(bytes, j + 6);
+                if bytes.get(j) == Some(&b'"') {
+                    j += 1;
+                    while j < bytes.len() && bytes[j] != b'"' {
+                        j += 1;
+                    }
+                    j = skip_ws(bytes, j + 1);
+                }
+            }
+            if word_at(bytes, j, b"fn") {
+                j = skip_ws(bytes, j + 2);
+                let start = j;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j > start
+                    && let Ok(name) = std::str::from_utf8(&bytes[start..j])
+                {
+                    out.push(name.to_string());
+                }
+            }
+            i += 3;
+        }
+        out
+    }
+
+    /// Every `pub fn` NAME declared under `root`, recursively. Lines that begin
+    /// a `//` comment are skipped, so a `pub fn` inside a doc example is not
+    /// part of the surface. This is the `libc` crate's OWN declaration surface,
+    /// read from a crate this one does not edit.
+    fn libc_pub_fn_names(root: &Path) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for line in text.lines() {
+                        let line = line.trim_start();
+                        if line.starts_with("//") {
+                            continue;
+                        }
+                        names.extend(pub_fn_names_in_line(line));
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The pinned `libc` crate source root (`…/registry/src/<index>/libc-<version>/src`),
+    /// or `None` when the source for the `Cargo.lock` version is not present on
+    /// this machine.
+    fn pinned_libc_source_root() -> Option<PathBuf> {
+        let lock =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
+                .ok()?;
+        let document: toml::Value = toml::from_str(&lock).ok()?;
+        let version = document
+            .get("package")?
+            .as_array()?
+            .iter()
+            .find(|package| package.get("name").and_then(toml::Value::as_str) == Some("libc"))?
+            .get("version")?
+            .as_str()?
+            .to_string();
+        let home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+        for index in std::fs::read_dir(home.join("registry").join("src")).ok()? {
+            let root = index
+                .ok()?
+                .path()
+                .join(format!("libc-{version}"))
+                .join("src");
+            if root.join("lib.rs").is_file() {
+                return Some(root);
+            }
+        }
+        None
+    }
+
+    /// The reviewed family ([`INDEPENDENT_KNOWN_NAME_MUTATORS`]) intersected
+    /// with the pinned `libc` crate's own `pub fn` declaration surface. This is
+    /// the DERIVED set the belt must COVER; it is not a hand list.
+    fn libc_surface_from_source(root: &Path) -> BTreeSet<String> {
+        let declared = libc_pub_fn_names(root);
+        INDEPENDENT_KNOWN_NAME_MUTATORS
+            .iter()
+            .map(|(symbol, _, _)| *symbol)
+            .filter(|symbol| declared.contains(*symbol))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The generated [`LIBC_NAME_MUTATION_SURFACE`] IS the reviewed family
+    /// INTERSECTED with the pinned `libc` crate's own declaration surface. When
+    /// that source is present — the normal case, because `cargo test` built
+    /// `libc` from the registry — the set is RE-DERIVED here from the crate
+    /// this one does not edit and any drift fails. When the source is absent the
+    /// checked-in list plus the count/digest pin in
+    /// [`the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel`]
+    /// stand.
+    #[test]
+    fn the_libc_name_mutation_surface_matches_the_pinned_libc_crate() {
+        let checked_in = libc_name_mutation_surface();
+        assert_eq!(
+            checked_in.len(),
+            LIBC_NAME_MUTATION_SURFACE_COUNT,
+            "the checked-in libc surface changed size; regenerate it and update the pin"
+        );
+        assert_eq!(
+            surface_digest(&checked_in),
+            LIBC_NAME_MUTATION_SURFACE_FNV1A64,
+            "the checked-in libc surface changed content; regenerate it (see its header) and \
+             update the count and digest pins"
+        );
+        let Some(root) = pinned_libc_source_root() else {
+            eprintln!(
+                "NOTE: the pinned libc source is not present; the checked-in surface and its \
+                 count/digest pin stand unconfirmed against the live crate"
+            );
+            return;
+        };
+        let live = libc_surface_from_source(&root);
+        assert_eq!(
+            live,
+            checked_in,
+            "the checked-in libc name-mutation surface disagrees with the pinned `libc` crate's \
+             own `pub fn` declaration surface at {}. Regenerate with `cargo test --lib -- \
+             --ignored --exact \
+             atomic::guard::tests::regenerate_libc_name_mutation_surface`.",
+            root.display()
+        );
+    }
+
+    /// Regenerate [`LIBC_NAME_MUTATION_SURFACE`] from the pinned `libc` source,
+    /// preserving the prose header. `#[ignore]`d so it runs only when invoked:
+    ///
+    /// `cargo test --lib -- --ignored --exact \
+    ///  atomic::guard::tests::regenerate_libc_name_mutation_surface`
+    #[test]
+    #[ignore = "regenerates the checked-in libc name-mutation surface; run deliberately"]
+    fn regenerate_libc_name_mutation_surface() {
+        let root = pinned_libc_source_root()
+            .expect("the pinned libc source must be locatable to regenerate the surface");
+        let names = libc_surface_from_source(&root);
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/atomic/libc_name_mutation_surface.txt");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut text: String = existing
+            .lines()
+            .take_while(|line| line.starts_with('#') || line.is_empty())
+            .map(|line| format!("{line}\n"))
+            .collect();
+        if text.is_empty() {
+            text.push_str("# GENERATED FILE - DO NOT EDIT BY HAND.\n");
+        }
+        for name in &names {
+            text.push_str(name);
+            text.push('\n');
+        }
+        std::fs::write(&path, text).expect("write the regenerated libc surface");
+        eprintln!(
+            "wrote {} names to {} (count {}, digest {:#x})",
+            names.len(),
+            path.display(),
+            names.len(),
+            surface_digest(&names)
+        );
+    }
+
+    /// ROUND-12 ANCHOR ORACLE. The `libc` belt is the device cited to make a
     /// REVIEWED PIN outside the funnel safe, so it must REFUSE a pinned known
-    /// name-mutating syscall even if the two classification lists are edited
-    /// against each other. For a symbol the lint does not deny (`libc::chmod`)
-    /// the belt is the SOLE device.
+    /// name-mutating syscall even if the hand-written classification lists are
+    /// edited against each other. For a symbol the lint does not deny
+    /// (`libc::chmod`) the belt is the SOLE device.
     ///
-    /// WHAT ROUND 10 GOT WRONG. [`KNOWN_NAME_MUTATORS`] and
-    /// [`MUTATING_LIBC_SYSCALLS`] are two hand-written literals IN THIS FILE, and
-    /// every arm but (5) compared them to EACH OTHER. A set equality between
-    /// things you edit together is not an oracle: deleting `chown` from BOTH
-    /// literals and adding it to [`NON_MUTATING_LIBC_CALLS`] disarmed the belt
-    /// with every arm green (measured; the same 3-way edit works for 52 of the
-    /// 54 round-10 members). Arm (5) hardcoded only `chmod` and `renameat2`, so
-    /// it did not notice the other 52.
+    /// WHAT ROUNDS 10 AND 11 GOT WRONG. [`KNOWN_NAME_MUTATORS`],
+    /// [`MUTATING_LIBC_SYSCALLS`] and [`INDEPENDENT_KNOWN_NAME_MUTATORS`] are
+    /// three hand-written artifacts IN THIS FILE, and round 11's arms compared
+    /// them to EACH OTHER — so a 3-way edit (drop the symbol from all three, add
+    /// it to [`NON_MUTATING_LIBC_CALLS`], pin a non-funnel `libc::<symbol>`
+    /// call) left every libc test and both clippy runs green. A set equality
+    /// between things you edit together is not an oracle. Only the 19 named
+    /// negative controls were outside the co-edit.
     ///
-    /// THIS ORACLE ITERATES [`INDEPENDENT_KNOWN_NAME_MUTATORS`], the THIRD
-    /// artifact, and asserts:
-    /// (0) the anchor is non-trivial, its classes come from the CLOSED
+    /// THE FIX. [`LIBC_NAME_MUTATION_SURFACE`] is DERIVED from the pinned
+    /// `libc` crate's own `pub fn` declaration surface — a crate this one does
+    /// not edit — so it stays naming a member the hand family dropped.
+    /// [`the_libc_name_mutation_surface_matches_the_pinned_libc_crate`]
+    /// re-derives it and fails on drift.
+    ///
+    /// THIS ORACLE asserts:
+    /// (0) the reviewed anchor is non-trivial, its classes come from the CLOSED
     ///     [`KNOWN_NAME_MUTATOR_CLASSES`] set, every entry carries a non-empty
     ///     reason distinct from its class, and the named negative controls
     ///     (`lutimes`, `fchmodat2`, `mq_open`, …) are still present;
-    /// (1) the two family literals name the SAME symbols AND the anchor names
-    ///     every family member and nothing else — so co-editing BOTH family
-    ///     literals leaves the anchor naming a symbol the family lost, and fails
-    ///     here; a family member with no anchor entry fails too (membership
-    ///     requires an individual class + reason, not merely "it is in the
-    ///     list");
+    /// (0b) the DERIVED surface is pinned by count and digest, every member is
+    ///     on [`MUTATING_LIBC_SYSCALLS`] (so dropping a member from the family
+    ///     fails HERE even when every hand artifact was edited in lockstep), and
+    ///     every member is refused by the belt and by the default-deny clause
+    ///     alone; the residual — reviewed members the pinned `libc` declares
+    ///     nowhere — is an EXPLICIT list;
+    /// (1) the two family literals name the SAME symbols, the reviewed anchor
+    ///     names every family member, and a family member WITHOUT an anchor
+    ///     entry is allowed only through the EXPLICIT
+    ///     [`FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY`] list with a reason (so the
+    ///     anchor and the family may disagree, but never silently);
     /// (2) DISJOINTNESS from [`NON_MUTATING_LIBC_CALLS`], checked against the
-    ///     ANCHOR, so a 3-way MOVE into the review list fails even if both
-    ///     family literals were edited to match;
+    ///     UNION of the family, the anchor, and the derived surface, so a 3-way
+    ///     MOVE into the review list fails even if every hand list was edited to
+    ///     match;
     /// (3) every anchor member is REFUSED by the belt the audit DERIVES from a
     ///     source that references it, via the audit's OWN predicate
     ///     ([`libc_reference_outside_funnel_is_allowed`]);
@@ -3661,6 +4104,14 @@ mod tests {
     ///     the non-mutating review list would add; and
     /// (5) for EVERY anchor member the lint does NOT deny, the belt is the SOLE
     ///     device, with a non-vacuous count, so the arm is not a hardcoded pair.
+    ///
+    /// STATED RESIDUAL. The derived surface is the `libc` crate's SYMBOL
+    /// surface, so it cannot name a mutator libc does not export
+    /// (`acl_set_file`, `acl_set_link_np`, `fchmodat2`, `openat2` — the four in
+    /// the residual above) or one reached by NUMBER (`syscall(SYS_…)`, an
+    /// `io_uring` submission, a local `extern "C"` declaration, a `windows_sys`
+    /// creator). Those are refused, where they are refused at all, by the belt's
+    /// clause (a) and the module-level residue, not by this surface.
     #[test]
     fn the_libc_belt_refuses_a_known_name_mutator_pinned_outside_the_funnel() {
         // (0) THE ANCHOR ITSELF: a closed class set, an individual reason per
@@ -3693,31 +4144,110 @@ mod tests {
         // THE NAMED NEGATIVE CONTROLS. These were in NEITHER round-10 hand list;
         // they are the members that make the anchor larger than that family, so
         // removing one is the narrowing this arm exists to fail on.
-        for symbol in [
-            "chown",
-            "mknodat",
-            "lutimes",
-            "futimes",
-            "futimesat",
-            "fchmodat2",
-            "mq_open",
-            "mq_unlink",
-            "sem_open",
-            "sem_unlink",
-            "shm_open",
-            "shm_unlink",
-            "mkstemp",
-            "mkostemp",
-            "mkstemps",
-            "mkostemps",
-            "mkdtemp",
-            "acl_set_file",
-            "acl_set_link_np",
-        ] {
+        for &symbol in NAMED_NEGATIVE_CONTROLS {
             assert!(
                 anchor.contains(symbol),
                 "the independently-specified anchor lost the negative control {symbol}; it must \
                  stay anchored OUTSIDE the co-editable family pair"
+            );
+        }
+
+        // (0b) THE DERIVED EXTERNAL SURFACE — THE INDEPENDENT ANCHOR. The three
+        // hand-written artifacts above all live in THIS FILE and can be edited
+        // in lockstep, so a set equality among them is not an oracle. This
+        // surface is GENERATED from the pinned `libc` crate's own `pub fn`
+        // declaration surface, a crate this one does not edit, so it DISAGREES
+        // with any shrinking of the family: it stays naming the member the
+        // family dropped. It is pinned by count and digest (so any hand edit is
+        // a deliberate second edit), every member must be on the family, and
+        // every member must be REFUSED by the belt.
+        let surface = libc_name_mutation_surface();
+        assert_eq!(
+            surface.len(),
+            LIBC_NAME_MUTATION_SURFACE_COUNT,
+            "the derived libc surface changed size: regenerate it and update the pin"
+        );
+        assert_eq!(
+            surface_digest(&surface),
+            LIBC_NAME_MUTATION_SURFACE_FNV1A64,
+            "the derived libc surface changed content: regenerate it (see its header) and update \
+             the count and digest pins"
+        );
+        let surface_not_in_family: Vec<&String> = surface
+            .iter()
+            .filter(|symbol| !MUTATING_LIBC_SYSCALLS.contains(&symbol.as_str()))
+            .collect();
+        assert!(
+            surface_not_in_family.is_empty(),
+            "the DERIVED libc name-mutation surface names {surface_not_in_family:?}, which \
+             MUTATING_LIBC_SYSCALLS does not: the external surface is the AUTHORITY the hand \
+             family must COVER, so dropping a member from the family (or from the two literals) \
+             fails HERE even when all three hand artifacts were edited in lockstep — and the belt \
+             would otherwise AUTHORIZE a pinned call to it outside the funnel. Restore the member \
+             or regenerate the surface."
+        );
+        let justified: BTreeSet<&str> = INDEPENDENT_KNOWN_NAME_MUTATORS
+            .iter()
+            .map(|(symbol, _, _)| *symbol)
+            .collect();
+        // THE STATED RESIDUAL. A reviewed family member the pinned `libc` crate
+        // declares NOWHERE has no `libc::<name>` symbol for the derived surface
+        // to key on, so it cannot appear above. The four below are exactly that
+        // class: the crate reaches them through a raw syscall by number or does
+        // not wrap them at all. They stay on the belt's clause (a).
+        let residual: BTreeSet<&str> = justified
+            .iter()
+            .copied()
+            .filter(|symbol| !surface.contains(*symbol))
+            .collect();
+        let expected_residual: BTreeSet<&str> =
+            SURFACE_RESIDUAL.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            residual, expected_residual,
+            "the residual — reviewed family members the pinned `libc` crate declares NOWHERE — \
+             changed. If the member is now exported, regenerate the surface; if the family gained \
+             a name with no `libc` symbol, add it to SURFACE_RESIDUAL with the reason it has no \
+             symbol."
+        );
+        for (name, reason) in SURFACE_RESIDUAL {
+            assert!(
+                !reason.trim().is_empty(),
+                "the residual {name} must carry the reason libc does not export it"
+            );
+        }
+        // The NAMED NEGATIVE CONTROLS must remain refused by the belt whether or
+        // not the pinned `libc` exports them, so each must be either on the
+        // derived surface or in the stated residual.
+        for &symbol in NAMED_NEGATIVE_CONTROLS {
+            assert!(
+                surface.contains(symbol) || residual.contains(symbol),
+                "the derived surface AND the stated residual both lost the negative control \
+                 {symbol}; the belt must keep refusing it"
+            );
+        }
+        // (3)+(4) for the DERIVED surface too: every externally-confirmed member
+        // is refused by the belt AND by the default-deny clause alone.
+        for symbol in &surface {
+            let sources = vec![(
+                "src/prod/synthetic.rs".to_string(),
+                format!("unsafe fn f(p: *const libc::c_char) {{ libc::{symbol}(p); }}"),
+            )];
+            let reference = format!("libc::{symbol}");
+            let belt = mutating_libc_belt(&sources);
+            assert!(
+                !libc_reference_outside_funnel_is_allowed(&belt, &reference),
+                "the DERIVED libc surface names the name mutator {reference} and the belt ALLOWED \
+                 it; the external surface is authoritative, so a pinned OUTSIDE reference would be \
+                 authorized. The belt must refuse it: {belt:?}"
+            );
+            let default_deny: BTreeSet<String> = libc_call_symbols(&code_only(&sources[0].1))
+                .into_iter()
+                .filter(|name| !NON_MUTATING_LIBC_CALLS.contains(&name.as_str()))
+                .collect();
+            assert!(
+                !libc_reference_outside_funnel_is_allowed(&default_deny, &reference),
+                "the DEFAULT-DENY clause ALONE must refuse the DERIVED {reference}; it did not, \
+                 which means the symbol sits on NON_MUTATING_LIBC_CALLS: {default_deny:?}"
             );
         }
 
@@ -3741,19 +4271,46 @@ mod tests {
              here: the anchor still names it, and clause (a) of the belt no longer refuses it. \
              Restore the family member or state the reclassification in the anchor."
         );
-        let missing_from_anchor: Vec<&&str> = code_family.difference(&anchor).collect();
+        // The OTHER direction is NO LONGER an equality. The family may be
+        // LARGER than the reviewed anchor, but only by an EXPLICIT curated entry
+        // with a reason ([`FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY`]), so a member
+        // cannot be added to the belt silently and cannot leave the anchor
+        // silently. Today that list is empty; the DERIVED surface above is a
+        // strict SUBSET of the family, so the anchor and the family already
+        // disagree, and the disagreement is visible rather than forced.
+        let unexpected_family: Vec<&&str> = code_family
+            .difference(&anchor)
+            .filter(|symbol| {
+                !FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY
+                    .iter()
+                    .any(|(name, _)| name == *symbol)
+            })
+            .collect();
         assert!(
-            missing_from_anchor.is_empty(),
-            "MUTATING_LIBC_SYSCALLS names {missing_from_anchor:?}, which the anchor does not. \
-             Every family member needs an individual class + reason in \
-             INDEPENDENT_KNOWN_NAME_MUTATORS: membership must be a reviewed justification, not \
-             merely `it is in the list`."
+            unexpected_family.is_empty(),
+            "MUTATING_LIBC_SYSCALLS names {unexpected_family:?}, which the anchor does not and \
+             which is not in FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY. Every family member needs \
+             either an individual class + reason in INDEPENDENT_KNOWN_NAME_MUTATORS or an \
+             explicit curated exemption with a reason: membership must be reviewed, not merely \
+             `it is in the list`."
         );
+        for (name, reason) in FAMILY_MEMBERS_WITHOUT_AN_ANCHOR_ENTRY {
+            assert!(
+                code_family.contains(name) && !reason.trim().is_empty(),
+                "the curated family exemption {name:?} must name a real family member and carry a \
+                 non-empty reason: {reason:?}"
+            );
+        }
 
-        // (2) DISJOINTNESS, checked against the ANCHOR, so a MOVE of an anchor
-        // member into the review list fails even if both family literals were
-        // edited to match the move.
-        let overlap: Vec<&&str> = anchor
+        // (2) DISJOINTNESS, checked against the UNION of the family, the
+        // reviewed anchor, and the DERIVED surface, so a MOVE of ANY of them
+        // into the review list fails even if every hand list was edited to
+        // match the move: a family member cannot appear on the review list
+        // whether or not it is in the anchor.
+        let mut reviewed: BTreeSet<&str> = code_family.clone();
+        reviewed.extend(anchor.iter().copied());
+        reviewed.extend(surface.iter().map(String::as_str));
+        let overlap: Vec<&&str> = reviewed
             .iter()
             .filter(|symbol| NON_MUTATING_LIBC_CALLS.contains(symbol))
             .collect();

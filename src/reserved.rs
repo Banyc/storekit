@@ -331,15 +331,23 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   each takes a [`crate::atomic::GuardedRel`] capability that
 ///   `GuardedRel::new_for_owned_lock_record` mints only after the guard has
 ///   run, so their rename/remove/create on the crate's own temp/swap names is
-///   the funnel's own code, not a path around it. Only two production
-///   mutation families never consult the guard: the transport's own
-///   destination-root/layout DIRECTORY creation (`create_dir_all` on
-///   `self.base` and its bootstrap dirs, which creates directories rather
-///   than mutating an existing NAME), and the private ssh hostkey cache's
+///   the funnel's own code, not a path around it. The production mutation
+///   sites that do NOT consult the guard are a CLASS defined by RULE, not a
+///   count: a site whose only protection is its OWN naming or its own
+///   naming-check rather than the reserved-spelling guard. Three such sites
+///   exist today — the transport's own destination-root/layout DIRECTORY
+///   creation (`create_dir_all` on `self.base` and its bootstrap dirs, which
+///   creates directories the caller names OUTRIGHT rather than mutating an
+///   existing NAME the guard owns); the private ssh hostkey cache's
 ///   drop-and-re-pin `remove_file`/create under the transport's own resolved
-///   `cache_dir` (`hostkey.rs`) — a path derived from the transport's private
-///   cache, never from a caller's store-relative name, so neither can be
-///   steered to the record's spelling. The AUTHORITATIVE list of which module
+///   `cache_dir` (`hostkey.rs`), a path derived from the transport's private
+///   cache and never from a caller's store-relative name; and the verbatim
+///   copier described in the next bullet (`copy_tree_verbatim`, whose whole
+///   contract is to CARRY reserved and temp spellings — including through
+///   `platform::symlink_verbatim`, the ONE deliberately unguarded symlink
+///   creator). None can be steered to the record's spelling, and each is
+///   exempt for its OWN naming reason, so the class is stated as a rule rather
+///   than as a count to keep in step. The AUTHORITATIVE list of which module
 ///   may spell which disallowed symbol is `clippy.toml`'s comment plus the
 ///   per-module `#![allow(clippy::disallowed_methods)]`s — consult those
 ///   rather than keeping a second list here.
@@ -356,11 +364,15 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   the substrate (a foreign process, a raw `std::fs` call the caller writes
 ///   itself) is not stopped.
 /// * a foreign process, or a developer writing a brand-new direct `libc::`
-///   mutation OUTSIDE the funnel module, is not stopped by the type system.
+///   mutation OUTSIDE the funnel region, is not stopped by the type system.
 ///   The crate carries two source audits
 ///   (`atomic::guard::tests::no_libc_reference_outside_the_funnel` and
 ///   `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned`) that fail on ANY
-///   new `libc` reference outside `src/atomic/unix.rs` — a mutating symbol, a
+///   new `libc` reference outside the DERIVED funnel region — the
+///   allow-bearing modules the audit derives from the module-level
+///   `#![allow(clippy::disallowed_methods)]`s, today the FOUR files
+///   `src/atomic/{mod,unix,windows,guard}.rs` (`guard.rs` is a CHILD of
+///   `atomic/mod.rs`, so its parent's allow reaches it) — a mutating symbol, a
 ///   `use libc as alias` module alias, a braced self-alias, a re-export, a
 ///   glob, or a call broken across a newline — and when a `std::fs`
 ///   removal/replace/rename call in PRODUCTION code changes count. Their exact scope (and the holes no

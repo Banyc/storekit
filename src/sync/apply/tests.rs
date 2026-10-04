@@ -13229,6 +13229,61 @@ fn a_destination_ownership_token_is_bound_to_its_local_root() {
     );
 }
 
+/// The PULL TWIN of
+/// [`a_destination_ownership_token_is_bound_to_its_local_root`]. For a PULL the
+/// LOCAL root IS the destination: a token minted for destination root A,
+/// replayed with destination root B and the SAME source transport, is refused
+/// with the typed RUN-BINDING mismatch, and NEITHER root is mutated.
+///
+/// DIRECTION GATE. `Prepared::matches` step 1 combines the direction check
+/// with the local-root comparison, so gating the ROOT half on
+/// `direction == Direction::Push` left the whole suite green: this test is what
+/// makes the PULL half of the axis fail. The IMPACT of the gated form is
+/// BOUNDED and is stated here rather than implied: `run` uses the TOKEN's
+/// `prepared.local` (A), not the `local_root` argument (B), so B is never
+/// mutated even by the un-pinned clause — the clause is a silently IGNORED
+/// ARGUMENT, not a containment breach. A is what the un-pinned run would
+/// mutate, which is exactly why the refusal must precede `run`.
+#[test]
+fn a_pull_destination_ownership_token_is_bound_to_its_local_root() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let dst_a = dir.path().join("dst-a");
+    let dst_b = dir.path().join("dst-b");
+    let src = dir.path().join("src");
+    write(&src.join("f"), b"payload");
+    write(&dst_a.join("f"), b"destination-a");
+    write(&dst_b.join("f"), b"destination-b");
+    let before_a = canonicalize_tree(&dst_a).unwrap();
+    let before_b = canonicalize_tree(&dst_b).unwrap();
+
+    let ownership = DestinationOwnership::lock(Direction::Pull, &dst_a, &transport(&src))
+        .expect("minting a PULL token for destination root A");
+    let err = sync(
+        Direction::Pull,
+        &dst_b,
+        &transport(&src),
+        &ReplaceAll,
+        Keep,
+        ownership,
+    )
+    .expect_err("a PULL token minted for another local root must be refused");
+    assert_eq!(
+        err.error().preflight_reason(),
+        Some(PreflightKind::RunBindingMismatch),
+        "the refusal must be the typed run-binding mismatch: {err:?}"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst_a).unwrap(),
+        before_a,
+        "the token's OWN destination root (A) must be unmutated by the refused run"
+    );
+    assert_eq!(
+        canonicalize_tree(&dst_b).unwrap(),
+        before_b,
+        "the destination root named on the call (B) must be unmutated"
+    );
+}
+
 /// The token is bound to the DIRECTION as well as to the roots. A token
 /// minted for a PUSH whose destination root spelling EQUALS the local source
 /// root leaves EVERY other compared axis identical — the pinned local root,
