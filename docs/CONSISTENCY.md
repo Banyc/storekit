@@ -166,8 +166,14 @@ itself (an `OwnedFd` on unix against a `PathBuf` on windows, with a stronger
 only a claim about PRESENCE; presence is now equal, and meaning is what a
 consumer must read.
 
-The crate's public-function total fell 186 → 174 across this and API constraint
-#1 — the constraint's real product is a smaller surface, not a longer document.
+The crate's public surface SHRANK across this and API constraint
+#1 — that is the constraint's real product, a smaller surface rather than a longer
+document. An earlier version of this sentence gave the figures as "186 → 174"; they
+are DELETED here for the same reason the 191/11 counts were removed two paragraphs
+up (a bare count with no counting rule is a label, and no rule in this doc produces
+174). The measured property that matters is axis J's: the accessible public NAME SETS
+are identical on both targets, 0 unix-only and 0 windows-only, reproduced by two
+reviewers with their own instruments.
 
 **K — a reading taken from the wrong revision.** A `pub fn` surface count and a
 full `cargo test --lib` were both run from a checkout whose working copy was
