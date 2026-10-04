@@ -3722,7 +3722,11 @@ mod tests {
     }
 
     /// The entry names DIRECTLY under the path-based directory `dir`, sorted:
-    /// a failed replace must leave NOTHING but the names the test seeded.
+    /// a failed replace must leave nothing but the names the test seeded, PLUS
+    /// any durable PARENT chain the replace CREATED when the target's parents
+    /// were missing. Tests asserting exact CONTENTS pre-create the target's
+    /// directory (so no parent is created); the missing-parent regression
+    /// asserts the created chain separately.
     fn entry_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -4101,6 +4105,50 @@ mod tests {
                 entry_names(dir.path()),
                 only("marker.json"),
                 "{stage:?}: a failed replace must leave no stray temp"
+            );
+        }
+    }
+
+    /// The `atomic` module doc's cleanup claim is about the TEMP entry only.
+    /// A failed replace whose target's PARENT CHAIN did not exist still leaves
+    /// the durable parent chain it CREATED (that creation is what makes a
+    /// later rename durable), and the OLD state is exactly "absent" because
+    /// the file never existed. This pins the REAL behaviour at each
+    /// pre-rename stage: (a) no stray temp, (b) the target is still absent,
+    /// and (c) the created parent chain REMAINS.
+    #[test]
+    fn failed_replace_with_a_missing_parent_chain_leaves_the_created_parents_behind() {
+        for stage in [
+            ReplaceStage::Write,
+            ReplaceStage::Sync,
+            ReplaceStage::Rename,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            // `dir/a/b/c` does NOT exist; the replace creates it durably
+            // BEFORE the Write stage, so a pre-rename fault cannot roll it
+            // back.
+            let path = dir.path().join("dir/a/b/c/file");
+            let err = write_atomic_replace(&path, b"NEW", &mut |s| {
+                (s == stage).then(|| Error::store(format!("injected {stage:?} fault")))
+            })
+            .unwrap_err();
+            assert!(matches!(err, Error::Store { .. }), "{stage:?}: got {err:?}");
+            // (a) no stray temp: the deepest created directory is EMPTY.
+            assert_eq!(
+                entry_names(&dir.path().join("dir/a/b/c")),
+                Vec::<String>::new(),
+                "{stage:?}: a failed replace must leave no stray temp"
+            );
+            // (b) the target never existed, so its OLD state is "absent".
+            assert!(
+                std::fs::symlink_metadata(&path).is_err(),
+                "{stage:?}: the target must be absent, exactly as before"
+            );
+            // (c) the created parent chain REMAINS — the intentional, lasting
+            // side effect of a durable replace.
+            assert!(
+                dir.path().join("dir/a/b/c").is_dir(),
+                "{stage:?}: the durably-created parent chain must remain"
             );
         }
     }

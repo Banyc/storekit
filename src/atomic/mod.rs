@@ -11,10 +11,14 @@
 //! FSYNC is commit point 2 (the rename becomes DURABLE across power loss).
 //! A failure before the rename is an `Err` — the OLD content is still
 //! visible, and the temp file the replace wrote is UNLINKED before the call
-//! returns, so a failed replace leaves the directory exactly as it found it
-//! (no stray temp entry). The best-effort unlink is never silent: if it
-//! itself fails, the error carries both the original failure and the cleanup
-//! failure. A failure of the parent-directory open/fsync AFTER the rename
+//! returns, so a failed replace leaves no stray TEMP entry. (The durable
+//! PARENT CHAIN the replace CREATED when the target's parents were missing
+//! is an INTENTIONAL, lasting side effect, not something a failure rolls
+//! back: creating it durably is exactly what makes a later rename durable,
+//! so only the temp entry is undone.) The best-effort unlink is never
+//! silent: if it itself fails, the error carries both the original failure
+//! and the cleanup failure. A failure of the parent-directory open/fsync
+//! AFTER the rename
 //! is [`ReplaceOutcome::ReplacedDurabilityUnknown`] — the NEW content IS
 //! visible but its durability is UNCONFIRMED — never a bare `Err` (a bare
 //! `Err` would conflate "the rename never happened" with "the rename

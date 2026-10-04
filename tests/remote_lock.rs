@@ -114,8 +114,12 @@ impl TestSshd {
         std::fs::create_dir_all(&tmpdir).expect("create the harness TMPDIR");
 
         let user = whoami();
-        let (child, port) = start_listener(root, &host_key, &authorized);
-        let known_hosts = scan_known_hosts(root, port);
+        // The ed25519 blob our OWN sshd must present. The harness verifies the
+        // listener against it, so a port stolen between `free_port` and the
+        // `sshd` bind can never be mistaken for our sshd.
+        let host_key_blob = host_key_blob(&host_key);
+        let (child, port) = start_listener(root, &host_key, &authorized, &host_key_blob);
+        let known_hosts = scan_known_hosts(root, port, &host_key_blob);
         TestSshd {
             dir,
             child,
@@ -196,15 +200,116 @@ fn whoami() -> String {
         .unwrap_or_else(|_| "root".to_string())
 }
 
+/// Serializes every sshd start in THIS process: the test binary runs its tests
+/// on parallel threads, and two overlapping `free_port` windows are exactly how
+/// a sibling's sshd (or an outgoing connection's ephemeral source port) ends up
+/// holding the port this harness just released.
+static SSHD_START_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The ed25519 public-key blob the harness's generated host key presents.
+fn host_key_blob(host_key: &Path) -> String {
+    let pub_path = host_key.with_extension("pub");
+    let text = std::fs::read_to_string(&pub_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", pub_path.display()));
+    text.split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("{} has no key blob field", pub_path.display()))
+        .to_string()
+}
+
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     listener.local_addr().expect("local addr").port()
 }
 
-/// Start `sshd -D` on a fresh port, wait until it accepts, and return the
-/// listener child and the port.
-fn start_listener(root: &Path, host_key: &Path, authorized: &Path) -> (Child, u16) {
+/// The outcome of waiting for the port our `sshd` was asked to bind.
+enum ListenerWait {
+    /// Something is accepting on the port — NOT necessarily our sshd; the
+    /// caller verifies the host key.
+    Open,
+    /// OUR `sshd` child exited before it accepted: the port was taken before it
+    /// could bind, or `sshd` failed to start.
+    ChildExited(String),
+    /// Nothing accepted within the timeout.
+    TimedOut,
+}
+
+/// Wait for a listener on `port`, but NEVER accept success once OUR child has
+/// exited: an `sshd` that lost the port race (or failed to start) must be
+/// retried on a fresh port, not mistaken for a running listener.
+fn wait_for_listener(child: &mut Child, port: u16, timeout: Duration) -> ListenerWait {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return ListenerWait::ChildExited(format!("sshd exited with {status}"));
+        }
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return ListenerWait::Open;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ListenerWait::TimedOut
+}
+
+/// Does the ed25519 key the listener on `port` PRESENTS equal `expected_blob`?
+///
+/// `Ok(true)` — our sshd. `Ok(false)` — a DIFFERENT sshd took the port. `Err` —
+/// no ed25519 key could be read (a non-`ssh` listener, or a failed
+/// connection). Both non-`true` outcomes are a port TOCTOU, never an
+/// authentication problem.
+fn listener_presents_expected_key(port: u16, expected_blob: &str) -> Result<bool, String> {
+    let out = Command::new("ssh-keyscan")
+        .args([
+            "-T",
+            "2",
+            "-p",
+            &port.to_string(),
+            "-t",
+            "ed25519",
+            "127.0.0.1",
+        ])
+        .output()
+        .map_err(|e| format!("run ssh-keyscan: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // `host algo blob`: the third field is the key blob.
+        if let Some(blob) = line.split_whitespace().nth(2) {
+            return Ok(blob == expected_blob);
+        }
+    }
+    Err(format!(
+        "ssh-keyscan read no ed25519 key (status {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Start `sshd -D` on a fresh port, wait until it accepts, VERIFY the listener
+/// is the child just spawned (by its host key), and return the child and port.
+///
+/// A bare "the port is open" is not success: `free_port` releases the port
+/// before `sshd` binds it, so a sibling's `sshd` — or an outgoing connection's
+/// ephemeral source port — can take it. Accepting such a listener would make
+/// the client authenticate against a FOREIGN `AuthorizedKeysFile` and fail
+/// later as an opaque `Permission denied (publickey)`. Every rejected port is
+/// reported as the port TOCTOU it is.
+fn start_listener(
+    root: &Path,
+    host_key: &Path,
+    authorized: &Path,
+    expected_blob: &str,
+) -> (Child, u16) {
     let sshd = find_sshd();
+    // Hold the process-wide start lock across port pick + spawn + verify so a
+    // sibling test thread cannot take a port this thread just released.
+    let _serialized = SSHD_START_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut last_error = String::new();
     for _ in 0..10 {
         let port = free_port();
@@ -245,29 +350,54 @@ fn start_listener(root: &Path, host_key: &Path, authorized: &Path) -> (Child, u1
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn sshd");
-        if wait_for_port(port, Duration::from_secs(10)) {
-            return (child, port);
+        match wait_for_listener(&mut child, port, Duration::from_secs(10)) {
+            ListenerWait::Open => match listener_presents_expected_key(port, expected_blob) {
+                Ok(true) => return (child, port),
+                Ok(false) => {
+                    last_error = format!(
+                        "port {port} was taken by a FOREIGN listener: it presents a different \
+                         ed25519 host key than the harness sshd"
+                    );
+                    eprintln!("storekit real-sshd harness: {last_error}; retrying on a fresh port");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e) => {
+                    last_error = format!(
+                        "port {port} was taken by a NON-SSH listener (no ed25519 host key could \
+                         be read): {e}"
+                    );
+                    eprintln!("storekit real-sshd harness: {last_error}; retrying on a fresh port");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            ListenerWait::ChildExited(why) => {
+                let _ = child.wait();
+                last_error = format!(
+                    "{why}: the port {port} released by free_port was taken before sshd could \
+                     bind it (or sshd failed to start); log: {}",
+                    std::fs::read_to_string(&log).unwrap_or_default().trim()
+                );
+                eprintln!("storekit real-sshd harness: {last_error}; retrying on a fresh port");
+            }
+            ListenerWait::TimedOut => {
+                let _ = child.kill();
+                let _ = child.wait();
+                last_error = format!(
+                    "sshd on port {port} never accepted within 10s; log: {}",
+                    std::fs::read_to_string(&log).unwrap_or_default().trim()
+                );
+            }
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        last_error = std::fs::read_to_string(&log).unwrap_or_default();
     }
-    panic!("could not start a real sshd on any tried port; last log: {last_error}");
+    panic!(
+        "could not start a real sshd on any tried port: the ports free_port chose kept being \
+         taken by foreign listeners, or sshd failed to start; last error: {last_error}"
+    );
 }
 
-fn wait_for_port(port: u16, timeout: Duration) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
-
-fn scan_known_hosts(root: &Path, port: u16) -> PathBuf {
+fn scan_known_hosts(root: &Path, port: u16, expected_blob: &str) -> PathBuf {
     for _ in 0..50 {
         let out = Command::new("ssh-keyscan")
             .args(["-p", &port.to_string(), "-t", "ed25519", "127.0.0.1"])
@@ -277,6 +407,15 @@ fn scan_known_hosts(root: &Path, port: u16) -> PathBuf {
         {
             let text = String::from_utf8_lossy(&out.stdout);
             if text.contains("ssh-ed25519") {
+                // The scanned key MUST be the harness's own. A foreign listener
+                // that took the port would otherwise be trusted here and fail
+                // later as an authentication error.
+                if !text.contains(expected_blob) {
+                    panic!(
+                        "the listener on port {port} presented a FOREIGN ed25519 host key \
+                         (the port was taken by another listener); refusing to trust it"
+                    );
+                }
                 let path = root.join("known_hosts");
                 std::fs::write(&path, text.as_bytes()).expect("write known_hosts");
                 set_mode(&path, 0o600);
@@ -285,7 +424,7 @@ fn scan_known_hosts(root: &Path, port: u16) -> PathBuf {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("ssh-keyscan never returned the ed25519 host key");
+    panic!("ssh-keyscan never returned the ed25519 host key for port {port}");
 }
 
 // ---------------------------------------------------------------------------
@@ -625,4 +764,33 @@ fn lock_remote_refuses_a_local_destination() {
         Some(PreflightKind::LocalDestinationViaRemoteLock),
         "the refusal must be the typed local-destination refusal: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. A foreign listener on the chosen port is DIAGNOSED, never trusted
+// ---------------------------------------------------------------------------
+
+/// The port-TOCTOU probe itself: a listener that is not our sshd must never be
+/// mistaken for it. A plain TCP listener presents no ed25519 host key, so the
+/// probe does not return `Ok(true)` AND names the cause; the harness then
+/// retries on a fresh port and, if every port is taken, fails naming the port
+/// race rather than surfacing an opaque authentication error from the wrong
+/// `AuthorizedKeysFile`.
+#[test]
+fn a_foreign_listener_on_the_chosen_port_is_not_mistaken_for_our_sshd() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a foreign listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let verdict = listener_presents_expected_key(port, "AAAA-not-our-key");
+    match &verdict {
+        Ok(true) => panic!("a foreign listener must not be accepted as the harness sshd"),
+        Ok(false) => { /* a foreign sshd: a DIFFERENT ed25519 key */ }
+        Err(why) => {
+            assert!(
+                why.contains("no ed25519 key"),
+                "the port-race diagnostic must name the cause, got: {why}"
+            );
+            eprintln!("port {port} rejected as foreign: {why}");
+        }
+    }
+    drop(listener);
 }

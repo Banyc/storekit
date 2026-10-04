@@ -236,6 +236,31 @@ impl Residue {
     /// (a residue inside the strand is a SEPARATE stranded original the caller
     /// must discard first). A missing aside is an idempotent success.
     pub fn discard(&self) -> Result<()> {
+        // SERIALIZE against a cooperating writer, EXACTLY as `recover_to`
+        // does. A sync run holds the destination's operation lock for its
+        // whole duration, so a discard takes the SAME lock through the SAME
+        // authority ([`crate::lock::FileLock`]) for this discard's duration.
+        // A live holder is the typed contention refusal. Without this, a
+        // cooperating second process could discard the claim-aside a LIVE run
+        // created between its claim-aside rename and its install/rollback —
+        // the run's rollback would then have nothing to restore, i.e. the
+        // caller's only copy is destroyed.
+        let lock_path = crate::sync::destination_lock_path(&self.root).ok_or_else(|| {
+            Error::preflight(format!(
+                "cannot discard the residue at {}: the destination root {} has no derivable \
+                 operation-lock path, so the discard cannot be serialized against a sync run",
+                self.aside.display(),
+                self.root.display()
+            ))
+        })?;
+        let _operation_lock = crate::lock::FileLock::acquire(
+            &lock_path,
+            &format!(
+                "storekit residue discard at {} (pid {})",
+                self.root.display(),
+                std::process::id()
+            ),
+        )?;
         let dir = RootDir::open(&self.root)?;
         // Re-establish the ONE precondition against the spelling, so the pair
         // shares it: a handle can only ever discard a residue, never ordinary
@@ -503,6 +528,35 @@ mod tests {
             fs::read(root.join("restored")).unwrap(),
             b"stranded original"
         );
+    }
+
+    /// A4b: `discard` HOLDS the destination operation lock (the SAME
+    /// `FileLock` authority a sync run holds) for its duration, exactly like
+    /// `recover_to`. PRE-FIX it opened the root and unlinked the aside with NO
+    /// lock, so a cooperating second process could remove the claim-aside a
+    /// LIVE run created between its claim-aside rename and its
+    /// install/rollback — the run's rollback would then have nothing to
+    /// restore, i.e. the caller's only copy destroyed.
+    #[test]
+    fn discard_is_serialized_by_the_destination_operation_lock() {
+        use crate::lock::FileLock;
+        let dir = tmpdir();
+        let root = dir.path();
+        write(&root.join(".sync-aside.999.0"), b"stranded original");
+        let residue = Residue::detect(root, Path::new(".sync-aside.999.0")).unwrap();
+        let lock_path = crate::sync::destination_lock_path(root)
+            .expect("the root names a derivable lock record");
+        let held = FileLock::acquire(&lock_path, "held").expect("hold the operation lock");
+        let err = residue.discard().unwrap_err();
+        assert!(matches!(err, Error::LockContended(_)), "{err:?}");
+        assert!(
+            root.join(".sync-aside.999.0").exists(),
+            "the strand survives a contended discard"
+        );
+        // Once the lock is released the discard lands.
+        drop(held);
+        residue.discard().unwrap();
+        assert!(fs::symlink_metadata(root.join(".sync-aside.999.0")).is_err());
     }
 
     /// A6: a consumer can tell DESTROYING A STRAND (`ResidueBelow`) from an
