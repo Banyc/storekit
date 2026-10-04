@@ -405,3 +405,66 @@ historical register ("`parse_mode` was removed"), and no text scan distinguishes
 "cited as current" from "cited as removed". That instrument was discarded rather
 than shipped, and it is recorded here because a discarded instrument is the same
 mistake as the defects it was meant to catch.
+
+## The adversarial review (round 2)
+
+Same two reviewers, same byte-identical prompt, run against the FIXED tree. Eight
+findings, all fixed here; one is a P0.
+
+| # | finding | axis | fixed by |
+|---|---|---|---|
+| 1 | **P0: the P0 of round 1, still open, with the FIX's reasoning as the cause.** The result-containment check decided what the destination will hold AFTER the run from the static diff plus the `Extraneous` value — but the run's actual occupants are decided later: a destination entry at a path the source also holds is NOT necessarily replaced (a `Refuse` policy, `AppendTail` on a non-file, `Diverged` and `ParentRefused` all leave it), and a destination-only entry under `Delete` is NOT necessarily removed (`remove_extraneous` skips entries a conflict prohibits, that alias an installed entry, or that are residue-guarded). Reproduced on macOS and Linux through the public API with a BUILT-IN policy as well as a custom one: `sync` returned `Ok`, installed a link, and the link resolved outside the root, while the report simultaneously named the component an unsupported escaping symlink. | C | `oywnzuuxmvkv` (+ `wqzpyltvyyyv`) |
+| 2 | The `std::fs` audit was evaded by an ordinary alias of the `std` CRATE (`use std as s; use s::fs::remove_file;` — rustfmt- and clippy-clean), and the exact-count pin by a space before the call's paren. | H | `vskttuqsxtky` |
+| 3 | `transport::with_operation_lock_sidecar` CREATED caller-chosen reserved spellings (`operation.lock`, `.sync-aside.1`, and their case/`state/` variants) where seven guarded paths refused, and the helper was absent from constraint #1's enumerated list — the list's SECOND omission of the same kind. | M | `nwqxqyokptst` |
+| 4 | Both audits exempted any file named `*_regression.rs` / `*_test_support.rs`, so a production module with that name could contain a raw `libc::unlinkat` with every gate green. | H | `vskttuqsxtky` |
+| 5 | Axis J's own verification claim was FALSE: the sweep re-checked the population the earlier fix had emptied and reported that the unix-only and windows-only public sets were "both EMPTY", while three platform-scoped `pub` items survived and broke a Windows build for a consumer. | A | `vrrrxukzkxty` |
+| 6 | Two forgery `compile_fail` doctests were VACUOUS: `X {}` fails with `E0063` whether the fields are private or public, so making them public would have left the fence passing. | H | `oywnzuuxmvkv` |
+| 7 | Constraint #4 was marked done while its FIFTH class (`Error::Preflight`) had no kind at all, and the crate's own newest tests told its conditions apart by message substring — the constraint's stated product, violated by the crate itself. | A | `npnmnroqpukq` |
+| 8 | `MIGRATION.md` asserted both "deploy does not depend on the crate yet. Nothing below has been executed" and, sixty lines later, DONE. | A | `xmzpwuzsszpk` |
+
+**Finding 1 is finding 1 of round 1, and that is the finding.** The previous fix
+was not a patch that missed a case: it reasoned from a view (the static diff) to a
+property of the result (what will be on disk), and the two are not the same
+function. The remedy is not a better case analysis either — `extraneous` and every
+`EntryPolicy` were REMOVED from the check, so for each traversed component the
+decision reads only the SOURCE manifest's kind and the DESTINATION observation's
+kind (symlink in either view → refuse; both present with different kinds → refuse;
+destination-only → refuse; source-only or both absent or both the same
+non-symlink kind → permit). The class is now unrepresentable rather than handled:
+there is no plan in scope to be wrong about. The COST is stated with its number —
+this refuses a destination-only component under BOTH `Extraneous` values (2 of 2),
+including the 3 `Keep` cases the previous rule permitted and where
+`remove_extraneous` is never even called — and it is the sanctioned direction: the
+fold is a denial tool, never a permission tool.
+
+**Two findings were invisible to both reviewers and appeared only because a fix
+was done as a CONSTRAINT rather than as a patch.** Typing `PreflightKind` exposed
+that `a_destination_ownership_token_is_bound_to_its_run` matched
+`"destination ownership was taken for"` — an opening that BOTH the root-mismatch
+and the run-binding refusals share — so it had been asserting the ROOT refusal
+while claiming to assert the run binding; it now asserts `RemoteRootMismatch` and
+a new test covers `RunBindingMismatch`. And guarding the sidecar helper turned
+"it is missing from a list" into "it really creates `operation.lock`", a plain
+gap in the one guarded funnel. Neither was reported; both came from doing the
+constraint instead of documenting the gap.
+
+**A correction is not a rewrite.** Fixing finding 1's justification produced six
+corrected comments and a list of eleven comments VERIFIED as already accurate and
+left alone — a refusal whose recorded reason names a mechanism that cannot run
+(here: attributing a `Keep`-policy refusal to a `Delete` decision, when
+`remove_extraneous` is not called under `Keep` at all) is the axis-A defect the
+whole review keeps finding, and a correct behaviour with a false reason is a claim
+the next reader will act on.
+
+**The API change owed the consumer.** Typing `PreflightKind` made
+`Error::Preflight(String)` a struct variant, which broke `~/code/deploy`'s own
+error bridge (its `S::Preflight(message)` arm). The fix landed in the same round
+(`deploy` `xlkvyqnomlxp`), because a public-API change justified by a constraint
+is only justified if the consumer still compiles.
+
+Residuals stated, not hidden: the `std::fs` audit is a TEXT scan, so a function
+pointer, a `dyn` dispatch, a macro/include expansion, and a raw
+`extern "C" { fn unlinkat(...); }` declaration remain outside it; the sidecar
+helper's raw `base: &Path` still follows pre-existing intermediate symlinks
+(bounded by caller trust in `base` and by the spelling's lexical confinement,
+now that the reserved-name hole is closed).
