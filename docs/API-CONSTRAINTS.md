@@ -177,14 +177,37 @@ directions; each is now two.
   `canonicalize_tree` and `canonicalize_remote_entries` cannot produce a
   `DestinationTree`.
 
-**The delta, measured.** The typed field is STRICTER at the boundary in one
-way and identical everywhere else: a mode string longer than the twelve
-permission bits (or any non-octal spelling) is refused by `Deserialize` rather
-than masked by `parse_mode` at first use — the refusal is the same, its SITE
-moved. No input the old projections accepted is now refused, and no branch that
-was load-bearing (the guard, the lock, the audit, the copy) was touched. The
-source audits' pinned maps are unchanged: no `libc` or `std::fs` symbol was
-added or removed.
+**The delta, measured.** The typed field now IS stricter at the boundary, and
+this paragraph was REWRITTEN because its first version claimed a strictness the
+code did not have: `mode_octal::deserialize` had carried `& 0o7777` over from
+`parse_mode`, so it MASKED, and `from_str_radix` also accepted a leading `+` and
+any length — `"10644"` loaded as `0o644` with the setuid bit silently dropped,
+and `"+755"` loaded at all. The refusal is now real: `mode_octal::deserialize`
+accepts EXACTLY the spelling `serialize` emits — four octal digits, no sign — so
+the accepted set equals the emitted set and the wire parse is INJECTIVE. That
+injectivity is load-bearing rather than tidy: `compute_tree_digest` hashes the
+VALIDATED values re-serialized as `{:04o}`, so two spellings aliasing to one
+value would yield one `tree_sha256` from two different wire records.
+
+| spelling | before | after |
+|---|---|---|
+| `"0644"`, `"0755"`, `"0000"`, every `0..=0o7777` | accepted | accepted |
+| `"644"`, `"00644"` | accepted (masked) | **refused** |
+| `"10644"` (the setuid form) | accepted → `0o644`, bit dropped | **refused** |
+| `"+755"` | accepted → `0o755` | **refused** |
+| `"37777777777"`, `"77777"`, `"07777"`, `"17777"` | accepted (masked) | **refused** |
+| `"8"`, `""`, `"0o644"`, `"0x1a4"`, `" 644"`, `"0644 "`, `"-644"`, `"0644a"` | refused | refused |
+
+**No row is old-refused/new-accepted: the change narrows only.** It is a real
+behaviour change on the read path — a `tree.json` carrying one of the six
+non-canonical spellings above used to load and now fails to load — and it is the
+reading these documents already claimed. No in-tree fixture used a non-canonical
+spelling (`sync/diff.rs` uses `"0644"`). The rule governs the JSON `tree.json`
+wire ONLY: the far-side listing frame carries the raw `st_mode` in HEX
+(`printf "%x"` ↔ `from_str_radix(.., 16)`), where masking the file-type bits IS
+the semantics, and is untouched. No branch that was load-bearing (the guard, the
+lock, the audit, the copy) was touched, and the source audits' pinned maps are
+unchanged: no `libc` or `std::fs` symbol was added or removed.
 
 ## Rules for adding a constraint
 
