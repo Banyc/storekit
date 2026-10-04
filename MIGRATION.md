@@ -81,6 +81,27 @@ receiver-marker adoption (done).
   a remote destination the caller does not own, and `Unowned` still names the
   weaker path.
 
+## The lock record is self-describing (change `34ab81ee`)
+
+`lock::FileLock::acquire` used to truncate and rewrite whatever non-empty entry it
+found at the record path. It now adopts an entry only when it is EMPTY or already
+carries the record header (`storekit lock record v1`), and refuses anything else with
+the typed `PreflightKind::LockRecordNotRecognized`, leaving the entry byte-for-byte
+and mode-for-mode untouched.
+
+**Consequence for an existing store**: a record written by an earlier revision holds
+a bare op id and no header, so the first acquisition after the upgrade is REFUSED —
+fail-closed and typed, not silent. The refusal names the remedy, including the
+condition under which the remedy is safe: move the entry aside (or remove it) only
+when NO RUN IS HOLDING IT, because unlinking a record a live holder has flocked lets
+the next acquisition lock a different inode. A record holds nothing but the holder's
+op id, so nothing is lost by moving it.
+
+This is not a data migration: no tool has to rewrite anything, and a `deploy` record
+created through its own `FileLock::acquire` call sites carries the header from the
+first acquisition after the upgrade. It is listed here because it is the one change
+in this migration that turns a previously-accepted on-disk state into a refusal.
+
 ## The one real data migration: the receiver marker
 
 `deploy` stores `recv-<uuid-v7>` at `<deploy_dir>/receiver-uuid`. The crate

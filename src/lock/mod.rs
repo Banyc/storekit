@@ -266,7 +266,8 @@ impl FileLock {
                      entry that is not a lock record this crate wrote, so acquiring would \
                      truncate content the caller may not intend to lose; a record this crate \
                      writes begins with {:?}. Move the existing entry aside (or remove it) if it \
-                     is not wanted",
+                     is not wanted, and only when NO RUN IS HOLDING IT: unlinking a record a live \
+                     holder has flocked lets the next acquisition lock a different inode",
                     path.display(),
                     RECORD_HEADER.trim_end(),
                 ),
