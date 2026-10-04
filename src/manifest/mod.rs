@@ -316,7 +316,7 @@ use walkdir::WalkDir;
 /// re-reads API constraint #7 removes. A wire value outside the canonical set
 /// is refused by `Deserialize` (fail closed), exactly as the old projection
 /// refused it, and the emitted bytes are unchanged (see
-/// `manifest_entries_serialize_byte_identically_to_the_wire_strings`).
+/// `manifest_entries_serialize_to_the_same_wire_strings`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntryKind {
     File,
@@ -395,8 +395,9 @@ pub struct TreeEntry {
     /// `file`, `dir`, or `symlink`, as the VALIDATED [`EntryKind`].
     #[serde(rename = "type")]
     pub entry_type: EntryKind,
-    /// The entry's permission mode as its low twelve bits, serialized as the
-    /// four-digit octal STRING the manifest always used (e.g. `"0755"`).
+    /// The entry's permission mode as its low twelve bits, serialized as
+    /// EXACTLY four octal digits (e.g. `"0755"`); any other spelling is refused
+    /// at deserialization, so the accepted set equals the emitted set.
     #[serde(with = "mode_octal")]
     pub mode: u32,
     /// For files: SHA-256 of contents. For symlinks: SHA-256 of the target.
@@ -427,12 +428,15 @@ fn mode_bits(m: u32) -> u32 {
     m & 0o7777
 }
 
-/// Serde for a [`TreeEntry::mode`]: the wire form is the four-digit octal
-/// STRING the canonicalizers always emitted (e.g. `"0755"`), and a value that
-/// is not four-or-fewer octal digits is refused at deserialization. This is
-/// the ONE place a mode spelling is parsed; before this the field was a
-/// `String` and every consumer re-parsed it with a fallible `parse_mode`, the
-/// mode re-reads API constraint #7 removes.
+/// Serde for a [`TreeEntry::mode`]: the wire form is EXACTLY the four-digit
+/// octal STRING the canonicalizer emits (e.g. `"0755"`); any other spelling —
+/// a leading sign, a shorter or longer octal string, non-octal text, or the
+/// empty string — is refused at deserialization. The accepted set therefore
+/// equals the emitted set (`format!("{:04o}", mode & 0o7777)`), so the wire
+/// parse is injective: no two wire byte strings name one mode. This is the ONE
+/// place a mode spelling is parsed; before this the field was a `String` and
+/// every consumer re-parsed it with a fallible `parse_mode`, the mode re-reads
+/// API constraint #7 removes.
 mod mode_octal {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -447,9 +451,22 @@ mod mode_octal {
         deserializer: D,
     ) -> std::result::Result<u32, D::Error> {
         let spelling = String::deserialize(deserializer)?;
-        u32::from_str_radix(&spelling, 8)
-            .map(|mode| mode & 0o7777)
-            .map_err(|_| serde::de::Error::custom(format!("invalid manifest mode {spelling:?}")))
+        let bytes = spelling.as_bytes();
+        // Accept EXACTLY the spelling `serialize` emits: four octal digits,
+        // nothing else. `from_str_radix` would also accept a leading `+` and
+        // over-long strings, and the old `& 0o7777` then folded those onto a
+        // different spelling's value (`"10644"` -> `0o644`), so the wire parse
+        // was non-injective. Four octal digits are at most `0o7777`, so no mask
+        // is needed or possible here.
+        if bytes.len() == 4 && bytes.iter().all(|b| (b'0'..=b'7').contains(b)) {
+            Ok(bytes
+                .iter()
+                .fold(0u32, |mode, b| mode * 8 + u32::from(*b - b'0')))
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "invalid manifest mode {spelling:?}"
+            )))
+        }
     }
 }
 
@@ -1075,7 +1092,7 @@ pub struct UnsupportedEntry {
 ///
 /// A destination observation is not a source manifest:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use storekit::manifest::{canonicalize_tree_destination, verify_tree_metadata};
 /// let destination = canonicalize_tree_destination(std::path::Path::new("/tmp")).unwrap();
 /// // `verify_tree_metadata` takes the canonical SOURCE type; the destination
@@ -1087,7 +1104,7 @@ pub struct UnsupportedEntry {
 /// A destination observation is not a SOURCE manifest, in either position of
 /// the direction-typed diff:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use storekit::manifest::{canonicalize_tree, canonicalize_tree_destination};
 /// use storekit::sync::diff::diff_source_and_destination;
 /// let source = canonicalize_tree(std::path::Path::new("/tmp")).unwrap();
@@ -2228,6 +2245,126 @@ mod tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: TreeMetadata = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, meta, "a manifest must round-trip byte-stably");
+    }
+
+    /// The mode wire spelling is EXACTLY the four-digit octal string the
+    /// serializer emits; every other spelling is REFUSED at the Deserialize
+    /// boundary. The parser used to do `u32::from_str_radix(m, 8) & 0o7777`,
+    /// which silently accepted a leading `+`, over-long octal strings, and a
+    /// spelling whose top digit carried the setuid/setgid/sticky bits:
+    /// `"10644"` became `0o644`, `"644"`/`"00644"` became `0o644`, and
+    /// `"37777777777"` became `0o7777`. Each of those then re-serialized to a
+    /// canonical spelling and hashed identically to it.
+    #[test]
+    fn non_canonical_mode_spellings_are_refused_at_the_wire_boundary() {
+        for spelling in [
+            // Too short, non-canonical zero padding, and a dropped setuid digit.
+            "644",
+            "00644",
+            "10644",
+            // A leading sign is not an octal digit.
+            "+755",
+            // Eleven digits of octal overflow the low twelve bits.
+            "37777777777",
+            // Five digits that the old mask folded onto a low value.
+            "77777",
+            "07777",
+            "17777",
+            // Non-octal text and empty input.
+            "8",
+            "",
+            "0o644",
+            "0x1a4",
+            " 644",
+            "0644 ",
+            "-644",
+            "0644a",
+            "0777_7",
+        ] {
+            let wire = format!(r#"{{"path":"x","type":"file","mode":"{spelling}"}}"#);
+            let err = serde_json::from_str::<TreeEntry>(&wire).expect_err(&format!(
+                "the non-canonical mode spelling {spelling:?} must be refused at the wire boundary"
+            ));
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("invalid manifest mode {spelling:?}")),
+                "the refusal for {spelling:?} must be the mode-boundary error, got {message:?}"
+            );
+        }
+    }
+
+    /// The ACCEPTED set equals the EMITTED set: every low-twelve-bit mode the
+    /// serializer can emit round-trips, and the emitted spelling is exactly
+    /// four octal digits. Because the accepted spelling is unique, two
+    /// different wire byte strings can never name the same mode, so the digest
+    /// over the re-serialized record is injective.
+    #[test]
+    fn canonical_mode_wire_spelling_round_trips_and_is_injective() {
+        for mode in 0u32..=0o7777 {
+            let entry = TreeEntry {
+                path: "x".to_string(),
+                entry_type: EntryKind::File,
+                mode,
+                content_sha256: None,
+                symlink_target: None,
+            };
+            let bytes = serde_json::to_vec(&entry).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let spelling = wire["mode"].as_str().unwrap();
+            assert_eq!(
+                spelling,
+                format!("{mode:04o}"),
+                "mode {mode:04o} must be emitted as exactly four canonical octal digits"
+            );
+            let back: TreeEntry = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(back, entry, "mode {mode:04o} must round-trip byte-stably");
+        }
+    }
+
+    /// The regression this fixes: `"10644"` and `"0644"` are different wire
+    /// byte strings that used to deserialize to the SAME `TreeEntry` mode and
+    /// therefore hash to the SAME `compute_tree_digest` (the digest hashes the
+    /// re-serialized VALIDATED value as `"0644"`). Now the non-canonical
+    /// spelling is refused, so no second wire byte string can alias the
+    /// canonical record's digest.
+    #[test]
+    fn a_non_canonical_mode_cannot_alias_a_canonical_manifest_digest() {
+        let entry = TreeEntry {
+            path: "x".to_string(),
+            entry_type: EntryKind::File,
+            mode: 0o644,
+            content_sha256: Some("ab".repeat(32)),
+            symlink_target: None,
+        };
+        let meta = build_metadata(vec![entry]);
+        let canonical_bytes = serde_json::to_vec(&meta).unwrap();
+        let canonical = String::from_utf8(canonical_bytes).unwrap();
+        assert!(
+            canonical.contains(r#""mode":"0644""#),
+            "the fixture must carry the canonical mode spelling: {canonical}"
+        );
+        let aliased = canonical.replace(r#""mode":"0644""#, r#""mode":"10644""#);
+        assert_ne!(
+            aliased, canonical,
+            "the aliased wire bytes must differ from the canonical wire bytes"
+        );
+        // Pre-fix this parsed to the SAME record (mode 0o644) and re-serialized
+        // to `"0644"`, so `compute_tree_digest` returned `meta.tree_sha256` for
+        // BOTH byte strings. It is now refused, so only one byte string names
+        // this record.
+        let err = serde_json::from_str::<TreeMetadata>(&aliased).expect_err(
+            "the setuid-dropping spelling \"10644\" must not parse into the canonical record",
+        );
+        assert!(
+            err.to_string().contains("invalid manifest mode"),
+            "unexpected error for the aliased wire: {err}"
+        );
+        // And the one surviving spelling parses to the canonical record.
+        let reparsed: TreeMetadata = serde_json::from_str(&canonical).unwrap();
+        assert_eq!(
+            reparsed, meta,
+            "the canonical wire record must parse back to the exact canonical record"
+        );
     }
 
     /// A legitimate filename containing `..` as a SUBSTRING (e.g. `a..b`,
