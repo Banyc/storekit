@@ -954,7 +954,7 @@ removed in a scratch copy; these are the tests that fail:
 | axis | comparison removed | tests that fail |
 |---|---|---|
 | direction | `self.direction != direction` | `a_destination_ownership_token_is_bound_to_its_direction`, `..._refuses_a_derived_destination_shape_swap` |
-| pinned local root | `normalize_root(local_root) != self.local.root_path` | `a_destination_ownership_token_is_bound_to_its_local_root` |
+| pinned local root | `normalize_root(local_root) != self.local.root_path` | `a_destination_ownership_token_is_bound_to_its_local_root` (PUSH) and `a_pull_destination_ownership_token_is_bound_to_its_local_root` (PULL) |
 | remote root | `normalize_root(remote.root()) != self.remote_root` | `..._is_bound_to_its_run`, `a_remote_token_is_refused_across_roots_with_the_same_endpoint`, `a_pull_token_is_refused_against_a_different_source_root`, `the_endpoint_and_root_refusals_carry_distinct_typed_kinds` |
 | endpoint identity | `remote.endpoint_identity() != self.remote_identity` | `a_remote_token_is_refused_across_endpoints_with_the_same_root`, `a_pull_token_is_refused_against_a_different_source_endpoint` |
 | remote localness | `remote.is_local() != self.remote_is_local` | `a_pull_token_is_refused_when_{the_source_flips_from_local_to_non_local,equal_content_hides_the_local_to_non_local_flip}` and `a_push_token_is_refused_when_{the_destination_flips_from_local_to_non_local,equal_content_hides_the_local_to_non_local_flip}` |
