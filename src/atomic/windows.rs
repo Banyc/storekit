@@ -1097,7 +1097,7 @@ pub fn remove_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
 }
 
 /// Path-based symlink creation (unlink any existing entry first, then link),
-/// guarded like the Unix port's `symlink_fd` (R1). The platform helper
+/// guarded like the Unix port's `symlink_fd`. The platform helper
 /// requires admin/developer mode; a failure propagates.
 pub fn symlink_fd(root: &RootDir, target: &Path, rel: &RootedRelativePath) -> Result<()> {
     let rel = rel.as_path();

@@ -1012,7 +1012,7 @@ mod tests {
 
     /// A local NON-GENERIC `type` alias (`type ZZBuilder =
     /// std::fs::OpenOptions;`) with the path it names and the module it is
-    /// declared in. Round 10's resolver keyed the owner on the literal
+    /// declared in. An earlier resolver keyed the owner on the literal
     /// last-segment name, so a `type` alias of a builder type was invisible to
     /// BOTH the funnel closure and the count pin: inside a funnel module,
     /// `type ZZBuilder = std::fs::OpenOptions;` followed by
@@ -1599,7 +1599,7 @@ mod tests {
                     }
                 }
             }
-            // ROUND-11 P2-C: local non-generic `type` aliases are bindings too.
+            // P2-C: local non-generic `type` aliases are bindings too.
             // A `type ZZBuilder = std::fs::OpenOptions;` inside a funnel module
             // must resolve to the same canonical builder owner as the direct
             // spelling, or `ZZBuilder::new()…create_new(…)` is invisible to both
@@ -2972,7 +2972,7 @@ mod tests {
             // again and is pinned here. The guard still runs on the function.
             ("src/atomic/unix.rs", "rename", 1),
             ("src/atomic/windows.rs", "remove_dir", 2),
-            // TWO production `remove_dir_all` calls since R2: the implicit
+            // TWO production `remove_dir_all` calls: the implicit
             // recursive removal (`remove_dir_all_fd`, refused for residue) and
             // the EXPLICIT discard (`remove_residue_dir_all_fd`), whose caller
             // has already decided the strand is disposable. Both run the lock
@@ -3082,7 +3082,7 @@ mod tests {
         );
     }
 
-    /// ROUND-8 P1-A REGRESSION: the count pin's symbol set is DERIVED from
+    /// P1-A REGRESSION: the count pin's symbol set is DERIVED from
     /// `clippy.toml`, so every ADOPTING symbol the lint denies is counted even
     /// inside a funnel module, where the module-level `#[allow]` blinds the
     /// lint. Before this arm, seven adopting symbols were denied by the lint but
@@ -4496,7 +4496,7 @@ mod tests {
     /// which the arms above see; this residual is a real reach INSIDE the
     /// funnel, not a hole the lint closes.
     ///
-    /// ROUND 11 P2-C CLOSED ONE SPELLING: a `type` ALIAS of the builder type
+    /// P2-C CLOSED ONE SPELLING: a `type` ALIAS of the builder type
     /// used to be a hole in BOTH devices — inside a funnel module,
     /// `type ZZBuilder = std::fs::OpenOptions;` followed by
     /// `ZZBuilder::new().write(true).create_new(true).open(p)?` left clippy,
@@ -4576,7 +4576,7 @@ mod tests {
         }
     }
 
-    /// ROUND-8 P1-B RECONCILIATION. `OpenOptionsExt::custom_flags` forwards
+    /// P1-B RECONCILIATION. `OpenOptionsExt::custom_flags` forwards
     /// ARBITRARY bits to `open(2)`, and `O_CREAT` through it ADOPTS a name. The
     /// lint must name the RESOLVED trait path
     /// (`std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`); the surface
@@ -4633,7 +4633,7 @@ mod tests {
         );
     }
 
-    /// ROUND-8 P2-A REGRESSION: a pathname-socket `bind` CREATES a directory
+    /// P2-A REGRESSION: a pathname-socket `bind` CREATES a directory
     /// entry — a name ADOPTION in the same class as `create_dir`/`symlink` — so
     /// it is denied crate-wide for both `UnixListener` and `UnixDatagram`, the
     /// surface derivation can SEE it if the funnel ever uses one, the count pin
@@ -4725,7 +4725,7 @@ fn split_local() {
     opts.append(true);
 }
 
-// ROUND-11 P2-C: a local non-generic `type` alias of the builder type. The
+// P2-C: a local non-generic `type` alias of the builder type. The
 // resolver used to key the owner on the literal last-segment name, so this
 // spelling recorded NOTHING and the closure + count pin were both blind to it;
 // a `use … as` alias WAS resolved.
@@ -4771,7 +4771,7 @@ fn not_attributed(p: &std::path::Path) {
             "std::fs::DirBuilder::default",
             "std::fs::OpenOptions::create",
             "std::fs::OpenOptions::read",
-            // ROUND-11 P2-C: the builder reached through a local non-generic
+            // P2-C: the builder reached through a local non-generic
             // `type` ALIAS. `mode`/`recursive` are spelled ONLY through the
             // aliases here, so their presence pins the alias resolution rather
             // than the direct spelling beside it.
@@ -4801,7 +4801,7 @@ fn not_attributed(p: &std::path::Path) {
         );
     }
 
-    /// ROUND-6 REGRESSION ARM (the round whose log CLAIMED this arm): the
+    /// REGRESSION ARM (an earlier draft of this audit CLAIMED this arm): the
     /// surface derivation must see an `#[allow(clippy::disallowed_methods)]`
     /// on an IMPL METHOD and on a TRAIT METHOD exactly as it sees one on a
     /// freestanding `fn`. The impl/trait forms are `syn::ImplItem` /
@@ -4904,11 +4904,11 @@ impl S {
         );
     }
 
-    /// ROUND-11 P3-D REGRESSION ARM. `funnel_modules` / `funnel_symbol_surface`
+    /// P3-D REGRESSION ARM. `funnel_modules` / `funnel_symbol_surface`
     /// treat a CHILD FILE of an allow-bearing parent module as inside the region
     /// by an ANCESTOR-OR-SELF prefix test ([`module_is_in_funnel_region`]), the
-    /// exact reach of Rust's attribute inheritance. Round 10 shipped that
-    /// derivation with NO test that fails when it regresses to an EXACT-module
+    /// exact reach of Rust's attribute inheritance. That derivation shipped with
+    /// NO test that fails when it regresses to an EXACT-module
     /// match: the only symbol `src/atomic/guard.rs` contributes to the real
     /// closure is already on the deny list, so replacing the prefix test with
     /// equality left all 690 tests green.
@@ -5375,7 +5375,7 @@ impl S {
         ),
     ];
 
-    /// ROUND-8 P2-B / ROUND-10 P3-B BOUNDARY. The pair-less derivation is
+    /// P2-B / P3-B BOUNDARY. The pair-less derivation is
     /// SYNTACTIC on the parameter type, and its class is exactly
     /// `Path`/`PathBuf`, the same nested through a PATH-BEARING CONTAINER
     /// (`Option`/`Box`/`Cow`/`Rc`/`Arc`/`Vec`/`Result`, a slice/array, or a
@@ -5642,8 +5642,8 @@ impl S {
                 break;
             };
             k += 1;
-            // ROUND-11 P2-B: skip a `<…>` GENERIC-PARAMETER group after the
-            // name. Round 10 expected `(` IMMEDIATELY, so
+            // P2-B: skip a `<…>` GENERIC-PARAMETER group after the
+            // name. An earlier scan expected `(` IMMEDIATELY, so
             // `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
             // skipped entirely — a real public raw-path mutator with the
             // tripwire AND the pair-less derivation both green.
@@ -5695,7 +5695,7 @@ impl S {
         out
     }
 
-    /// ROUND-10 P3-A TRIPWIRE. `collect_audited_fns` walks the `syn` item
+    /// P3-A TRIPWIRE. `collect_audited_fns` walks the `syn` item
     /// graph, and `syn` does NOT descend into a macro's token stream (its
     /// `visit_token_stream` hook is a no-op), so a `macro_rules!` body that
     /// emits a `pub fn` taking a raw path is NOT derived: the walk sees the
@@ -5740,7 +5740,7 @@ impl S {
     /// both are pinned as test arms below.
     #[test]
     fn production_macro_bodies_emitting_public_path_fns_are_refused() {
-        // ROUND-11 P2-B ARMS: the token scan must see a `pub fn` whose name is
+        // P2-B ARMS: the token scan must see a `pub fn` whose name is
         // followed by a `<…>` generic-parameter group and/or a `where` clause.
         // Before the fix these returned EMPTY, which is why a generic
         // `pub fn zz<T>(_p: &Path)` planted in a production `macro_rules!` body

@@ -88,7 +88,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-/// TEST-ONLY ORDERING PROBE for the atomic replace (A1). It records, on the
+/// TEST-ONLY ORDERING PROBE for the atomic replace. It records, on the
 /// calling thread only, the sequence of directory-entry commits the durable
 /// directory helper performs and the rename the replace performs, so a test can
 /// assert that every directory the replace CREATED had its entry fsynced into
@@ -189,7 +189,7 @@ pub fn write_atomic_replace(
         // DURABLE creation of the parent chain: every directory created here
         // has its own entry fsynced into its parent BEFORE the temp write and
         // the rename, so the replace's durability claim covers the WHOLE chain
-        // (A1). `create_dir_all` left the created directories' entries unsynced.
+        // `create_dir_all` left the created directories' entries unsynced.
         ensure_private_dir_durable(parent)?;
     }
     let tmp = temp_name_for(path);
@@ -750,7 +750,7 @@ fn openat_no_follow_io_path(
     flags: i32,
     mode: u32,
 ) -> std::io::Result<OwnedFd> {
-    // R3, closed at the PRIMITIVE: an open that can create, replace, or
+    // Closed at the PRIMITIVE: an open that can create, replace, or
     // truncate a directory entry is a name mutation, so the lock-record guard
     // runs HERE, on the full relative path, for EVERY caller — a new
     // primitive that reaches for this wrapper with `O_WRONLY|O_CREAT|O_TRUNC`
@@ -886,7 +886,7 @@ fn refuse_mutation_name(name: &OsStr, sanction: Sanction<'_>) -> Result<()> {
 
 /// renameat between two names in (possibly different) directory fds.
 ///
-/// R2, closed at the PRIMITIVE: the guard used to sit only in
+/// Closed at the PRIMITIVE: the guard used to sit only in
 /// [`renameat_paths`], so calling this raw primitive (which was `pub`)
 /// renamed the lock record straight through it. The name checks live HERE
 /// now, and the function is PRIVATE: there is no public rename primitive
@@ -1341,7 +1341,7 @@ fn replace_core(
     fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CoreReplace> {
     // A replace whose TARGET is a lock-record spelling would rename a fresh
-    // inode over the record and so admit a second holder (F2); the guard is
+    // inode over the record and so admit a second holder; the guard is
     // the SAME authority the removal primitives consult.
     refuse_reserved_mutation(rel, Sanction::None)?;
     // The parent directory is created if missing — the same
@@ -1358,7 +1358,7 @@ fn replace_core(
         // `ReplaceOutcome::ReplacedDurable`] claim ("visible under its final
         // name AND durable across power loss") is true for the WHOLE chain,
         // not only for the final entry's parent. The non-durable helper used
-        // to leave the created directories' entries unsynced (A1).
+        // to leave the created directories' entries unsynced.
         ensure_private_dir_durable_fd_path(root, parent_rel)?;
     }
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
@@ -1854,7 +1854,7 @@ pub fn remove_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
 /// This is the ONLY public rename authority, and the rename WORKER below
 /// demands a [`GuardedRel`] for each end — unforgeable tokens that only
 /// [`GuardedRel::new`] can mint — so no new primitive can name a rename
-/// without running the guard (R2, lens-g).
+/// without running the guard.
 pub fn renameat_paths(
     root: &RootDir,
     from: &RootedRelativePath,
@@ -2083,7 +2083,7 @@ fn remove_dir_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Re
 ///
 /// This is the ONE symlink authority. The lock-record guard runs on the full
 /// path AND the `unlinkat`/`symlinkat` chokepoints guard the final name, so a
-/// call that names the record cannot destroy it and install a link (R1).
+/// call that names the record cannot destroy it and install a link.
 pub fn symlink_fd(root: &RootDir, target: &Path, rel: &RootedRelativePath) -> Result<()> {
     let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
@@ -2462,7 +2462,7 @@ fn create_destination_chain(root: &RootDir, dst_rel: &Path) -> Result<(Option<u3
     Ok((final_preexisting_mode, created))
 }
 
-/// The copy's UNDO JOURNAL for destination directory modes (I2/I3). Every
+/// The copy's UNDO JOURNAL for destination directory modes. Every
 /// directory whose mode the call changes — or creates — is recorded with the
 /// mode to restore if the call FAILS, and `Drop` restores them deepest-first.
 /// This is what makes a FAILED copy leave a destination the crate can remove
@@ -2786,7 +2786,7 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// itself (a lock, or copying from a snapshot) — the crate does not lock an
 /// arbitrary source path.
 ///
-/// ERROR CLASSES (H3): the old live `symlink_metadata` probe collapsed EVERY
+/// ERROR CLASSES: the old live `symlink_metadata` probe collapsed EVERY
 /// error — ENOENT, ENOTDIR, ELOOP, EACCES, ENAMETOOLONG — into `Absent` ("no
 /// symlink here", i.e. ACCEPT), a fail-OPEN arm. The containment index has no
 /// error arm: it answers `Absent`/`NotSymlink`/`Symlink` from enumerated
@@ -2946,7 +2946,7 @@ pub fn copy_dir_recursive_fd(
 
     // Create the destination chain (guarded, component-wise O_NOFOLLOW) and
     // record an UNDO JOURNAL of every directory mode this call changes, so a
-    // failure restores them (I2/I3). A PRE-EXISTING final directory is added
+    // failure restores them. A PRE-EXISTING final directory is added
     // to the journal with its ORIGINAL mode before it is widened, so a failed
     // copy puts it back exactly; a directory this call CREATED is added with
     // the removable 0o700.
@@ -3367,7 +3367,7 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
                 // A file or symlink: unlinkat removes the entry itself (a
                 // symlink is removed, never its target). The guard runs on
                 // EVERY entry the walk unlinks, so removing an ANCESTOR can
-                // never take the record with it (F3).
+                // never take the record with it.
                 // record, not on the full `child_rel` (which includes a
                 // deliberately permitted discard root).
                 refuse_reserved_mutation(&child_rel, Sanction::Residue)?;
@@ -3494,7 +3494,7 @@ pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> 
 /// component is refused (ELOOP) — a read can never be redirected outside
 /// the root the descriptor pins. `O_NONBLOCK` (a no-op for a regular file)
 /// plus the `fstat` classification of the OPENED inode refuse a FIFO/socket/
-/// device promptly instead of hanging forever on a FIFO (A2).
+/// device promptly instead of hanging forever on a FIFO.
 pub fn read_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<Vec<u8>> {
     let rel = rel.as_path();
     let f = openat_readable_regular(root.as_fd(), rel, libc::O_RDONLY)
@@ -3558,7 +3558,7 @@ pub fn read_json_fd<T: serde::de::DeserializeOwned>(
 /// the final component is ABSENCE (`Ok(false)`); EVERY other filesystem
 /// error is a real failure → [`Error::store`], NEVER treated as absence.
 /// The final open is `O_NONBLOCK` and the OPENED inode is classified, so a
-/// FIFO is refused promptly (A2) instead of blocking the open forever.
+/// FIFO is refused promptly instead of blocking the open forever.
 pub fn path_state_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
     let rel = rel.as_path();
     match openat_readable_regular(root.as_fd(), rel, libc::O_RDONLY) {
@@ -3659,7 +3659,7 @@ fn read_dir_fd_path(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
 /// and could not reach residue sitting directly at the store root (a crashed
 /// temp, a stray file). The root descriptor is already pinned by the
 /// [`RootDir`], so no path spelling is involved; each entry is classified
-/// exactly as [`read_dir_fd`] classifies a child (B1).
+/// exactly as [`read_dir_fd`] classifies a child.
 pub fn read_root_dir_fd(root: &RootDir) -> Result<Vec<DirEntry>> {
     let dir_fd = root
         .as_fd()
@@ -4641,7 +4641,7 @@ mod tests {
             "the record must keep its stable inode"
         );
         drop(holder);
-        // The case ALIAS of the record is protected too (A3/A5).
+        // The case ALIAS of the record is protected too.
         let alias_err = remove_file_fd(&root, &rp(".Destroot.Operation.Lock"))
             .expect_err("a case alias of the lock record must be refused");
         assert!(matches!(alias_err, Error::Conflict(_)), "{alias_err:?}");
@@ -4881,7 +4881,7 @@ mod tests {
         );
     }
 
-    /// R2 — the RAW rename primitive is guarded at the PRIMITIVE, not at the
+    /// The RAW rename primitive is guarded at the PRIMITIVE, not at the
     /// higher-level `renameat_paths`. Pre-fix `renameat_fd` was `pub` and
     /// unguarded: calling it directly renamed the record and freed the path a
     /// successor lock acquires (two holders, different inodes). PRE-FIX
@@ -4925,7 +4925,7 @@ mod tests {
         assert!(format!("{err}").contains("lock record"), "got: {err}");
     }
 
-    /// R3 — a raw open with a MUTATING flag set is refused at the primitive.
+    /// A raw open with a MUTATING flag set is refused at the primitive.
     /// Pre-fix `openat_no_follow` was `pub` and unguarded, so
     /// `O_WRONLY|O_TRUNC` truncated the record (the inode survived, but the
     /// holder-identity bytes the contention diagnostic reads were destroyed).
@@ -4957,7 +4957,7 @@ mod tests {
         drop(fd);
     }
 
-    /// R1 (DATA LOSS): the recursive-removal walk consulted only the
+    /// DATA LOSS: the recursive-removal walk consulted only the
     /// lock-record authority, so `remove_dir_all_path`/`remove_dir_all_fd`
     /// walked straight over a stranded `.sync-aside.` and destroyed the
     /// caller's only copy of the original. The walk and the entry points now
@@ -5059,7 +5059,7 @@ mod tests {
         );
     }
 
-    /// R6 at the authority: the capability-gated retirement removes ONLY the
+    /// At the authority: the capability-gated retirement removes ONLY the
     /// record the presented [`OwnedLockRecord`] owns. A DIFFERENT record — even
     /// one of the same spelling family — and ordinary content are refused, so
     /// the sanctioned break cannot be reached for anything but the owned
@@ -5093,7 +5093,7 @@ mod tests {
         assert!(dir.path().join("ordinary").exists());
     }
 
-    /// R2: the EXPLICIT discard is the only sanctioned break of the implicit
+    /// The EXPLICIT discard is the only sanctioned break of the implicit
     /// residue guard. It removes the ONE strand, still refuses the lock
     /// authority, and still refuses a NESTED residue (a second stranded
     /// original inside the strand).

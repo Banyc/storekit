@@ -1135,7 +1135,7 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
     // enforced here, at the wire/local boundary: a component longer than any
     // filesystem entry could hold is refused with a clear materialization
     // error instead of being accepted here and then refused by the store with
-    // `ENAMETOOLONG` (B5).
+    // `ENAMETOOLONG`.
     if let Some(component) = path
         .split('/')
         .find(|component| component.len() > crate::atomic::NAME_MAX)
@@ -4233,7 +4233,7 @@ mod tests {
         }
     }
 
-    /// Over-refusal residual re-check (F4): the order fix adds NO over-refusal.
+    /// Over-refusal residual re-check: the order fix adds NO over-refusal.
     /// The two pre-existing fail-closed refusals are unchanged: the trailing
     /// `.`/space strip (a Win32 fold model applied on every host) and the
     /// widened-case refusal of a case-variant spelling on a case-SENSITIVE host

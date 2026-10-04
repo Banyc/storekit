@@ -1335,12 +1335,12 @@ impl RecordingRemote {
         self.metadata_calls.load(Ordering::SeqCst)
     }
 
-    /// The number of `prepare_identity` calls this transport saw (F1).
+    /// The number of `prepare_identity` calls this transport saw.
     fn identity_calls(&self) -> usize {
         self.identity_calls.load(Ordering::SeqCst)
     }
 
-    /// The remote-request count observed at each `prepare_identity` call (F1):
+    /// The remote-request count observed at each `prepare_identity` call:
     /// `[0]` means the identity was prepared before ANY remote request.
     fn identity_op_index(&self) -> Vec<usize> {
         self.identity_op_index.lock().unwrap().clone()
@@ -1444,7 +1444,7 @@ impl RecordingRemote {
             //
             // This models a FOREIGN `rename(2)` that unlinked the source, so it
             // DELIBERATELY bypasses the crate's guarded recursive removal: since
-            // R1 that primitive REFUSES to destroy a subtree holding residue (a
+            // that primitive REFUSES to destroy a subtree holding residue (a
             // source can hold a nested `.sync-aside.`), and a foreign rename is
             // exactly the case the guard does not and cannot cover.
             if let Ok(Some(meta)) = self.inner.metadata_opt(from) {
@@ -2234,7 +2234,7 @@ fn a_destination_resident_symlink_component_makes_the_run_refuse() {
     );
 }
 
-/// G2, control B. FLIPPED (P0): `dir/sub` is DESTINATION-SUPPLIED (the source
+/// G2, control B. FLIPPED: `dir/sub` is DESTINATION-SUPPLIED (the source
 /// holds no entry at `dir/sub`), so whether `Extraneous::Delete` removes it is
 /// the run's own plan decision (a conflict, an alias, or the residue guard can
 /// prohibit the removal). The plan-free rule refuses rather than guess, so the
@@ -2424,7 +2424,7 @@ fn a_destination_non_residue_symlink_component_is_refused_as_control() {
 /// holds no original, so `Extraneous::Delete` WOULD remove it when nothing
 /// blocks the removal.
 ///
-/// FLIPPED (P0): the component is DESTINATION-SUPPLIED — the source holds no
+/// FLIPPED: the component is DESTINATION-SUPPLIED — the source holds no
 /// entry at `temp` — so whether it still exists after the run is exactly what
 /// the run's own plan decides (`Extraneous::Delete` removes a destination-only
 /// entry only when no conflict, alias, or residue guard PROHIBITS the
@@ -2473,7 +2473,7 @@ fn extraneous_delete_removes_a_crate_temp_symlink_component_and_permits_the_link
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2, the crate-temp counterpart under `Keep`. JUSTIFICATION CORRECTED (P0):
+/// G2, the crate-temp counterpart under `Keep`. JUSTIFICATION CORRECTED:
 /// the run REFUSES because the component is DESTINATION-SUPPLIED (the source
 /// holds no entry at `temp`). The rule is POLICY-INDEPENDENT BY CONSTRUCTION:
 /// it does not consult the `Extraneous` value at all, because the applier's
@@ -2508,7 +2508,7 @@ fn a_destination_crate_temp_symlink_component_is_refused_under_keep() {
     assert_eq!(read(&outside.join("secret")), b"SECRET");
 }
 
-/// G2. FLIPPED (P0): a destination residue entry is DESTINATION-SUPPLIED (the
+/// G2. FLIPPED: a destination residue entry is DESTINATION-SUPPLIED (the
 /// source holds no entry at `.sync-aside.1.2`), and the rule is
 /// POLICY-INDEPENDENT BY CONSTRUCTION: it does not consult the `Extraneous`
 /// value, because the applier's post-run set is not a function of it. See
@@ -2545,7 +2545,7 @@ fn a_destination_residue_directory_does_not_break_a_legitimate_link() {
     );
 }
 
-/// G2. FLIPPED (P0): the same with a residue REGULAR FILE. The component
+/// G2. FLIPPED: the same with a residue REGULAR FILE. The component
 /// `.sync-aside.3.4` is DESTINATION-SUPPLIED (the source holds no entry
 /// there), and the rule is POLICY-INDEPENDENT BY CONSTRUCTION: it does not
 /// consult the `Extraneous` value, because the applier's post-run set is not a
@@ -5985,7 +5985,7 @@ fn a_push_strips_a_case_alias_of_the_lock_record() {
 /// for the root-level spelling); the record is now recognized as residue (the
 /// same authority gap as F1), left in place, and named in the report so a
 /// caller learns it is there. Both the in-root `state/operation.lock` and the
-/// bare root-level `operation.lock` are covered (G2).
+/// bare root-level `operation.lock` are covered.
 #[cfg(unix)]
 #[test]
 fn extraneous_delete_spares_and_names_the_lock_record() {
@@ -5996,7 +5996,7 @@ fn extraneous_delete_spares_and_names_the_lock_record() {
     std::fs::create_dir_all(dst.join("state")).unwrap();
     let record = dst.join("state/operation.lock");
     std::fs::write(&record, b"held").unwrap();
-    // The BARE application lock record at the destination root too (G2).
+    // The BARE application lock record at the destination root too.
     let bare = dst.join("operation.lock");
     std::fs::write(&bare, b"held").unwrap();
 
@@ -6831,7 +6831,7 @@ fn a_stranded_aside_is_residue_never_transferred_or_deleted() {
     assert_residue_present(&report, &[&dst2]);
 }
 
-/// R2: a stranded claim-aside left by a KILLED run (reproduced deterministically
+/// A stranded claim-aside left by a KILLED run (reproduced deterministically
 /// as the exact on-disk state a `SIGKILL` leaves: the install fails, then the
 /// rollback rename fails, so the aside survives holding the original) can be
 /// RECOVERED to the path it belongs at, or DISCARDED deliberately. Before this
@@ -6934,7 +6934,7 @@ fn a_stranded_aside_can_be_recovered_or_deliberately_discarded() {
     assert!(fs::symlink_metadata(dst.join(residue.aside())).is_err());
 }
 
-/// R6: every sync leaves an unremovable sibling lock record
+/// Every sync leaves an unremovable sibling lock record
 /// (`.<name>.operation.lock`), so a many-snapshot store accumulates one per
 /// snapshot forever. `retire_destination_lock` is the sanctioned break: it
 /// reuses the ownership authority (identity, not spelling) and REFUSES while
@@ -7059,7 +7059,7 @@ fn retire_destination_lock_fails_closed_when_presence_cannot_be_determined() {
     );
 }
 
-/// R1 at the PUBLIC transport surface: `Remote::remove_dir_all` is the
+/// At the PUBLIC transport surface: `Remote::remove_dir_all` is the
 /// primitive a consumer's `prune` names, and it refused nothing before the
 /// fix, so it destroyed the stranded aside. It now carries the substrate's
 /// residue refusal.
@@ -9576,7 +9576,7 @@ fn a_tab_in_a_source_symlink_target_is_refused_at_manifest_time() {
     assert_eq!(fs::read_link(src.join("l")).unwrap(), Path::new("a\tb"));
 }
 
-/// HIGH(F1): a REMOTE symlink target containing a tab is truncated
+/// HIGH: a REMOTE symlink target containing a tab is truncated
 /// by the tab-separated wire (`a\tb` -> `a`), so the assembler stored the
 /// truncated target, the diff read it as `Missing`, `transfer_symlink`
 /// installed the WRONG target, verification hashed the truncated target the
@@ -9619,7 +9619,7 @@ fn a_tab_in_a_remote_symlink_target_is_refused_not_installed_truncated() {
     );
 }
 
-/// HIGH(F1/F2): the wire assembler stored a truncated target, so a
+/// HIGH: the wire assembler stored a truncated target, so a
 /// destination symlink whose REAL target is `a\tb` was described as target
 /// `a`. A source whose target IS `a` then compared EQUAL, the diff read the
 /// entry as `Same`, and the push returned `Ok` with the entry skipped while
@@ -9661,7 +9661,7 @@ fn a_tab_in_a_remote_destination_symlink_target_is_refused_not_read_as_same() {
     );
 }
 
-/// HIGH(F3): a non-UTF-8 symlink TARGET was stored with
+/// HIGH: a non-UTF-8 symlink TARGET was stored with
 /// `from_utf8_lossy` while the RAW bytes were hashed, so `transfer_symlink`
 /// installed a REWRITTEN link and only THEN failed verification — the
 /// destination was MUTATED to a different target before the error surfaced.
@@ -9719,7 +9719,7 @@ fn a_non_utf8_symlink_target_is_refused_at_manifest_time_and_mutates_nothing() {
     );
 }
 
-/// HIGH(F2): the far-side walk printed the raw bytes of a name that
+/// HIGH: the far-side walk printed the raw bytes of a name that
 /// is not valid UTF-8 and the runner decoded the wire with `from_utf8_lossy`,
 /// so the assembler stored a U+FFFD spelling that addresses NOTHING while
 /// `canonicalize_tree` (the local walk) would refuse the same tree. With
@@ -10096,7 +10096,7 @@ fn delete_extraneous_never_destroys_a_nested_case_aliased_transfer() {
 }
 
 // ---------------------------------------------------------------------------
-// Round 19: the fold a `to_lowercase` model MISSES.
+// The fold a `to_lowercase` model MISSES.
 //
 // macOS APFS (and ext4 with `casefold`) folds `Straße.txt` onto `STRASSE.txt`,
 // `ﬁ.txt` onto `fi.txt`, and `ς` onto `σ`, while `str::to_lowercase` keeps
@@ -10503,7 +10503,7 @@ fn a_fully_refused_case_pair_leaves_the_destination_root_absent() {
 }
 
 // ---------------------------------------------------------------------------
-// Round 20: a source manifest the assembler should have refused (not
+// A source manifest the assembler should have refused (not
 // PARENT-CLOSED), and the post-transfer checks that must hold even if one
 // reaches the applier.
 //
@@ -10831,7 +10831,7 @@ fn a_failed_verification_read_is_an_infrastructure_error_not_a_content_mismatch(
 }
 
 // ---------------------------------------------------------------------------
-// Round 21: content verification for mode-only transfers, KIND verification for
+// Content verification for mode-only transfers, KIND verification for
 // every report-named path, and the faithful destination listing.
 // ---------------------------------------------------------------------------
 
@@ -11707,7 +11707,7 @@ fn the_case_fold_predicate_names_only_a_fold_it_models() {
 }
 
 // ---------------------------------------------------------------------------
-// Round 23: the TOTAL sanction rule (OwnPartial included), rollback accounting,
+// The TOTAL sanction rule (OwnPartial included), rollback accounting,
 // and the live-kind gate for the mode-only short circuit.
 // ---------------------------------------------------------------------------
 
@@ -12053,7 +12053,7 @@ fn a_claim_window_writer_source_addressed_child_is_preserved_under_own_partial()
 }
 
 // ---------------------------------------------------------------------------
-// Round 24: the LIVE-KIND dispatch rule (Finding 1: a kind observed at an
+// The LIVE-KIND dispatch rule (a kind observed at an
 // earlier moment must never select a mutation against the live object) and the
 // confined-LOCAL destination coverage gap that hid it. `pull`'s destination is
 // a `Side::Local` that no `Remote` wrapper can intercept, so the reviewer's

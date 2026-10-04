@@ -86,7 +86,7 @@ fn fifo_entries_do_not_hang_the_read_side_primitives() {
                 probes, 4,
                 "all four read-side primitives must have been probed:\n{stdout}"
             );
-            // Say WHICH platform ran the probe (A2's report requirement).
+            // Say WHICH platform ran the probe.
             println!(
                 "FIFO regression probes ran on platform={} (4 primitives refused a FIFO promptly)",
                 std::env::consts::OS

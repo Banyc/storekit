@@ -9,7 +9,7 @@ use std::os::unix::io::AsRawFd;
 /// (`truncate(false)`). The record's stable inode is the whole point of the
 /// lock, so a symlink planted at its spelling must fail closed here, before any
 /// `set_permissions`/`set_len`/write can be redirected through the link into an
-/// arbitrary victim file (A2). A symlink makes `open` fail `ELOOP`; the caller
+/// arbitrary victim file. A symlink makes `open` fail `ELOOP`; the caller
 /// maps that to a typed refusal. `O_CLOEXEC` keeps the descriptor out of a
 /// spawned far-side helper.
 //

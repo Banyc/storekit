@@ -2472,7 +2472,7 @@ impl LocalTransport {
 
     #[cfg(unix)]
     fn symlink_confined(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
-        // R1: the whole symlink (ensure parent, unlink any existing entry,
+        // The whole symlink (ensure parent, unlink any existing entry,
         // symlinkat, fsync parent) is issued by the ONE guarded atomic
         // authority, so a link spelled as the lock record cannot unlink the
         // record and install a link. There is NO raw `libc::unlinkat` /
@@ -2867,7 +2867,7 @@ impl Remote for LocalTransport {
     /// sync's own claim-aside (a residue spelling) is removed through the
     /// residue-sanctioning atomic primitive. Without this override the ordinary
     /// `remove_file` would refuse the strand once the residue authority joined
-    /// the ONE gate (A1), breaking the engine's own `drop_claim`.
+    /// the ONE gate, breaking the engine's own `drop_claim`.
     fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("remove residue {}: {e}", rel.display())))?;
@@ -2909,7 +2909,7 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
-        // R4: no direct `std::fs` mutation here any more. The path-based
+        // No direct `std::fs` mutation here any more. The path-based
         // Windows seam routes through the SAME guarded atomic funnel the Unix
         // port uses, so the Windows atomic guards are actually reached. The
         // mode chmod is inode-preserving and stays a best-effort path call.
@@ -3010,7 +3010,7 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
-        // R4: route through the guarded atomic funnel (a missing entry is the
+        // Route through the guarded atomic funnel (a missing entry is the
         // tolerated no-op).
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("remove {}: {e}", rel.display())))?;
@@ -3075,7 +3075,7 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        // R4: the Windows atomic guard (`refuse_lock_record_in_tree`) is now
+        // The Windows atomic guard (`refuse_lock_record_in_tree`) is now
         // reached through the funnel instead of being bypassed by a direct
         // `std::fs::remove_dir_all`. The funnel's own walk is iterative on
         // Windows (std), so the deep-tree guarantee is unchanged. A missing
@@ -3543,7 +3543,7 @@ mod tests {
         }
     }
 
-    /// R1 — the transport's symlink CANNOT destroy the lock record. Pre-fix
+    /// The transport's symlink CANNOT destroy the lock record. Pre-fix
     /// `symlink_confined` removed any existing entry at the link path with a
     /// raw `unlinkat` and installed a symlink, so a caller could acquire the
     /// lock, symlink OVER the record, and acquire a SECOND lock with a

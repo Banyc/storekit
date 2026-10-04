@@ -9060,7 +9060,7 @@ impl LocalSide {
 
     #[cfg(not(unix))]
     fn remove_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        // R4: the non-Unix seam routes through the SAME guarded atomic funnel
+        // The non-Unix seam routes through the SAME guarded atomic funnel
         // instead of a bare `std::fs::remove_dir`.
         crate::atomic::remove_dir_fd(self.root_dir()?, rel)
     }
@@ -9250,7 +9250,8 @@ fn set_local_mode(
 /// (never followed). The parent directory is synced so the new entry is
 /// durable.
 /// The applier's local symlink goes through the ONE guarded atomic symlink
-/// authority (R1's SECOND implementation): the raw `unlinkat`/`symlinkat` that
+/// authority (the second implementation of the lock-record guard): the raw
+/// `unlinkat`/`symlinkat` that
 /// used to live here was a consumer-reachable route to destroying the lock
 /// record and installing a link. `symlink_fd` ensures the parent, unlinks any
 /// existing entry, creates the link, and fsyncs the parent — all guarded.

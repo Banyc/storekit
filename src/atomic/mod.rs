@@ -47,7 +47,7 @@
 //! consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the OWNED
 //! ROOT itself (the empty and `.` child spellings are refused, so residue at
 //! the root was otherwise unreachable) and [`is_crate_temp_name`] recognises
-//! the crate's own crash residue (B1/B2).
+//! the crate's own crash residue.
 //!
 //! The `_fd` tree pair a migration onto this crate needs — an arbitrary-path
 //! SOURCE copied to a ROOT-CONFINED destination, and the fd-confined tree
@@ -561,7 +561,7 @@ pub(crate) fn is_crate_temp_shape(name: &str) -> bool {
 /// is a shape match on that spelling, never a heuristic on the destination
 /// name.
 ///
-/// # Crash residue (B2): the recognizer and the recovery recipe
+/// # Crash residue: the recognizer and the recovery recipe
 ///
 /// A failed atomic replace cleans up its temp on an ERROR RETURN (best-effort,
 /// the cleanup failure carried with the original error). A process that is
@@ -956,7 +956,7 @@ mod tests {
     /// tail, and the operation-lock sidecar recover one-part `<pid>` tail —
     /// and nothing else.
     ///
-    /// CHANGED DELIBERATELY (G1/F4): the pre-fix predicate was BOTH over- and
+    /// CHANGED DELIBERATELY: the pre-fix predicate was BOTH over- and
     /// under-broad — it matched `notes.tmp.1.0` (no leading dot: a name the id
     /// rule ACCEPTS, so the documented recovery sweep could delete live
     /// content) and MISSED the far-side `mktemp` tail `.tmp.aB3xY9` and the
@@ -979,11 +979,11 @@ mod tests {
             // Local atomic-replace tail: `<pid>.<counter>`.
             ".sync-aside.foo.tmp.12345.0",
             ".sync-aside.case.tmp.1.2",
-            // Sidecar replace tail: `<pid>.<time>.<rand>` (G1).
+            // Sidecar replace tail: `<pid>.<time>.<rand>`.
             ".sync-aside.foo.tmp.1.2.3",
             ".op.json.tmp.1234.1700000000.42",
             ".sync-aside.foo.tmp.12345.0.1",
-            // Far-side `mktemp` tail: six alphanumerics (G1).
+            // Far-side `mktemp` tail: six alphanumerics.
             ".sync-aside.foo.tmp.aB3xY9",
             ".op.json.tmp.abc123",
             ".sync-aside.foo.claim.Zz09Qw",

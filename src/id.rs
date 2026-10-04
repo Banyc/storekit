@@ -303,7 +303,7 @@ mod tests {
         // The near-miss `operation.lock` is NO LONGER a valid id: it is the
         // crate's own application-store lock record, which FileLock::acquire
         // truncates and rewrites, so an id that named it could not coexist
-        // with the lock. Its case aliases are refused too (A3/A4).
+        // with the lock. Its case aliases are refused too.
         assert!(Identifier::parse("operation.lock").is_err());
         assert!(Identifier::parse("OPERATION.LOCK").is_err());
         assert!(Identifier::parse(".sync-aside").is_ok());

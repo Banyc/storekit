@@ -13,7 +13,7 @@ use std::os::windows::io::AsRawHandle;
 /// POINT (symlink) at the record's own path, and without a truncating open. A
 /// reparse point is opened itself (`FILE_FLAG_OPEN_REPARSE_POINT`) and then
 /// REFUSED by inspecting the opened handle, so the `set_len`/write below can
-/// never be redirected through the link into an arbitrary victim file (A2).
+/// never be redirected through the link into an arbitrary victim file.
 //
 // The LOCK PROTOCOL's own record open: this is the ONE function that may ADOPT
 // the lock record's name (its `create(true)` flag), at the path

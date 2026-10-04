@@ -409,7 +409,7 @@ mod tests {
     /// of the same path fails with the explicit "held by" message (the flock
     /// is exclusive on the single inode, so any contender is refused) AND with
     /// the TYPED contention signal, never the same `Preflight` class a real
-    /// open/flock failure uses (B3).
+    /// open/flock failure uses.
     #[test]
     fn contention_is_refused_with_holder_message() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -431,7 +431,7 @@ mod tests {
 
     /// The lock record is PRIVATE (`0o600`), not the umask-derived mode the
     /// process happens to have: the one non-private record in a store of
-    /// `0o600` files and `0o700` directories (C1). This also tightens a record
+    /// `0o600` files and `0o700` directories. This also tightens a record
     /// an earlier version created with a wider mode, without changing its inode.
     #[cfg(unix)]
     #[test]

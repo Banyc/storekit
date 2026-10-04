@@ -212,7 +212,7 @@ pub fn is_unaddressable_name(name: &str) -> bool {
 
 /// Whether `name` case-folds onto one of the crate's own TEMP shapes
 /// ([`crate::atomic::is_crate_temp_shape`]) while being byte-different. See
-/// [`is_unaddressable_name`] (F6).
+/// [`is_unaddressable_name`].
 fn is_crate_temp_case_alias(name: &str) -> bool {
     if name.is_empty() {
         return false;
