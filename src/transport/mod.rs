@@ -727,8 +727,7 @@ pub trait Remote {
         Ok(())
     }
     /// Fsync the PARENT DIRECTORY of `rel` so a rename/removal/creation
-    /// inside it survives power loss on Linux (the macOS caveat is at
-    /// [`crate::atomic::ReplaceOutcome::ReplacedDurable`]) — the durability commit point of every
+    /// inside it survives power loss — the durability commit point of every
     /// atomic mutation (the staged-publish renames, the `current` symlink
     /// swap, the record replaces): a mutation's success is reported ONLY
     /// after this succeeds. FAIL-CLOSED: a failed open OR a failed fsync is

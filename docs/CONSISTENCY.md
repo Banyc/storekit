@@ -93,43 +93,12 @@ Named, scoped, not pursued:
   shape is outside the pin's guarantee rather than a hole in a promise, and the
   contract's clause (c) says so.
 - **No deny entry is checked for RESOLUTION.** `clippy.toml` is a list of resolved
-  symbols, and nothing verifies that a given entry resolves on a given target. A typo
-  there produces a non-fatal config-time `does not refer to a reachable function`
-  diagnostic that the gate's `-D warnings` does not cover, so it can rot silently; a
-  symbol the funnel DOES use is caught only by the closure test, which checks the LIST,
-  not the resolution (`cargo clippy --all-targets --target x86_64-pc-windows-msvc` exits
-  0 while naming 87 entries: the six funnel-used `libc::…at` symbols, 77 other `libc`
-  entries, and four `std::os::unix::*` ones). On
-  Windows those six do not resolve, so those entries are inert there; FIFTEEN other
-  `libc` entries DO resolve and are live denies (the crate calls none of them on that
-  target). Some wider-set entries name symbols no supported target exports at all
-  (`libc::shm_rename` is FreeBSD-only). The entries are kept as the reviewed record
-  rather than pruned, and the deny bites on each target that DOES export the symbol.
-- **The far-side root of an `SshTransport` destination is unresolvable from here.**
-  When the remote is not local its root names a path on another host, so nothing this
-  host can see establishes that it is disjoint from the local root — they may be a
-  bind mount, a shared filesystem, or an `ssh` target that is this very host. No
-  refusal is computed there and none is implied: a caller that co-locates the two on
-  one filesystem enforces disjointness itself. Stated at `src/sync/apply.rs`'s module
-  docs.
-- **The count pins pin CALL COUNTS, not arguments.** A change to an argument at a
-  call site inside a reviewed allow region moves no `std::fs` count, and the deny is
-  allowed there. The boundary is precise, and narrower than "no device notices it": an
-  argument that introduces a NEW counted symbol IS noticed — measured,
-  `custom_flags(libc::O_NONBLOCK | libc::O_CREAT)` fails the libc pin on `libc::O_CREAT`,
-  because the four UNIX funnel sites spell their flags as `libc::…`. On Windows the
-  three funnel `custom_flags` sites spell `windows_sys` constants
-  (`FILE_FLAG_OPEN_REPARSE_POINT`, `FILE_FLAG_BACKUP_SEMANTICS`), which the libc pin does
-  not count, so an added flag IS invisible there. An argument change that introduces no
-  newly counted symbol (a constant, a length, a bit already spelled) is a review
-  responsibility. The contract's clause (c) is about a changed or ADDED call.
-- **`fsync` is not a power-loss barrier on macOS.** Every durability claim here rests
-  on `fsync` (`File::sync_all`) and the crate never calls `fcntl(F_FULLFSYNC)`. On
-  Linux that is the power-loss barrier; on macOS `fsync` is documented not to flush the
-  device write cache, so a destination there is durable against a process crash and NOT
-  necessarily against power loss. A consumer budgeting power-loss recovery on macOS
-  needs the stronger call, which this crate does not make. Stated at the README's
-  "Durability and atomicity".
+  symbols and nothing verifies that an entry resolves on the Unix target: a typo
+  produces a non-fatal config-time `does not refer to a reachable function`
+  diagnostic that the gate's `-D warnings` does not cover, so it can rot silently. A
+  symbol the funnel DOES use is caught by the closure test, which checks the LIST,
+  not the resolution. Entries naming symbols no Unix libc exports are kept as the
+  reviewed record rather than pruned.
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde

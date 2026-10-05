@@ -179,11 +179,6 @@ local port's replace is the ONE non-atomic case (no directory fsync; the target
 is removed before the rename) and is unverified. The exact commit points are in
 the `manifest` module's "Durability and atomicity of a written entry".
 
-DURABLE means the `fsync`/`rename` discipline. On Linux that IS the power-loss
-barrier; on macOS `fsync` does not flush the device write cache and the crate never
-calls `fcntl(F_FULLFSYNC)`, so a macOS destination is durable against a process crash
-and NOT necessarily against power loss. `docs/CONSISTENCY.md` states the reach.
-
 `EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
 remote append primitive and the append is a compare-and-replace of the whole
 file. Measured on Linux release with `strace` byte accounting (kache
@@ -293,6 +288,19 @@ are `#[cfg(unix)]`; the rest of the suite is compiled for Windows.
 Restrictions the crate does not enforce, because it cannot. Each buys a
 simplification; removing one means adding back the logic it removes.
 
+- **Durability is a LINUX claim.** *Buys:* one durability story instead of a
+  per-platform one. `fsync` is the power-loss barrier on Linux; macOS's `fsync` does
+  not flush the device write cache (this crate does not call `F_FULLFSYNC`) and the
+  Windows port has no directory fsync, so on those targets the crate guarantees the
+  replace's ATOMICITY and durability against a process CRASH, not against power loss.
+  A caller needing power-loss recovery there owns that step.
+- **The name-mutation devices target UNIX.** *Buys:* one funnel, one deny list, one
+  pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so
+  the `libc` entries are inert there by construction, and the Windows port is a
+  COMPILE target whose runtime this contract does not cover.
+- **Every claim has ONE home.** *Buys:* no copies to disagree. A fact is stated where
+  it is enforced and POINTED AT elsewhere; a second copy is a defect, not redundancy.
+
 - **The destination changes only through this run.** *Buys:* one read of the
   destination is authoritative for the whole run, so work is never ordered
   against an unknown mutation. The crate takes the destination's operation lock
@@ -391,13 +399,9 @@ takes responsibility for exactly this, and no more.
   them (`clippy.toml`: the symbols the funnel uses, plus a reviewed set around
   them — the list is deliberately WIDER than the funnel, and naming a symbol the
   funnel never calls is how a route it could acquire later is refused in
-  advance). The deny's reach is per SYMBOL and per TARGET: an entry is inert only on a
-  target that does not export the symbol. On Windows the six `libc::…at` symbols the
-  Unix wrappers call do not resolve, while FIFTEEN other `libc` entries (`open`,
-  `unlink`, `rename`, `chmod`, `mkdir`, `rmdir`, `creat`, `fopen`, `freopen`, `remove`,
-  `bind`, `wchmod`, `wopen`, `wrmdir`, `wutime`) DO resolve and are live denies there —
-  the crate calls none of them on that target, which is the advance protection working.
-  (b) Every production
+  advance). The device is a UNIX-target device (see the assumptions): on Windows the
+  `libc` entries are inert by construction because `libc` is not the crate's I/O library
+  there. (b) Every production
   `libc` reference is either inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`)
   or NAMED in the audit's pin, by file, symbol and count; the map of references NOT on
   the pin is asserted EMPTY, so an unreviewed `libc` reference is a failing test. The

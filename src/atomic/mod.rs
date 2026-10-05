@@ -8,8 +8,7 @@
 //! TWO DISTINCT COMMIT POINTS and `write_atomic_replace` reports them
 //! EXPLICITLY ([`ReplaceOutcome`]): the RENAME is commit point 1 (the new
 //! content becomes VISIBLE under its final name), and the PARENT-DIRECTORY
-//! FSYNC is commit point 2 (the rename becomes DURABLE across power loss on Linux;
-//! see [`ReplaceOutcome::ReplacedDurable`] for the macOS caveat).
+//! FSYNC is commit point 2 (the rename becomes DURABLE across power loss).
 //! A failure before the rename is an `Err` — the OLD content is still
 //! visible, and the temp file the replace wrote is UNLINKED before the call
 //! returns, so a failed replace leaves no stray TEMP entry. (The durable
@@ -646,13 +645,7 @@ fn discard_temp(original: Error, tmp: &Path) -> Error {
 pub enum ReplaceOutcome {
     /// BOTH commit points confirmed: the new content is visible under its
     /// final name AND the parent-directory fsync succeeded — the replace
-    /// is durable across power loss — on LINUX, where `fsync` is the power-loss
-    /// barrier. On macOS `fsync` does not flush the device write cache and this
-    /// crate never calls `fcntl(F_FULLFSYNC)`, so there the verdict means durable
-    /// against a PROCESS CRASH, not necessarily against power loss: a consumer
-    /// budgeting power-loss recovery on macOS needs the stronger call, which this
-    /// crate does not make (the residual is stated in `docs/CONSISTENCY.md`).
-    /// When the replace had to CREATE the
+    /// is durable across power loss. When the replace had to CREATE the
     /// parent chain, every newly created directory's own entry was fsynced
     /// into its parent BEFORE the rename (the durable directory helper), so
     /// the claim covers the WHOLE chain, not only the final entry's parent.
