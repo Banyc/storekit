@@ -1496,9 +1496,9 @@ mod tests {
     fn an_exit_255_with_a_strong_transport_marker_is_transport() {
         for stderr in [
             "kex_exchange_identification: read: Connection reset by peer",
-            // The reviewer's real-sshd ground truth for a genuinely closed
-            // port: exit 255 AND this exact ssh diagnostic, which must still
-            // route to transport.
+            // A genuinely closed port's ground truth: real sshd reports exit
+            // 255 AND this exact ssh diagnostic, which must still route to
+            // transport.
             "ssh: connect to host 127.0.0.1 port 22: Connection refused",
         ] {
             let out = ExecOutcome {

@@ -3813,8 +3813,8 @@ mod tests_ssh {
     /// fifo/socket/device. Pre-fix the SSH classification was
     /// `is_file = !is_symlink && !is_dir`, so an `S_IFIFO` entry reported
     /// `is_file == true` over SSH while `LocalTransport::metadata` reported
-    /// false (the public-API inconsistency the reviewer verified against a real
-    /// sshd). Both now use a strict `S_IFREG` test.
+    /// false (an inconsistency between the two transports, reachable against a
+    /// real sshd). Both now use a strict `S_IFREG` test.
     #[cfg(unix)]
     #[test]
     fn fifo_is_not_a_file_on_either_transport() {
@@ -6257,10 +6257,10 @@ mod tests_ssh {
     ///
     /// The short read is SIMULATED here with a fake `cat` that consumes only 3
     /// of the payload's bytes and exits 0 — exactly the clean, short EOF a lost
-    /// connection produces. The reviewer proved the REAL-connection case over
-    /// live sshds (killing the ControlMaster mid-128-MiB-write left a strict
-    /// prefix: 36,110,336 bytes on macOS/BSD, 196,608 on GNU/Linux, with the
-    /// OLD content gone). Pre-fix this test FAILED: the script renamed the
+    /// connection produces. The REAL-connection case reproduces over live
+    /// sshds: killing the ControlMaster mid-128-MiB-write left a strict prefix
+    /// (36,110,336 bytes on macOS/BSD, 196,608 on GNU/Linux) with the OLD
+    /// content gone. Pre-fix this test FAILED: the script renamed the
     /// 3-byte temp over `state/f` and exited 0, so `OLD-CONTENT` was replaced.
     #[test]
     fn upload_refuses_to_publish_a_truncated_payload() {

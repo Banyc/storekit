@@ -3,8 +3,8 @@
 //! point of view (the public API only), so they can be run unchanged against
 //! the pre-fix tree in a scratch workspace at the parent revision.
 //!
-//! The defects pinned here are the ones a reviewer found by using the
-//! primitive the way `~/code/deploy` does — an arbitrary out-of-root source,
+//! The defects pinned here are the ones the primitive's consumer meets using
+//! it the way `~/code/deploy` does — an arbitrary out-of-root source,
 //! a fresh staging destination, then the caller's own canonicalize + digest
 //! + fsync + rename:
 //!
@@ -386,12 +386,12 @@ fn a_failed_nested_copy_restores_modes_and_keeps_the_created_ancestors_removable
     set_mode(&src.join("keep"), 0o755);
 }
 
-/// CHARACTERIZATION for the reviewer's exact repro: at THIS revision a
-/// `src/bad` directory of mode `0o000` is caught by the FAIL-CLOSED containment
-/// enumeration before any destination mutation, so nothing is created. (The
-/// reviewer's run left `dst/bad` at `0o200`; that pre-dated the enumeration
-/// this chain added. The undo journal still closes the general class: any
-/// reachable mid-walk failure now restores every mode it changed.)
+/// CHARACTERIZATION of the defect this pins: pre-fix, a `src/bad` directory of
+/// mode `0o000` walked through to the destination and left `dst/bad` at
+/// `0o200`; at THIS revision the FAIL-CLOSED containment enumeration catches it
+/// before any destination mutation, so nothing is created. (The undo journal
+/// still closes the general class: any reachable mid-walk failure now restores
+/// every mode it changed.)
 #[test]
 fn a_mode_0000_source_directory_fails_closed_before_creating_anything() {
     let base = tmpdir();

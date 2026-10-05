@@ -4862,9 +4862,9 @@ trait T {
             "the derivation must see an `#[allow]`-ed trait method's body"
         );
 
-        // C — the CONTROL the reviewers used: the freestanding `#[allow]`
-        // form. It was already seen before the fix, so it isolates the
-        // impl/trait arms rather than proving the whole file is parsed.
+        // C — the CONTROL: the freestanding `#[allow]` form. It was already
+        // seen before the fix, so it isolates the impl/trait arms rather than
+        // proving the whole file is parsed.
         let freestanding = r##"
 #[allow(clippy::disallowed_methods)]
 fn adopt(p: &std::path::Path) {
@@ -5271,8 +5271,7 @@ impl S {
     /// The REVIEWED exemptions: public raw-path fns/methods that are
     /// deliberately NOT pair-less mutations, each with its reason. The
     /// derivation below requires the block to cover every OTHER public
-    /// raw-path item, so this list is the residue a reviewer checks one entry
-    /// at a time.
+    /// raw-path item, so this list is the residue to audit one entry at a time.
     const PAIR_LESS_EXEMPTIONS: &[(&str, &str)] = &[
         ("atomic::path_state", "lstat-style state read; no mutation"),
         (
@@ -5817,7 +5816,7 @@ impl S {
     /// production item graph, and (c) derives every PUBLIC fn/method that takes
     /// a raw path argument and requires each to be named in the block or in the
     /// reviewed [`PAIR_LESS_EXEMPTIONS`] list. Any omission is therefore a
-    /// failing test rather than a reviewer's find: adding a new public
+    /// failing test rather than a silent omission: adding a new public
     /// raw-path mutating fn makes `uncovered` non-empty until the block (or an
     /// exemption with a reason) names it.
     ///

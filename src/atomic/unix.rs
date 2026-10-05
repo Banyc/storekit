@@ -5128,8 +5128,8 @@ mod tests {
         assert!(format!("{err}").contains("lock record"), "{err}");
     }
 
-    /// The reviewer's EXACT primitive: `remove_dir_all_path` over the aside
-    /// path itself. PRE-FIX: returned `Ok(())` and destroyed it.
+    /// The exact primitive this pins: `remove_dir_all_path` over the aside path
+    /// itself. PRE-FIX: returned `Ok(())` and destroyed it.
     #[test]
     fn path_based_removal_never_destroys_a_stranded_aside() {
         let (dir, _root) = owned_root();

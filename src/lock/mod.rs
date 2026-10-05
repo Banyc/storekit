@@ -749,7 +749,7 @@ mod tests {
         );
     }
 
-    /// The reviewer's shape, at BOTH an ordinary path and the reserved record
+    /// The shape this pins, at BOTH an ordinary path and the reserved record
     /// spelling: a pre-existing NON-EMPTY file that is not a record this crate
     /// wrote is REFUSED with the typed
     /// [`PreflightKind::LockRecordNotRecognized`] and left byte-for-byte and

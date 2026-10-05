@@ -1380,8 +1380,8 @@ mod runner_property_tests {
         let runner =
             SshRunner::with_seam(seam, Duration::from_millis(50), Duration::from_millis(50));
         // An explicit `known_hosts` file: `prepare_identity` then only creates
-        // the mux dir (no keyscan pin), which is exactly the fresh-transport
-        // path the reviewer reproduced.
+        // the mux dir (no keyscan pin), exactly the fresh-transport path this
+        // test exercises.
         let transport = SshTransport::with_runner(
             "deploy",
             "self-prepare.test",

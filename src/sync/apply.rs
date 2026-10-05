@@ -4531,8 +4531,12 @@ impl Applier<'_, '_> {
             // top-level pass already refused. It is kept rather than relying on
             // that reachability argument, so a future caller (or a diff that
             // admits a conflicted path below an extraneous directory) still
-            // cannot destroy a protected path. There is no test that fails when
-            // it is deleted, because no reachable state reaches it.
+            // cannot destroy a protected path. The state is unreachable through
+            // `remove_extraneous`, but the arm is witnessed DIRECTLY by
+            // `an_extraneous_child_below_a_prohibited_ancestor_may_not_be_deleted`
+            // (see `src/sync/apply/tests.rs`), which asks this guard about an
+            // extraneous child of a conflict-prohibited ancestor; deleting the
+            // comparison fails that test.
             Sanction::ExtraneousFlag => {
                 self.diff.classify(path) == Some(EntryDiff::Extraneous) && !self.is_prohibited(path)
             }

@@ -29,8 +29,9 @@
 //! encryption, no `sshd`, no `ControlMaster`, no OpenSSH option parsing, no
 //! remote login-shell startup files, and no remote filesystem semantics — the
 //! far side is the SAME host and the SAME local filesystem. Real-`sshd`
-//! coverage (one Linux sshd, one macOS sshd) is recorded in the change's test
-//! evidence, not in this file.
+//! coverage (one Linux sshd, one macOS sshd) is NOT established by this file:
+//! nothing here contacts an `sshd`, so a green run says nothing about the
+//! real-`sshd` cases.
 #![cfg(unix)]
 // Test-only fixtures drive the same name-mutating primitives the funnel guards;
 // the production name-mutation rule does not apply to this test crate.
@@ -661,9 +662,11 @@ fn try_write_new_already_present_fsyncs_the_parent_portably() {
 /// `Ok(())`. The probe's fake perl exits 9 on the directory-fsync hook; the
 /// walk must surface that as an `Err`, never a swallowed success.
 ///
-/// Pre-fix this test FAILED with `Ok(())` (the reviewer proved it over a GNU
-/// sshd on 2222 and a BSD sshd on 2223). `fsync_parent` already propagated
-/// (`fsync_parent_failure_propagates`), so this is the one hole.
+/// Pre-fix this test FAILED with `Ok(())`, and the hole reproduces over a real
+/// sshd: measured against a GNU sshd on 2222 and a BSD sshd on 2223, a tree
+/// whose every far-side fsync failed still made `find` exit 0. `fsync_parent`
+/// already propagated (`fsync_parent_failure_propagates`), so this is the one
+/// hole.
 #[test]
 fn fsync_tree_failure_propagates() {
     let h = Harness::new("dst");
@@ -809,8 +812,8 @@ fn list_remote_and_local_agree_field_by_field_on_the_same_tree() {
         remote_fields, local_fields,
         "the SSH and local listings of the SAME tree must agree field by field"
     );
-    // The values the reviewer's `b1_list_tree` vs `b1_LISTLOCAL` comparison
-    // pinned: raw modes (type bits included) and real sizes.
+    // The values this comparison pins: raw modes (type bits included) and real
+    // sizes.
     let get = |name: &str| remote.iter().find(|e| e.name == name).unwrap();
     assert_eq!(get(".hidden").mode, 0o100600);
     assert_eq!(get(".hidden").size, 1);

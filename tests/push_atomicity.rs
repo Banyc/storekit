@@ -2,9 +2,9 @@
 //! PULL. Before the fix the push direction wrote through `Remote::write`
 //! (`LocalTransport::write_confined`), which opened the destination
 //! `O_WRONLY|O_CREAT|O_TRUNC` and did ONE `write` with no temp, no rename and
-//! no fsync anywhere under the destination. A write that failed part-way — the
-//! reviewer's ENOSPC on a small tmpfs — therefore DESTROYED the previous
-//! content and left the entry TORN: truncated to zero, then partially
+//! no fsync anywhere under the destination. A write that failed part-way — an
+//! ENOSPC on a small tmpfs — therefore DESTROYED the previous content and left
+//! the entry TORN: truncated to zero, then partially
 //! rewritten. The identical operation expressed as a PULL (which already used
 //! the crate's durable fd-confined primitives) left the old file intact.
 //!

@@ -3831,7 +3831,7 @@ mod tests {
         );
     }
 
-    /// The reviewer's escape: a RELATIVE target whose SPELLED walk reaches a
+    /// The spelled-walk escape: a RELATIVE target whose SPELLED walk reaches a
     /// symlink component. `R/dir/sub -> ../other` and `R/dir/link ->
     /// sub/../../outside` collapse lexically to `R/outside` (inside the root,
     /// because the first `..` undoes `sub`), but the kernel WALKS THROUGH the

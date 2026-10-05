@@ -2114,7 +2114,7 @@ fn an_in_root_relative_symlink_round_trips_through_push_and_pull() {
     );
 }
 
-/// The reviewer's escape tree must be refused by a REAL push and a REAL pull,
+/// The escape tree built here must be refused by a REAL push and a REAL pull,
 /// not only by `canonicalize_tree`: the strict SOURCE manifest is the gate and
 /// it fires before any mutation. `src/dir/sub -> ../other` is an accepted
 /// in-root link, and `src/dir/link -> sub/../../outside` walks THROUGH it, so
@@ -12148,8 +12148,9 @@ fn a_claim_window_writer_source_addressed_child_is_preserved_under_own_partial()
 // The LIVE-KIND dispatch rule (a kind observed at an
 // earlier moment must never select a mutation against the live object) and the
 // confined-LOCAL destination coverage gap that hid it. `pull`'s destination is
-// a `Side::Local` that no `Remote` wrapper can intercept, so the reviewer's
-// `oracle_stale_claim_kind` scenario had never been exercised there.
+// a `Side::Local` that no `Remote` wrapper can intercept, so the LIVE-KIND
+// dispatch rule had never been exercised against a confined-LOCAL destination
+// before the tests below.
 // ---------------------------------------------------------------------------
 
 /// Whether the report NAMES the writer subtree planted at `p/wc`: either the
@@ -12430,7 +12431,7 @@ fn a_restore_never_applies_a_recorded_mode_to_a_live_kind_it_never_recorded() {
     assert_report_lists_disjoint(error.report());
 }
 
-/// THE REMOVAL-WINDOW HOLE (second reviewer): `remove_subtree` enumerated a
+/// THE REMOVAL-WINDOW HOLE: `remove_subtree` enumerated a
 /// directory's children, decided each child's fate through the live authority,
 /// and then removed the DIRECTORY itself with a RECURSIVE primitive (`rm -rf`
 /// remotely, `remove_dir_all_fd` locally). A non-reserved entry created AFTER
@@ -14064,11 +14065,11 @@ fn removing_an_all_extraneous_nested_chain_does_not_fail_the_removal_verify() {
     );
 }
 
-/// Build an [`Applier`] with a FRESH ancestry memo, for asserting exactly
-/// which destinations may populate it. Every other field is the empty default
-/// the run constructor uses, so `guard_destination` is the only code that can
-/// touch `ancestry_dirs`.
-fn applier_with_ancestry_memo<'a, 'b>(
+/// Build an [`Applier`] over `diff` with every field at the empty default the
+/// run constructor uses. Tests that interrogate a private guard DIRECTLY
+/// (rather than through `run`) start from here, so the guard is exercised
+/// against a freshly built record rather than a hand-rolled partial state.
+fn applier_over<'a, 'b>(
     source: &'b Side<'a>,
     dest: &'b Side<'a>,
     policy: &'b dyn Policy,
@@ -14102,6 +14103,19 @@ fn applier_with_ancestry_memo<'a, 'b>(
         ancestry_dirs: std::cell::RefCell::new(BTreeSet::new()),
         transfers: 0,
     }
+}
+
+/// Build an [`Applier`] with a FRESH ancestry memo, for asserting exactly
+/// which destinations may populate it. Every other field is the empty default
+/// the run constructor uses, so `guard_destination` is the only code that can
+/// touch `ancestry_dirs`.
+fn applier_with_ancestry_memo<'a, 'b>(
+    source: &'b Side<'a>,
+    dest: &'b Side<'a>,
+    policy: &'b dyn Policy,
+    diff: &'b TreeDiff,
+) -> Applier<'a, 'b> {
+    applier_over(source, dest, policy, diff)
 }
 
 /// The confinement predicate is a CONJUNCTION: the side kind ([`Side::Local`])
@@ -14188,6 +14202,70 @@ fn the_ancestry_memo_is_off_for_a_path_based_destination_on_this_platform() {
             "the memo must hold the confirmed ancestors, got {memo:?}"
         );
     }
+}
+
+/// WITNESS for the `Sanction::ExtraneousFlag` backstop in [`Applier::may_delete`].
+///
+/// The arm refuses to destroy a destination-only path that is (or is below) a
+/// path a conflict forbids destroying. That state is UNREACHABLE through
+/// [`Applier::remove_extraneous`]: every conflict a removal can record is
+/// derived from the destination-only entries the diff walked, and a prohibited
+/// path is refused with [`ConflictReason::ParentRefused`] before `may_delete`
+/// is consulted, so no run asks the guard about a protected path. The
+/// comparison is kept as a BACKSTOP — for a future caller, or for a diff that
+/// admits a conflicted path below an extraneous directory — and this test pins
+/// it DIRECTLY through the module's private fields rather than claiming a
+/// reachable path. It reproduces the shape the backstop exists for: an
+/// extraneous destination subtree (`d/f`) below a directory a conflict forbids
+/// destroying (`d`). Removing the `!self.is_prohibited(path)` half of the arm
+/// makes the final assertion fail.
+#[test]
+fn an_extraneous_child_below_a_prohibited_ancestor_may_not_be_deleted() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    write(&dst.join("d/f"), b"destination-only");
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    assert_eq!(
+        diff.classify("d/f"),
+        Some(EntryDiff::Extraneous),
+        "the fixture must present `d/f` as destination-only: {diff:?}"
+    );
+
+    let local = LocalSide::open(root, true).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+
+    // The control: with no conflict the sanction alone admits the deletion, so
+    // the refusal below is the prohibition's doing and not the fixture's.
+    assert!(
+        applier.may_delete("d/f", Sanction::ExtraneousFlag),
+        "an unconflicted extraneous path is deletable"
+    );
+
+    // A conflict on the ANCESTOR `d` — the shape the removal pass records for a
+    // directory it refuses — forbids destroying `d/f` too. This is the state
+    // `remove_extraneous` never lets `may_delete` see.
+    applier.conflict(
+        "d",
+        EntryKind::Dir,
+        EntryPolicy::Refuse,
+        ConflictReason::ParentRefused,
+    );
+    assert!(
+        applier.is_prohibited("d/f"),
+        "the conflict at the ancestor must prohibit the child"
+    );
+    assert!(
+        !applier.may_delete("d/f", Sanction::ExtraneousFlag),
+        "the backstop must refuse the extraneous child of a protected directory"
+    );
 }
 
 /// REGRESSION: a PUSH to a destination root that does not exist yet must
