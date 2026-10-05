@@ -4207,6 +4207,80 @@ fn a_pull_into_a_destination_inside_the_remote_source_is_refused() {
     assert_eq!(read(&remote_root.join("top")), b"TOP");
 }
 
+/// The FAR-SIDE pull residual: `refuse_overlapping_roots` computes NOTHING
+/// when the REMOTE is not LOCAL, so a PULL whose local destination is nested
+/// inside the far-side SOURCE root gets no up-front `RootsOverlap` refusal.
+/// This pins the residual's measured shape (the far-side probe showed
+/// `sub/sub`, `sub/sub/x` and `sub/top` created and `sub/x` removed): the run
+/// WRITES INTO ITS SOURCE, and the end-of-run source re-check is what fails
+/// it — after the writes.
+///
+/// HAND-OFF: this is a witness for a STATED residual (`docs/CONSISTENCY.md`,
+/// "The far-side root of an `SshTransport` is unresolvable from here, on
+/// EITHER side"), NOT an endorsement of the behaviour. IF a refusal is ever
+/// added for this case, REPLACE this test with one asserting the refusal (no
+/// mutation, the typed `MaterializationKind::RootsOverlap`).
+#[test]
+fn a_far_side_source_overlap_is_not_refused_and_the_source_check_is_what_catches_it() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let remote_root = dir.path().join("remote");
+    // The local destination is NESTED INSIDE the far-side source root, so the
+    // two roots really do overlap on the co-located filesystem even though
+    // this host cannot resolve the far-side spelling.
+    let local = remote_root.join("sub");
+    write(&remote_root.join("sub/x"), b"SOURCE-X");
+    write(&remote_root.join("top"), b"TOP");
+
+    // `is_local = false`: the REMOTE is the SOURCE of a PULL and is not local,
+    // which is exactly the early-return condition in `refuse_overlapping_roots`.
+    let remote = RecordingRemote::over(transport(&remote_root), false);
+    let err = unowned(Direction::Pull, &local, &remote, &ReplaceAll, Delete)
+        .expect_err("the end-of-run source re-check must fail this run");
+
+    // HALF ONE: nothing refused this up front — the failure is NOT the typed
+    // `RootsOverlap` refusal, and the run got far enough to mutate.
+    assert_ne!(
+        err.error().materialization_reason(),
+        Some(crate::error::MaterializationKind::RootsOverlap),
+        "the far-side overlap is NOT refused up front: {err:?}"
+    );
+    assert!(
+        matches!(err.error(), Error::Integrity(_)),
+        "the end-of-run source re-check is an integrity failure, got {err:?}"
+    );
+    let message = err.error().to_string();
+    assert!(
+        message.contains("the SOURCE changed during the run")
+            && message.contains("violating the caller's quiescence precondition"),
+        "the failure names the source-quiescence precondition: {message}"
+    );
+
+    // HALF TWO: the source re-check names EVERY SOURCE path the run changed,
+    // each as its own list entry (`sub/x` is not satisfied by `sub/sub/x`).
+    assert!(
+        message.contains("changed paths: sub/sub, sub/sub/x, sub/top, sub/x"),
+        "the source re-check names the changed source paths: {message}"
+    );
+
+    // NON-VACUITY: the run really did WRITE INTO ITS SOURCE — the mutations the
+    // re-check reports are on disk, not a stale-plan claim.
+    assert!(
+        err.report().transfers > 0 && !err.report().applied.is_empty(),
+        "the run applied transfers into its source before the re-check caught it: {:?}",
+        err.report()
+    );
+    assert_eq!(read(&remote_root.join("sub/sub/x")), b"SOURCE-X");
+    assert_eq!(read(&remote_root.join("sub/top")), b"TOP");
+    assert!(
+        fs::symlink_metadata(remote_root.join("sub/sub")).is_ok(),
+        "the self-nested source directory was created by the run"
+    );
+    assert!(
+        fs::symlink_metadata(remote_root.join("sub/x")).is_err(),
+        "the run removed the source entry `sub/x` as destination-extraneous"
+    );
+}
+
 /// NEGATIVE CONTROL: EQUAL roots are the idempotent no-op, NOT an overlap.
 /// `OwnedRoot::parse` refuses equal roots for two simultaneous OWNERS, but a
 /// sync of a tree with itself has identical manifests, an empty diff, and no
