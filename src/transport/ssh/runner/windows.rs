@@ -68,8 +68,7 @@ pub(crate) fn spawn(
             return Ok(());
         };
         // No process groups on Windows: terminate the OWNED child
-        // (TerminateProcess). A background descendant survives — the
-        // documented weaker guarantee of the Windows port.
+        // (TerminateProcess). A background descendant survives.
         owned.child.kill()
     });
     let wait_child = child.clone();

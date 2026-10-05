@@ -223,10 +223,8 @@ pub enum StoreKind {
     /// A source entry the copy must read is not a regular file (a FIFO,
     /// socket, or device), refused instead of blocking in `open(2)`.
     CopySourceNotRegular,
-    /// A source entry is a hard link (link count > 1), which the crate refuses on
-    /// UNIX by rule so a copy cannot silently duplicate it into an independent file
-    /// (the local Windows walk cannot see `nlink`; the remote assembler still
-    /// refuses it).
+    /// A source entry is a hard link (link count > 1), refused so a copy cannot
+    /// silently duplicate it into an independent file.
     CopyHardLink,
     /// A source symlink's target is invalid or cannot be shown to stay inside
     /// the root, so copying it as a link would land an escaping link.

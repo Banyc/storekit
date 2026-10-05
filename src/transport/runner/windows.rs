@@ -91,8 +91,7 @@ pub(crate) fn exec(
         if !timed_out && now >= deadline {
             timed_out = true;
             // Terminate the OWNED child. No process group: a background
-            // descendant survives — the documented weaker guarantee of the
-            // Windows port.
+            // descendant survives.
             if let Err(e) = config.kill.kill_owned(&mut child.child) {
                 kill_error = Some(format!("kill child {pid}: {e}"));
             }
@@ -120,8 +119,7 @@ pub(crate) fn exec(
     // holder dies. A channel still open at the bound proves a live
     // descendant HOLDS the pipe — the pipe-EOF containment signal (the
     // same violation the Unix drain reports). The blocked reader thread is
-    // left to EOF when the descendant dies (the documented weaker
-    // guarantee of the Windows port).
+    // left to EOF when the descendant dies.
     let drain_bound = config.reap_bound;
     let stdout = recv_bounded(&stdout_rx, drain_bound).ok_or_else(|| {
         RunError::Background(format!(

@@ -5781,8 +5781,7 @@ mod tests {
     /// statement of what a sync carries: name, kind, mode INCLUDING the
     /// setuid/setgid/sticky bits, content, and symlink target ARE carried;
     /// ownership, xattrs, ACLs, timestamps, file flags, and sparseness are
-    /// SILENTLY dropped; hard links are REFUSED (on UNIX by the local walk,
-    /// on every platform by the remote wire). `Remote::copy_tree` has TWO
+    /// SILENTLY dropped; hard links are REFUSED. `Remote::copy_tree` has TWO
     /// implementations with DIFFERENT fidelity, so the carried and the
     /// not-carried axes are pinned per path here.
     ///

@@ -288,9 +288,7 @@
 //! ## Unsupported destination entries: delete-sanctioned, never transferred
 //!
 //! A destination may legitimately hold an entry the manifest model refuses to
-//! ACCEPT as a faithful tree member — an absolute symlink, an escaping
-//! symlink, or a hard link (refused on UNIX by the local walk, on every
-//! platform by the remote wire; see
+//! ACCEPT as a faithful tree member (see
 //! [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
 //! recorded in the DESTINATION manifest (under its live kind) and named in
 //! `DestinationTree::unsupported`, so the diff can classify it rather than the
@@ -687,8 +685,7 @@
 //! check cannot redirect a mutation (they use the pinned descriptor) but can
 //! still make the diff describe the pre-swap tree. Closing those requires
 //! descriptor-relative walking, which this module does not have. On Windows
-//! there is no directory descriptor, so the pinned-inode check does not exist
-//! (the documented weaker guarantee of the Windows port).
+//! there is no directory descriptor, so the pinned-inode check does not exist.
 //!
 //! A PULL's LOCAL destination root is created LAZILY, immediately before the
 //! first mutation that needs it, so a pull whose every entry is refused leaves
@@ -718,9 +715,7 @@
 //! a CONFIRMED absent path enumerates as empty) and carries the live KIND, so a
 //! symlink where the manifest says `Dir` is never treated as an intact
 //! directory. The preflight duplicates a window a component-confined
-//! destination already closes in `crate::atomic` (the platform property is
-//! [`crate::atomic::COMPONENT_CONFINED`]; on Unix every `_fd` primitive
-//! resolves components with `O_NOFOLLOW`); for a
+//! destination already closes in `crate::atomic`; for a
 //! [`LocalTransport`](crate::transport::LocalTransport) the transport itself
 //! resolves every non-root path component-wise with `O_NOFOLLOW` (no window) —
 //! mutations AND the reads this applier verifies against (`read`, `read_link`,
@@ -1056,9 +1051,7 @@ pub enum Extraneous {
     /// This PERMANENTLY destroys destination data the source does not hold.
     ///
     /// This INCLUDES a destination-only entry the address-fidelity rules
-    /// refuse to ACCEPT as a faithful tree member — an absolute or escaping
-    /// symlink, or a hard link (refused on UNIX by the local walk, on every
-    /// platform by the remote wire; see
+    /// refuse to ACCEPT as a faithful tree member (see
     /// [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
     /// classified [`EntryDiff::Extraneous`] like any other destination-only
     /// path and removed through the SAME live-kind, fold-aware, non-recursive
@@ -1565,9 +1558,7 @@ pub struct SyncReport {
     pub transfers: usize,
     /// WHY each tolerated UNSUPPORTED destination entry was tolerated: the
     /// manifest spelling and the strict address-fidelity rule that refused it
-    /// (an absolute/escaping symlink, or a hard link — refused on UNIX by the
-    /// local walk, on every platform by the remote wire — see
-    /// [`crate::manifest::UnsupportedEntry`]), sorted by path and unique.
+    /// (see [`crate::manifest::UnsupportedEntry`]), sorted by path and unique.
     ///
     /// This is an ANNOTATION, not a partition list. It adds NO path to the
     /// report and changes no outcome: the SAME path is already named by a
@@ -3045,8 +3036,8 @@ fn prepare(
         ));
     }
     // (3) READ THE SOURCE MANIFEST, STRICTLY, BEFORE ESTABLISHING OWNERSHIP.
-    // `source.manifest()` refuses an unrepresentable source entry (a hard link ON
-    // UNIX, an absolute or escaping symlink on every platform) HERE — before the
+    // `source.manifest()` refuses an unrepresentable source entry (see
+    // `crate::manifest::canonicalize_tree`) HERE — before the
     // destination lock
     // record is created and before `run` provisions the destination root. The
     // old order provisioned and locked first, so a run refused for its SOURCE
@@ -3669,8 +3660,7 @@ fn run(
         )));
     }
     // The destination manifest is built TOLERANTLY: an entry the address
-    // -fidelity rules refuse (an absolute/escaping symlink, a hard link —
-    // refused on UNIX by the local walk, on every platform by the remote wire)
+    // -fidelity rules refuse (see `crate::manifest::canonicalize_tree_destination`)
     // is recorded in `dest_unsupported` and still present in the manifest under
     // its live kind, so the diff classifies it and the report names it. A
     // SOURCE manifest (`source.manifest()` above) stays strict, so an
@@ -4007,10 +3997,9 @@ struct Applier<'a, 'b> {
     /// the deletion prohibition itself is derived from [`Applier::conflicts`].
     dest_residue: BTreeSet<String>,
     /// The RAW destination manifest's TOLERATED unsupported entries (the strict
-    /// address-fidelity refusals the destination manifest kept: an
-    /// absolute/escaping symlink, or a hard link — refused on UNIX by the local
-    /// walk, on every platform by the remote wire — each with the strict rule's
-    /// reason). Populated from [`crate::manifest::DestinationTree::unsupported`]
+    /// address-fidelity refusals the destination manifest kept, each with the
+    /// strict rule's reason). Populated from
+    /// [`crate::manifest::DestinationTree::unsupported`]
     /// before the diff. It is the source of
     /// [`SyncReport::unsupported_destination`]: the preflight uses it to refuse
     /// writing a source entry over such a path, and the report surfaces the
@@ -4077,10 +4066,8 @@ struct Applier<'a, 'b> {
     ///
     /// SCOPED TO CONFINED DESTINATIONS — A PROPERTY OF THE SIDE AND THE
     /// PLATFORM, ENFORCED AT THE USE SITE. The memo is populated and consulted
-    /// ONLY while [`Side::is_confined_local`] holds: a [`Side::Local`]
-    /// destination on a platform whose `_fd` primitives resolve components with
-    /// `O_NOFOLLOW` ([`crate::atomic::COMPONENT_CONFINED`]), so every mutation
-    /// and probe is resolved component-wise through `crate::atomic`. On a
+    /// ONLY while [`Side::is_confined_local`] holds, so every mutation and
+    /// probe is resolved component-wise through `crate::atomic`. On a
     /// PATH-BASED [`Side::Remote`] destination — and equally on a [`Side::Local`]
     /// one where the platform's primitives are path-based — the preflight is
     /// the confinement (see "Destination-component confinement" on the module),
@@ -4719,8 +4706,7 @@ impl Applier<'_, '_> {
         //
         // The ancestry memo is consulted ONLY where the destination's own
         // primitives enforce component-wise confinement
-        // ([`Side::is_confined_local`], which conjoins the side kind with
-        // [`crate::atomic::COMPONENT_CONFINED`]); on a path-based destination
+        // ([`Side::is_confined_local`]); on a path-based destination
         // the preflight IS the confinement, so every operation probes live and
         // nothing is cached (see [`Applier::ancestry_dirs`]).
         let memo_ancestry = self.dest.is_confined_local();
@@ -8391,10 +8377,9 @@ impl Side<'_> {
     }
 
     /// The manifest of this side as a DESTINATION: the same tree description,
-    /// but TOLERANT of the destination-only address-fidelity refusals (an
-    /// absolute or escaping symlink, a hard link — refused on UNIX by the local
-    /// walk, on every platform by the remote wire), which are returned in
-    /// [`DestinationTree::unsupported`] instead of failing the run. A SOURCE
+    /// but TOLERANT of the destination-only address-fidelity refusals (see
+    /// [`crate::manifest::canonicalize_tree_destination`]), which are returned
+    /// in [`DestinationTree::unsupported`] instead of failing the run. A SOURCE
     /// uses [`Side::manifest`], which stays strict.
     fn destination_manifest(&self) -> Result<DestinationTree> {
         match self {
@@ -8801,7 +8786,7 @@ impl LocalSide {
 
     /// Confirm that the path the manifest walk just described is the inode the
     /// pinned descriptor holds. Closes the pin/manifest swap window on Unix;
-    /// the Windows port has no descriptor, so the documented weaker guarantee
+    /// the path-based port has no descriptor, so its documented weaker guarantee
     /// applies (see the module docs).
     #[cfg(unix)]
     fn confirm_pinned_root(&self) -> Result<()> {
@@ -9253,9 +9238,9 @@ fn set_local_mode(
         .map_err(|e| Error::store(format!("chmod {}: {e}", rel.display())))
 }
 
-/// The Windows port has no directory descriptors and no Unix mode bits: the
-/// mode is applied path-based (a no-op), with the documented weaker
-/// confinement guarantee of the store's Windows implementation.
+/// This port has no directory descriptors and no Unix mode bits: the
+/// mode is applied path-based (a no-op), with its documented weaker
+/// confinement guarantee.
 #[cfg(not(unix))]
 fn set_local_mode(
     _root: &crate::atomic::RootDir,

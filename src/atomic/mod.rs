@@ -623,12 +623,9 @@ fn discard_temp(original: Error, tmp: &Path) -> Error {
 #[derive(Debug)]
 pub enum ReplaceOutcome {
     /// BOTH commit points confirmed: the new content is visible under its
-    /// final name AND the parent-directory fsync succeeded — the replace
-    /// is durable across power loss — ON LINUX, where `fsync` is the power-loss
-    /// barrier. The crate's durability assumption (README) states what it guarantees
-    /// on those targets instead: durability against a process crash, not against
-    /// power loss — and atomicity on every UNIX destination, macOS included, since the
-    /// WINDOWS replace is the crate's ONE non-atomic case (see `atomic::windows`). When the replace had to CREATE the
+    /// final name AND the parent-directory fsync succeeded — the replace is
+    /// durable across power loss, as scoped by the README's durability
+    /// assumption. When the replace had to CREATE the
     /// parent chain, every newly created directory's own entry was fsynced
     /// into its parent BEFORE the rename (the durable directory helper), so
     /// the claim covers the WHOLE chain, not only the final entry's parent.
@@ -841,9 +838,8 @@ impl RootDir {
     /// Windows (the path-based port) stores the normalized path, so both
     /// spellings name the same root for every later mutation. It does NOT
     /// guarantee the same refusal: there is no directory descriptor and no
-    /// `O_NOFOLLOW` equivalent here, so a symlink root (which on Windows
-    /// requires admin/developer mode) is not refused at open — the
-    /// documented weaker guarantee of the Windows port.
+    /// `O_NOFOLLOW` equivalent here, so a symlink root (which requires
+    /// admin/developer mode) is not refused at open.
     pub fn open(base: &Path) -> Result<RootDir> {
         let base = normalize_root(base);
         #[cfg(unix)]

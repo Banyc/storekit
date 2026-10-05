@@ -171,7 +171,7 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
 /// It is PUBLIC because it is part of the interface this crate was
 /// extracted from — a consumer's port calls the path-based replace (see
 /// `docs/CONSISTENCY.md`, axis M) — and a public-API name is justified by a
-/// consumer's need, never by this crate's own tests. The Windows port keeps
+/// consumer's need, never by this crate's own tests. A path-based port keeps
 /// the same PUBLIC name because its fd surface is path-based throughout.
 ///
 /// THE `fault` SEAM: `fault` is consulted before each stage that can fail and an
@@ -448,10 +448,9 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
 ///   takes its source mode DEEPEST-FIRST at the end, so a read-only source
 ///   tree copies cleanly. A PRE-EXISTING destination directory keeps its own
 ///   mode; a directory this call CREATED takes the source's mode.
-/// * **hard links** — REFUSED with [`StoreKind::CopyHardLink`]. The crate
-///   refuses hard links by rule on UNIX, so silently duplicating one into an
-///   independent regular file would be the unfaithful choice; reproducing the
-///   link (`linkat`) is deliberately not done here.
+/// * **hard links** — REFUSED with [`StoreKind::CopyHardLink`]. Silently
+///   duplicating one into an independent regular file would be the unfaithful
+///   choice; reproducing the link (`linkat`) is deliberately not done here.
 /// * **special files** (a FIFO, socket, or device) — REFUSED with
 ///   [`StoreKind::CopySourceNotRegular`]. The source is opened
 ///   `O_NONBLOCK` and the OPENED inode classified, so a FIFO cannot block the
@@ -1372,8 +1371,7 @@ fn replace_core(
         // DURABLE creation of the parent chain: every directory this call
         // creates has its OWN entry fsynced into its parent BEFORE the temp
         // write and the rename, so the [
-        // `ReplaceOutcome::ReplacedDurable`] claim ("visible under its final
-        // name AND durable across power loss", on Linux) is true for the WHOLE chain,
+        // `ReplaceOutcome::ReplacedDurable`] claim is true for the WHOLE chain,
         // not only for the final entry's parent. The non-durable helper used
         // to leave the created directories' entries unsynced.
         ensure_private_dir_durable_fd_path(root, parent_rel)?;
@@ -2357,7 +2355,7 @@ fn dir_chain_contains(from: &OwnedFd, target: (u64, u64)) -> Result<bool> {
     )))
 }
 
-// The ancestry bound is SHARED with the Windows port: [`super::MAX_ANCESTRY`]
+// The ancestry bound is SHARED with the path-based port: [`super::MAX_ANCESTRY`]
 // (single-sourced in `atomic/mod.rs`, next to the other shared atomic
 // constants).
 
@@ -2713,10 +2711,10 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// freed as each frame drops.
 ///
 /// HARD LINKS are REFUSED (a regular file with `st_nlink > 1`): the crate's
-/// own `canonicalize_tree` refuses hard links by rule ON UNIX, so silently
-/// duplicating one into an independent regular file would materialize a tree
-/// the crate cannot canonicalize. A caller that must copy such a tree
-/// pre-checks and dereferences them itself.
+/// own `canonicalize_tree` refuses them, so silently duplicating one into an
+/// independent regular file would materialize a tree the crate cannot
+/// canonicalize. A caller that must copy such a tree pre-checks and
+/// dereferences them itself.
 ///
 /// OVERLAP is refused BEFORE anything is created, and the decision is made by
 /// directory IDENTITY, not by path spelling ([`refuse_overlapping_copy`]): the

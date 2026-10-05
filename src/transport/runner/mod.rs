@@ -21,8 +21,7 @@
 //!   leader, pgid == pid), so a timeout terminates the WHOLE group (`killpg`
 //!   SIGTERM, then — after a short grace — SIGKILL) and GRANDCHILDREN die
 //!   with it. Windows has no process groups: the timeout terminates the
-//!   direct child only (a background descendant survives — the documented
-//!   weaker guarantee of the Windows port).
+//!   direct child only (a background descendant survives).
 //! * **Mandatory wait/join before returning** — every returned outcome
 //!   (success, timeout, error) happens only after the child was REAPED: the
 //!   runner waits synchronously on its owned handle, `try_wait` consumes the
@@ -54,8 +53,7 @@
 //!   commands must not daemonize. A CLEAN command (no live members —
 //!   the common case) pays one enumeration and its exit code and captured
 //!   output are exactly as before. On Windows the foreground-only check is
-//!   NOT performed (no process-group enumeration exists) — the documented
-//!   weaker guarantee of the Windows port.
+//!   NOT performed (no process-group enumeration exists).
 //! * **A timeout-kill failure is an ERROR** — if the group kill fails (a real
 //!   failure, not the benign ESRCH of a group that is already gone), or the
 //!   escalated kill fails, or the reap cannot be confirmed within the bound,
@@ -232,9 +230,8 @@ const DROP_KILL_SIGNAL: i32 = 0;
 /// recycled after the reap can never be hit — the drop backstop returns early).
 ///
 /// The backstop's GROUP kill is a no-op on Windows (no process groups), so
-/// there it terminates the direct child only and reaps it — the documented
-/// weaker guarantee of the Windows port, with the SAME one-authority backstop
-/// shape.
+/// there it terminates the direct child only and reaps it, with the SAME
+/// one-authority backstop shape.
 pub(crate) struct OwnedChild {
     /// The owned child. `pub(crate)` so a seam's wait closure can drain its
     /// pipes and poll it; the handle is never signalled directly on Unix — the

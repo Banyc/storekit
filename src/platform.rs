@@ -14,8 +14,7 @@
 use std::path::Path;
 
 /// Set a file's mode bits — a no-op on Windows (no Unix mode bits; file
-/// ACLs are the privacy mechanism). Documented weaker guarantee of the
-/// Windows port.
+/// ACLs are the privacy mechanism).
 ///
 /// This is the crate's ONE PATH-BASED mode authority, so the crate-root
 /// `#![deny(clippy::disallowed_methods)]` is relaxed here for this single
@@ -58,7 +57,7 @@ pub fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
 }
 
 /// Read a file's mode bits — a fixed conventional mode (0o644) on Windows
-/// (no Unix mode bits). Documented weaker guarantee of the Windows port.
+/// (no Unix mode bits).
 pub fn file_mode(path: &Path) -> std::io::Result<u32> {
     #[cfg(unix)]
     {
@@ -73,8 +72,7 @@ pub fn file_mode(path: &Path) -> std::io::Result<u32> {
 }
 
 /// The mode bits of an already-read [`std::fs::Metadata`] — a fixed
-/// conventional mode (0o644) on Windows (no Unix mode bits). Documented
-/// weaker guarantee of the Windows port.
+/// conventional mode (0o644) on Windows (no Unix mode bits).
 pub fn metadata_mode(m: &std::fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -89,8 +87,7 @@ pub fn metadata_mode(m: &std::fs::Metadata) -> u32 {
 }
 
 /// Create a symlink — on Windows, best-effort via the platform symlink API
-/// (which requires admin/developer mode; a failure propagates). Documented
-/// weaker guarantee of the Windows port.
+/// (which requires admin/developer mode; a failure propagates).
 ///
 /// # The reserved-spelling guard
 ///

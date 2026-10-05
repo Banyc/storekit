@@ -47,8 +47,7 @@ use super::*;
 use std::io::Write;
 
 /// Windows has no Unix mode bits: the private-permission contract is a
-/// no-op (file ACLs are the privacy mechanism). Documented weaker
-/// guarantee of the Windows port.
+/// no-op (file ACLs are the privacy mechanism).
 pub(crate) fn set_private(path: &Path) -> Result<()> {
     // The mode change is inode-preserving, but the guard keeps the spelling
     // contract uniform with the Unix port.
@@ -645,8 +644,7 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 ///
 /// DOCUMENTED WEAKER GUARANTEE: there is no directory descriptor and no
 /// `O_NOFOLLOW`, so a symlink injected into a destination component IS
-/// followed (`rel_join` only refuses absolute/`..`/`.` spellings). This is
-/// the same weakness every other `_fd` primitive of the Windows port carries.
+/// followed (`rel_join` only refuses absolute/`..`/`.` spellings).
 /// Modes are a no-op on this port (`crate::platform::chmod`), so the Unix
 /// port's undo journal has nothing to undo here and the source cannot be
 /// mutated through a mode.
@@ -1044,8 +1042,7 @@ pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &RootedRelativePath) -
     ensure_private_dir_durable(&rel_join(root, rel)?)
 }
 
-/// Windows has no directory fsync: a no-op (documented weaker durability
-/// guarantee of the Windows port).
+/// A no-op: this port has no directory fsync (see the module docs).
 pub fn sync_parent_dir_fd(_root: &RootDir, _rel: &RootedRelativePath) -> Result<()> {
     Ok(())
 }

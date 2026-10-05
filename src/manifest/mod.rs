@@ -230,13 +230,10 @@
 //! the destination can reveal the divergence.
 //!
 //! **NOT carried — REFUSED, not dropped:** a hard link (an entry with
-//! `nlink > 1`) is rejected by the remote wire assembler unconditionally and by the
-//! local walk on UNIX, with an error naming the entry — on WINDOWS the local walk
-//! cannot see `nlink` (it is not surfaced through `std::fs`), so a local Windows
-//! source records both names as ordinary files; see `atomic::windows`. The
-//! DESTINATION pair TOLERATES a hard link instead, keeping it as an unsupported
-//! entry (see `canonicalize_tree_destination`), rather than being
-//! silently materialized as two independent copies. Refusal is the crate's
+//! `nlink > 1`) is refused with an error naming the entry — see
+//! [`canonicalize_tree`] for the platform split. The DESTINATION pair TOLERATES
+//! one instead, keeping it as an unsupported entry rather than materializing it
+//! as two independent copies. Refusal is the crate's
 //! doctrine for anything it cannot reproduce faithfully (the name and
 //! symlink-target rules above follow the same principle): a silent
 //! transformation that changes what the tree means is worse than a loud
@@ -1322,9 +1319,11 @@ pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<
 /// names that are not valid UTF-8 or not
 /// already NFC (the stored path IS the on-disk name, never a normalized
 /// re-spelling), duplicate paths, escaping/absolute symbolic links, devices,
-/// sockets, and FIFOs. A hard link is rejected too ON UNIX: the local walk cannot
-/// see `nlink` on Windows, so there both names are recorded as ordinary files (the
-/// remote wire assembler rejects it on every platform).
+/// sockets, and FIFOs. A hard link (an entry with `nlink > 1`) is refused: the
+/// local walk applies this ON UNIX only — `std::fs` does not surface `nlink` on
+/// Windows, so a Windows walk records both names as ordinary files — while the
+/// remote wire assembler applies it on every platform, since the wire carries
+/// `nlink`.
 ///
 /// COST: this READS AND HASHES EVERY FILE IN THE TREE, so a snapshot's cost is
 /// O(bytes scanned), NOT O(bytes changed). Content addressing makes the STORE
@@ -1341,8 +1340,7 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 
 /// One DESTINATION entry that the manifest model can carry as PRESENT but that
 /// the strict address-fidelity rules refuse to ACCEPT as a faithful member of
-/// the tree: an absolute or escaping symlink, or a hard link — refused on UNIX
-/// by the local walk, on every platform by the remote wire. It is returned
+/// the tree. It is returned
 /// alongside the manifest by [`canonicalize_tree_destination`] (and
 /// [`canonicalize_remote_entries_destination`]) so the sync can classify the
 /// entry as destination-only and let a caller-sanctioned
@@ -1454,8 +1452,7 @@ impl DestinationTree {
 
 /// Canonicalize a destination tree, TOLERATING the address-fidelity refusals
 /// that a destination may legitimately hold: an absolute symlink, an escaping
-/// symlink, and a hard link (refused only by the local walk ON UNIX: a Windows
-/// walk cannot see `nlink` and records both names as ordinary files). Each
+/// symlink, and a hard link. Each
 /// tolerated entry is recorded in the returned
 /// [`DestinationTree::unsupported`] with the strict rule's reason, and the
 /// manifest still carries it (under its live kind) so a caller-sanctioned
@@ -1981,9 +1978,8 @@ pub fn canonicalize_remote_entries_checked(
 }
 
 /// The destination-tolerant form of [`canonicalize_remote_entries`]: the same
-/// wire validation, but a hard link — which this assembler refuses on every
-/// platform, since the wire carries `nlink` — and an absolute or escaping
-/// symlink are RECORDED in [`DestinationTree::unsupported`] (and kept in the
+/// wire validation, but the strict refusals are RECORDED in
+/// [`DestinationTree::unsupported`] (and kept in the
 /// manifest under their live kind) instead of failing the whole assembly. A
 /// special-file line (`o`) is still refused: the crate's kind models have no
 /// value for one (the applier's live-kind classifiers error on
