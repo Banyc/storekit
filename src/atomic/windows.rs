@@ -572,8 +572,10 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
     let prefix = |a: &[String], b: &[String]| b.len() >= a.len() && a == &b[..a.len()];
     let spelling_overlap = d == s || prefix(&s, &d) || prefix(&d, &s);
 
-    if anchor_id == src_id || anchor_inside_source || source_inside_destination || spelling_overlap
-    {
+    // No `anchor_id == src_id` term: `path_chain_contains` tests `from` itself
+    // first, so that identity is already inside `anchor_inside_source` (the Unix
+    // port's twin rule drops it for the same reason).
+    if anchor_inside_source || source_inside_destination || spelling_overlap {
         return Err(Error::store_kind(
             StoreKind::CopyOverlap,
             format!(

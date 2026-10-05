@@ -89,9 +89,10 @@ Named, scoped, not pursued:
   co-locates them owns the check. Stated in `src/sync/apply.rs`'s module docs.
 - **The count pins pin CALL COUNTS, not arguments.** An argument change at a call site
   inside a reviewed allow region moves no `std::fs` count, and the deny is allowed
-  there. An argument that introduces a NEW counted symbol IS noticed — measured,
-  `custom_flags(libc::O_NONBLOCK | libc::O_CREAT)` fails the libc pin on
-  `libc::O_CREAT`. An argument that introduces none (a constant, a length, a bit
+  there. An argument that introduces a NEW counted symbol IS noticed, by the same token
+  scan: adding `libc::O_CREAT` to a funnel's `custom_flags` adds a reference the pin
+  does not expect (no test ships for it — it is a property of the scan, not a case the
+  suite exercises). An argument that introduces none (a constant, a length, a bit
   already spelled) is a review responsibility, and on Windows an added flag is
   invisible to that pin because the funnel's `custom_flags` sites spell `windows_sys`
   constants there.

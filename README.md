@@ -98,11 +98,12 @@ A consumer can ask whether a name may be used BEFORE it fails. The authority
 is `storekit::is_unaddressable_name` (one path segment) and its path form
 `storekit::is_unaddressable_path` (a canonical manifest path): these are the
 predicate the identifier rule `storekit::id::valid_name` itself consults. The
-implication runs ONE WAY: `valid_name(s)` false does NOT mean `s` is a single safe
-segment, because the identifier rule ALSO constrains the charset
-(`[A-Za-z0-9-_.]`, so `Ünïcode` is refused and is not unaddressable), the first byte
-(no leading `-`), the length (`NAME_MAX`) and the `.`/`..` spellings — so read these
-predicates as "spellings the crate cannot address", NOT as a `valid_name` oracle.
+implication runs ONE WAY: `is_unaddressable_name(s)` false does NOT mean
+`valid_name(s)`, because the identifier rule ALSO constrains the charset
+(`[A-Za-z0-9-_.]`, so `Ünïcode` is addressable and is still not a valid id), the
+first byte (no leading `-`), the length (`NAME_MAX`) and the `.`/`..` spellings —
+so read these predicates as "spellings the crate cannot address", NOT as a
+`valid_name` oracle.
 They report the spellings the crate reserves for its OWN bookkeeping — the
 `.sync-aside.` claim-aside prefix, the `.<name>.operation.lock` record, the
 application lock record `operation.lock`, case aliases of any of those, crate
@@ -217,9 +218,10 @@ Two costs a checkpoint tool must budget for, both measured on a 350 MB tree
 unless stated otherwise. The TIMING figures here and the resident-memory bound in
 `manifest`'s module docs were taken by the reviewing consumer on its own hosts and
 tree; this repository ships no benchmark or fixture that reproduces them, so they are
-reported measurements rather than ones a reader can re-run here. The path-limit TABLE
-below is reproducible (grow a chain, ask `canonicalize_tree` after each level — the
-method is stated with it), and the append byte accounting names its `strace` method.
+reported measurements rather than ones a reader can re-run here. The path-limit
+figures below ARE reproducible (grow a chain, ask `canonicalize_tree` after each level —
+the method is stated with them), and the append byte accounting names its `strace`
+method.
 
 **Memory is O(largest entry), not O(changed bytes).** `Remote::write` takes
 `data: &[u8]` and the read side materializes the whole entry, so a single
