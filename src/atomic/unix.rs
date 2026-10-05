@@ -2206,10 +2206,10 @@ fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
 /// descriptor — and compare their `(st_dev, st_ino)` identities (the crate's
 /// ONE identity pair, resolved by [`fd_entry_identity`]). Refuse when
 ///
-/// * the anchor IS the source (they are the same directory — this is the
-///   bind-mount, firmlink, and case-fold case), or
-/// * the anchor is at or INSIDE the source (creating `dst_rel` would put it in
-///   the source subtree, which is what runs the walk away), or
+/// * the anchor is at or INSIDE the source — the SAME directory counts, and that
+///   is the bind-mount, firmlink and case-fold case; creating `dst_rel` would
+///   otherwise put it in the source subtree, which is what runs the walk away —
+///   or
 /// * the whole `dst_rel` already exists AND is at or above the source (the
 ///   source is inside the destination).
 ///
@@ -2252,7 +2252,7 @@ fn refuse_overlapping_copy(
     } else {
         false
     };
-    if anchor_id == src_id || anchor_inside_source || source_inside_destination {
+    if anchor_inside_source || source_inside_destination {
         let dst_shown = owned_root_self_path(root)
             .map(|root_path| root_path.join(dst_rel).display().to_string())
             .unwrap_or_else(|_| dst_rel.display().to_string());
@@ -6048,8 +6048,8 @@ mod tests {
         );
     }
 
-    /// The reverse overlap (source inside the destination root) and the
-    /// equal case are refused too.
+    /// The reverse overlap (source inside the destination root) and the EQUAL
+    /// case (the anchor is the source itself) are refused too.
     #[test]
     fn copy_dir_recursive_fd_refuses_a_source_inside_the_destination() {
         let (base, root, _src) = out_of_root_fixture();
@@ -6058,6 +6058,12 @@ mod tests {
         let inner = base.path().join("root/tree/sub");
         let err = copy_dir_recursive_fd(&root, &inner, &rp("tree"))
             .expect_err("a source inside the destination must be refused");
+        assert!(err.to_string().contains("overlap"), "{err}");
+
+        // The EQUAL case: the destination anchor IS the source directory.
+        let same = base.path().join("root/tree");
+        let err = copy_dir_recursive_fd(&root, &same, &rp("tree"))
+            .expect_err("copying a directory onto itself must be refused");
         assert!(err.to_string().contains("overlap"), "{err}");
     }
 

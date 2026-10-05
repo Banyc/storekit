@@ -83,9 +83,12 @@ pub const LOCAL_ENDPOINT_MARKER: &str = "local";
 /// (the sync's source and destination, say) reuses THIS predicate rather than
 /// writing a second comparison, so the two can never drift apart. The
 /// comparison is component-wise ([`Path::starts_with`]), so `a/bc` is not
-/// treated as a descendant of `a/b`.
+/// treated as a descendant of `a/b` — and because `starts_with` is true when the
+/// paths are EQUAL, one comparison covers equality, ancestry and descent: the
+/// equal term that used to stand here was a subset of this one and could not
+/// change the result.
 pub(crate) fn roots_overlap(a: &Path, b: &Path) -> bool {
-    a == b || a.starts_with(b) || b.starts_with(a)
+    a.starts_with(b) || b.starts_with(a)
 }
 
 /// The process-global ownership registry: for each resolved endpoint, the

@@ -300,9 +300,11 @@ simplification; removing one means adding back the logic it removes.
 - **Durability is a LINUX claim.** *Buys:* one durability story instead of a
   per-platform one. `fsync` is the power-loss barrier on Linux; macOS's `fsync` does
   not flush the device write cache (this crate does not call `F_FULLFSYNC`) and the
-  Windows port has no directory fsync, so on those targets the crate guarantees the
-  replace's ATOMICITY and durability against a process CRASH, not against power loss.
-  A caller needing power-loss recovery there owns that step. Wherever this crate calls a
+  Windows port has no directory fsync, so on those targets durability means a process
+  CRASH, not power loss — and the replace's ATOMICITY holds on macOS only: the WINDOWS
+  replace is the ONE non-atomic case, because Windows `rename` does not overwrite an
+  existing target and the target is therefore removed first (a reader can observe a
+  transient absence). A caller needing power-loss recovery there owns that step. Wherever this crate calls a
   write DURABLE, this is the claim it means.
 - **The name-mutation devices target UNIX.** *Buys:* one funnel, one deny list, one
   pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so a
