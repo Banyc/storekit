@@ -200,9 +200,10 @@ pub enum MaterializationKind {
 ///
 /// These are the substrate refusals a caller or the crate's own external
 /// tests distinguish from a plain mechanical I/O failure: the tree copy's
-/// source-audit refusals (a symlink or special file where a directory was
-/// expected, a hard link, an unlandable name, an overlapping source and
-/// destination), the residue gate, and the visible-but-not-durable outcome a
+/// source-audit refusals (a special file where a REGULAR file was expected, a
+/// symlink whose target is invalid or cannot be shown to stay in the root, a hard
+/// link, an unlandable name, an overlapping source and destination), the residue
+/// gate, and the visible-but-not-durable outcome a
 /// caller must not read as a plain failure. Every other store error is a
 /// mechanical I/O failure with no consumer-side branch, and stays
 /// [`Self::Unclassified`].
@@ -309,7 +310,8 @@ pub enum TransportKind {
 ///
 /// These are the conditions a caller must tell apart BEFORE a run mutates
 /// anything: the ownership/token binding checks (the transport's ENDPOINT
-/// identity and ROOT spelling, the run the token was minted for), the
+/// identity and ROOT spelling, the remote's LOCALNESS, and the run the token was
+/// minted for), the
 /// destination-lockability checks (a remote destination handed to the local
 /// lock constructor, a local destination handed to the far-side constructor,
 /// a root with no derivable sibling record, the composed form's requirement

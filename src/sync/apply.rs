@@ -5706,10 +5706,11 @@ impl Applier<'_, '_> {
             self.conflict(&path, kind, policy, ConflictReason::ReservedName);
         }
         // A SOURCE pair that differs only by case cannot both exist on a
-        // case-insensitive destination. Detect it BEFORE ANY TRANSFER, using a
-        // case-sensitivity probe of the destination — the probe creates and removes
+        // case-insensitive destination. Detect it BEFORE ANY MANIFEST TRANSFER, using
+        // a case-sensitivity probe of the destination — the probe creates and removes
         // one directory inside the destination root, and those touches ARE counted in
-        // `SyncReport::transfers` (see `dest_case_insensitive`). Report the member(s)
+        // `SyncReport::transfers`, which counts every attempted mutation (see
+        // `dest_case_insensitive`). Report the member(s)
         // that cannot be represented, so the sync never silently loses one and
         // never destroys the entry the other aliases.
         self.refuse_unrepresentable_case_aliases()?;

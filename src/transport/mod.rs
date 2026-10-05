@@ -2959,10 +2959,13 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
-        // No direct `std::fs` mutation here any more. The path-based
-        // Windows seam routes through the SAME guarded atomic funnel the Unix
-        // port uses, so the Windows atomic guards are actually reached. The
-        // mode chmod is inode-preserving and stays a best-effort path call.
+        // The SAME shape as the Unix arm, and the SAME primitive: the Windows
+        // port has `write_atomic_replace_fd_under_existing_parent` too, and this
+        // used to call `write_file_fd` — which on this port is `std::fs::write`,
+        // a create-or-truncate with no temp and no rename, so a push into a local
+        // destination could leave the entry torn and truncated. The Windows
+        // replace is the crate's ONE non-atomic one (the target is removed before
+        // the rename), but it IS a replace, and that is what the docs describe.
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
         if let Some(parent) = rel.parent()
@@ -2971,8 +2974,25 @@ impl Remote for LocalTransport {
             crate::atomic::ensure_private_dir_fd(&root, &parent)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
         }
-        crate::atomic::write_file_fd(&root, rel, data)
-            .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
+        match crate::atomic::write_atomic_replace_fd_under_existing_parent(
+            &root,
+            rel,
+            data,
+            &mut |_| None,
+        )
+        .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?
+        {
+            crate::atomic::ReplaceOutcome::ReplacedDurable => {}
+            crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown { error } => {
+                return Err(Error::transport_kind(
+                    TransportKind::DurabilityUnconfirmed,
+                    format!(
+                        "write {}: the entry is visible but its durability is unconfirmed: {error}",
+                        rel.display()
+                    ),
+                ));
+            }
+        }
         if mode != 0 {
             crate::platform::chmod(&join(&self.base, rel), mode & 0o7777)
                 .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))?;

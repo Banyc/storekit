@@ -411,8 +411,8 @@ test per direction.
 `copy_dir_recursive_fd` and `fsync_tree_recursive_fd` from its own store module and
 drives a staged publish through `with_operation_lock_sidecar`; `copy_tree_verbatim` is
 public for a live-base clone the migration needs but no consumer calls yet (no
-occurrence anywhere in the consumer tree `deploy`, at the revision `MIGRATION.md` names
-— a search of that tree, not a test here). A public name is justified by a CONSUMER's need — a
+occurrence anywhere in the consumer tree `deploy`, at the revision
+`tests/consumer_fit.rs` names (`a76da6d4`) — a search of that tree, not a test here). A public name is justified by a CONSUMER's need — a
 current one or a stated, planned one — and never by this crate's own production; where
 the need is planned rather than present, the docs say which it is.
 
