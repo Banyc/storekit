@@ -2758,7 +2758,7 @@ mod tests {
             ("src/transport/mod.rs", "libc::O_CLOEXEC", 2),
             ("src/transport/mod.rs", "libc::O_DIRECTORY", 2),
             ("src/transport/mod.rs", "libc::O_NOFOLLOW", 4),
-            ("src/transport/mod.rs", "libc::O_NONBLOCK", 1),
+            ("src/transport/mod.rs", "libc::O_NONBLOCK", 5),
             ("src/transport/mod.rs", "libc::O_RDONLY", 7),
             ("src/transport/mod.rs", "libc::S_IFDIR", 1),
             ("src/transport/mod.rs", "libc::S_IFLNK", 1),

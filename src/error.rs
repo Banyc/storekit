@@ -156,7 +156,8 @@ pub enum MaterializationKind {
     HardLink,
     /// A non-regular, non-directory, non-symlink entry (a FIFO, socket, or
     /// device). Refused on BOTH forms: the applier has no primitive to remove
-    /// it by name, and a read of it could block.
+    /// it by name, a read of it could block, and no mode can be applied to it
+    /// (the `_confined` `set_mode` refuses it rather than chmodding it).
     SpecialFile,
     /// A name the manifest wire cannot represent faithfully: a NUL/LF/CR/TAB
     /// character, a spelling that is not already NFC, an absolute path, a

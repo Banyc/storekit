@@ -2438,13 +2438,35 @@ impl LocalTransport {
                 rel.display()
             ))
         })?;
-        let fd = crate::atomic::openat_no_follow(
+        // Open the final component `O_NOFOLLOW` AND `O_NONBLOCK`, then
+        // classify the OPENED inode. `open(2)` of a FIFO read-only BLOCKS
+        // until a writer appears, so a bare `O_RDONLY` here hung forever on
+        // one FIFO in the store; `O_NONBLOCK` (a no-op for a regular file or
+        // a directory) makes the open return immediately. Only a regular file
+        // or a directory is chmodded: a special file (a FIFO, socket, or
+        // device) is REFUSED, exactly as the crate refuses one everywhere
+        // else, never opened blocking and never chmodded.
+        let opened = std::fs::File::from(crate::atomic::openat_no_follow(
             root.as_fd(),
             rel,
-            libc::O_RDONLY | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             0,
-        )?;
-        std::fs::File::from(fd)
+        )?);
+        let file_type = opened
+            .metadata()
+            .map_err(|e| Error::transport(format!("fstat {}: {e}", rel.display())))?
+            .file_type();
+        if !(file_type.is_file() || file_type.is_dir()) {
+            return Err(Error::materialization_kind(
+                crate::error::MaterializationKind::SpecialFile,
+                format!(
+                    "chmod {}: refusing to chmod a special file (a FIFO, socket, or device); \
+                     the opened inode is neither a regular file nor a directory",
+                    rel.display()
+                ),
+            ));
+        }
+        opened
             .set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
             .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
     }
@@ -2500,7 +2522,15 @@ impl LocalTransport {
         match crate::atomic::remove_file_fd(&root, rel) {
             Ok(()) => Ok(()),
             Err(error) => {
-                match crate::atomic::openat_no_follow_io(root.as_fd(), rel, libc::O_RDONLY, 0) {
+                // `O_NONBLOCK` so a FIFO at `rel` cannot block this
+                // existence probe; it is a no-op for every other kind, and
+                // the `NotFound` verdict below is unchanged.
+                match crate::atomic::openat_no_follow_io(
+                    root.as_fd(),
+                    rel,
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                    0,
+                ) {
                     // A missing entry OR a missing parent component is the
                     // old path-based `remove_file`'s tolerated `NotFound`.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2521,7 +2551,14 @@ impl LocalTransport {
         match crate::atomic::remove_dir_all_fd(&root, rel) {
             Ok(()) => Ok(()),
             Err(error) => {
-                match crate::atomic::openat_no_follow_io(root.as_fd(), rel, libc::O_RDONLY, 0) {
+                // `O_NONBLOCK` for the same reason as `remove_file_confined`
+                // above: a FIFO must not block the existence probe.
+                match crate::atomic::openat_no_follow_io(
+                    root.as_fd(),
+                    rel,
+                    libc::O_RDONLY | libc::O_NONBLOCK,
+                    0,
+                ) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     _ => Err(Error::transport(format!(
                         "rmdir {}: {error}",
@@ -2577,14 +2614,18 @@ impl LocalTransport {
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             let child = rel.join(&entry.name)?;
-            let (is_dir, is_symlink) = match crate::atomic::path_kind_fd(&root, &child)? {
-                Some(crate::atomic::PathKind::Dir) => (true, false),
-                Some(crate::atomic::PathKind::Symlink) => (false, true),
-                Some(crate::atomic::PathKind::File) | Some(crate::atomic::PathKind::Other) => {
-                    (false, false)
-                }
+            // Classify the child FIRST. A non-regular entry (a FIFO, socket,
+            // or device) is then LISTED from its OWN metadata WITHOUT ever
+            // being opened, so a FIFO in the directory cannot block the
+            // listing — and this arm reports exactly what the path-based and
+            // far-side arms report (`is_dir`/`is_symlink` false, with the
+            // entry's own size and mode).
+            let kind = match crate::atomic::path_kind_fd(&root, &child)? {
+                Some(kind) => kind,
                 None => continue,
             };
+            let is_dir = kind == crate::atomic::PathKind::Dir;
+            let is_symlink = kind == crate::atomic::PathKind::Symlink;
             let name = entry.name.into_string().map_err(|_| {
                 Error::transport(format!(
                     "read_dir {}: entry name is not valid UTF-8, so the listing cannot be compared byte-exactly (distinct names would both decode to U+FFFD); refusing: {}",
@@ -2592,7 +2633,7 @@ impl LocalTransport {
                     child.display()
                 ))
             })?;
-            let (size, mode) = self.entry_size_mode_confined(&root, &child, is_symlink)?;
+            let (size, mode) = self.entry_size_mode_confined(&root, &child, kind)?;
             out.push(RemoteEntry {
                 name,
                 is_dir,
@@ -2604,24 +2645,30 @@ impl LocalTransport {
         Ok(out)
     }
 
-    /// The size and mode of one live child. A FILE or DIRECTORY is opened
-    /// `O_NOFOLLOW` relative to the pinned root and `fstat`ed through the SAME
-    /// descriptor (no path re-resolution). A SYMLINK is classified without
-    /// following it and its OWN size/mode come from a component-wise
-    /// `fstatat(AT_SYMLINK_NOFOLLOW)` ([`LocalTransport::confined_lstat`]); it is
-    /// never followed.
+    /// The size and mode of one live child. A REGULAR FILE is opened
+    /// `O_NOFOLLOW | O_NONBLOCK` relative to the pinned root and `fstat`ed
+    /// through the SAME descriptor (no path re-resolution); `O_NONBLOCK` is a
+    /// no-op for a regular file and is defence in depth against a kind swap to
+    /// a FIFO between the classification and the open. EVERY other kind — a
+    /// DIRECTORY, a SYMLINK, or a special file (a FIFO, socket, or device) —
+    /// is classified WITHOUT being opened: its OWN size/mode come from a
+    /// component-wise `fstatat(AT_SYMLINK_NOFOLLOW)`
+    /// ([`LocalTransport::confined_lstat`]), so the `_confined` listing never
+    /// opens a FIFO (a read-only `open(2)` of one BLOCKS until a writer
+    /// appears) and reports the SAME size/mode the path-based
+    /// `symlink_metadata` arm reports. A symlink is never followed.
     #[cfg(unix)]
     fn entry_size_mode_confined(
         &self,
         root: &crate::atomic::RootDir,
         child: &RootedRelativePath,
-        is_symlink: bool,
+        kind: crate::atomic::PathKind,
     ) -> Result<(u64, u32)> {
-        if !is_symlink {
+        if kind == crate::atomic::PathKind::File {
             let fd = crate::atomic::openat_no_follow(
                 root.as_fd(),
                 child,
-                libc::O_RDONLY | libc::O_NOFOLLOW,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
                 0,
             )?;
             let meta = std::fs::File::from(fd)
