@@ -162,8 +162,10 @@ disallowed-methods = [
   # std::os — the `custom_flags` ADOPTION. On UNIX `custom_flags` forwards
   # ARBITRARY bits to `open(2)`, and `O_CREAT` through it CREATES a name:
   # `OpenOptions::new().write(true).custom_flags(O_CREAT).open(p)` adopts `p`
-  # exactly as `.create(true)` does (measured: macOS `O_CREAT` = 512, Linux
-  # x86_64 = 64; both created the name through `custom_flags` alone). On WINDOWS
+  # exactly as `.create(true)` does (checked by hand on those two hosts: `O_CREAT`
+  # is 512 on macOS and 64 on Linux x86_64, and both created the name through
+  # `custom_flags` alone — reported, not reproducible from this repository, whose
+  # only `custom_flags` test checks this LIST rather than the adoption). On WINDOWS
   # `custom_flags` forwards ARBITRARY `dwFlagsAndAttributes` bits to
   # `CreateFileW`, and the creation DISPOSITION is a SEPARATE argument that the
   # create/create_new/access_mode flags decide — so the Windows form cannot adopt

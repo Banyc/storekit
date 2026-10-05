@@ -1322,7 +1322,9 @@ pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<
 /// names that are not valid UTF-8 or not
 /// already NFC (the stored path IS the on-disk name, never a normalized
 /// re-spelling), duplicate paths, escaping/absolute symbolic links, devices,
-/// sockets, FIFOs, and hard links.
+/// sockets, and FIFOs. A hard link is rejected too ON UNIX: the local walk cannot
+/// see `nlink` on Windows, so there both names are recorded as ordinary files (the
+/// remote wire assembler rejects it on every platform).
 ///
 /// COST: this READS AND HASHES EVERY FILE IN THE TREE, so a snapshot's cost is
 /// O(bytes scanned), NOT O(bytes changed). Content addressing makes the STORE

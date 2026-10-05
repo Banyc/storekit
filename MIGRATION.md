@@ -84,7 +84,7 @@ domain), and the receiver-marker adoption (done).
   a remote destination the caller does not own, and `Unowned` still names the
   weaker path.
 
-## The lock record is self-describing (change `34ab81ee`)
+## The lock record is self-describing (change `vylurynk`, commit `34ab81ee`)
 
 `lock::FileLock::acquire` used to truncate and rewrite whatever non-empty entry it
 found at the record path. It now adopts an entry only when it is EMPTY or already
@@ -120,7 +120,7 @@ requires **40 lowercase hex** and fails closed on anything else, with no adoptio
 path — so without this step every existing deployment directory reads as
 malformed, and the failure is silent to a test suite that builds fresh fixtures.
 
-### Done (`deploy` `dev`, change `47e0e092`)
+### Done (`deploy` `dev`, commit `47e0e092`)
 
 Adopt-on-read is implemented in `deploy` (`remote::transport::receiver_marker`):
 

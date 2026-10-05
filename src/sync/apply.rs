@@ -3042,8 +3042,9 @@ fn prepare(
         ));
     }
     // (3) READ THE SOURCE MANIFEST, STRICTLY, BEFORE ESTABLISHING OWNERSHIP.
-    // `source.manifest()` refuses an unrepresentable source entry (a hard link,
-    // an absolute or escaping symlink) HERE — before the destination lock
+    // `source.manifest()` refuses an unrepresentable source entry (a hard link ON
+    // UNIX, an absolute or escaping symlink on every platform) HERE — before the
+    // destination lock
     // record is created and before `run` provisions the destination root. The
     // old order provisioned and locked first, so a run refused for its SOURCE
     // had already created the destination root and the sibling lock record. A
