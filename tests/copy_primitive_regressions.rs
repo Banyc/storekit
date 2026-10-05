@@ -169,6 +169,90 @@ fn an_ordinary_source_inside_the_destination_is_still_refused() {
     assert!(err.to_string().contains("overlap"), "{err}");
 }
 
+// ----------------------------------------------------------------------
+// The destination ANCHOR strictly inside the source (the middle refusing arm).
+// ----------------------------------------------------------------------
+
+const ANCHOR_MODE_ENV: &str = "STOREKIT_COPY_ANCHOR_INSIDE_MODE";
+const ANCHOR_ROOT_ENV: &str = "STOREKIT_COPY_ANCHOR_INSIDE_ROOT";
+const ANCHOR_CHILD: &str = "copy_anchor_inside_source_child";
+const ANCHOR_DONE: &str = "STOREKIT_COPY_ANCHOR_INSIDE_CHILD_DONE";
+const ANCHOR_NOFILE: u64 = 64;
+
+/// The destination's ANCHOR (the deepest existing directory on `dst_rel`) lies
+/// STRICTLY INSIDE the source: `src = <root>/tree`, a pre-existing
+/// `<root>/tree/sub`, and `dst = "tree/sub/deeper"`. The anchor `tree/sub` is
+/// neither the source itself nor ABOVE it, so ONLY the
+/// anchor-inside-the-source arm can refuse; with that one arm replaced by
+/// `false` the walk creates `tree/sub/deeper` inside its own source, re-yields
+/// it, and recurses without bound.
+///
+/// The copy runs in a CHILD of this test binary with `RLIMIT_NOFILE` lowered,
+/// so the arm-deleted run fails FAST (a clean descriptor-exhaustion `Err`,
+/// never a disk-filling runaway) and the typed-overlap assertion in the child
+/// then fails on that wrong error — the arm is observed, not merely exercised.
+#[test]
+fn a_destination_anchor_strictly_inside_the_source_is_refused() {
+    let tmp = tmpdir();
+    let exe = std::env::current_exe().expect("the integration test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", ANCHOR_CHILD, "--ignored", "--nocapture"])
+        .env(ANCHOR_MODE_ENV, "anchor_inside_source")
+        .env(ANCHOR_ROOT_ENV, tmp.path())
+        .output()
+        .expect("spawn the anchor-inside-source child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a destination whose anchor is strictly inside the source must be refused with the typed \
+         overlap error; the child failed: status={:?}\n--- stdout ---\n{stdout}\n--- stderr \
+         ---\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains(ANCHOR_DONE),
+        "the child exited 0 but never reached the assertion:\n{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "spawned by a_destination_anchor_strictly_inside_the_source_is_refused"]
+fn copy_anchor_inside_source_child() {
+    let Ok(mode) = std::env::var(ANCHOR_MODE_ENV) else {
+        return;
+    };
+    if mode != "anchor_inside_source" {
+        return;
+    }
+    let root_path =
+        PathBuf::from(std::env::var_os(ANCHOR_ROOT_ENV).expect("ANCHOR_ROOT_ENV is set"));
+    let tree = root_path.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).expect("create the pre-existing tree/sub");
+    let root = RootDir::open(&root_path).expect("open the owned root");
+    // Bound the arm-deleted runaway: without the anchor-inside-source arm the
+    // walk descends one level per iteration; a low descriptor limit makes it
+    // surface a clean EMFILE instead of filling the disk.
+    let saved = set_nofile_soft(ANCHOR_NOFILE).expect("lower RLIMIT_NOFILE");
+    let result = copy_dir_recursive_fd(&root, &tree, &rp("tree/sub/deeper"));
+    restore_nofile(saved).expect("restore RLIMIT_NOFILE");
+    let err = result.expect_err("a destination anchor strictly inside the source must be refused");
+    assert_eq!(
+        err.store_reason(),
+        Some(StoreKind::CopyOverlap),
+        "the refusal must be the typed overlap condition, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("overlap"),
+        "the refusal must name the overlap, got: {err}"
+    );
+    assert!(
+        !tree.join("sub/deeper").exists(),
+        "nothing may be created before the refusal"
+    );
+    println!("{ANCHOR_DONE}");
+}
+
 #[test]
 fn a_non_overlapping_source_still_copies() {
     let base = tmpdir();

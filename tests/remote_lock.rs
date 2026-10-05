@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use storekit::env::SysEnv;
 use storekit::error::{Error, PreflightKind};
+use storekit::lock::FileLock;
 use storekit::sync::{
     DestinationOwnership, Direction, Extraneous, ReplaceAll, SyncResult, destination_lock_path,
     sync,
@@ -192,6 +193,17 @@ impl Drop for TestSshd {
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// The permission bits (not the file type) of `path`, so a test can assert the
+/// record's mode is untouched by a refusal and `0600` after an adoption.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .expect("stat the record")
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 fn whoami() -> String {
@@ -793,4 +805,131 @@ fn a_foreign_listener_on_the_chosen_port_is_not_mistaken_for_our_sshd() {
         }
     }
     drop(listener);
+}
+
+// ---------------------------------------------------------------------------
+// 7. The far-side holder adopts the SAME record the local arm does
+// ---------------------------------------------------------------------------
+
+/// The header text the crate writes and recognises ([`storekit::lock`]'s
+/// `RECORD_HEADER`). Spelled here as the DOCUMENTED wire text so this test
+/// pins the interop between the two arms, not one module's private literal.
+const RECORD_HEADER: &[u8] = b"storekit lock record v1\n";
+
+/// A pre-existing FOREIGN record at the far-side path is not a record this
+/// crate wrote, so a far-side acquisition REFUSES it with the local arm's
+/// typed `LockRecordNotRecognized` and leaves the entry byte-for-byte and
+/// mode-for-mode untouched. PRE-FIX the holder unconditionally truncated the
+/// entry and wrote a bare op id, destroying the caller's data and returning
+/// success.
+#[test]
+fn far_side_acquisition_refuses_a_foreign_record_without_truncating_it() {
+    let f = Fixture::new();
+    let record = f.record();
+    let mut foreign = b"a caller's data (NOT a storekit lock record)".to_vec();
+    foreign.resize(51, b'.');
+    assert_eq!(foreign.len(), 51, "the fixture is a 51-byte foreign record");
+    std::fs::write(&record, &foreign).expect("plant the foreign record");
+    set_mode(&record, 0o644);
+    let before_mode = mode_of(&record);
+
+    let err = f
+        .try_acquire()
+        .err()
+        .expect("a far-side acquisition must refuse a pre-existing foreign record");
+    assert_eq!(
+        err.preflight_reason(),
+        Some(PreflightKind::LockRecordNotRecognized),
+        "the far-side refusal must be the SAME typed condition the local arm raises: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&record).expect("read the record back"),
+        foreign,
+        "a refused far-side acquisition must not truncate or rewrite the record"
+    );
+    assert_eq!(
+        mode_of(&record),
+        before_mode,
+        "a refused far-side acquisition must not chmod the record"
+    );
+    assert!(
+        !f.far_root.exists(),
+        "the refusal must leave the far side untouched"
+    );
+}
+
+/// A record the crate wrote (header + op id) is ADOPTED by the far-side holder
+/// — the header survives the acquisition — and a later LOCAL
+/// `FileLock::acquire` on the same path SUCCEEDS instead of refusing it with
+/// `LockRecordNotRecognized`. PRE-FIX the holder rewrote the entry as a bare op
+/// id, so the local arm then refused the far side's own record.
+#[test]
+fn a_crate_written_record_is_adopted_across_the_far_side_and_local_arms() {
+    let f = Fixture::new();
+    let record = f.record();
+    let mut seeded = RECORD_HEADER.to_vec();
+    seeded.extend_from_slice(b"pre-seeded op id");
+    std::fs::write(&record, &seeded).expect("seed a record this crate wrote");
+    set_mode(&record, 0o600);
+
+    let ownership = f.acquire();
+    // Snapshot what the FAR-SIDE arm wrote before the local arm rewrites it.
+    let after_far_side = std::fs::read(&record).expect("read the far-side record");
+    drop(ownership);
+
+    // The flock is released asynchronously. Retry ONLY the typed contention;
+    // a LockRecordNotRecognized is the defect and must fail here at once.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let local = loop {
+        match FileLock::acquire(&record, "local after far side") {
+            Ok(guard) => break guard,
+            Err(Error::LockContended(_)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!(
+                "a local FileLock::acquire must accept the record the far-side arm wrote, got \
+                 {e:?}"
+            ),
+        }
+    };
+    drop(local);
+
+    // The far-side arm wrote a record the local arm recognises. PRE-FIX this
+    // held a BARE op id (no header), which is why the local acquire above was
+    // refused.
+    assert!(
+        after_far_side.starts_with(RECORD_HEADER),
+        "the far-side acquisition must write the crate's record header, got: {:?}",
+        String::from_utf8_lossy(&after_far_side)
+    );
+    assert!(
+        !after_far_side[RECORD_HEADER.len()..].is_empty(),
+        "the far-side holder must record its op id after the header"
+    );
+}
+
+/// The far-side acquisition makes the record PRIVATE (`0600`), tightening a
+/// record an earlier version left wider — the local arm's chmod, on the same
+/// record. PRE-FIX the holder never chmodded, so a `0644` record stayed `0644`.
+#[test]
+fn a_far_side_acquisition_tightens_the_record_mode_to_0600() {
+    let f = Fixture::new();
+    let record = f.record();
+    let mut seeded = RECORD_HEADER.to_vec();
+    seeded.extend_from_slice(b"pre-seeded op id");
+    std::fs::write(&record, &seeded).expect("seed a record this crate wrote");
+    set_mode(&record, 0o644);
+    assert_eq!(
+        mode_of(&record),
+        0o644,
+        "premise: the record starts wider than 0600"
+    );
+
+    let ownership = f.acquire();
+    assert_eq!(
+        mode_of(&record),
+        0o600,
+        "a far-side acquisition must tighten the record to 0600 like the local arm"
+    );
+    drop(ownership);
 }

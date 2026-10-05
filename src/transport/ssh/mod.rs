@@ -18,7 +18,7 @@ mod hostkey;
 mod runner;
 
 use crate::env::SysEnv;
-use crate::error::{Error, Result, TransportKind};
+use crate::error::{Error, PreflightKind, Result, TransportKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -235,16 +235,41 @@ const PERL_VERIFY_LEN: &str = "my $n = -s $ARGV[0]; if (!defined $n || $n != $AR
 /// * `flock(LOCK_EX | LOCK_NB)` is tried ONCE: a live holder is `EWOULDBLOCK`
 ///   -> exit 3, a real lock failure -> exit 5 (both printed with an anchored
 ///   `LOCKCONTENDED` / `LOCKERR` diagnostic); no case ever waits;
-/// * on success the holder identity is written into the record (so a refused
-///   contender can name the holder, like the local record), `LOCKOK <pid>` is
-///   printed and flushed, and the process BLOCKS reading stdin;
+/// * AFTER the flock is held — the same order the local `FileLock::acquire`
+///   uses — the entry is read to the length of [`crate::lock::RECORD_HEADER`]:
+///   an entry that is NON-EMPTY and does not begin with that header is not a
+///   record this crate wrote, so the holder REFUSES
+///   (`LOCKRECORDNOTRECOGNIZED`, exit 6) WITHOUT truncating or writing it,
+///   byte-for-byte and mode-for-mode untouched (the local arm's typed
+///   `LockRecordNotRecognized` rule, on the SAME record);
+/// * otherwise the record is chmodded `0600` (tightening a record an earlier
+///   version left wider) and the header followed by the holder identity is
+///   written into it (so a refused contender can name the holder, like the
+///   local record), `LOCKOK <pid>` is printed and flushed, and the process
+///   BLOCKS reading stdin;
 /// * stdin EOF (the local client closed its pipe, or the connection dropped)
 ///   ends the loop; the explicit `LOCK_UN` + `close` then release the flock,
 ///   and process death releases it regardless.
 ///
 /// The trailing `# STOREKIT_TEST_HOLD_LOCK` token is the stable hook a test's
 /// fake `perl` on `PATH` matches to recognise this exact program.
-const PERL_HOLD_LOCK: &str = concat!(
+fn perl_hold_lock() -> String {
+    let script = PERL_HOLD_LOCK_TEMPLATE.replace(
+        RECORD_HEADER_PLACEHOLDER,
+        &perl_double_quoted(crate::lock::RECORD_HEADER),
+    );
+    debug_assert!(
+        !script.contains(RECORD_HEADER_PLACEHOLDER),
+        "the holder template must carry `RECORD_HEADER_PLACEHOLDER` verbatim"
+    );
+    script
+}
+
+/// The holder program as a template: [`RECORD_HEADER_PLACEHOLDER`] stands in
+/// for the record header so the text has ONE authority
+/// ([`crate::lock::RECORD_HEADER`]); [`perl_hold_lock`] splices it in as a Perl
+/// double-quoted literal.
+const PERL_HOLD_LOCK_TEMPLATE: &str = concat!(
     "use strict; use warnings; ",
     "use Fcntl qw(:flock O_RDWR O_CREAT O_NOFOLLOW); ",
     "use File::Basename qw(dirname); ",
@@ -261,12 +286,50 @@ const PERL_HOLD_LOCK: &str = concat!(
     "if ($e == Errno::EWOULDBLOCK() || $e == Errno::EAGAIN()) { ",
     "print STDERR \"LOCKCONTENDED $path: $!\\n\"; exit 3; } ",
     "print STDERR \"LOCKERR flock $path: $!\\n\"; exit 5; } ",
-    "truncate($fh, 0); seek($fh, 0, 0); print $fh $op_id; $fh->flush; ",
+    "my $header = ",
+    "__STOREKIT_LOCK_RECORD_HEADER__",
+    "; ",
+    "my $head = ''; my $chunk; ",
+    "while (length($head) < length($header)) { ",
+    "my $n = read($fh, $chunk, length($header) - length($head)); ",
+    "last if !defined($n) || $n == 0; $head .= $chunk; } ",
+    "if (length($head) != 0 && substr($head, 0, length($header)) ne $header) { ",
+    "print STDERR \"LOCKRECORDNOTRECOGNIZED $path: the entry is not a lock record this crate wrote; refusing to truncate it\\n\"; exit 6; } ",
+    "chmod(0600, $fh) or do { print STDERR \"LOCKERR chmod $path: $!\\n\"; exit 4; }; ",
+    "seek($fh, 0, 0); truncate($fh, 0); print $fh $header, $op_id; $fh->flush; ",
     "print \"LOCKOK $$\\n\"; STDOUT->flush; ",
     "my $buf; while (1) { my $n = sysread(STDIN, $buf, 8192); last if !defined($n) || $n == 0; } ",
     "flock($fh, LOCK_UN); close($fh); ",
     "# STOREKIT_TEST_HOLD_LOCK",
 );
+
+/// The stable placeholder [`PERL_HOLD_LOCK_TEMPLATE`] carries in place of the
+/// record header; [`perl_hold_lock`] replaces it with the header rendered as a
+/// Perl double-quoted literal.
+const RECORD_HEADER_PLACEHOLDER: &str = "__STOREKIT_LOCK_RECORD_HEADER__";
+
+/// Render `s` as a Perl DOUBLE-QUOTED string literal: escape the backslash, the
+/// quote, the two sigils Perl interpolates (`$`, `@`), and the newline/cr/tab
+/// escapes, so the embedded header is byte-identical to
+/// [`crate::lock::RECORD_HEADER`] whatever it holds.
+fn perl_double_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '@' => out.push_str("\\@"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// How long [`SshTransport::lock_far_side`] waits for the far-side holder to
 /// report `LOCKOK` before giving up. It covers the whole SSH connection setup
@@ -2837,7 +2900,7 @@ impl Remote for SshTransport {
 
     /// Acquire a REAL far-side operation-lock session (the [`FarSideLockSession`]
     /// contract): spawn a long-lived local `ssh` client whose remote `perl`
-    /// ([`PERL_HOLD_LOCK`]) takes the record's `flock` non-blocking and then
+    /// ([`perl_hold_lock`]) takes the record's `flock` non-blocking and then
     /// blocks on stdin. The guard owns the child; dropping it closes stdin,
     /// waits for the holder to exit, then kills and reaps the client if it did
     /// not, so the record is released on every path. A connection that dies
@@ -3165,7 +3228,7 @@ fn reap_bounded(
 
 impl SshTransport {
     /// Spawn the long-lived far-side lock holder and wait (bounded) for its
-    /// `LOCKOK` readiness line. See [`PERL_HOLD_LOCK`] for the script and
+    /// `LOCKOK` readiness line. See [`perl_hold_lock`] for the script and
     /// [`SshFarSideLock`] for the lifetime.
     fn spawn_far_side_lock(&self, record: &Path, op_id: &str) -> Result<SshFarSideLock> {
         // The mux dir must exist before the `ControlPath` option is used, and a
@@ -3175,7 +3238,7 @@ impl SshTransport {
         let inner = Self::argv_cmd(&[
             "perl".into(),
             "-e".into(),
-            PERL_HOLD_LOCK.to_string(),
+            perl_hold_lock(),
             "--".into(),
             record.to_string_lossy().into_owned(),
             op_id.to_string(),
@@ -3296,7 +3359,9 @@ fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
 /// Map a far-side lock holder's failure to the typed refusal a caller branches
 /// on. The layers are separated by EVIDENCE (the anchored far-side diagnostic
 /// and the exit status), never by a guess from one number: `LOCKCONTENDED` /
-/// exit 3 is the typed contention, `LOCKERR` / exit 4/5 is a far-side refusal
+/// exit 3 is the typed contention, `LOCKRECORDNOTRECOGNIZED` / exit 6 is the
+/// record-recognition refusal (the SAME typed condition the local
+/// `FileLock::acquire` raises), `LOCKERR` / exit 4/5 is a far-side refusal
 /// (no perl, an uncreatable/read-only parent, a real `flock` failure), 126/127
 /// and the `perl: not found` markers are the missing interpreter, and an `ssh`
 /// exit 255 is the transport failing before the far-side command ran.
@@ -3320,6 +3385,21 @@ fn far_side_lock_refusal(
              a refusal to WAIT, not a wait): {stderr_disp}",
             record.display()
         ));
+    }
+    if code == Some(6) || line_starts("LOCKRECORDNOTRECOGNIZED") {
+        return Error::preflight_kind(
+            PreflightKind::LockRecordNotRecognized,
+            format!(
+                "the far-side operation-lock record {} already holds a NON-EMPTY entry that is \
+                 not a lock record this crate wrote, so the far-side holder REFUSED to truncate \
+                 content the caller may not intend to lose: {stderr_disp}. A record this crate \
+                 writes begins with {:?}. Move the existing entry aside (or remove it) if it is \
+                 not wanted, and only when NO RUN IS HOLDING IT: unlinking a record a live \
+                 holder has flocked lets the next acquisition lock a different inode.",
+                record.display(),
+                crate::lock::RECORD_HEADER.trim_end(),
+            ),
+        );
     }
     if code == Some(126)
         || code == Some(127)
@@ -3987,6 +4067,24 @@ mod tests_ssh {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    /// The far-side holder must recognise the LOCAL arm's record header from
+    /// ONE authority: the script is generated from
+    /// [`crate::lock::RECORD_HEADER`], so the rendered Perl carries exactly
+    /// that header as a double-quoted literal and no placeholder survives.
+    #[test]
+    fn the_far_side_holder_carries_the_local_record_header() {
+        let script = perl_hold_lock();
+        assert!(
+            !script.contains(RECORD_HEADER_PLACEHOLDER),
+            "the rendered holder must not carry the placeholder"
+        );
+        let literal = perl_double_quoted(crate::lock::RECORD_HEADER);
+        assert!(
+            script.contains(&format!("my $header = {literal};")),
+            "the holder must assign the header from the local authority: {script}"
+        );
     }
 
     /// The `fsync_tree` command must exit NONZERO when a
