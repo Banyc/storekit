@@ -61,6 +61,16 @@ Each of these was learned by finding the opposite in the code. They are binding.
 
 ## Stated residuals
 
+- **The contract is PROSE, and prose drifts from the code.** Every claim in this repository
+  — the README's contract, this file's axes, doc comments — is a sentence someone has to
+  keep true. Two devices reduce the drift: each rule has ONE authoritative home with the
+  restatements deleted, and the measured figures that no test here could reproduce were
+  DELETED rather than qualified. Neither device CHECKS a sentence against the code: the
+  compiler checks types and the gate checks tests, so keeping this file honest is a review
+  responsibility, and a claim narrowed in one place while a sibling copy keeps the old
+  wording is the defect class that responsibility covers.
+
+
 Named, scoped, not pursued:
 
 - **Funnel completeness.** No mechanism certifies that *every* name mutation anywhere
