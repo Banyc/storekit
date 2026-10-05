@@ -134,7 +134,8 @@ it and reports it in `Extraneous` — so "unaddressable" must not be read as
 
 Carried: name, kind, mode (including setuid, setgid, sticky), content, symlink
 target. Not carried: ownership, extended attributes, POSIX ACLs, timestamps,
-file flags, sparseness. Refused rather than dropped: hard links. The loss is
+file flags, sparseness. Refused rather than dropped: hard links — on a UNIX source;
+the local Windows walk cannot see `nlink`, so it records both names as ordinary files. The loss is
 INVISIBLE TO THE DIFFER: a dropped xattr or ACL leaves `local_manifest ==
 remote_manifest` true and the sync reporting no difference, so only
 xattr/ACL-aware tooling on the destination can reveal it. Authoritative
@@ -151,7 +152,8 @@ that differ only in mtime compare `Same`.
 `storekit` moves a tree faithfully WITHIN THE MANIFEST MODEL; it is **not a
 backup or checkpoint format**, and it cannot stand in for one:
 
-- A source containing a **hard link**, an **absolute symlink**, or an
+- A source containing a **hard link** (on a UNIX source — see above), an **absolute
+  symlink**, or an
   **escaping symlink** cannot be snapshotted AT ALL: the strict source manifest
   refuses the run, so such a tree must be normalized (copy the hard-linked
   content, make the symlink relative) before it can be pushed. A relative

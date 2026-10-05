@@ -14,14 +14,15 @@
 //! * directories are created before their children (the diff is path-ordered,
 //!   and a parent path is a proper prefix so it sorts first); modes and
 //!   symlinks are transferred faithfully; a symlink is never followed;
-//! * BOTH directions write a regular file ATOMICALLY and DURABLY. A PULL
-//!   writes through this crate's durable, fd-confined primitive
-//!   ([`crate::atomic::write_atomic_replace_fd`]) so an interrupted pull cannot
-//!   leave a torn entry; a PUSH into a LOCAL destination
-//!   ([`crate::transport::LocalTransport`]) routes through the SAME primitive,
-//!   and a PUSH into a REMOTE one through the far-side temp-and-rename the SSH
-//!   transport emits, so an interrupted push cannot destroy the previous
-//!   snapshot either. The exact discipline, by direction and destination kind,
+//! * BOTH directions write a regular file through a REPLACE, so an interrupted
+//!   run cannot leave a torn entry: a PULL writes through this crate's durable,
+//!   fd-confined primitive ([`crate::atomic::write_atomic_replace_fd`]); a PUSH
+//!   into a LOCAL destination ([`crate::transport::LocalTransport`]) routes
+//!   through the SAME primitive, and a PUSH into a REMOTE one through the far-side
+//!   temp-and-rename the SSH transport emits, so an interrupted push cannot destroy
+//!   the previous snapshot either. On a WINDOWS local destination the replace is
+//!   not ATOMIC — the target is removed before the rename, the ONE such case, named
+//!   in [`crate::manifest`]'s authority — but it is a replace, not a truncation. The exact discipline, by direction and destination kind,
 //!   is stated in [`crate::manifest`]'s "Durability and atomicity of a written
 //!   entry". A directory and a symlink are still created through
 //!   [`Remote::create_dir_all`] / [`Remote::symlink`] and modes through

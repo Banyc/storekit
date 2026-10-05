@@ -200,10 +200,10 @@ pub enum MaterializationKind {
 ///
 /// These are the substrate refusals a caller or the crate's own external
 /// tests distinguish from a plain mechanical I/O failure: the tree copy's
-/// source-audit refusals (a special file where a REGULAR file was expected, a
-/// symlink whose target is invalid or cannot be shown to stay in the root, a hard
-/// link, an unlandable name, an overlapping source and destination), the residue
-/// gate, and the visible-but-not-durable outcome a
+/// source-audit refusals (what the source IS, the shape and name it has, and whether
+/// it overlaps the destination — the `Copy*` arms below are the definition, and this
+/// sentence deliberately does not re-list them), the residue gate, and the
+/// visible-but-not-durable outcome a
 /// caller must not read as a plain failure. Every other store error is a
 /// mechanical I/O failure with no consumer-side branch, and stays
 /// [`Self::Unclassified`].
