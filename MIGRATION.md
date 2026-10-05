@@ -70,7 +70,10 @@ domain), and the receiver-marker adoption (done).
   destination's operation lock ON THE FAR SIDE for the whole run through a
   persistent far-side lock session (a long-lived `ssh` client whose remote
   `perl` takes a non-blocking `flock` on the SAME sibling record the local case
-  uses). A `deploy` push into a remote destination should prefer this over
+  uses, under the SAME record rule — it adopts an empty or header-prefixed entry
+  and refuses any other non-empty one untouched, so neither arm destroys the
+  other's record; see "The lock record is self-describing" below). A `deploy`
+  push into a remote destination should prefer this over
   `DestinationOwnership::Unowned`: it serialises concurrent cooperating runs and
   the record is released on every exit path. It is NOT a lease — a far-side lock
   cannot outlive its client — so `deploy`'s own far-side serialisation need not
@@ -88,6 +91,14 @@ found at the record path. It now adopts an entry only when it is EMPTY or alread
 carries the record header (`storekit lock record v1`), and refuses anything else with
 the typed `PreflightKind::LockRecordNotRecognized`, leaving the entry byte-for-byte
 and mode-for-mode untouched.
+
+Both arms carry this rule. The far-side holder (change `rkqqztok`) reads the entry
+AFTER its flock and, if it is non-empty and does not begin with the header, refuses
+it with the same typed `PreflightKind::LockRecordNotRecognized` and the same
+byte-for-byte and mode-for-mode guarantee, before any `chmod`; otherwise it writes
+the header with its identity and tightens the mode to `0600`. So a record either arm
+wrote is adopted by the other — measured across a real `sshd` by
+`remote_lock`'s `a_crate_written_record_is_adopted_across_the_far_side_and_local_arms`.
 
 **Consequence for an existing store**: a record written by an earlier revision holds
 a bare op id and no header, so the first acquisition after the upgrade is REFUSED —
