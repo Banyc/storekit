@@ -152,7 +152,8 @@ pub enum MaterializationKind {
     /// refused for a SOURCE.
     EscapingSymlink,
     /// A regular file with link count > 1. Tolerated for a DESTINATION,
-    /// refused for a SOURCE.
+    /// refused for a SOURCE (on UNIX by the local walk; on every platform by
+    /// the remote wire assembler).
     HardLink,
     /// A non-regular, non-directory, non-symlink entry (a FIFO, socket, or
     /// device). Refused on BOTH forms because no KIND MODEL here can carry it:

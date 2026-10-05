@@ -449,7 +449,7 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
 ///   tree copies cleanly. A PRE-EXISTING destination directory keeps its own
 ///   mode; a directory this call CREATED takes the source's mode.
 /// * **hard links** — REFUSED with [`StoreKind::CopyHardLink`]. The crate
-///   refuses hard links by rule, so silently duplicating one into an
+///   refuses hard links by rule on UNIX, so silently duplicating one into an
 ///   independent regular file would be the unfaithful choice; reproducing the
 ///   link (`linkat`) is deliberately not done here.
 /// * **special files** (a FIFO, socket, or device) — REFUSED with
@@ -2712,7 +2712,7 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// freed as each frame drops.
 ///
 /// HARD LINKS are REFUSED (a regular file with `st_nlink > 1`): the crate's
-/// own `canonicalize_tree` refuses hard links by rule, so silently
+/// own `canonicalize_tree` refuses hard links by rule ON UNIX, so silently
 /// duplicating one into an independent regular file would materialize a tree
 /// the crate cannot canonicalize. A caller that must copy such a tree
 /// pre-checks and dereferences them itself.
@@ -3082,7 +3082,7 @@ pub fn copy_dir_recursive_fd(
                 None
             }
             kind @ (PathKind::File | PathKind::Other) => {
-                // The crate refuses HARD LINKS by rule
+                // The crate refuses HARD LINKS by rule ON UNIX
                 // (`canonicalize_tree` refuses a file with nlink > 1), so a
                 // copy must not silently duplicate one into an independent
                 // regular file.

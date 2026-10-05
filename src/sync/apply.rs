@@ -289,7 +289,8 @@
 //!
 //! A destination may legitimately hold an entry the manifest model refuses to
 //! ACCEPT as a faithful tree member — an absolute symlink, an escaping
-//! symlink, or a hard link (see
+//! symlink, or a hard link (refused on UNIX by the local walk, on every
+//! platform by the remote wire; see
 //! [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
 //! recorded in the DESTINATION manifest (under its live kind) and named in
 //! `DestinationTree::unsupported`, so the diff can classify it rather than the
@@ -1056,7 +1057,8 @@ pub enum Extraneous {
     ///
     /// This INCLUDES a destination-only entry the address-fidelity rules
     /// refuse to ACCEPT as a faithful tree member — an absolute or escaping
-    /// symlink, or a hard link (see
+    /// symlink, or a hard link (refused on UNIX by the local walk, on every
+    /// platform by the remote wire; see
     /// [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
     /// classified [`EntryDiff::Extraneous`] like any other destination-only
     /// path and removed through the SAME live-kind, fold-aware, non-recursive
@@ -1563,7 +1565,8 @@ pub struct SyncReport {
     pub transfers: usize,
     /// WHY each tolerated UNSUPPORTED destination entry was tolerated: the
     /// manifest spelling and the strict address-fidelity rule that refused it
-    /// (an absolute/escaping symlink, or a hard link — see
+    /// (an absolute/escaping symlink, or a hard link — refused on UNIX by the
+    /// local walk, on every platform by the remote wire — see
     /// [`crate::manifest::UnsupportedEntry`]), sorted by path and unique.
     ///
     /// This is an ANNOTATION, not a partition list. It adds NO path to the
@@ -3666,8 +3669,9 @@ fn run(
         )));
     }
     // The destination manifest is built TOLERANTLY: an entry the address
-    // -fidelity rules refuse (an absolute/escaping symlink, a hard link) is
-    // recorded in `dest_unsupported` and still present in the manifest under
+    // -fidelity rules refuse (an absolute/escaping symlink, a hard link —
+    // refused on UNIX by the local walk, on every platform by the remote wire)
+    // is recorded in `dest_unsupported` and still present in the manifest under
     // its live kind, so the diff classifies it and the report names it. A
     // SOURCE manifest (`source.manifest()` above) stays strict, so an
     // unrepresentable source entry still fails the run.
@@ -4004,7 +4008,8 @@ struct Applier<'a, 'b> {
     dest_residue: BTreeSet<String>,
     /// The RAW destination manifest's TOLERATED unsupported entries (the strict
     /// address-fidelity refusals the destination manifest kept: an
-    /// absolute/escaping symlink or a hard link, each with the strict rule's
+    /// absolute/escaping symlink, or a hard link — refused on UNIX by the local
+    /// walk, on every platform by the remote wire — each with the strict rule's
     /// reason). Populated from [`crate::manifest::DestinationTree::unsupported`]
     /// before the diff. It is the source of
     /// [`SyncReport::unsupported_destination`]: the preflight uses it to refuse
@@ -8387,7 +8392,8 @@ impl Side<'_> {
 
     /// The manifest of this side as a DESTINATION: the same tree description,
     /// but TOLERANT of the destination-only address-fidelity refusals (an
-    /// absolute or escaping symlink, a hard link), which are returned in
+    /// absolute or escaping symlink, a hard link — refused on UNIX by the local
+    /// walk, on every platform by the remote wire), which are returned in
     /// [`DestinationTree::unsupported`] instead of failing the run. A SOURCE
     /// uses [`Side::manifest`], which stays strict.
     fn destination_manifest(&self) -> Result<DestinationTree> {

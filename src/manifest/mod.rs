@@ -1341,7 +1341,8 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 
 /// One DESTINATION entry that the manifest model can carry as PRESENT but that
 /// the strict address-fidelity rules refuse to ACCEPT as a faithful member of
-/// the tree: an absolute or escaping symlink, or a hard link. It is returned
+/// the tree: an absolute or escaping symlink, or a hard link — refused on UNIX
+/// by the local walk, on every platform by the remote wire. It is returned
 /// alongside the manifest by [`canonicalize_tree_destination`] (and
 /// [`canonicalize_remote_entries_destination`]) so the sync can classify the
 /// entry as destination-only and let a caller-sanctioned
@@ -1453,7 +1454,9 @@ impl DestinationTree {
 
 /// Canonicalize a destination tree, TOLERATING the address-fidelity refusals
 /// that a destination may legitimately hold: an absolute symlink, an escaping
-/// symlink, and a hard link. Each tolerated entry is recorded in the returned
+/// symlink, and a hard link (refused only by the local walk ON UNIX: a Windows
+/// walk cannot see `nlink` and records both names as ordinary files). Each
+/// tolerated entry is recorded in the returned
 /// [`DestinationTree::unsupported`] with the strict rule's reason, and the
 /// manifest still carries it (under its live kind) so a caller-sanctioned
 /// removal can address it.
@@ -1879,7 +1882,9 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// output ([`remote_tree_verify_script`]), applying the SAME validations the
 /// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
 /// names (a non-NFC name is refused, never normalized),
-/// NUL/traversal/absolute/duplicate path rejection, hardlink rejection, and
+/// NUL/traversal/absolute/duplicate path rejection, hardlink rejection (which
+/// this assembler applies on every platform, unlike the local walk, whose
+/// `nlink` check is UNIX-only), and
 /// in-root symlink targets that are valid UTF-8 and free of every
 /// `WIRE_UNREPRESENTABLE_CHARS` character (NUL/LF/CR/TAB). A line is split on
 /// LF ALONE and refused when it ends in a bare CR (Rust's `str::lines` would
@@ -1976,9 +1981,10 @@ pub fn canonicalize_remote_entries_checked(
 }
 
 /// The destination-tolerant form of [`canonicalize_remote_entries`]: the same
-/// wire validation, but a hard link and an absolute or escaping symlink are
-/// RECORDED in [`DestinationTree::unsupported`] (and kept in the manifest
-/// under their live kind) instead of failing the whole assembly. A
+/// wire validation, but a hard link — which this assembler refuses on every
+/// platform, since the wire carries `nlink` — and an absolute or escaping
+/// symlink are RECORDED in [`DestinationTree::unsupported`] (and kept in the
+/// manifest under their live kind) instead of failing the whole assembly. A
 /// special-file line (`o`) is still refused: the crate's kind models have no
 /// value for one (the applier's live-kind classifiers error on
 /// [`crate::atomic::PathKind::Other`]), so it cannot be carried through the
@@ -3371,8 +3377,8 @@ mod tests {
     }
 
     /// A hard link (nlink > 1) must be rejected by the remote verification
-    /// path exactly as the local canonicalizer rejects it: the script prints
-    /// the raw nlink and the assembler refuses nlink > 1.
+    /// path exactly as the UNIX local canonicalizer rejects it: the script
+    /// prints the raw nlink and the assembler refuses nlink > 1.
     #[test]
     fn hard_links_rejected_by_remote_path() {
         skip_without_perl!("hard_links_rejected_by_remote_path");

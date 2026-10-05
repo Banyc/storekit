@@ -156,8 +156,10 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// the tolerant destination-side form and still refuses an absent root.
 ///
 /// This is the STRICT form and it describes the SOURCE side: an entry the
-/// address-fidelity rules cannot represent (a hard link, an absolute or
-/// escaping symlink) makes the whole manifest an ERROR. Use it for the tree
+/// address-fidelity rules cannot represent (a hard link — refused on UNIX by
+/// the in-process walk and on every platform by the wire assembler — or an
+/// absolute or escaping symlink) makes the whole manifest an ERROR. Use it for
+/// the tree
 /// the content comes FROM. For the DESTINATION a caller must use
 /// [`remote_destination_manifest`], which returns those entries in
 /// [`DestinationTree::unsupported`] instead of refusing the tree; that is
