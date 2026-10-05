@@ -34,9 +34,10 @@
 //!
 //! * `Remote::exists` — `src/remote/transport/mod.rs`, the trait method the
 //!   consumer's interface requires, `fn exists(&self, rel: &RootedRelativePath)
-//!   -> bool`, called in production
-//!   by `src/remote/helper/mod.rs`, `src/remote/helper/durable.rs` and
-//!   `src/store/local/objects.rs`.
+//!   -> bool`. Its PRODUCTION caller is `src/store/local/objects.rs`; the two
+//!   other files that call it (`src/remote/helper/mod.rs`, `durable.rs`) do so
+//!   from `#[cfg(test)]` modules, so they attest the trait method's shape but
+//!   not a production need.
 //! * the path-based atomic replace — the ABSOLUTE-PATH call shape
 //!   `write_atomic_replace(&path, bytes, &mut hook)`, which the consumer's
 //!   retention history-floor writer uses (`src/retention/reachability/

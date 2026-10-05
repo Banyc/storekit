@@ -35,40 +35,18 @@
 //! write is visible but may be lost". The per-operation sequencing on top
 //! of these primitives belongs to the caller, not to this module.
 //!
-//! The helpers here are the shared plumbing — the `pub` free functions this
-//! crate exports as its durable-I/O layer:
-//! the tri-state existence check (`path_state`), the fail-closed
-//! parent-dir fsync (`sync_parent_dir`), unique temp naming
-//! (`temp_name_for`), the atomic marker/JSONL rewrites
-//! (`write_atomic_replace`, `write_jsonl_atomic`), private permissions
-//! (`set_private`), the tree-object directory
-//! copy (`copy_dir_recursive_fd` for a root-confined landing, and the
-//! deliberately-named, tolerant `copy_tree_verbatim` for a clone that is NOT
-//! landing into a store root), and the JSON readers. Two more are the
-//! consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the OWNED
-//! ROOT itself (the empty and `.` child spellings are refused, so residue at
-//! the root was otherwise unreachable) and [`is_crate_temp_name`] recognises
-//! the crate's own crash residue.
-//!
-//! The `_fd` tree pair a migration onto this crate needs — an arbitrary-path
-//! SOURCE copied to a ROOT-CONFINED destination, and the fd-confined tree
-//! fsync — is [`copy_dir_recursive_fd`] and [`fsync_tree_recursive_fd`] (both
-//! ITERATIVE, and both documenting their deltas from the source tool's
-//! originals; see the README's "Design conflicts surfaced by the consumer
-//! audit").
-//!
-//! Parse-sensitive marker reads: a PRESENT-but-malformed marker CONTENT is
-//! semantic CORRUPTION and maps to [`Error::integrity`] via
-//! `read_json_marker` (the file exists, it is just not a valid marker),
-//! while a mechanical filesystem I/O failure (open/read/rename/fsync)
-//! stays [`Error::store`] — the class split a caller can always
-//! distinguish "this marker is corrupt" from "disk read failed".
-//! `read_json` folds both into [`Error::store`], which is correct for
-//! its non-marker callers (observed.json, retention-debt.json, tree
-//! metadata, ...); callers of `read_json_marker` must still perform
-//! their own schema-version check after a successful parse (also
-//! [`Error::integrity`]): an unsupported `schema_version` is a
-//! marker-format violation, not an I/O failure.
+//! The helpers here are the shared plumbing: the tri-state existence check
+//! (`path_state`), unique temp naming (`temp_name_for`), the atomic replace in both
+//! forms (`write_atomic_replace`, `write_atomic_replace_fd`) with the
+//! compare-and-replace twin, the tree-object directory copy (`copy_dir_recursive_fd`
+//! for a root-confined landing, and the deliberately-named, tolerant
+//! `copy_tree_verbatim` for a clone that is NOT landing into a store root), the JSON
+//! readers (`read_json`, `read_json_fd`), and the crate-internal durable helpers
+//! (`set_private`, `sync_parent_dir` — `pub(crate)`, deliberately not public). Two
+//! more are the consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the
+//! OWNED ROOT itself (the empty and `.` child spellings are refused, so residue at the
+//! root was otherwise unreachable) and [`is_crate_temp_name`] recognises the crate's
+//! own crash residue.
 //!
 //! # The reserved-spelling guard is STRUCTURAL, not a list of call sites
 //!
@@ -672,12 +650,12 @@ pub enum ReplaceStage {
     /// The temp-file CREATE/WRITE stage (before any I/O on the temp): the
     /// visible target is wholly OLD; a fault here is an `Err`.
     Write,
-    /// The temp-file FSYNC stage (after the write, before the chmod): a
-    /// dot-prefixed temp exists and is unlinked before the `Err` is
-    /// returned; the visible target is wholly OLD; a fault here is an
-    /// `Err`.
+    /// The temp-file FSYNC stage (after the write AND after the private-mode
+    /// chmod, before the atomic rename): a dot-prefixed temp exists and is
+    /// unlinked before the `Err` is returned; the visible target is wholly
+    /// OLD; a fault here is an `Err`.
     Sync,
-    /// The RENAME stage (after the chmod, before the atomic rename): the
+    /// The RENAME stage (after the fsync, before the atomic rename): the
     /// visible target is wholly OLD; a fault here is an `Err`.
     Rename,
     /// The PARENT-DIRECTORY open/fsync stage, AFTER the rename: the new

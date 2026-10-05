@@ -169,7 +169,7 @@ backup or checkpoint format**, and it cannot stand in for one:
 
 A file a sync writes is published ATOMICALLY and DURABLY for every Unix
 reachable destination kind (durability means the LINUX power-loss barrier — see the
-durability assumption above): a LOCAL destination (a pull, or a push whose
+durability assumption below): a LOCAL destination (a pull, or a push whose
 transport is `LocalTransport`) uses the crate's durable atomic replace (unique
 temp + `fsync` + `rename` + parent-directory `fsync`), and a REMOTE destination
 uses the same shape on the far side (temp, payload on stdin, mode, perl
