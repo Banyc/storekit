@@ -187,16 +187,22 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 /// needs that question; the sync strips with the BROAD
 /// [`is_unaddressable_path`] and [`is_residue_path`].)
 ///
-/// The temp half is checked in CASE-FOLDED form too
-/// ([`is_crate_temp_case_alias`]). The byte-exact recognizer
+/// The temp half is checked in the SAME denial fold as the lock-record
+/// family too ([`is_crate_temp_case_alias`]): the FULL Unicode case fold
+/// followed by the Win32 trailing `.`/` ` strip
+/// ([`fold_lock_record_component`]). The byte-exact recognizer
 /// [`crate::atomic::is_crate_temp_name`] cannot see that `.FOO.TMP.1.0`
 /// aliases `.foo.tmp.1.0` on a case-insensitive filesystem (macOS APFS,
-/// Windows), so without this arm `valid_name(".FOO.TMP.1.0")` would be true
-/// while the crate treats `.foo.tmp.1.0` as its own temp — the id rule's
+/// Windows), nor that `.foo.tmp.1.0.` aliases it on a trailing-dot-folding
+/// one (Win32 strips a final `.`/` ` from a path component); without this arm
+/// `valid_name(".FOO.TMP.1.0")` and `valid_name(".foo.tmp.1.0.")` would be
+/// true while the crate treats `.foo.tmp.1.0` as its own temp — the id rule's
 /// stated purpose ("an accepted id can never alias the crate's own
 /// bookkeeping on a supported filesystem") would then be false for that
-/// family. Refusing the alias makes the purpose true. Linux cannot exhibit
-/// the alias (its filesystem is case-sensitive), so the rule is deliberately
+/// family, and on Windows the trailing spelling IS the very entry the
+/// documented recovery sweep REMOVES. Refusing the alias makes the purpose
+/// true. Linux cannot exhibit either alias (its filesystem is case-sensitive
+/// and preserves a trailing dot), so the rule is deliberately
 /// platform-INDEPENDENT: an id rule that changed with the host filesystem
 /// would make a manifest mean different things on different hosts.
 pub fn is_unaddressable_name(name: &str) -> bool {
@@ -208,14 +214,26 @@ pub fn is_unaddressable_name(name: &str) -> bool {
         || is_crate_temp_case_alias(name)
 }
 
-/// Whether `name` case-folds onto one of the crate's own TEMP shapes
-/// ([`crate::atomic::is_crate_temp_shape`]) while being byte-different. See
-/// [`is_unaddressable_name`].
+/// Whether `name` is a CASE or trailing-`.`/` ` ALIAS of one of the crate's
+/// own TEMP shapes ([`crate::atomic::is_crate_temp_shape`]) while being
+/// byte-different. See [`is_unaddressable_name`].
+///
+/// The identifier keeps its historical `case_alias` name; the fold it applies
+/// is the crate's shared DENIAL fold ([`fold_lock_record_component`], the full
+/// case fold plus the Win32 trailing `.`/` ` strip), the same one
+/// [`is_lock_record_name`] uses. Sharing it is what keeps the TEMP family's
+/// identity check folded exactly like the LOCK family's, so a trailing-dot
+/// spelling of a crate temp cannot be an accepted id. The BYTE-EXACT shape
+/// authority stays [`crate::atomic::is_crate_temp_shape`]: this arm only widens
+/// the REFUSAL, it never turns [`crate::atomic::is_crate_temp_name`] (the
+/// recovery recognizer a caller runs against real directory entries) into an
+/// alias match, which would let the sweep delete a distinct trailing-dot entry
+/// on a dot-preserving filesystem.
 fn is_crate_temp_case_alias(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    let folded = crate::casefold::case_fold(name);
+    let folded = fold_lock_record_component(name);
     folded != name && crate::atomic::is_crate_temp_shape(&folded)
 }
 
@@ -400,14 +418,15 @@ pub fn is_lock_record_name(name: &str) -> bool {
     sibling(&folded) || is_application_lock_name(&folded)
 }
 
-/// The ONE normalization used to DENY a lock-record spelling
-/// ([`is_lock_record_name`]): the FULL Unicode case fold
+/// The ONE normalization used to DENY a reserved-FAMILY spelling ALIAS
+/// ([`is_lock_record_name`] and the crate-temp arm of
+/// [`is_unaddressable_name`]): the FULL Unicode case fold
 /// ([`crate::casefold`], the fold the crate's case-alias model uses) followed
 /// by stripping trailing `.` and ` ` (the Win32 final-component normalization
-/// that removes a trailing dot/space on a short absolute drive path;
-/// `is_lock_record_name` must recognise that alias everywhere so a Windows
-/// path cannot slip a record past the guard, and folding is harmless on a
-/// case-sensitive, dot-preserving filesystem).
+/// that removes a trailing dot/space on a short absolute drive path; the
+/// DENIAL predicates must recognise that alias everywhere so a Windows path
+/// cannot slip a lock record or a crate temp past the guard, and folding is
+/// harmless on a case-sensitive, dot-preserving filesystem).
 ///
 /// The fold is the FULL case fold, not `str::to_lowercase`: a case-insensitive
 /// host folds `ß` to `ss`, the `ﬁ`/`ﬂ` ligatures to `fi`/`fl`, and long s
@@ -784,6 +803,57 @@ mod tests {
         for ok in ["operation.lockx", "a.operation.lock", ".operation.lock."] {
             assert!(!is_unaddressable_name(ok), "{ok:?} must stay ordinary");
             assert!(crate::id::valid_name(ok), "{ok:?} must stay a valid id");
+        }
+    }
+
+    /// Every reserved FAMILY is folded the SAME way on every supported host:
+    /// the full Unicode case fold PLUS the Win32 trailing-dot/space strip
+    /// ([`fold_lock_record_component`]), so a spelling that RESOLVES to a
+    /// reserved entry on a folding host is unaddressable as an identity and
+    /// refused by [`crate::id::valid_name`].
+    ///
+    /// PRE-FIX the crate TEMP family was the one holdout: its identity check
+    /// (`is_crate_temp_shape` byte-exact plus a CASE-only alias) had no
+    /// trailing-dot arm, so `is_unaddressable_name(".foo.tmp.1.2.")` was
+    /// `false` and `crate::id::valid_name(".foo.tmp.1.2.")` was `true` while
+    /// on Windows the spelling resolves to the crate's own temp
+    /// `.foo.tmp.1.2` — the very entry the documented recovery sweep REMOVES.
+    /// THIS test pins the trailing fold for all four families together, so a
+    /// later narrowing of any one family fails here.
+    #[test]
+    fn trailing_dot_and_space_aliases_are_unaddressable_for_every_reserved_family() {
+        let families: [(&str, &[&str]); 4] = [
+            (
+                "lock record",
+                &[".dest.operation.lock.", ".dest.operation.lock "],
+            ),
+            (
+                "application lock record",
+                &["operation.lock.", "operation.lock "],
+            ),
+            ("claim-aside", &[".sync-aside.1.", ".sync-aside.1 "]),
+            (
+                "crate temp",
+                &[
+                    ".foo.tmp.1.2.",
+                    ".foo.tmp.1.2 ",
+                    ".foo.claim.1.2.",
+                    ".foo.claim.1.2 ",
+                ],
+            ),
+        ];
+        for (family, spellings) in families {
+            for alias in spellings {
+                assert!(
+                    is_unaddressable_name(alias),
+                    "{family}: {alias:?} resolves to a reserved entry on a trailing-dot/space \
+                     folding host and must be unaddressable as an identity"
+                );
+                assert!(
+                    !crate::id::valid_name(alias),
+                    "{family}: the id rule must refuse the trailing alias {alias:?}"
+                );
+            }
         }
     }
 

@@ -160,11 +160,13 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// the claim-aside namespace `.sync-aside.`, the operation-lock record spelling
 /// `.<name>.operation.lock`, the application-store lock record `operation.lock`,
 /// any CASE ALIAS of those (on a case-insensitive filesystem
-/// `.SYNC-ASIDE.1` IS `.sync-aside.1`) or LOCK-RECORD spelling in the DENIAL
-/// fold of a trailing `.`/` ` (on Windows `.dest.operation.lock.` and
-/// `operation.lock.` ARE a lock record), and any of the crate's own TEMP shapes
-/// ([`crate::atomic::is_crate_temp_name`]) or a CASE ALIAS of a temp shape
-/// (`.FOO.TMP.1.0`). The temp shapes are refused because
+/// `.SYNC-ASIDE.1` IS `.sync-aside.1`), any of those or a crate TEMP shape in
+/// the DENIAL fold of a trailing `.`/` ` (on Windows `.dest.operation.lock.`
+/// and `operation.lock.` ARE a lock record, and `.foo.tmp.1.0.` IS the crate
+/// temp `.foo.tmp.1.0`), and any of the crate's own TEMP shapes
+/// ([`crate::atomic::is_crate_temp_name`]), a CASE ALIAS of a temp shape
+/// (`.FOO.TMP.1.0`), or a trailing-dot/space alias of one (`.foo.tmp.1.0.`).
+/// The temp shapes and their aliases are refused because
 /// the crate owns that namespace: a consumer's documented recovery sweep
 /// REMOVES every [`crate::atomic::is_crate_temp_name`] match, so an id that
 /// looked like a temp would be addressable content the sweep silently deletes.
