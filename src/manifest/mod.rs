@@ -3105,14 +3105,69 @@ mod tests {
         );
     }
 
+    /// The HARD wall-clock cap on one run of the remote verification script.
+    ///
+    /// The script classifies each entry from `lstat` BEFORE opening it, so it
+    /// must terminate for any tree. A regression that opened a FIFO read-only
+    /// would BLOCK until a writer appears — and libtest has no per-test
+    /// timeout, nor does this crate ship a `nextest.toml`/`.cargo/config.toml`
+    /// that adds one, so such a regression would hang the whole suite forever.
+    /// This bound turns that hang into a TEST FAILURE instead.
+    const REMOTE_SCRIPT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Run the remote verification script on `root` under
+    /// [`REMOTE_SCRIPT_LIMIT`] and return the raw subprocess result, so a
+    /// caller can assert on the EXIT STATUS (the script must fail closed when
+    /// it cannot enumerate the whole tree).
+    ///
+    /// The previous bare `Command::output()` had no bound at all: a script
+    /// that blocked in a read-only `open` of a FIFO would hang the suite
+    /// forever rather than fail a test. Past the cap the child is KILLED and
+    /// the test PANICS naming the FIFO hang — the script never blocks on a
+    /// regular file, so a hang can only be a blocking open of a special file —
+    /// so the suite itself can never hang.
+    fn run_remote_script_bounded(root: &Path) -> std::process::Output {
+        let mut child = std::process::Command::new("perl")
+            .args(["-e", remote_tree_verify_script()])
+            .arg(root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("perl must run");
+        let deadline = std::time::Instant::now() + REMOTE_SCRIPT_LIMIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    return child
+                        .wait_with_output()
+                        .expect("collect the script's output");
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let out = child
+                        .wait_with_output()
+                        .expect("collect the script's output");
+                    panic!(
+                        "the remote verification script did not finish within \
+                         {REMOTE_SCRIPT_LIMIT:?} and was killed: it blocked in a read-only `open` \
+                         of a special file (the FIFO hang — a read-only `open` of a FIFO waits \
+                         until a writer appears, and this harness used to wait forever). A hang \
+                         on user data is never acceptable.\n\
+                         --- script stdout ---\n{}\n--- script stderr ---\n{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(e) => panic!("waiting on the remote verification script: {e}"),
+            }
+        }
+    }
+
     /// Run the remote verification script on `root` and return its stdout
     /// (the caller asserts on the parse outcome).
     fn run_remote_script(root: &Path) -> String {
-        let out = std::process::Command::new("perl")
-            .args(["-e", remote_tree_verify_script()])
-            .arg(root)
-            .output()
-            .expect("perl must run");
+        let out = run_remote_script_bounded(root);
         assert!(
             out.status.success(),
             "script failed: {}",
@@ -3125,11 +3180,7 @@ mod tests {
     /// subprocess result, so a test can assert on the EXIT STATUS (the script
     /// must fail closed when it cannot enumerate the whole tree).
     fn run_remote_script_raw(root: &Path) -> std::process::Output {
-        std::process::Command::new("perl")
-            .args(["-e", remote_tree_verify_script()])
-            .arg(root)
-            .output()
-            .expect("perl must run")
+        run_remote_script_bounded(root)
     }
 
     /// An existing EMPTY DIRECTORY is a legitimate tree: the script exits 0
@@ -3269,9 +3320,13 @@ mod tests {
     /// A FIFO (or socket/device) must be rejected by BOTH verification
     /// paths: the local canonicalizer refuses non-regular files, and the
     /// remote script classifies it as `o` (other) — never `f` — so the
-    /// assembler rejects it too, and the script never `open`s the FIFO
-    /// (which would block until the exec timeout). This pins the
-    /// convergence of the two paths on special files.
+    /// assembler rejects it too, and the script never `open`s the FIFO.
+    /// The harness runs the script behind a HARD wall-clock bound
+    /// ([`REMOTE_SCRIPT_LIMIT`]), so a regression that DID `open` the FIFO
+    /// read-only — which blocks until a writer appears — is KILLED and
+    /// reported as a test failure instead of hanging the whole suite: this
+    /// test is a real witness for that hang. This pins the convergence of the
+    /// two paths on special files.
     // unix-only: needs a FIFO (mkfifo(2)); Windows has no mkfifo.
     #[cfg(unix)]
     #[test]
@@ -3302,6 +3357,10 @@ mod tests {
         // assembler rejects it (and the script COMPLETES — it never blocks
         // opening the FIFO).
         let out = run_remote_script(&root);
+        assert!(
+            out.lines().any(|line| line.starts_with("pipe\to\t")),
+            "the far-side listing must list the FIFO as an `o` entry, got: {out:?}"
+        );
         let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
         assert!(
             remote_err.to_string().contains("unsupported file type"),
