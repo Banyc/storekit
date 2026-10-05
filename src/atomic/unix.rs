@@ -2721,9 +2721,9 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// directory IDENTITY, not by path spelling ([`refuse_overlapping_copy`]): the
 /// source directory and the DESTINATION ANCHOR (the deepest existing directory
 /// on `dst_rel`, resolved component-wise from the owned root descriptor) are
-/// compared by `(st_dev, st_ino)`, and the call refuses when they are the same
-/// directory, when the anchor is inside the source, or when an EXISTING
-/// destination is above the source. A spelling-based comparison is bypassable
+/// compared by `(st_dev, st_ino)`, and the call refuses when the anchor is AT OR
+/// INSIDE the source (the same directory counts — one term covers it) or when an
+/// EXISTING destination is at or above the source. A spelling-based comparison is bypassable
 /// by any two spellings `realpath` does not unify — a Linux `mount --bind`
 /// alias, a macOS firmlink, a case-fold-equal `dst_rel` on a folding
 /// filesystem — and each of those made the destination be created INSIDE the

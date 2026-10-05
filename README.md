@@ -190,7 +190,7 @@ the `manifest` module's "Durability and atomicity of a written entry".
 `EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
 remote append primitive and the append is a compare-and-replace of the whole
 file. Measured on Linux release with `strace` byte accounting (see the PROVENANCE NOTE
-above), ONE run that appends 32 bytes to a 1 MiB log reads
+below), ONE run that appends 32 bytes to a 1 MiB log reads
 **8,388,768 bytes** and writes **1,048,678 bytes**: three whole reads of the
 1 MiB destination (the destination manifest, the prefix test, and the
 compare-and-replace), three whole reads of the 1 MiB + 32 source (the source
@@ -220,10 +220,10 @@ fsync the parent directory entry.
 
 ## What a snapshot costs
 
-Two costs a checkpoint tool must budget for, both measured on a 350 MB tree
+Three costs a checkpoint tool must budget for, all measured on a 350 MB tree
 unless stated otherwise.
 
-**PROVENANCE NOTE.** Most figures in this section are REPORTED measurements, not ones a
+**PROVENANCE NOTE.** Most figures in this README are REPORTED measurements, not ones a
 reader can re-run from this repository: no benchmark or fixture ships here. The
 resident-memory bound in `manifest`'s module docs, the append byte accounting with
 `strace`, and the fresh-destination and `canonicalize_tree` figures were taken by the
