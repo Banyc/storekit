@@ -82,9 +82,10 @@ Named, scoped, not pursued:
   DESTINATION (a push into a root that nests the source) or the SOURCE (a pull into a
   local destination nested inside the far-side source). A bind mount, a shared mount,
   or an `ssh` target that IS this host is exactly the case where the two really do
-  overlap, and nothing this host can see establishes otherwise. Measured for the pull
-  direction: no `RootsOverlap` is raised, the run WRITES INTO ITS SOURCE, and the
-  end-of-run source re-check is what fails it — after the writes. The caller that
+  overlap, and nothing this host can see establishes otherwise.
+  `a_far_side_source_overlap_is_not_refused_and_the_source_check_is_what_catches_it`
+  measures the pull direction: no `RootsOverlap` is raised, the run WRITES INTO ITS
+  SOURCE, and the end-of-run source re-check is what fails it — after the writes. The caller that
   co-locates them owns the check. Stated in `src/sync/apply.rs`'s module docs.
 - **The count pins pin CALL COUNTS, not arguments.** An argument change at a call site
   inside a reviewed allow region moves no `std::fs` count, and the deny is allowed
