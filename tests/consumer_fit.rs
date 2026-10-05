@@ -38,11 +38,12 @@
 //!   by `src/remote/helper/mod.rs`, `src/remote/helper/durable.rs` and
 //!   `src/store/local/objects.rs`.
 //! * the path-based atomic replace — the ABSOLUTE-PATH call shape
-//!   `write_atomic_replace(&root.path().join(rel), ..)`, which the consumer's
-//!   Windows port uses. That port's `store/atomic/windows.rs` is now a re-export
-//!   of this crate, so the durable evidence is the CALL SHAPE, not a file that
-//!   moves under it; its descriptor-relative wrapper
-//!   `write_atomic_replace_at` drives the confined `write_atomic_replace_fd`.
+//!   `write_atomic_replace(&path, bytes, &mut hook)`, which the consumer's
+//!   retention history-floor writer uses (`src/retention/reachability/
+//!   history_floor.rs`; the migration deleted `deploy`'s platform-specific store
+//!   modules, so the durable evidence is the CALL SHAPE, not a file that moves
+//!   under it) — and its confined twin `write_atomic_replace_fd`, which the
+//!   consumer's `store/local` writer drives.
 //! * the tree pair — `copy_dir_recursive_fd` (out-of-root `&Path` source into a
 //!   root-confined `RootedRelativePath` staging destination) then
 //!   `fsync_tree_recursive_fd`; recorded in the README's "Design conflicts
@@ -141,9 +142,9 @@ fn remote_existence_probe_and_typed_absence() {
 }
 
 /// The path-based UNCONFINED atomic replace — the ABSOLUTE-PATH call shape the
-/// consumer's Windows port used at the revision above; that port's
-/// `store/atomic/windows.rs` is now a re-export of this crate, so the durable
-/// evidence is the CALL SHAPE, not a file that moves under it — AND its confined
+/// consumer's retention history-floor writer uses at the revision above (the
+/// migration deleted its platform-specific store modules, so the durable evidence
+/// is the CALL SHAPE, not a file that moves under it) — AND its confined
 /// equivalent `write_atomic_replace_fd` (deploy's `write_atomic_replace_at`
 /// resolves through it). Both must be nameable, and both must install the bytes.
 #[test]

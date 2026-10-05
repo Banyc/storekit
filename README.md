@@ -299,8 +299,11 @@ simplification; removing one means adding back the logic it removes.
   pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so
   the `libc` entries are inert there by construction, and the Windows port is a
   COMPILE target whose runtime this contract does not cover.
-- **Every claim has ONE home.** *Buys:* no copies to disagree. A fact is stated where
-  it is enforced and POINTED AT elsewhere; a second copy is a defect, not redundancy.
+- **Every claim has one AUTHORITATIVE home.** *Buys:* a place to correct, and a rule for
+  the copies. A fact is stated where it is enforced and pointed at elsewhere; where a
+  second statement of a MEASURED number is genuinely useful (a README figure beside the
+  code comment that measured it), the two must AGREE, and a drift between them is a
+  defect in whichever is stale.
 
 - **The destination changes only through this run.** *Buys:* one read of the
   destination is authoritative for the whole run, so work is never ordered

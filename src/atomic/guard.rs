@@ -2970,7 +2970,7 @@ mod tests {
             // commit-point-1 rename. It was briefly dropped from this pin when
             // that replace was demoted to `#[cfg(test)]`/`pub(crate)`; the
             // demotion was REVERTED because a CONSUMER's interface requires
-            // the name (deploy's Windows port calls the path-based replace —
+            // the name (deploy's retention history-floor writer calls the path-based replace —
             // see docs/CONSISTENCY.md axis M), so the rename is production code
             // again and is pinned here. The guard still runs on the function.
             ("src/atomic/unix.rs", "rename", 1),

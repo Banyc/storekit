@@ -151,7 +151,7 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
 }
 /// The PATH-BASED, UNCONFINED durable atomic replace: write a UNIQUE hidden
-/// temp in the target's directory, fsync it, chmod it 0o600, rename it into
+/// temp in the target's directory, chmod it 0o600, fsync it, rename it into
 /// place
 /// (COMMIT POINT 1), then fsync the parent directory (COMMIT POINT 2). A
 /// failure BEFORE the rename is an `Err`, leaves the OLD content visible, and

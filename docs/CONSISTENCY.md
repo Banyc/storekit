@@ -97,16 +97,20 @@ Named, scoped, not pursued:
   pinned reference (the `use`) and the call itself moves no count — and because the deny
   is allowed in a funnel module, all three devices are blind to that spelling. The
   `std::fs` half is strict here: an aliased `std::fs` call is a `ModuleAlias` violation.
-- **`FileLock::acquire` checks the record's IMMEDIATE PARENT only.** A symlink in a
-  GRANDPARENT component of the record path is still followed by the path-based helper;
-  the refused-by-rule set covers a swapped component in-root, not this.
+- **`FileLock::acquire` checks the record's IMMEDIATE PARENT only.** It `lstat`s that
+  parent's final component, so a symlink THERE is refused; a symlink in ANY HIGHER
+  ancestor (grandparent and above) is still followed by its path-based helpers, and the
+  refused-by-rule set covers a swapped component in-root, not this.
 - **No deny entry is checked for RESOLUTION.** `clippy.toml` is a list of resolved
   symbols and nothing verifies that an entry resolves on the Unix target: a typo
   produces a non-fatal config-time `does not refer to a reachable function`
   diagnostic that the gate's `-D warnings` does not cover, so it can rot silently. A
   symbol the funnel DOES use is caught by the closure test, which checks the LIST,
-  not the resolution. Entries naming symbols no Unix libc exports are kept as the
-  reviewed record rather than pruned.
+  not the resolution, and DELETING a wider-set entry is noticed by nothing: the
+  funnel-used subset is closure-checked and the `std::fs` half has a pinned expected
+  table, but an entry naming a symbol no code path references has no witness at all.
+  Entries naming symbols no Unix libc exports are kept as the reviewed record rather
+  than pruned.
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde
