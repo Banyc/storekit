@@ -178,17 +178,19 @@ durability assumption below): a LOCAL destination (a pull, or a push whose
 transport is `LocalTransport`) uses the crate's durable atomic replace (unique
 temp + `fsync` + `rename` + parent-directory `fsync`), and a REMOTE destination
 uses the same shape on the far side (temp, payload on stdin, mode, perl
-`fsync(2)`, perl `rename(2)`, parent-directory `fsync(2)`). A write that fails
-before the rename leaves the PREVIOUS content in place and removes the temp, so
-a failed push can no longer destroy the snapshot it was replacing. The Windows
+`fsync(2)`, perl `rename(2)`, parent-directory `fsync(2)`). On every UNIX
+destination a write that fails before the rename leaves the PREVIOUS content in
+place and removes the temp, so a failed push can no longer destroy the snapshot it
+was replacing (the Windows replace's pre-rename removal is the exception named
+below). The Windows
 local port's replace is the ONE non-atomic case (no directory fsync; the target
 is removed before the rename) and is unverified. The exact commit points are in
 the `manifest` module's "Durability and atomicity of a written entry".
 
 `EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
 remote append primitive and the append is a compare-and-replace of the whole
-file. Measured on Linux release with `strace` byte accounting (wrapper
-neutralised, load ~1), ONE run that appends 32 bytes to a 1 MiB log reads
+file. Measured on Linux release with `strace` byte accounting (see the PROVENANCE NOTE
+above), ONE run that appends 32 bytes to a 1 MiB log reads
 **8,388,768 bytes** and writes **1,048,678 bytes**: three whole reads of the
 1 MiB destination (the destination manifest, the prefix test, and the
 compare-and-replace), three whole reads of the 1 MiB + 32 source (the source
@@ -201,7 +203,9 @@ verification, not just the append rule. Batch small appends, or keep the log
 outside the synced tree and ship it whole.
 
 **`AppendTail` is NOT a concurrency-safe append.** It is a whole-file
-compare-and-replace: concurrent appends are NOT preserved (two runs can read
+compare-and-replace, and on a WINDOWS destination that replace is additionally
+non-atomic (the target is removed before the rename, as the Windows paragraph
+above says): concurrent appends are NOT preserved (two runs can read
 the same prefix and the later publish discards the other's line — a lost
 update on a remote destination, and a `renameat`-wide window locally). A
 consumer that relies on one `O_APPEND` write of a complete line landing under
@@ -217,14 +221,16 @@ fsync the parent directory entry.
 ## What a snapshot costs
 
 Two costs a checkpoint tool must budget for, both measured on a 350 MB tree
-unless stated otherwise. The TIMING figures here and the resident-memory bound in
-`manifest`'s module docs were taken by the consuming tool (`deploy`) on its own hosts
-and
-tree; this repository ships no benchmark or fixture that reproduces them, so they are
-reported measurements rather than ones a reader can re-run here. The path-limit
-figures below ARE reproducible (grow a chain, ask `canonicalize_tree` after each level —
-the method is stated with them), and the append byte accounting names its `strace`
-method.
+unless stated otherwise.
+
+**PROVENANCE NOTE.** Most figures in this section are REPORTED measurements, not ones a
+reader can re-run from this repository: no benchmark or fixture ships here. The
+resident-memory bound in `manifest`'s module docs, the append byte accounting with
+`strace`, and the fresh-destination and `canonicalize_tree` figures were taken by the
+consuming tool (`deploy`) on its own hosts and tree; the Linux and macOS incremental
+figures were re-measured in a release build of this crate on its own hosts (load ≈0.3
+Linux / ≈1.4 macOS). The path-limit figures below ARE reproducible: grow a 1-byte chain
+and ask `canonicalize_tree` after each level, exactly as stated with them.
 
 **Memory is O(largest entry), not O(changed bytes).** `Remote::write` takes
 `data: &[u8]` and the read side materializes the whole entry, so a single
@@ -270,10 +276,8 @@ doublings, where a purely cubic curve predicts 8. `canonicalize_tree` alone is
 cheap (2.76 ms / 6.53 ms /
 25.4 ms), so the engine's per-path verification is the cost, and a checkpoint
 tool that recreates its destination per snapshot should budget cubic-OR-WORSE. The
-Linux and macOS incremental figures above are re-measured in a release build
-(wrapper neutralised, load ≈0.3 Linux / ≈1.4 macOS); the
-fresh-destination and `canonicalize_tree` figures are `deploy`'s,
-not re-measured here.
+incremental figures, the fresh-destination figures and the `canonicalize_tree` figures
+are attributed in the PROVENANCE NOTE above.
 
 ## A fresh destination
 

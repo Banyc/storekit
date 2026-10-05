@@ -1131,13 +1131,14 @@ pub enum EntryPolicy {
     /// `O_APPEND` open; it is NOT part of this crate. This warning is a
     /// documentation fix and deliberately does not change `AppendTail`'s
     /// behaviour. Adding such a primitive is an owner decision — see the
-    /// README's "Design conflicts surfaced by the consumer audit".)
+    /// README's "Design conflicts the `deploy` migration surfaced".)
     ///
     /// KNOWN COST: an append is O(TOTAL SIZE), not O(appended bytes). There is
     /// no [`Remote::append`](crate::transport::Remote) primitive, so the append
     /// is realized as a compare-and-replace of the WHOLE file, and the run's
     /// post-transfer verification re-reads the whole result. Measured on Linux
-    /// release with `strace` byte accounting, ONE run that appends 32 bytes to
+    /// release with `strace` byte accounting (a reported measurement: see the
+    /// README's PROVENANCE NOTE), ONE run that appends 32 bytes to
     /// a 1 MiB log reads 8,388,768 bytes and writes 1,048,678 bytes: three
     /// whole reads of the 1 MiB destination (manifest, prefix test, compare),
     /// three whole reads of the 1 MiB + 32 source (manifest, prefix test, and

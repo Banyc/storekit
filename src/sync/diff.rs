@@ -2381,7 +2381,7 @@ mod tests {
             );
         }
         // An ABSENT root is not a transport failure at all, so it carries no
-        // transport kind — the distinction the consumer audit needed.
+        // transport kind — the distinction the migration needed.
         let absent = ExecOutcome {
             exit_code: 2,
             stdout: String::new(),

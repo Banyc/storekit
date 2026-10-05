@@ -2600,7 +2600,7 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 ///
 /// This is the public equivalent of the source tool's
 /// `deploy::store::atomic::copy_dir_recursive_fd` (see the README's "Design
-/// conflicts surfaced by the consumer audit"): `Remote::copy_tree` cannot
+/// conflicts the `deploy` migration surfaced"): `Remote::copy_tree` cannot
 /// stand in for it, because that trait method requires BOTH endpoints to be
 /// [`RootedRelativePath`]s under ONE transport root, while this primitive
 /// reads its source from an arbitrary path (the source tool's staging copy

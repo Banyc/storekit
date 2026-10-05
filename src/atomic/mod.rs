@@ -816,8 +816,8 @@ impl RootDir {
     ///
     /// PREREQUISITE — the directory MUST ALREADY EXIST: `open` does NOT
     /// create it. A caller that owns a fresh root must `create_dir_all` it
-    /// first (the transports do this in `LocalTransport::new` / their layout
-    /// provisioning). This is deliberate — the root's own spelling and mode
+    /// first — the transports do it in `Remote::provision_layout`
+    /// (`LocalTransport::new` is side-effect-free and creates nothing). This is deliberate — the root's own spelling and mode
     /// are the caller's trust decision, and `open`'s job is only to pin an
     /// existing directory, so it cannot be tricked into creating one
     /// through a symlinked component.

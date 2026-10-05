@@ -48,7 +48,7 @@
 //! * the tree pair — `copy_dir_recursive_fd` (out-of-root `&Path` source into a
 //!   root-confined `RootedRelativePath` staging destination) then
 //!   `fsync_tree_recursive_fd`; recorded in the README's "Design conflicts
-//!   surfaced by the consumer audit" (c).
+//!   the `deploy` migration surfaced" (c).
 //! * the ONE `sync` entry point in BOTH ownership states —
 //!   `DestinationOwnership::lock(..)` (owned) and
 //!   `DestinationOwnership::Unowned` (the explicitly weaker path). HELD FOR THE
