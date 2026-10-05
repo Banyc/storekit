@@ -456,11 +456,9 @@ pub trait Remote {
     /// Read the WHOLE entry at `rel` into memory.
     ///
     /// MEMORY BOUND: the entire entry is materialized as one `Vec<u8>` (and the
-    /// caller holds it, alongside any copy the sync makes), so a single 350 MB
-    /// file costs peak RSS ~362 MB — measured 362,064 KB (macOS) / 362,860 KB
-    /// (Linux), a reported measurement not reproducible from this repository (see
-    /// the README's provenance note) — for BOTH snapshot and restore, and a 4 GB
-    /// entry needs ~4 GB.
+    /// caller holds it, alongside any copy the sync makes), so peak RSS tracks the
+    /// LARGEST single entry — for BOTH snapshot and restore — and an entry near the
+    /// process's memory budget cannot be transferred at all.
     /// There is no streaming read. Keep the largest entry under the process's
     /// memory budget, or move large blobs outside the synced tree and ship them
     /// with a tool that streams; a streaming transport API is a deliberate
@@ -501,9 +499,9 @@ pub trait Remote {
     /// out of band.
     ///
     /// MEMORY AND TIME BOUND, and the LOCAL/REMOTE asymmetry. `data` is the
-    /// WHOLE entry, already in memory: a 350 MB file costs peak RSS ~362 MB
-    /// (measured 362,064 KB macOS / 362,860 KB Linux; see the README's provenance
-    /// note), so a 4 GB entry needs ~4 GB; there is no streaming write. The two kinds are also NOT equally
+    /// WHOLE entry, already in memory: peak RSS tracks the LARGEST single entry, so
+    /// an entry near the process's memory budget cannot be transferred at all —
+    /// there is no streaming write. The two kinds are also NOT equally
     /// protected against a slow link: [`SshTransport`] derives a size-aware
     /// deadline from the payload (`upload_deadline` / `transfer_deadline(bytes,
     /// min_rate, command_deadline)`), while [`LocalTransport`] has NEITHER a
@@ -5781,7 +5779,7 @@ mod tests {
     /// statement of what a sync carries: name, kind, mode INCLUDING the
     /// setuid/setgid/sticky bits, content, and symlink target ARE carried;
     /// ownership, xattrs, ACLs, timestamps, file flags, and sparseness are
-    /// SILENTLY dropped; hard links are REFUSED. `Remote::copy_tree` has TWO
+    /// SILENTLY dropped; hard links are REFUSED (on a UNIX source; the local Windows walk cannot see `nlink`). `Remote::copy_tree` has TWO
     /// implementations with DIFFERENT fidelity, so the carried and the
     /// not-carried axes are pinned per path here.
     ///

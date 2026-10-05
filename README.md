@@ -194,16 +194,13 @@ the `manifest` module's "Durability and atomicity of a written entry".
 
 `EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
 remote append primitive and the append is a compare-and-replace of the whole
-file. Measured on Linux release with `strace` byte accounting (see the PROVENANCE NOTE
-below), ONE run that appends 32 bytes to a 1 MiB log reads
-**8,388,768 bytes** and writes **1,048,678 bytes**: three whole reads of the
-1 MiB destination (the destination manifest, the prefix test, and the
-compare-and-replace), three whole reads of the 1 MiB + 32 source (the source
-manifest, the prefix test, and the end-of-run source re-check), and two whole
-reads of the 1 MiB + 32 result for the TWO post-transfer verification passes —
-plus the whole 1 MiB + 32 result written through the atomic temp and the
-70-byte lock record. The old "~3.1 MB read" figure counted only the append
-rule's three whole-file reads and omitted the verification reads. Budget the
+file. ONE run that appends a few bytes to a log rewrites the WHOLE log and
+re-reads it several times over: the destination manifest, the prefix test and the
+compare-and-replace each read the destination whole; the source manifest, the prefix
+test and the end-of-run source re-check each read the source whole; and the two
+post-transfer verification passes each read the result whole — plus the whole result
+written through the atomic temp, and the lock record. Reads are therefore a small
+multiple of the log, not of the appended bytes. Budget the
 verification, not just the append rule. Batch small appends, or keep the log
 outside the synced tree and ship it whole.
 
