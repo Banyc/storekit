@@ -227,7 +227,9 @@ const DROP_KILL_SIGNAL: i32 = 0;
 /// its wait path. A child that exited is consumed by [`OwnedChild::wait`] (or
 /// marked with [`OwnedChild::mark_reaped`] when the reap already happened
 /// through `try_wait`), after which nothing may signal anything (a pid the OS
-/// recycled after the reap can never be hit — the drop backstop returns early).
+/// recycled after the reap can never be hit — the drop backstop returns early,
+/// a guard with no reachable trigger on any runner path and therefore witnessed
+/// DIRECTLY by `a_reaped_owned_child_is_never_signalled_by_the_drop_backstop`).
 ///
 /// The backstop's GROUP kill is a no-op on Windows (no process groups), so
 /// there it terminates the direct child only and reaps it, with the SAME
@@ -451,7 +453,7 @@ impl ChildRunner {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     /// How long the oracle polls for a process to disappear. The runner's own
@@ -967,6 +969,142 @@ mod tests {
         assert!(
             forged.wait_until_gone(Duration::from_millis(50)),
             "a pid whose start token moved must read as the tracked process being gone"
+        );
+    }
+
+    /// A [`KillSeam`] that RECORDS every call, so a test can assert DIRECTLY
+    /// whether the drop backstop fired. With `terminate` set it delegates to
+    /// [`RealKill`] (so a test that relies on the backstop to collect a real
+    /// child really collects it); with it clear the seam is INERT, so the
+    /// guard-removal witness below cannot signal a pid the OS may already have
+    /// recycled.
+    struct RecordingKill {
+        terminate: bool,
+        group_calls: Mutex<Vec<(i32, i32)>>,
+        owned_calls: AtomicUsize,
+    }
+
+    impl RecordingKill {
+        fn recording(terminate: bool) -> Arc<Self> {
+            Arc::new(RecordingKill {
+                terminate,
+                group_calls: Mutex::new(Vec::new()),
+                owned_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn group_calls(&self) -> Vec<(i32, i32)> {
+            self.group_calls.lock().unwrap().clone()
+        }
+
+        fn owned_calls(&self) -> usize {
+            self.owned_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl KillSeam for RecordingKill {
+        fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()> {
+            self.group_calls.lock().unwrap().push((pgid, sig));
+            if self.terminate {
+                RealKill.kill_group(pgid, sig)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn kill_owned(&self, child: &mut Child) -> std::io::Result<()> {
+            self.owned_calls.fetch_add(1, Ordering::SeqCst);
+            if self.terminate {
+                RealKill.kill_owned(child)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Spawn `sh -c script` in its OWN process group (as production does) with
+    /// stdio nulled, so the backstop's group kill targets the child's group and
+    /// never the test process's.
+    fn spawn_grouped(script: &str) -> Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a child in its own process group")
+    }
+
+    /// WITNESS for the `if self.reaped { return; }` guard in
+    /// [`OwnedChild::drop`].
+    ///
+    /// The guard protects against signalling a pid the OS RECYCLED after the
+    /// reap: [`OwnedChild::wait`] (and [`OwnedChild::mark_reaped`]) release the
+    /// pid, and a `killpg`/`kill` on the released number could land on an
+    /// unrelated process. The state it guards is therefore UNREACHABLE by
+    /// design on the runner's own paths — every path signals only BEFORE the
+    /// reap — so no reachable-path test can cover it; this test pins the guard
+    /// DIRECTLY, through the module's own reap path, and asserts the drop
+    /// backstop does NOT signal.
+    ///
+    /// The REAPED arm calls [`OwnedChild::wait`] (chosen over `mark_reaped`
+    /// because it consumes the exit status, so the pid is really reaped, not
+    /// merely declared so) and drops the handle: the recording seam must record
+    /// NO group kill and NO direct kill. The CONTROL arm drops an UN-REAPED
+    /// handle with the same fixture: it must record exactly one group kill (the
+    /// drop signal) and one direct kill, proving the silence above is the
+    /// guard's doing and not the seam's. Deleting the guard makes the REAPED
+    /// arm's assertions fail.
+    #[test]
+    fn a_reaped_owned_child_is_never_signalled_by_the_drop_backstop() {
+        // REAPED: `wait` consumes the exit status and sets the guard, so the
+        // drop backstop must return before it touches the seam. The seam is
+        // INERT (records without signalling) precisely because the pid under
+        // test is released: even with the guard deleted this witness cannot
+        // signal a recycled pid.
+        let reaped_seam = RecordingKill::recording(false);
+        {
+            let mut owned = OwnedChild::new(spawn_grouped("exit 0"), reaped_seam.clone());
+            owned.wait().expect("a promptly-exiting child must reap");
+        }
+        assert_eq!(
+            reaped_seam.group_calls(),
+            Vec::new(),
+            "a reaped child's group must never be signalled by the drop backstop"
+        );
+        assert_eq!(
+            reaped_seam.owned_calls(),
+            0,
+            "a reaped child must never be signalled directly by the drop backstop"
+        );
+
+        // CONTROL: the same fixture, but the child is NOT reaped, so the drop
+        // backstop must fire. The seam TERMINATES (delegates to `RealKill`) so
+        // the control's child is really collected by the backstop's own bounded
+        // reap — no child is left behind.
+        let control_seam = RecordingKill::recording(true);
+        let pid = {
+            let owned = OwnedChild::new(spawn_grouped("exec sleep 30"), control_seam.clone());
+            let pid = owned.child.id();
+            drop(owned);
+            pid
+        };
+        assert_eq!(
+            control_seam.group_calls(),
+            vec![(pid as i32, DROP_KILL_SIGNAL)],
+            "the control's un-reaped child must be killed as a group by the drop backstop"
+        );
+        assert_eq!(
+            control_seam.owned_calls(),
+            1,
+            "the control's un-reaped child must also be killed through the owned handle"
+        );
+        assert!(
+            wait_until_not_live(pid, GONE_BUDGET),
+            "the control's child {pid} must be collected by the drop backstop, not left live"
         );
     }
 }
