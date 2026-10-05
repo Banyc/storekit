@@ -208,8 +208,10 @@ pub fn is_reserved_case_alias(name: &str) -> bool {
 /// platform-INDEPENDENT: an id rule that changed with the host filesystem
 /// would make a manifest mean different things on different hosts.
 pub fn is_unaddressable_name(name: &str) -> bool {
+    // FIVE arms: `is_lock_record_name` already covers `is_application_lock_name`,
+    // whose one true input folds to itself, so a separate arm here would be a
+    // comparison no test can notice the removal of.
     is_reserved_name(name)
-        || is_application_lock_name(name)
         || is_reserved_case_alias(name)
         || is_lock_record_name(name)
         || crate::atomic::is_crate_temp_shape(name)

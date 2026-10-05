@@ -7806,7 +7806,7 @@ fn aside_name() -> OsString {
 }
 
 /// Whether a single file name is UNADDRESSABLE. The SET is exactly
-/// [`crate::reserved::is_unaddressable_name`]'s — six arms, enumerated at that
+/// [`crate::reserved::is_unaddressable_name`]'s — five arms, enumerated at that
 /// ONE authority rather than here, because an incomplete list in a caller reads
 /// as the definition. Delegates to the ONE
 /// authority in [`crate::reserved`], which [`crate::id::valid_name`] also

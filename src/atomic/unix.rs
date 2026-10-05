@@ -1600,7 +1600,7 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8
     }
     // Private BEFORE visible: chmod the installed file, then fsync the
     // parent directory (THE DURABILITY COMMIT POINT — fail closed, see
-    // [`write_atomic_cas`]).
+    // [`write_atomic_cas_fd`]).
     {
         let f = std::fs::File::from(openat_readable_regular(
             &parent_fd,

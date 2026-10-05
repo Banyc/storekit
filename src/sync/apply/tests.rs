@@ -12493,7 +12493,8 @@ fn a_late_child_in_the_removal_window_is_refused_and_preserved() {
     );
 }
 
-/// The DEPTH of the destination chain [`deep_tree_removal`] removes, and the
+/// The DEPTH of the destination chain `deep_tree_removal_does_not_abort_the_process`
+/// removes, and the
 /// STACK the removal thread is given.
 ///
 /// A REGRESSION HERE CANNOT BE TESTED WITH THE DEFAULT 2 MiB STACK AT THE DEPTH

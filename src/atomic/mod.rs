@@ -312,8 +312,8 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 /// silently read a permission/I/O error on the marker directory as "no
 /// floor" / "no pending cleanup" / "no backups".
 ///
-/// The store's WRITE-path open-or-create checks (`append_attempt`,
-/// `append_snapshot`, `write_atomic_cas`) are deliberately NOT converted:
+/// The store's WRITE-path open-or-create checks (`append_attempt`, the
+/// write-path CAS `write_atomic_cas_fd`) are deliberately NOT converted:
 /// there a swallowed `exists()` error lands in the subsequent open/create
 /// call, which fails and propagates anyway — no silent absence is possible.
 ///
