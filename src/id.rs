@@ -459,10 +459,12 @@ mod tests {
         }
     }
 
-    /// A SECOND WRITING of the name rule, checked against `valid_name` for
-    /// divergence below. It is NOT an oracle anchored outside the rule — a wrong
-    /// rule copied into both places would pass — so read the test as a
-    /// consistency check between two copies, not as an independent certification.
+    /// A DUPLICATE-TEXT DRIFT GUARD, not a second writing of the rule: this is
+    /// `valid_name`'s body again, character for character, and the test below
+    /// only proves the two texts still agree. It does NOT certify the rule — a
+    /// wrong rule present in both would pass — and it is not an oracle anchored
+    /// outside the rule. Its whole value is noticing an edit to one copy that the
+    /// other does not get.
     /// A value is a safe
     /// filesystem ASCII single path segment iff it is non-empty, at most
     /// [`crate::atomic::NAME_MAX`] bytes, uses only `[a-zA-Z0-9._-]`, is not a
@@ -639,8 +641,9 @@ mod tests {
         }
     }
 
-    /// An exhaustive (rather than random) check that `valid_name` agrees with
-    /// its second writing, over every string up to the allowed
+    /// An exhaustive (rather than random) check that `valid_name` still agrees with
+    /// the duplicate text kept beside it (see `is_safe_segment`: this is a drift
+    /// guard, not a second writing), over every string up to the allowed
     /// alphabet's length limit: one character by default, three characters
     /// when the full suite is requested. The alphabet includes the
     /// traversal (`/`, `\`, `.`), the leading-dash, and the separator classes

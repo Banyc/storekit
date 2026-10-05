@@ -3382,14 +3382,20 @@ mod tests {
         std::fs::write(root.join("a.txt"), b"content").unwrap();
         std::fs::hard_link(root.join("a.txt"), root.join("b.txt")).unwrap();
 
-        // Local path: rejected.
-        let local_err = canonicalize_tree(&root).unwrap_err();
-        assert!(
-            local_err.to_string().contains("hard links not allowed"),
-            "local canonicalizer must reject the hard link, got: {local_err}"
-        );
+        // Local path: rejected — ON UNIX ONLY. The local walk's `nlink` check is
+        // `#[cfg(unix)]` (a Windows walk cannot see `nlink` and records both names
+        // as ordinary files), so this half is gated rather than left to fail there.
+        #[cfg(unix)]
+        {
+            let local_err = canonicalize_tree(&root).unwrap_err();
+            assert!(
+                local_err.to_string().contains("hard links not allowed"),
+                "local canonicalizer must reject the hard link, got: {local_err}"
+            );
+        }
 
-        // Remote path: the script prints nlink=2 and the assembler rejects it.
+        // Remote path: the script prints nlink=2 and the assembler rejects it on
+        // EVERY platform (the wire carries `nlink`).
         let out = run_remote_script(&root);
         let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
         assert!(

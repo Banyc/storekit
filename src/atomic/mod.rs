@@ -627,8 +627,8 @@ pub enum ReplaceOutcome {
     /// is durable across power loss — ON LINUX, where `fsync` is the power-loss
     /// barrier. The crate's durability assumption (README) states what it guarantees
     /// on those targets instead: durability against a process crash, not against
-    /// power loss — and atomicity on macOS only, since the WINDOWS replace is the
-    /// crate's ONE non-atomic case (see `atomic::windows`). When the replace had to CREATE the
+    /// power loss — and atomicity on every UNIX destination, macOS included, since the
+    /// WINDOWS replace is the crate's ONE non-atomic case (see `atomic::windows`). When the replace had to CREATE the
     /// parent chain, every newly created directory's own entry was fsynced
     /// into its parent BEFORE the rename (the durable directory helper), so
     /// the claim covers the WHOLE chain, not only the final entry's parent.

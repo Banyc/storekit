@@ -19,7 +19,8 @@ domain), and the receiver-marker adoption (done).
   and stays in `deploy` (`remote/helper/**`). The crate supplies the transport
   and, where the transfer is a plain tree mirror, the `sync` engine.
 - **Not tolerant of what `deploy` tolerates.** The crate's fidelity scope is
-  strict and documented: no hard links, no absolute or escaping symlink
+  strict and documented: no hard links (on a UNIX source; the local Windows walk
+  cannot see `nlink`), no absolute or escaping symlink
   targets, NFC-only names, no CR/LF/TAB. A `deploy` directory holding any of
   those is refused, loudly, rather than carried.
 
