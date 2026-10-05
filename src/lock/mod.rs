@@ -188,7 +188,8 @@ impl FileLock {
         // directory that way, bypassing the durable first-append helper (the
         // directory already existed when the append's creation detection ran,
         // so no parent sync happened) and a reported-successful first write
-        // could recover with the directory missing after power loss. A caller
+        // could recover with the directory missing after power loss (on Linux —
+        // see the README's durability assumption). A caller
         // that needs a durable directory ahead of locking pre-creates it
         // itself; this helper makes the lock path itself durable for every
         // caller.

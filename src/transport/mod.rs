@@ -717,9 +717,9 @@ pub trait Remote {
     /// durable (including the child directory itself), and
     /// `fsync_parent(<child>)` makes the PARENT directory entry that names the
     /// child durable. A per-subtree transport cannot perform the second call
-    /// on its own root, because a [`RootedRelativePath`] must be non-empty (it
-    /// refuses the empty path), so the transport rooted AT the child cannot
-    /// name the child to fsync the grandparent. The recipe is therefore:
+    /// on its own root, because the PUBLIC constructor refuses the empty path and the
+    /// only empty value the crate mints names its own owned root, so the transport
+    /// rooted AT the child cannot name the child to fsync the grandparent. The recipe is therefore:
     /// `parent.fsync_tree(child)` then `parent.fsync_parent(child)`, both on
     /// the transport rooted at the child's PARENT.
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {

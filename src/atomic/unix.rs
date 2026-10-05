@@ -323,8 +323,9 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 /// `targets/` itself was already created (UNSYNCED) by the store open, so
 /// the append must fsync BOTH the `targets/<target>/`
 /// entry (inside `targets/`) AND the `targets/` entry (inside the base) before
-/// it reports success — otherwise a power loss could lose the directories while
-/// the reported ledger survives.
+/// it reports success — otherwise a power loss (on Linux — see the README's
+/// durability assumption) could lose the directories while the reported ledger
+/// survives.
 ///
 /// The helper knows what it created by creating COMPONENT-BY-COMPONENT (walk
 /// up from `path` to the deepest existing ancestor, create the missing chain
@@ -1371,7 +1372,7 @@ fn replace_core(
         // creates has its OWN entry fsynced into its parent BEFORE the temp
         // write and the rename, so the [
         // `ReplaceOutcome::ReplacedDurable`] claim ("visible under its final
-        // name AND durable across power loss") is true for the WHOLE chain,
+        // name AND durable across power loss", on Linux) is true for the WHOLE chain,
         // not only for the final entry's parent. The non-durable helper used
         // to leave the created directories' entries unsynced.
         ensure_private_dir_durable_fd_path(root, parent_rel)?;
@@ -4513,12 +4514,16 @@ mod tests {
             .position(|event| event == "rename")
             .unwrap_or_else(|| panic!("the rename must be recorded: {events:?}"));
         for expected in ["commit-dir-entry newdir", "commit-dir-entry newdir/sub"] {
-            let at = events.iter().position(|event| event == expected).unwrap_or_else(|| {
-                panic!(
+            let at = events
+                .iter()
+                .position(|event| event == expected)
+                .unwrap_or_else(|| {
+                    panic!(
                     "the created directory entry {expected:?} was never fsynced into its parent, \
-                     so a power loss could lose it while the replace reports ReplacedDurable: {events:?}"
+                     so a power loss (on Linux — the durability assumption) could lose it while the
+                     replace reports ReplacedDurable: {events:?}"
                 )
-            });
+                });
             assert!(
                 at < rename_at,
                 "{expected:?} must be committed BEFORE the rename: {events:?}"

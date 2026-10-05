@@ -406,9 +406,10 @@
 //! coincide with, contain, or be contained by the local root (a bind mount, a
 //! shared filesystem, or an `ssh` target that is this very host). NO refusal is
 //! computed there, and none is implied: the two roots are NOT guaranteed
-//! disjoint for an [`SshTransport`](crate::transport::SshTransport)
-//! destination, and a caller that co-locates them on one filesystem must
-//! enforce disjointness itself. This is stated rather than papered over: the
+//! disjoint, whichever side the unresolvable root is on — a PUSH into a
+//! far-side destination that nests the source, or a PULL from a far-side source
+//! that contains the local destination — and a caller that co-locates them on
+//! one filesystem must enforce disjointness itself. This is stated rather than papered over: the
 //! guarantee this module computes is exactly the one it can see from here.
 //!
 //! ## The lock discipline: the destination is exclusively owned
