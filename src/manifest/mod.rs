@@ -230,8 +230,10 @@
 //! the destination can reveal the divergence.
 //!
 //! **NOT carried — REFUSED, not dropped:** a hard link (an entry with
-//! `nlink > 1`) is rejected by BOTH canonicalizers — the local walk and the
-//! remote wire assembler — with an error naming the entry, rather than being
+//! `nlink > 1`) is rejected by BOTH SOURCE canonicalizers — the local walk and the
+//! remote wire assembler — with an error naming the entry (the DESTINATION pair
+//! TOLERATES it instead, keeping it as an unsupported entry; see
+//! `canonicalize_tree_destination`), rather than being
 //! silently materialized as two independent copies. Refusal is the crate's
 //! doctrine for anything it cannot reproduce faithfully (the name and
 //! symlink-target rules above follow the same principle): a silent

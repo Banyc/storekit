@@ -85,8 +85,10 @@ check and the operation is a stated residual, not a guarantee.
 
 As a DESTINATION member, an absolute/escaping symlink or a hard link is not
 refused: the destination manifest records it, the diff reports it extraneous,
-and `Extraneous::Delete` removes it. It is never TRANSFERRED — a source entry
-at the same path is refused before any mutation. `Extraneous` is all-or-nothing
+and `Extraneous::Delete` removes it. It is never TRANSFERRED:
+when a source entry at that path DIFFERS the run refuses before any mutation, and a
+`Same` entry needs no refusal at all — nothing is mutated, so it is skipped and
+reported. `Extraneous` is all-or-nothing
 (no per-path delete policy): `Delete` cannot PRUNE EXACTLY one destination-only
 path (for example snapshot 002 while 001 and 003 are kept) — it removes every
 destination-only entry the diff classified extraneous, and `Keep` removes none.
@@ -216,7 +218,8 @@ fsync the parent directory entry.
 
 Two costs a checkpoint tool must budget for, both measured on a 350 MB tree
 unless stated otherwise. The TIMING figures here and the resident-memory bound in
-`manifest`'s module docs were taken by the reviewing consumer on its own hosts and
+`manifest`'s module docs were taken by the consuming tool (`deploy`) on its own hosts
+and
 tree; this repository ships no benchmark or fixture that reproduces them, so they are
 reported measurements rather than ones a reader can re-run here. The path-limit
 figures below ARE reproducible (grow a chain, ask `canonicalize_tree` after each level —
@@ -269,7 +272,7 @@ cheap (2.76 ms / 6.53 ms /
 tool that recreates its destination per snapshot should budget cubic-OR-WORSE. The
 Linux and macOS incremental figures above are re-measured in a release build
 (wrapper neutralised, load ≈0.3 Linux / ≈1.4 macOS); the
-fresh-destination and `canonicalize_tree` figures are the reviewing consumer's,
+fresh-destination and `canonicalize_tree` figures are `deploy`'s,
 not re-measured here.
 
 ## A fresh destination
@@ -371,7 +374,7 @@ simplification; removing one means adding back the logic it removes.
   model.** *Buys:* a small manifest, and no extended-attribute, ACL, ownership,
   timestamp or sparseness machinery.
 
-## Design conflicts surfaced by the consumer audit
+## Design conflicts the `deploy` migration surfaced
 
 Three places where this crate's guarantees and a real consumer's design pulled apart.
 All three are CLOSED, and the decisions are binding.
