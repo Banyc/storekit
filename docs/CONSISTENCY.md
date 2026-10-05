@@ -138,9 +138,12 @@ Named, scoped, not pursued:
   not the resolution, and DELETING an entry in the `libc` WIDER SET is noticed by
   nothing: the funnel-used subset is closure-checked and the `std::fs`/`std::os`
   halves carry a pinned expected table (removing `UnixDatagram::bind`'s entry fails
-  `pathname_socket_binds_are_denied_and_counted`), but a `libc` entry naming a symbol
-  no code path references has no witness at all. Those entries are kept as the
-  reviewed record rather than pruned.
+  `pathname_socket_binds_are_denied_and_counted`), and `libc::chmod`, `libc::renameat2`
+  and `libc::fopen` are named by hand in
+  `libc_alias_routes_are_seen_by_the_scanner_or_the_deny`, which fails when any of the
+  three leaves the deny. For every OTHER `libc` entry naming a symbol no code path
+  references there is no witness at all: deleting it leaves the suite green. Those
+  entries are kept as the reviewed record rather than pruned.
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde

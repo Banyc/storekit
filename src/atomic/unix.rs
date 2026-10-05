@@ -3501,8 +3501,8 @@ pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> 
 // FINAL component is opened with `O_NOFOLLOW` and so is refused too: a
 // symlink injected into ANY path component of a read is refused (ELOOP),
 // never followed, so a read can never be redirected outside the owned
-// root. The path-based free function above
-// (`path_state`) stays for the retention machinery (which operates on paths
+// root. The path-based free function `path_state` (defined in
+// `atomic/mod.rs`) stays for the retention machinery (which operates on paths
 // under a store base it does not hold a descriptor for); `read_json` is
 // `#[cfg(test)]` and has no production caller, so it is not part of that
 // surface. The store's OWN reads route through the `_fd` variants below.

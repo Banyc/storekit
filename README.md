@@ -207,8 +207,9 @@ concurrent appenders must keep those writes OUTSIDE the synced tree; see the
 
 To make a freshly pushed SUBTREE durable, call `fsync_tree(child)` AND
 `fsync_parent(child)` on the transport rooted at the child's PARENT. A
-`RootedRelativePath` cannot be empty, so a transport rooted at the child itself
-cannot name its own root to fsync the parent directory entry.
+`RootedRelativePath` is empty only for the crate-internal spelling that names an
+owned root itself, so a transport rooted at the child cannot name its own root to
+fsync the parent directory entry.
 
 ## What a snapshot costs
 
@@ -300,9 +301,11 @@ simplification; removing one means adding back the logic it removes.
   write DURABLE, this is the claim it means.
 - **The name-mutation devices target UNIX.** *Buys:* one funnel, one deny list, one
   pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so a
-  `libc` entry is inert only on a target that does not EXPORT the symbol: measured,
-  most do not resolve there, and the ones that DO are live denies there too (the crate
-  simply calls none of them on that target). The Windows port is a COMPILE target
+  `libc` entry is inert only on a target that does not EXPORT the symbol. Run the
+  gate's `cargo clippy --all-targets --target x86_64-pc-windows-msvc`: it exits 0 while
+  reporting 87 of the `libc`/`std::os::unix` entries as `does not refer to a reachable
+  function`, and the entries that DO resolve there are live denies too — the crate
+  simply calls none of them on that target. The Windows port is a COMPILE target
   whose runtime this contract does not cover.
 - **Every claim has one AUTHORITATIVE home.** *Buys:* a place to correct, and a rule for
   the copies. A fact is stated where it is enforced and pointed at elsewhere; where a

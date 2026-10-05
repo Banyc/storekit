@@ -40,9 +40,11 @@
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
 
-/// A validated RELATIVE path that stays inside an owned root: never empty,
-/// never absolute, and free of `.`/`..` components (including a literal `.`
-/// segment). A caller-supplied [`Layout`](crate::transport::Layout) produces
+/// A validated RELATIVE path that stays inside an owned root: never absolute,
+/// and free of `.`/`..` components (including a literal `.` segment). It is
+/// never empty for a MANIFEST address; the ONE empty value the crate mints
+/// names the owned root itself for a listing, and only `from_validated`
+/// (`pub(crate)`) can build it. A caller-supplied [`Layout`](crate::transport::Layout) produces
 /// these from validated identities; every path that crosses the
 /// [`Remote`](crate::transport::Remote) trait boundary AND every
 /// root-relative argument of a mutating primitive is one, so `root.join(rel)`
