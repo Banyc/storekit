@@ -75,6 +75,20 @@ Named, scoped, not pursued:
   is NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
   own call counts are pinned. The pin records a review, not a proof. Completeness of
   the SYMBOL SET is a review responsibility.
+- **The far-side root of an `SshTransport` destination is unresolvable from here.**
+  `refuse_overlapping_roots` returns early when the remote is not local, so a `sync`
+  whose SOURCE and far-side DESTINATION share a filesystem (a bind mount, a shared
+  mount, or an `ssh` target that IS this host) computes NO disjointness check: nothing
+  this host can see establishes that the destination root is disjoint. The caller that
+  co-locates them owns that check. Stated in `src/sync/apply.rs`'s module docs.
+- **The count pins pin CALL COUNTS, not arguments.** An argument change at a call site
+  inside a reviewed allow region moves no `std::fs` count, and the deny is allowed
+  there. An argument that introduces a NEW counted symbol IS noticed — measured,
+  `custom_flags(libc::O_NONBLOCK | libc::O_CREAT)` fails the libc pin on
+  `libc::O_CREAT`. An argument that introduces none (a constant, a length, a bit
+  already spelled) is a review responsibility, and on Windows an added flag is
+  invisible to that pin because the funnel's `custom_flags` sites spell `windows_sys`
+  constants there.
 - **The deny list names RESOLVED `std`/`libc` symbols**, so a Windows named-pipe
   creator (`CreateNamedPipeW`) or a raw `CreateFileW`/`NtCreateFile` reached
   through `windows_sys` is outside the clippy deny, and the `libc` pin is

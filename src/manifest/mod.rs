@@ -1967,8 +1967,10 @@ pub fn canonicalize_remote_entries_checked(
 /// wire validation, but a hard link and an absolute or escaping symlink are
 /// RECORDED in [`DestinationTree::unsupported`] (and kept in the manifest
 /// under their live kind) instead of failing the whole assembly. A
-/// special-file line (`o`) is still refused: the applier's live-kind authority
-/// has no primitive for it, so the crate cannot remove it safely.
+/// special-file line (`o`) is still refused: the crate's kind models have no
+/// value for one (the applier's live-kind classifiers error on
+/// [`crate::atomic::PathKind::Other`]), so it cannot be carried through the
+/// manifest even though the substrate could unlink it by name.
 pub(crate) fn canonicalize_remote_entries_destination(
     output: &str,
     root: &Path,

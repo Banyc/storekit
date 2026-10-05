@@ -67,7 +67,9 @@ symlink component (the kernel follows it, so a lexical collapse past it is not
 its resolution) · hard links · devices, sockets, FIFOs ·
 reserved-name collisions · overlapping roots, decided per operation rather than
 once: a `sync` requires its SOURCE and DESTINATION to be DISJOINT — a strict
-ancestor/descendant nesting is refused, while EQUAL roots are allowed and the
+ancestor/descendant nesting is refused WHEN THE DESTINATION'S ROOT IS LOCAL — a
+far-side root is unresolvable from here, so the caller owns that disjointness — while
+EQUAL roots are allowed and the
 run is an idempotent no-op (the two manifests are identical, so the diff is
 empty) — whereas `root::OwnedRoot::parse` refuses two roots on one endpoint
 whenever they are EQUAL or one is an ancestor/descendant of the other, and the
@@ -297,9 +299,11 @@ simplification; removing one means adding back the logic it removes.
   A caller needing power-loss recovery there owns that step. Wherever this crate calls a
   write DURABLE, this is the claim it means.
 - **The name-mutation devices target UNIX.** *Buys:* one funnel, one deny list, one
-  pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so
-  the `libc` entries are inert there by construction, and the Windows port is a
-  COMPILE target whose runtime this contract does not cover.
+  pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so a
+  `libc` entry is inert only on a target that does not EXPORT the symbol: measured,
+  most do not resolve there, and the ones that DO are live denies there too (the crate
+  simply calls none of them on that target). The Windows port is a COMPILE target
+  whose runtime this contract does not cover.
 - **Every claim has one AUTHORITATIVE home.** *Buys:* a place to correct, and a rule for
   the copies. A fact is stated where it is enforced and pointed at elsewhere; where a
   second statement of a MEASURED number is genuinely useful (a README figure beside the
@@ -405,9 +409,9 @@ takes responsibility for exactly this, and no more.
   them (`clippy.toml`: the symbols the funnel uses, plus a reviewed set around
   them — the list is deliberately WIDER than the funnel, and naming a symbol the
   funnel never calls is how a route it could acquire later is refused in
-  advance). The device is a UNIX-target device (see the assumptions): on Windows the
-  `libc` entries are inert by construction because `libc` is not the crate's I/O library
-  there. (b) Every production
+  advance). The device is a UNIX-target device (see the assumptions): on Windows `libc`
+  is not the crate's I/O library, so an entry is inert only where the target does not
+  export the symbol — the entries that DO resolve there are live denies as well. (b) Every production
   `libc` reference — inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`) or
   anywhere else — is NAMED in the audit's pin, by file, symbol and count; the map of
   references NOT on the pin is asserted EMPTY, so an unreviewed `libc` reference is a
@@ -424,7 +428,10 @@ takes responsibility for exactly this, and no more.
   inside a `macro_rules!` body IS counted (a test pins that); an aliased or
   non-canonical spelling there is not. `src/atomic/guard.rs`'s audit names the
   shape it can resolve at the derivation, and the review of a funnel change has
-  to cover the rest.
+  to cover the rest. A pin counts CALLS, not ARGUMENTS: an argument change that adds
+  no newly counted symbol is a review responsibility (on UNIX an argument that adds a
+  `libc::…` constant IS noticed — it moves the libc pin — while on Windows the funnel's
+  `custom_flags` sites spell `windows_sys` constants, which that pin does not count).
 * **Guaranteed as an API.** Root confinement (a relative symlink target cannot leave
   the root, and neither can a mutation named by `(&RootDir, &RootedRelativePath)`), the
   atomic replace's commit points and its reported durability, lock mutual exclusion

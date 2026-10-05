@@ -155,9 +155,13 @@ pub enum MaterializationKind {
     /// refused for a SOURCE.
     HardLink,
     /// A non-regular, non-directory, non-symlink entry (a FIFO, socket, or
-    /// device). Refused on BOTH forms: the applier has no primitive to remove
-    /// it by name, a read of it could block, and no mode can be applied to it
-    /// (the `_confined` `set_mode` refuses it rather than chmodding it).
+    /// device). Refused on BOTH forms because no KIND MODEL here can carry it:
+    /// the applier's live-kind classifiers (`Applier::kind_opt` and its
+    /// listing) return a store error for [`crate::atomic::PathKind::Other`],
+    /// and both canonicalizers refuse the wire's `o` line. (The substrate is not
+    /// what refuses it: `remove_file_fd` unlinks a FIFO by name like any other
+    /// non-directory.) A read of it could block, and the `_confined` `set_mode`
+    /// refuses it rather than chmodding it.
     SpecialFile,
     /// A name the manifest wire cannot represent faithfully: a NUL/LF/CR/TAB
     /// character, a spelling that is not already NFC, an absolute path, a
