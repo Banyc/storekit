@@ -179,6 +179,11 @@ local port's replace is the ONE non-atomic case (no directory fsync; the target
 is removed before the rename) and is unverified. The exact commit points are in
 the `manifest` module's "Durability and atomicity of a written entry".
 
+DURABLE means the `fsync`/`rename` discipline. On Linux that IS the power-loss
+barrier; on macOS `fsync` does not flush the device write cache and the crate never
+calls `fcntl(F_FULLFSYNC)`, so a macOS destination is durable against a process crash
+and NOT necessarily against power loss. `docs/CONSISTENCY.md` states the reach.
+
 `EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
 remote append primitive and the append is a compare-and-replace of the whole
 file. Measured on Linux release with `strace` byte accounting (kache

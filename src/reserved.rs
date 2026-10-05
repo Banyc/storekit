@@ -952,7 +952,7 @@ mod tests {
             return;
         }
         println!(
-            "A3 case-alias probe ran on platform={} (the filesystem folds case, so the two \
+            "case-alias probe ran on platform={} (the filesystem folds case, so the two \
              spellings are one entry)",
             std::env::consts::OS
         );

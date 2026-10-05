@@ -1,6 +1,14 @@
 //! Manifest production for both sides of a transfer, and the typed,
 //! path-ordered diff between them.
 //!
+//! REVIEW LABELS: the `F1`/`F2`/`F3` labels in this file's comments name its own
+//! tests — `f1_a_script_die_that_propagates_126_or_127_is_the_far_side_script`,
+//! `f1_a_real_interpreter_die_at_127_is_the_far_side_script`,
+//! `f2_the_typed_cause_not_the_status_alone_classifies_the_deadline` and
+//! `f3_the_real_at_255_spoof_vector_is_a_root_name_containing_a_raw_lf` (test
+//! functions, so they are not links) — so a reader can resolve every one of them
+//! here.
+//!
 //! A transfer starts by describing each side as a [`TreeMetadata`] manifest.
 //! The LOCAL side is canonicalized directly
 //! ([`crate::manifest::canonicalize_tree`]). The REMOTE side branches on

@@ -123,6 +123,13 @@ Named, scoped, not pursued:
   not count, so an added flag IS invisible there. An argument change that introduces no
   newly counted symbol (a constant, a length, a bit already spelled) is a review
   responsibility. The contract's clause (c) is about a changed or ADDED call.
+- **`fsync` is not a power-loss barrier on macOS.** Every durability claim here rests
+  on `fsync` (`File::sync_all`) and the crate never calls `fcntl(F_FULLFSYNC)`. On
+  Linux that is the power-loss barrier; on macOS `fsync` is documented not to flush the
+  device write cache, so a destination there is durable against a process crash and NOT
+  necessarily against power loss. A consumer budgeting power-loss recovery on macOS
+  needs the stronger call, which this crate does not make. Stated at the README's
+  "Durability and atomicity".
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde

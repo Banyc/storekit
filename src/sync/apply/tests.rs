@@ -6114,7 +6114,7 @@ fn extraneous_delete_spares_a_case_alias_of_a_reserved_spelling() {
         "a reserved alias is never extraneous content: {report:?}"
     );
     println!(
-        "G3 case-alias probe ran on platform={} (the filesystem folds case)",
+        "case-alias probe ran on platform={} (the filesystem folds case)",
         std::env::consts::OS
     );
 }
