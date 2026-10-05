@@ -641,8 +641,11 @@ pub(crate) enum SymlinkTargetRefusal {
 /// what it folds without making the manifest's verdict depend on which
 /// filesystem happened to describe it. The reserved-name, lock-record, and
 /// crate-temp DENIAL rules ([`crate::reserved`]) share the same
-/// [`crate::casefold`] primitive, so the containment view and the denial rules
-/// cannot disagree about what a host can fold together.
+/// [`crate::casefold`] primitive. They differ in the STEPS they apply — this fold is
+/// NFD, then case fold, then NFC; the denial fold is case fold only — and every
+/// reserved pattern is ASCII, so no key a denial matches is affected by the fold
+/// steps. A denial pattern that could match a non-ASCII folded key would have to
+/// apply them, exactly as this fold does.
 fn fold_component(name: &str) -> String {
     let nfd: String = name.nfd().collect();
     let folded: String = crate::casefold::case_fold(&nfd).nfc().collect();

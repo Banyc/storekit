@@ -9,8 +9,10 @@
 //! call killing its host is never acceptable. The walks are now explicit
 //! heap `Vec` stacks; the only remaining bound is the descriptor limit,
 //! which surfaces as a clean `Err`, never an abort. (The Windows transport
-//! delegates removal to `std::fs::remove_dir_all`, which is itself iterative
-//! on the installed toolchain — see `atomic::unix::remove_dir_all_path`.)
+//! delegates removal to `std::fs::remove_dir_all` through
+//! `atomic::remove_dir_all_fd`, which is itself iterative on the installed
+//! toolchain; `atomic::unix::remove_dir_all_path` is the Unix walk, kept for
+//! the crate's own tests and with no production caller.)
 //!
 //! The pre-fix failure is a PROCESS abort, so an in-process assertion cannot
 //! observe it (the test process would die with the child). These tests

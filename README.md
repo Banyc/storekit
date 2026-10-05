@@ -214,7 +214,12 @@ fsync the parent directory entry.
 ## What a snapshot costs
 
 Two costs a checkpoint tool must budget for, both measured on a 350 MB tree
-unless stated otherwise.
+unless stated otherwise. The TIMING figures here and the resident-memory bound in
+`manifest`'s module docs were taken by the reviewing consumer on its own hosts and
+tree; this repository ships no benchmark or fixture that reproduces them, so they are
+reported measurements rather than ones a reader can re-run here. The path-limit TABLE
+below is reproducible (grow a chain, ask `canonicalize_tree` after each level — the
+method is stated with it), and the append byte accounting names its `strace` method.
 
 **Memory is O(largest entry), not O(changed bytes).** `Remote::write` takes
 `data: &[u8]` and the read side materializes the whole entry, so a single
@@ -227,8 +232,8 @@ min_rate, command_deadline)`), while the LOCAL path has neither a deadline
 nor streaming. Workaround: keep the largest entry under the process's memory
 budget, or move large blobs outside the synced tree and ship them with a
 tool that streams. A streaming transport API would remove the bound; it is a
-deliberate future direction, not part of this change (adding it would
-transport-layer-wide redesign under a change that is about residue).
+deliberate future direction, and adding one would be a transport-layer redesign
+that this crate does not undertake.
 
 **A snapshot still scans and hashes the WHOLE tree, so it is O(bytes
 scanned), not O(bytes changed).** Content addressing makes the STORE
@@ -260,8 +265,8 @@ doublings, where a purely cubic curve predicts 8. `canonicalize_tree` alone is
 cheap (2.76 ms / 6.53 ms /
 25.4 ms), so the engine's per-path verification is the cost, and a checkpoint
 tool that recreates its destination per snapshot should budget cubic-OR-WORSE. The
-Linux and macOS incremental figures above are re-measured under the audit
-(release build, kache neutralised, load ≈0.3 Linux / ≈1.4 macOS); the
+Linux and macOS incremental figures above are re-measured in a release build
+(wrapper neutralised, load ≈0.3 Linux / ≈1.4 macOS); the
 fresh-destination and `canonicalize_tree` figures are the reviewing consumer's,
 not re-measured here.
 

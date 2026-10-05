@@ -508,7 +508,7 @@ pub trait Remote {
     /// deadline NOR streaming. Keep the largest entry under the process's
     /// memory budget, or move large blobs outside the synced tree and ship them
     /// with a tool that streams; a streaming transport API is a deliberate
-    /// future direction, not part of the residue change.
+    /// future direction, and adding one would be a transport-layer redesign.
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
     /// Atomically create `rel` with `data` only if it does not already exist,
     /// and make the install DURABLE before returning: the create-new

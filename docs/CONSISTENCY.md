@@ -116,10 +116,9 @@ Named, scoped, not pursued:
   the std::fs pin's: inside a funnel module, a `c::openat(…)` reached through an
   existing `use libc as c;` is neither NAMED nor counted by the pin (the `use` was
   pinned once, as `libc`, when it was added — adding one is a new unpinned reference
-  and fails the test). The deny still refuses the SYMBOL when `clippy.toml` does not
-  list it, because the completeness test resolves the alias, so what slips past all
-  three devices is an ADDITIONAL alias-spelled call of a symbol the deny already
-  names. The `std::fs` half is strict here: an aliased `std::fs` call is a
+  and fails the test). The completeness test still REFUSES a symbol the deny does not
+  list, because it resolves the alias; what slips past all three devices is an
+  ADDITIONAL alias-spelled call of a symbol the deny already names. The `std::fs` half is strict here: an aliased `std::fs` call is a
   `ModuleAlias` violation.
 - **The far-side lock holder has no twin for the local arm's parent checks.** The local
   `FileLock` refuses a record whose final component or whose parent is a symlink, each
@@ -139,12 +138,13 @@ Named, scoped, not pursued:
   not the resolution, and DELETING an entry in the `libc` WIDER SET is noticed by
   nothing: the funnel-used subset is closure-checked and the `std::fs`/`std::os`
   halves carry a pinned expected table (removing `UnixDatagram::bind`'s entry fails
-  `pathname_socket_binds_are_denied_and_counted`), and `libc::chmod`, `libc::renameat2`
-  and `libc::fopen` are named by hand in
-  `libc_alias_routes_are_seen_by_the_scanner_or_the_deny`, which fails when any of the
-  three leaves the deny. For every OTHER `libc` entry naming a symbol no code path
-  references there is no witness at all: deleting it leaves the suite green. Those
-  entries are kept as the reviewed record rather than pruned.
+  `pathname_socket_binds_are_denied_and_counted`). FOUR unreferenced entries are named
+  by hand and fail when their entry leaves the deny: `libc::bind` (in
+  `pathname_socket_binds_are_denied_and_counted`) and `libc::chmod`, `libc::renameat2`,
+  `libc::fopen` (in `libc_alias_routes_are_seen_by_the_scanner_or_the_deny`). For every
+  OTHER `libc` entry naming a symbol no code path references there is no witness at
+  all: deleting it leaves the suite green. Those entries are kept as the reviewed
+  record rather than pruned.
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde
