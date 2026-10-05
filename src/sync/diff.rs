@@ -375,14 +375,11 @@ pub fn apply_manifests(
 /// Strip every path matching `reserved` from a manifest, recomputing the tree
 /// digest so the manifest stays self-consistent. The predicate is a PARAMETER
 /// because the source and the destination strip DIFFERENT sets
-/// ([`apply_manifests`]). `compute_tree_digest` hashes the serialized metadata
-/// INCLUDING `tree_sha256`, so the field is BLANKED before recomputing:
-/// otherwise the new digest would hash the old one in and depend on the
-/// pre-strip value (non-canonical, non-idempotent). Every other producer of a
-/// tree digest blanks the field first.
+/// ([`apply_manifests`]). The recomputed digest depends only on the STRIPPED
+/// content: [`crate::manifest::compute_tree_digest`] clears `tree_sha256`
+/// itself, so the old digest cannot be folded into the new one.
 pub(crate) fn strip_reserved(mut meta: TreeMetadata, reserved: fn(&str) -> bool) -> TreeMetadata {
     meta.entries.retain(|entry| !reserved(&entry.path));
-    meta.tree_sha256 = String::new();
     meta.tree_sha256 = crate::manifest::compute_tree_digest(&meta);
     meta
 }

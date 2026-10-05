@@ -2318,9 +2318,14 @@ pub fn verify_tree_metadata(root: &Path, stored: &TreeMetadata) -> Result<TreeMe
 }
 
 /// Compute the canonical tree digest from metadata. Deterministic, independent
-/// of filesystem layout or source ordering.
+/// of filesystem layout or source ordering, and canonical by construction: the
+/// `tree_sha256` field is CLEARED before hashing, so a caller that passes the
+/// metadata it read back cannot fold the old digest into the new one (the field
+/// is part of the serialized form).
 pub fn compute_tree_digest(meta: &TreeMetadata) -> String {
-    let bytes = serde_json::to_vec(meta).expect("tree metadata serializes");
+    let mut meta = meta.clone();
+    meta.tree_sha256 = String::new();
+    let bytes = serde_json::to_vec(&meta).expect("tree metadata serializes");
     sha256_bytes(&bytes)
 }
 

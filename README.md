@@ -294,7 +294,8 @@ simplification; removing one means adding back the logic it removes.
   not flush the device write cache (this crate does not call `F_FULLFSYNC`) and the
   Windows port has no directory fsync, so on those targets the crate guarantees the
   replace's ATOMICITY and durability against a process CRASH, not against power loss.
-  A caller needing power-loss recovery there owns that step.
+  A caller needing power-loss recovery there owns that step. Wherever this crate calls a
+  write DURABLE, this is the claim it means.
 - **The name-mutation devices target UNIX.** *Buys:* one funnel, one deny list, one
   pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so
   the `libc` entries are inert there by construction, and the Windows port is a
@@ -407,9 +408,10 @@ takes responsibility for exactly this, and no more.
   advance). The device is a UNIX-target device (see the assumptions): on Windows the
   `libc` entries are inert by construction because `libc` is not the crate's I/O library
   there. (b) Every production
-  `libc` reference is either inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`)
-  or NAMED in the audit's pin, by file, symbol and count; the map of references NOT on
-  the pin is asserted EMPTY, so an unreviewed `libc` reference is a failing test. The
+  `libc` reference — inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`) or
+  anywhere else — is NAMED in the audit's pin, by file, symbol and count; the map of
+  references NOT on the pin is asserted EMPTY, so an unreviewed `libc` reference is a
+  failing test wherever it stands. The
   pin records a REVIEW, not a proof: a pinned reference is one somebody looked at, and
   whether the mutation it performs is refused is the deny's business only if the deny
   names the symbol. (c) The funnel's OWN call counts are pinned per file and per

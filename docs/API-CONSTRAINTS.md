@@ -31,8 +31,9 @@ made possible.
 - `platform::symlink` — the cross-platform symlink helper
 - `Remote::lock_far_side` — the far-side ownership seam (a trait method), whose holder
 applies the SAME record rule as `lock::FileLock::acquire`: it adopts an empty or
-header-prefixed entry, refuses any other non-empty one untouched with the same typed
-`PreflightKind::LockRecordNotRecognized`, and leaves the entry at mode `0600`
+header-prefixed entry, refuses any other non-empty one untouched (bytes AND mode
+unchanged, before any `chmod`) with the same typed `PreflightKind::LockRecordNotRecognized`,
+and writes an entry it does adopt at mode `0600`
 - `Remote::provision_layout` — the layout and bootstrap-`create_dir_all` seam (a trait method)
 - `transport::with_operation_lock_sidecar` — a raw `base` plus a caller-chosen `sidecar` spelling, refused by the reserved-mutation authority if it names the crate's bookkeeping
 - `transport::ssh::hostkey::pin_known_hosts` — the drop of a stale pinned host key under the transport's OWN private `cache_dir`

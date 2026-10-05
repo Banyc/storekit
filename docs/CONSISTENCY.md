@@ -71,8 +71,8 @@ Named, scoped, not pursued:
   cross-module alias route — are denied by the compiler in every module without the
   allow, on each target that EXPORTS the symbol (the six `libc::…at` symbols the Unix
   wrappers call do not resolve on Windows, so those entries are inert there; see the
-  resolution residual below); every production `libc` reference is either inside a funnel module
-  or NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
+  resolution residual below); every production `libc` reference, in a funnel module or not,
+  is NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
   own call counts are pinned. The pin records a review, not a proof. Completeness of
   the SYMBOL SET is a review responsibility.
 - **The deny list names RESOLVED `std`/`libc` symbols**, so a Windows named-pipe
@@ -93,10 +93,20 @@ Named, scoped, not pursued:
   shape is outside the pin's guarantee rather than a hole in a promise, and the
   contract's clause (c) says so.
 - **The `libc` pin is a TOKEN SCAN, not a call resolver.** Its miss-set is therefore not
-  the std::fs pin's: inside a funnel module, `use libc as c;` plus `c::openat(…)` is ONE
-  pinned reference (the `use`) and the call itself moves no count — and because the deny
-  is allowed in a funnel module, all three devices are blind to that spelling. The
-  `std::fs` half is strict here: an aliased `std::fs` call is a `ModuleAlias` violation.
+  the std::fs pin's: inside a funnel module, a `c::openat(…)` reached through an
+  existing `use libc as c;` is neither NAMED nor counted by the pin (the `use` was
+  pinned once, as `libc`, when it was added — adding one is a new unpinned reference
+  and fails the test). The deny still refuses the SYMBOL when `clippy.toml` does not
+  list it, because the completeness test resolves the alias, so what slips past all
+  three devices is an ADDITIONAL alias-spelled call of a symbol the deny already
+  names. The `std::fs` half is strict here: an aliased `std::fs` call is a
+  `ModuleAlias` violation.
+- **The far-side lock holder has no twin for the local arm's parent checks.** The local
+  `FileLock` refuses a record whose final component or whose parent is a symlink, each
+  with its own typed kind; the far-side holder's `perl` tests the directory with `-d`,
+  which FOLLOWS a symlinked parent, and a symlinked record surfaces as a generic
+  far-side script error. Mutual exclusion and the record-content rule still hold on
+  both arms; the difference is the typed refusal, and no document claims parity on it.
 - **`FileLock::acquire` checks the record's IMMEDIATE PARENT only.** It `lstat`s that
   parent's final component, so a symlink THERE is refused; a symlink in ANY HIGHER
   ancestor (grandparent and above) is still followed by its path-based helpers, and the

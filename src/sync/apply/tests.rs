@@ -8063,13 +8063,12 @@ fn names_resembling_the_reserved_namespace_transfer_normally() {
     assert_eq!(read(&dst.join("foo.sync-aside.bar")), b"two");
 }
 
-/// `compute_tree_digest` hashes the serialized metadata INCLUDING
-/// `tree_sha256`, so a producer that does not blank the field before
-/// recomputing hashes the OLD digest into the new one. `strip_reserved` must
-/// therefore produce the CANONICAL digest of the stripped metadata — the same
-/// value `canonicalize_tree` computes for the remaining content — and must be
-/// idempotent. Both clauses fail if the field is not cleared first: the
-/// survivor digest depends on the pre-strip value.
+/// `strip_reserved` must produce the CANONICAL digest of the stripped metadata
+/// — the same value `canonicalize_tree` computes for the remaining content —
+/// and must be idempotent. The field is part of the serialized form, so a
+/// digest that folded the pre-strip value in would make the survivor depend on
+/// what was stripped; `compute_tree_digest` clearing the field is what makes
+/// both clauses hold.
 #[test]
 fn strip_reserved_recomputes_the_canonical_digest() {
     let dir = fixture_tmpdir(&env()).unwrap();
