@@ -13065,6 +13065,46 @@ fn composed_ownership_refuses_a_remote_destination_like_the_plain_form() {
     );
 }
 
+/// WITNESS for the `dest_is_local` backstop in [`require_existing_root`].
+///
+/// That arm refuses the COMPOSED ownership form for a NON-LOCAL destination.
+/// The state is UNREACHABLE through the public constructors: the composed
+/// form's only caller is [`DestinationOwnership::lock_with_in_root_lock`],
+/// which runs [`prepare`] first, and `prepare` refuses a non-local destination
+/// EARLIER with [`PreflightKind::RemoteDestinationViaLocalLock`] (see
+/// `composed_ownership_refuses_a_remote_destination_like_the_plain_form`
+/// above). The comparison is kept as a BACKSTOP — for a future caller, or for a
+/// `prepare` whose refusal moves — so this test calls the private
+/// `require_existing_root` DIRECTLY with a non-local flag and pins the refusal,
+/// rather than claiming a reachable path. The control below shows the same
+/// fixture is `Ok` for a local destination, so the refusal is the flag's doing
+/// and not the fixture's; deleting the `if !dest_is_local` arm makes the
+/// refusal assertion fail.
+#[test]
+fn composed_ownership_requires_a_local_destination_in_the_root_check() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&dst).unwrap();
+
+    // The control: the SAME existing-directory fixture satisfies the root
+    // check for a LOCAL destination, so the refusal below is the
+    // `dest_is_local` flag's doing and not the fixture's.
+    require_existing_root(true, &dst)
+        .expect("an existing local destination root satisfies the root check");
+
+    let error = require_existing_root(false, &dst)
+        .expect_err("a non-local destination must be refused by the local-only backstop");
+    assert_eq!(
+        error.preflight_reason(),
+        Some(PreflightKind::ComposedRequiresLocalDestination),
+        "the refusal must be the typed local-only refusal: {error:?}"
+    );
+    assert!(
+        error.to_string().contains(&dst.display().to_string()),
+        "the refusal must name the destination root: {error}"
+    );
+}
+
 /// The FAR-SIDE ownership seam's DEFAULT is FAIL-CLOSED. A transport that
 /// does not override [`Remote::lock_far_side`] (here the [`RecordingRemote`]
 /// double, which declares itself remote but has no far-side locking) cannot be
