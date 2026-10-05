@@ -106,11 +106,12 @@ Named, scoped, not pursued:
   produces a non-fatal config-time `does not refer to a reachable function`
   diagnostic that the gate's `-D warnings` does not cover, so it can rot silently. A
   symbol the funnel DOES use is caught by the closure test, which checks the LIST,
-  not the resolution, and DELETING a wider-set entry is noticed by nothing: the
-  funnel-used subset is closure-checked and the `std::fs` half has a pinned expected
-  table, but an entry naming a symbol no code path references has no witness at all.
-  Entries naming symbols no Unix libc exports are kept as the reviewed record rather
-  than pruned.
+  not the resolution, and DELETING an entry in the `libc` WIDER SET is noticed by
+  nothing: the funnel-used subset is closure-checked and the `std::fs`/`std::os`
+  halves carry a pinned expected table (removing `UnixDatagram::bind`'s entry fails
+  `pathname_socket_binds_are_denied_and_counted`), but a `libc` entry naming a symbol
+  no code path references has no witness at all. Those entries are kept as the
+  reviewed record rather than pruned.
 - **The wire reader validates SHAPES, not cross-field consistency.** The reader now
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde

@@ -78,16 +78,11 @@ impl RootedRelativePath {
                 p
             )));
         }
-        if p.is_absolute() {
-            return Err(Error::transport(format!(
-                "invalid relative path {:?}: absolute paths are not allowed",
-                p
-            )));
-        }
         // The platform's component model is the ONE authority on what is a
         // traversal, a root, or a prefix. Anything that is not a plain name
-        // is refused: `ParentDir` walks above the root; `RootDir`/`Prefix`
-        // name an absolute location (and on Windows `Path::join` REPLACES
+        // is refused, and this single rule is what refuses an ABSOLUTE path too
+        // (a leading `/` makes the first component a `RootDir`): `ParentDir` walks
+        // above the root; `RootDir`/`Prefix` name an absolute location (and on Windows `Path::join` REPLACES
         // the base for a rooted/`\`-leading path, cancelling the deployment
         // root entirely); `CurDir` names a directory rather than an entry.
         if !p.components().all(|c| matches!(c, Component::Normal(_))) {

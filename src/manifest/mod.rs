@@ -1220,12 +1220,8 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
             ),
         ));
     }
-    if path.starts_with('/') {
-        return Err(Error::materialization_kind(
-            MaterializationKind::UnrepresentableName,
-            format!("absolute path not allowed: {path}"),
-        ));
-    }
+    // A leading `/` is refused by the component rule below, not by a separate
+    // absolute-path arm: one authority, one witness.
     if !has_only_normal_components(path) {
         return Err(Error::materialization_kind(
             MaterializationKind::UnrepresentableName,
