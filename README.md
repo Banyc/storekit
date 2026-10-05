@@ -67,9 +67,9 @@ symlink component (the kernel follows it, so a lexical collapse past it is not
 its resolution) · hard links · devices, sockets, FIFOs ·
 reserved-name collisions · overlapping roots, decided per operation rather than
 once: a `sync` requires its SOURCE and DESTINATION to be DISJOINT — a strict
-ancestor/descendant nesting is refused WHEN THE DESTINATION'S ROOT IS LOCAL — a
-far-side root is unresolvable from here, so the caller owns that disjointness — while
-EQUAL roots are allowed and the
+ancestor/descendant nesting is refused WHEN THE REMOTE SIDE IS LOCAL — a far-side root,
+ON EITHER SIDE of the run, is unresolvable from here, so the caller owns that
+disjointness — while EQUAL roots are allowed and the
 run is an idempotent no-op (the two manifests are identical, so the diff is
 empty) — whereas `root::OwnedRoot::parse` refuses two roots on one endpoint
 whenever they are EQUAL or one is an ancestor/descendant of the other, and the
@@ -415,7 +415,9 @@ takes responsibility for exactly this, and no more.
   `libc` reference — inside a funnel module (`atomic/{mod,guard,unix,windows}.rs`) or
   anywhere else — is NAMED in the audit's pin, by file, symbol and count; the map of
   references NOT on the pin is asserted EMPTY, so an unreviewed `libc` reference is a
-  failing test wherever it stands. The
+  failing test wherever it stands IN THE SPELLINGS THE SCAN READS: a call reached
+  through an aliased `use` is neither named nor counted once that `use` itself has been
+  reviewed (the residuals state the bound, as clause (c) does for its own). The
   pin records a REVIEW, not a proof: a pinned reference is one somebody looked at, and
   whether the mutation it performs is refused is the deny's business only if the deny
   names the symbol. (c) The funnel's OWN call counts are pinned per file and per

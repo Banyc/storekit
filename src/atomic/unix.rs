@@ -711,9 +711,9 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
 // [`write_atomic_replace_fd`]). Either way a symlink injected into a path
 // component can never redirect a mutation outside the owned root — the
 // descriptor pins the root, and no component is ever followed. The
-// path-based free functions above stay for the retention machinery (which
-// operates on paths under a store base it does not hold a descriptor
-// for); the store's OWN mutations route through the `_fd` variants below.
+// path-based free functions above stay for tests and for `path_state`
+// (`read_json` is `#[cfg(test)]`: no production caller uses the raw-path
+// reader); the store's OWN mutations route through the `_fd` variants below.
 // =====================================================================
 
 /// Split a ROOT-RELATIVE path into its components as raw bytes for the
@@ -3401,9 +3401,11 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The iterative, descriptor-relative removal of a directory NAME (a PATH,
-/// not a root-relative spelling). On Unix the local transport routes here;
-/// on Windows it delegates to `std::fs::remove_dir_all`, whose WINDOWS
+/// The iterative, descriptor-relative removal of a directory NAME (a PATH, not
+/// a root-relative spelling), kept for the crate's own tests: no production
+/// caller exists, and the transport routes to [`crate::atomic::remove_dir_all_fd`]
+/// (via `remove_dir_all_confined`). On Windows `remove_dir_all_fd` delegates to
+/// `std::fs::remove_dir_all`, whose WINDOWS
 /// implementation is itself iterative on the installed toolchain
 /// (`library/std/src/sys/fs/windows.rs:1382` opens the directory and calls
 /// `remove_dir_all_iterative`,
@@ -3499,10 +3501,11 @@ pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> 
 // FINAL component is opened with `O_NOFOLLOW` and so is refused too: a
 // symlink injected into ANY path component of a read is refused (ELOOP),
 // never followed, so a read can never be redirected outside the owned
-// root. The path-based free functions above
-// (`read_json`, `path_state`) stay for the retention machinery (which
-// operates on paths under a store base it does not hold a descriptor
-// for); the store's OWN reads route through the `_fd` variants below.
+// root. The path-based free function above
+// (`path_state`) stays for the retention machinery (which operates on paths
+// under a store base it does not hold a descriptor for); `read_json` is
+// `#[cfg(test)]` and has no production caller, so it is not part of that
+// surface. The store's OWN reads route through the `_fd` variants below.
 // =====================================================================
 
 /// Read the whole file at `rel` relative to `dir_fd`, resolved

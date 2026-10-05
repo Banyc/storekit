@@ -75,12 +75,17 @@ Named, scoped, not pursued:
   is NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
   own call counts are pinned. The pin records a review, not a proof. Completeness of
   the SYMBOL SET is a review responsibility.
-- **The far-side root of an `SshTransport` destination is unresolvable from here.**
-  `refuse_overlapping_roots` returns early when the remote is not local, so a `sync`
-  whose SOURCE and far-side DESTINATION share a filesystem (a bind mount, a shared
-  mount, or an `ssh` target that IS this host) computes NO disjointness check: nothing
-  this host can see establishes that the destination root is disjoint. The caller that
-  co-locates them owns that check. Stated in `src/sync/apply.rs`'s module docs.
+- **The far-side root of an `SshTransport` is unresolvable from here, on EITHER side.**
+  `refuse_overlapping_roots` returns early when the REMOTE is not local — that is the
+  condition, not "the destination is remote". So a `sync` whose two roots are not both
+  visible locally computes NO disjointness check, whether the far-side root is the
+  DESTINATION (a push into a root that nests the source) or the SOURCE (a pull into a
+  local destination nested inside the far-side source). A bind mount, a shared mount,
+  or an `ssh` target that IS this host is exactly the case where the two really do
+  overlap, and nothing this host can see establishes otherwise. Measured for the pull
+  direction: no `RootsOverlap` is raised, the run WRITES INTO ITS SOURCE, and the
+  end-of-run source re-check is what fails it — after the writes. The caller that
+  co-locates them owns the check. Stated in `src/sync/apply.rs`'s module docs.
 - **The count pins pin CALL COUNTS, not arguments.** An argument change at a call site
   inside a reviewed allow region moves no `std::fs` count, and the deny is allowed
   there. An argument that introduces a NEW counted symbol IS noticed — measured,
