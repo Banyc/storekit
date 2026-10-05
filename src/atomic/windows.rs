@@ -570,7 +570,10 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 
     let (d, s) = (key(&dst_abs), key(&src_c));
     let prefix = |a: &[String], b: &[String]| b.len() >= a.len() && a == &b[..a.len()];
-    let spelling_overlap = d == s || prefix(&s, &d) || prefix(&d, &s);
+    // No `d == s` term: `prefix(&d, &s)` is true when the two are equal, so the
+    // equality disjunct could not change the result (the same reason the identity
+    // term below is gone).
+    let spelling_overlap = prefix(&s, &d) || prefix(&d, &s);
 
     // No `anchor_id == src_id` term: `path_chain_contains` tests `from` itself
     // first, so that identity is already inside `anchor_inside_source` (the Unix

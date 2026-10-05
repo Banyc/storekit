@@ -264,7 +264,7 @@ shape depends on fresh vs incremental.** A LOCAL path-based destination
 re-verifies a path's ancestry before mutating it, at O(depth) per probe. A
 depth-D chain with ONE changed leaf is therefore SUPER-LINEAR in D, and the
 measured exponent is PLATFORM-DEPENDENT: ≈2.0 on Linux (measured 99 / 373 /
-1472 ms at D = 100 / 200 / 400; ratios 3.76 / 3.95) but ≈2.5 on macOS
+1472 ms at D = 100 / 200 / 400; ratios 3.77 / 3.95) but ≈2.5 on macOS
 (measured 0.64 / 3.44 / 21.2 s at the same depths; ratios 5.4 / 6.2; the
 consumer's earlier 0.63 / 3.38 / 21.6 s agree). The single O(D^2) label was
 wrong on macOS — budget for worse than quadratic. A FRESH destination installs
@@ -410,8 +410,9 @@ test per direction.
 **(c) The fd-confined tree helpers are public.** `deploy` CALLS
 `copy_dir_recursive_fd` and `fsync_tree_recursive_fd` from its own store module and
 drives a staged publish through `with_operation_lock_sidecar`; `copy_tree_verbatim` is
-public for a live-base clone the migration needs but no consumer calls yet (measured:
-zero occurrences in `deploy`). A public name is justified by a CONSUMER's need — a
+public for a live-base clone the migration needs but no consumer calls yet (no
+occurrence anywhere in the consumer tree `deploy`, at the revision `MIGRATION.md` names
+— a search of that tree, not a test here). A public name is justified by a CONSUMER's need — a
 current one or a stated, planned one — and never by this crate's own production; where
 the need is planned rather than present, the docs say which it is.
 

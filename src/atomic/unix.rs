@@ -2213,8 +2213,8 @@ fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
 /// * the whole `dst_rel` already exists AND is at or above the source (the
 ///   source is inside the destination).
 ///
-/// The second and third arms walk the directory's own `..` chain, comparing
-/// identities at each step, so they too are spelling-blind. A component that
+/// Each arm walks a directory's own `..` chain, comparing identities at each
+/// step, so the rule is spelling-blind. A component that
 /// exists but cannot be opened as a directory (a symlink, a non-directory) is a
 /// fail-CLOSED refusal, and any identity probe failure refuses rather than
 /// guessing: an overlap that cannot be ruled out is not allowed through.
