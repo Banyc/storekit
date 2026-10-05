@@ -184,7 +184,7 @@ the `manifest` module's "Durability and atomicity of a written entry".
 
 `EntryPolicy::AppendTail` costs O(TOTAL SIZE) per append, because there is no
 remote append primitive and the append is a compare-and-replace of the whole
-file. Measured on Linux release with `strace` byte accounting (kache
+file. Measured on Linux release with `strace` byte accounting (wrapper
 neutralised, load ~1), ONE run that appends 32 bytes to a 1 MiB log reads
 **8,388,768 bytes** and writes **1,048,678 bytes**: three whole reads of the
 1 MiB destination (the destination manifest, the prefix test, and the

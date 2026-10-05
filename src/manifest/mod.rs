@@ -119,7 +119,7 @@
 //! families, and the three Greek precomposed perispomeni+ypogegrammeni pairs
 //! are covered end to end by the `greek_*` tests in
 //! `tests/casefold_confinement.rs`. The Linux `ext4 -O casefold` half was NOT
-//! re-run in this environment (`ser` was unreachable), so the claim for that
+//! re-run in this environment (no casefold host was available), so the claim for that
 //! host rests only on the fold being the Unicode C+F caseless match and is
 //! left UNVERIFIED here rather than asserted. The over-refusal residual above
 //! is now true, and the added over-refusal is exactly the extra spellings those
@@ -221,7 +221,8 @@
 //!   resident memory is proportional to the LARGEST SINGLE FILE, not to the
 //!   tree's total size. This is a PER-FILE bound, not a total-tree bound,
 //!   and no streaming path exists. (Measured: a 512 MiB file → ~515 MiB RSS;
-//!   a 2 GiB file → ~2.00 GiB RSS.)
+//!   a 2 GiB file → ~2.00 GiB RSS — reported measurements, not reproducible from
+//!   this repository: see the README's provenance note.)
 //!
 //! The loss of xattrs, `security.capability`, and ACLs is INVISIBLE TO THE
 //! DIFFER: a second sync compares only the manifest model, sees the entry as
@@ -264,7 +265,8 @@
 //!   the destination's own directory, chmodded private, `fsync`ed, then
 //!   `renameat` into place (COMMIT POINT 1 — the new content becomes VISIBLE),
 //!   then the PARENT DIRECTORY is `fsync`ed (COMMIT POINT 2 — the rename
-//!   becomes DURABLE). A failure BEFORE the rename is an `Err` that leaves the
+//!   becomes DURABLE; on Linux, which is what this crate means by durable — see
+//!   the README's durability assumption). A failure BEFORE the rename is an `Err` that leaves the
 //!   PREVIOUS content wholly in place and unlinks the temp; a failure of the
 //!   parent fsync AFTER the rename is
 //!   [`crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`] — the new
@@ -1323,7 +1325,8 @@ pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<
 /// deduplicated, but there is no dirty tracking and no reuse of a previously
 /// computed manifest, so a periodic checkpoint that changes one 4-byte file in
 /// a 350 MB tree still pays the full scan: measured 1.327 s before -> 1.384 s
-/// after (macOS), 2.739 s -> 2.690 s (Linux). This is a design cost of the
+/// after (macOS), 2.739 s -> 2.690 s (Linux) — reported measurements, not
+/// reproducible from this repository: see the README's provenance note. This is a design cost of the
 /// manifest-and-hash model; reusing a caller-supplied previous manifest would
 /// remove it but is not implemented.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {

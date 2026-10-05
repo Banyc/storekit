@@ -2245,8 +2245,9 @@ fn acquire_in_root_lock(
 ///   depth-D path costs O(D^2) path operations. The run pays that PER PATH,
 ///   which makes the two shapes a checkpoint tool hits different by a whole
 ///   factor of D. **One changed leaf:** the run probes the D ancestors once, so
-///   the OPERATION count is O(D^2); the measured WALL TIME is SUPER-LINEAR with
-///   a platform-dependent exponent — ≈2.0 on Linux (99 / 373 / 1472 ms at
+///   the OPERATION count is O(D^2); the measured WALL TIME (reported measurements,
+///   not reproducible from this repository — see the README's provenance note) is
+///   SUPER-LINEAR with a platform-dependent exponent — ≈2.0 on Linux (99 / 373 / 1472 ms at
 ///   D = 100 / 200 / 400) and ≈2.5 on macOS (0.64 / 3.44 / 21.2 s; the earlier
 ///   0.63 / 3.38 / 21.6 s agree), so budget for WORSE than quadratic on macOS.
 ///   That is the case the deep-chain test bounds, and it is NOT the case
@@ -7804,10 +7805,10 @@ fn aside_name() -> OsString {
     ))
 }
 
-/// Whether a single file name is UNADDRESSABLE — one of the crate's RESERVED
-/// spellings (the claim-aside namespace [`ASIDE_PREFIX`] or the operation-lock
-/// record spelling `.<name>.operation.lock`), the application lock record
-/// `operation.lock`, or a case ALIAS of any of those. Delegates to the ONE
+/// Whether a single file name is UNADDRESSABLE. The SET is exactly
+/// [`crate::reserved::is_unaddressable_name`]'s — six arms, enumerated at that
+/// ONE authority rather than here, because an incomplete list in a caller reads
+/// as the definition. Delegates to the ONE
 /// authority in [`crate::reserved`], which [`crate::id::valid_name`] also
 /// consults, so a spelling refused as an id is exactly a spelling this sync
 /// strips from the manifests (and therefore can never transfer or destroy).

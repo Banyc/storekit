@@ -458,7 +458,9 @@ pub trait Remote {
     /// MEMORY BOUND: the entire entry is materialized as one `Vec<u8>` (and the
     /// caller holds it, alongside any copy the sync makes), so a single 350 MB
     /// file costs peak RSS ~362 MB — measured 362,064 KB (macOS) / 362,860 KB
-    /// (Linux) — for BOTH snapshot and restore, and a 4 GB entry needs ~4 GB.
+    /// (Linux), a reported measurement not reproducible from this repository (see
+    /// the README's provenance note) — for BOTH snapshot and restore, and a 4 GB
+    /// entry needs ~4 GB.
     /// There is no streaming read. Keep the largest entry under the process's
     /// memory budget, or move large blobs outside the synced tree and ship them
     /// with a tool that streams; a streaming transport API is a deliberate
@@ -500,8 +502,8 @@ pub trait Remote {
     ///
     /// MEMORY AND TIME BOUND, and the LOCAL/REMOTE asymmetry. `data` is the
     /// WHOLE entry, already in memory: a 350 MB file costs peak RSS ~362 MB
-    /// (measured 362,064 KB macOS / 362,860 KB Linux), so a 4 GB entry needs
-    /// ~4 GB; there is no streaming write. The two kinds are also NOT equally
+    /// (measured 362,064 KB macOS / 362,860 KB Linux; see the README's provenance
+    /// note), so a 4 GB entry needs ~4 GB; there is no streaming write. The two kinds are also NOT equally
     /// protected against a slow link: [`SshTransport`] derives a size-aware
     /// deadline from the payload (`upload_deadline` / `transfer_deadline(bytes,
     /// min_rate, command_deadline)`), while [`LocalTransport`] has NEITHER a

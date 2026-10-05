@@ -27,9 +27,10 @@
 //!   "may I use this name?" for a single segment and
 //!   [`is_unaddressable_path`] for a canonical manifest path. (The
 //!   byte-exact [`is_reserved_name`] / [`is_reserved_path`] do NOT answer that
-//!   question on their own: they are the narrow reserved MATCH the sync uses
-//!   for stripping, and deliberately leave the application lock record and the
-//!   case/trailing-dot aliases alone.)
+//!   question on their own: they answer only the narrow RESERVED match, and
+//!   deliberately leave the application lock record and the case/trailing-dot
+//!   aliases alone. They are also NOT what the sync strips with — see
+//!   [`is_unaddressable_name`], which each strip site names for its own side.)
 //!
 //! A reserved name is matched as a whole path COMPONENT, byte-exactly: the
 //! check never decodes, normalizes, or case-folds, so a name that merely
@@ -137,10 +138,11 @@ pub fn is_application_lock_name(name: &str) -> bool {
 }
 
 /// Whether `name` is a CASE ALIAS of a spelling the crate reserves for its own
-/// bookkeeping: its FULL Unicode case fold ([`crate::casefold`], the same fold
-/// the containment index and the sync's destination-alias model use) is a
-/// reserved spelling or the application lock record while `name` itself is
-/// byte-different.
+/// bookkeeping: its FULL Unicode case fold ([`crate::casefold`]) is a reserved
+/// spelling or the application lock record while `name` itself is byte-different.
+/// This is the fold-only step: the containment index wraps the same primitive in
+/// NFD/NFC and trims trailing dots and spaces, and the sync's destination-alias
+/// model uses `str::to_lowercase` instead — three folds, none of them the same.
 ///
 /// On a case-insensitive filesystem (macOS APFS by default, Windows by
 /// default) `name` and the reserved spelling are the SAME directory entry, so
