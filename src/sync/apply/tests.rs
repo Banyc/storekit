@@ -4478,15 +4478,15 @@ fn measure_deep_chain_sync(depth: usize) -> (usize, usize) {
 /// here comes ENTIRELY from verifying a path's ancestry ONCE per operation: the
 /// deepest guard already walks every prefix, so `widen_ancestors` performs one
 /// ancestry walk for the whole chain and each widen re-checks nothing. Both
-/// assertions below fail against the pre-fix code: its depth-32 count is 669
-/// probes and its depth-64 count is 2349 (measured), not a small multiple of
-/// the depth, and it grows QUADRATICALLY when the depth doubles. Measured after
-/// the per-operation restructuring (no memo, path-based destination): 173 ->
-/// 333, i.e. a 5*D growth in the count, linear in the depth.
+/// assertions below fail against the pre-fix code, whose count grows QUADRATICALLY
+/// when the depth doubles rather than as a small multiple of the depth. The counts
+/// themselves are not quoted: they were probes of a shape this revision no longer
+/// contains, and the bounds below are what this test actually pins.
 ///
 /// The bound is on the number of OPERATIONS, not on wall time: each probe of a
 /// PATH-BASED destination resolves its prefix component-wise, so the local
-/// wall time is O(D^2) (measured ~5x per doubling). For a REMOTE destination
+/// wall time is super-linear in D (the crate quotes no figures). For a REMOTE
+/// destination
 /// each probe is one ssh round trip, so the round-trip count IS the linear
 /// operation count; `sync`'s "Cost of verifying a path" states the real bound
 /// per destination kind.
@@ -12502,17 +12502,16 @@ fn a_late_child_in_the_removal_window_is_refused_and_preserved() {
 /// THE ABORT ACTUALLY NEEDS. `remove_subtree` is `O(depth^3)` in this codebase:
 /// every level re-probes EVERY ancestor through
 /// [`Applier::guard_destination`] (a descriptor-relative `lstat` walk per
-/// ancestor), so a removal of 96 levels already takes ~6 s and 400 levels
-/// ~12 min (measured on this host); 10 000 levels would take WEEKS. The abort
-/// threshold (~1 200 levels on the 2 MiB libtest stack, ~2.3 KiB of stack per
-/// recursive level in a debug build) is therefore unreachable through a real
-/// `sync` in bounded time. Shrinking the thread stack instead makes the SAME
-/// property — the recursion consumes one Rust stack frame PER LEVEL — testable
-/// at a depth that costs seconds: the recursive form needs ~220 KiB at 96
-/// levels (measured: it overflows a 128 KiB stack at 64 levels, 64 KiB at 96),
-/// while the iterative form's stack use is CONSTANT (measured: it fits in
-/// 16 KiB at 96 levels). `64 KiB` at `96` levels is a 3.4x margin over the
-/// recursive requirement and a >4x margin under the iterative one.
+/// ancestor), so the cost per level is the depth again, and a deep removal takes
+/// long enough that the abort threshold is unreachable through a real `sync` in
+/// bounded time. Shrinking the thread stack instead makes the SAME property — the
+/// recursion consumes one Rust stack frame PER LEVEL — testable at a depth that
+/// costs seconds: the recursive form OVERFLOWS a stack far smaller than the abort
+/// threshold at 96 levels, while the iterative form's stack use is CONSTANT and
+/// fits comfortably at the same depth. The chosen `64 KiB` at `96` levels leaves a
+/// margin over the recursive requirement and a larger one under the iterative
+/// requirement; this comment quotes no figures because the calibration is a
+/// property of the toolchain, and the test fails loudly if it stops holding.
 #[cfg(unix)]
 const DEEP_TREE_DEPTH: usize = 96;
 #[cfg(unix)]

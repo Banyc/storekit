@@ -105,9 +105,11 @@ const MIN_MUX_HASH_HEX: usize = 24;
 /// A `ControlPath` that passes OpenSSH's own `ssh.c` length check (`<
 /// sizeof(sun_path)`) but leaves less than this reserve still fails to bind a
 /// master — `unix_listener: path "..." too long for Unix domain socket`, with
-/// multiplexing silently disabled (measured on macOS 26 / OpenSSH 10.2p1: an
-/// 86-byte control path, temp 103, multiplexes; an 88-byte one, temp 105, does
-/// not). The suffix is `.` plus the 16 characters the code generates, so the
+/// multiplexing silently disabled. The boundary sits a few bytes above the
+/// longest path that multiplexes, which is why the reserve below is part of the
+/// budget rather than a guess (no figures here: the bound is a property of the
+/// OpenSSH build, and the reserve is what the crate pins). The suffix is `.` plus
+/// the 16 characters the code generates, so the
 /// reserve is exactly 17 bytes and MUST be part of the budget — not just the
 /// final path length — or the transport works without multiplexing.
 const MUX_LISTENER_RESERVE_BYTES: usize = 17;

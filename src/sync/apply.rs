@@ -1132,8 +1132,8 @@ pub enum EntryPolicy {
     /// KNOWN COST: an append is O(TOTAL SIZE), not O(appended bytes). There is
     /// no [`Remote::append`](crate::transport::Remote) primitive, so the append
     /// is realized as a compare-and-replace of the WHOLE file, and the run's
-    /// post-transfer verification re-reads the whole result. Measured on Linux
-    /// release with `strace` byte accounting, ONE run that appends a few bytes to a
+    /// post-transfer verification re-reads the whole result. By the SHAPE of the
+    /// work (the crate quotes no figures here), ONE run that appends a few bytes to a
     /// log rewrites and re-reads the WHOLE log several times over: the destination
     /// manifest, the prefix test and the compare-and-replace each read the
     /// destination whole; the source manifest, the prefix test and the end-of-run

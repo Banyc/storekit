@@ -9,9 +9,12 @@
 //! `ffi`), U+03C2 FINAL SIGMA to itself (not U+03C3), and the Cherokee
 //! uppercase letters to their separately-encoded lowercase forms (where case
 //! folding deliberately goes the other way). A case-insensitive host does the
-//! FULL fold: measured, macOS APFS resolves `straße == STRASSE == strasse`,
-//! `ς == σ == Σ`, and `ﬁle == file == FILE`, and Linux `ext4 -O casefold`
-//! resolves `straße == STRASSE == strasse` and `ﬁle == file == FILE`. A
+//! FULL fold, and the fold this crate implements is the Unicode C+F caseless
+//! match. On a host that resolves case-folded spellings, a fold:
+//! macOS APFS is measured to resolve `straße == STRASSE == strasse`,
+//! `ς == σ == Σ`, and `ﬁle == file == FILE` (the family test pins it); the Linux
+//! `ext4 -O casefold` half is NOT verified here — `manifest`'s module doc says why,
+//! and it rests on the fold being the Unicode match rather than on a measurement. A
 //! lower-case fold therefore UNDER-matches the host, and an under-matching
 //! fold is unsafe at every site that feeds a decision which can GRANT.
 //!

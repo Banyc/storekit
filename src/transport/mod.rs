@@ -683,9 +683,8 @@ pub trait Remote {
     ///
     /// MEMORY BOUND: the DEFAULT walk carries each file through
     /// [`Remote::read`] and [`Remote::write`], so every file is materialized
-    /// WHOLE — the same O(largest entry) peak RSS those primitives document
-    /// (a 350 MB file ≈ 362 MB peak), NOT a streaming copy. See
-    /// [`Remote::read`] for the measured figures and the workaround.
+    /// WHOLE — the same O(largest entry) peak RSS those primitives document —
+    /// NOT a streaming copy. See [`Remote::read`] for the bound and the workaround.
     fn copy_tree(&self, src: &RootedRelativePath, dest: &RootedRelativePath) -> Result<()> {
         if let Some(parent) = dest.parent() {
             self.create_dir_all(&parent)?;
