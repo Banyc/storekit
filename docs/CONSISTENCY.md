@@ -92,6 +92,14 @@ Named, scoped, not pursued:
   spelling there is not. That
   shape is outside the pin's guarantee rather than a hole in a promise, and the
   contract's clause (c) says so.
+- **The `libc` pin is a TOKEN SCAN, not a call resolver.** Its miss-set is therefore not
+  the std::fs pin's: inside a funnel module, `use libc as c;` plus `c::openat(…)` is ONE
+  pinned reference (the `use`) and the call itself moves no count — and because the deny
+  is allowed in a funnel module, all three devices are blind to that spelling. The
+  `std::fs` half is strict here: an aliased `std::fs` call is a `ModuleAlias` violation.
+- **`FileLock::acquire` checks the record's IMMEDIATE PARENT only.** A symlink in a
+  GRANDPARENT component of the record path is still followed by the path-based helper;
+  the refused-by-rule set covers a swapped component in-root, not this.
 - **No deny entry is checked for RESOLUTION.** `clippy.toml` is a list of resolved
   symbols and nothing verifies that an entry resolves on the Unix target: a typo
   produces a non-fatal config-time `does not refer to a reachable function`

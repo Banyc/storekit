@@ -300,7 +300,8 @@ pub fn write_atomic_replace(
     Ok(ReplaceOutcome::ReplacedDurable)
 }
 /// Durable directory sync: fsync the parent directory of `path` so a
-/// rename/removal inside it survives power loss. Errors PROPAGATE (a
+/// rename/removal inside it survives power loss (on Linux — see the README's
+/// durability assumption). Errors PROPAGATE (a
 /// failed dir sync means the change may not be durable).
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let parent = path

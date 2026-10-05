@@ -168,7 +168,8 @@ backup or checkpoint format**, and it cannot stand in for one:
 ## Durability and atomicity
 
 A file a sync writes is published ATOMICALLY and DURABLY for every Unix
-reachable destination kind: a LOCAL destination (a pull, or a push whose
+reachable destination kind (durability means the LINUX power-loss barrier — see the
+durability assumption above): a LOCAL destination (a pull, or a push whose
 transport is `LocalTransport`) uses the crate's durable atomic replace (unique
 temp + `fsync` + `rename` + parent-directory `fsync`), and a REMOTE destination
 uses the same shape on the far side (temp, payload on stdin, mode, perl
@@ -394,8 +395,9 @@ confinement, locks, validated ids and paths, manifest and wire, transport, sync.
 takes responsibility for exactly this, and no more.
 
 * **Enforced.** (a) The mutation symbols THIS crate funnels — including the `libc`
-  symbols its wrappers call — are denied by the compiler, on BOTH targets, in every
-  module that does not carry the allow, so no spelling, alias or module route reaches
+  symbols its wrappers call — are denied by the compiler in every module that does not
+  carry the allow, on each target that EXPORTS the symbol (the devices target UNIX —
+  see the assumptions), so no spelling, alias or module route reaches
   them (`clippy.toml`: the symbols the funnel uses, plus a reviewed set around
   them — the list is deliberately WIDER than the funnel, and naming a symbol the
   funnel never calls is how a route it could acquire later is refused in

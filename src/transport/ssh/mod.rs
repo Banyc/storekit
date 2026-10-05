@@ -5794,7 +5794,7 @@ mod tests_ssh {
         // SLOW-test gate: spawns many concurrent shells and exceeds the fast
         // suite's budget; run it under the full suites.
         if !crate::test_support::slow_tests_enabled() {
-            eprintln!("skipped: slow test — set STOREKIT_FULL_TESTS=1 to run");
+            crate::test_support::announce_skip("slow test — set STOREKIT_FULL_TESTS=1 to run");
             return;
         }
 
@@ -8262,7 +8262,7 @@ exec /bin/mv "$@"
         ) {
             // SLOW-test gate: exceeds ~20 s under the FULL gate
             if !crate::test_support::slow_tests_enabled() {
-                eprintln!("skipped: slow test — set STOREKIT_FULL_TESTS=1 to run");
+                crate::test_support::announce_skip("slow test — set STOREKIT_FULL_TESTS=1 to run");
                 return Ok(());
             }
             use std::os::unix::fs::PermissionsExt;
