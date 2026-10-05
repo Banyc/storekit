@@ -121,6 +121,12 @@ Named, scoped, not pursued:
   list, because it resolves the alias; what slips past all three devices is an
   ADDITIONAL alias-spelled call of a symbol the deny already names. The `std::fs` half is strict here: an aliased `std::fs` call is a
   `ModuleAlias` violation.
+- **The Windows compare-and-replace does not refuse a symlink, and the Unix arm does.**
+  `atomic::windows::write_atomic_if_match_fd` is path-based: its comparison reads through
+  `std::fs::read` (which FOLLOWS a link) and its replace removes the link and installs a
+  regular file, while `atomic::unix`'s compare opens the live entry `O_NOFOLLOW` and
+  refuses a symlink outright. Only the WINDOWS arm is affected, its runtime is out of
+  scope, and the divergence is stated at the function rather than left for a reader.
 - **The far-side lock holder has no twin for the local arm's parent checks.** The local
   `FileLock` refuses a record whose final component or whose parent is a symlink, each
   with its own typed kind; the far-side holder's `perl` tests the directory with `-d`,

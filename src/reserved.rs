@@ -356,8 +356,11 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   the funnel's own code, not a path around it. The production mutation
 ///   sites that do NOT consult the guard are a CLASS defined by RULE, not a
 ///   count: a site whose only protection is its OWN naming or its own
-///   naming-check rather than the reserved-spelling guard. Three such sites
-///   exist today — the transport's own destination-root/layout DIRECTORY
+///   naming-check rather than the reserved-spelling guard. The members found so
+///   far illustrate the RULE rather than enumerating it (the funnel's own
+///   `open_lock_file` in each port is a further one: it spells the adoption symbol
+///   under its own module allow and protects itself by protocol-computed naming and
+///   handle inspection) — the transport's own destination-root/layout DIRECTORY
 ///   creation (`create_dir_all` on `self.base` and its bootstrap dirs, which
 ///   creates directories the caller names OUTRIGHT rather than mutating an
 ///   existing NAME the guard owns); the private ssh hostkey cache's

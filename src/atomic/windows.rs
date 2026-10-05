@@ -959,8 +959,11 @@ pub enum CompareReplace {
 /// followed by the non-atomic Windows replace, so a writer that changes the
 /// entry between the read and the replace is NOT detected — the documented
 /// weaker guarantee of the Windows port (no descriptor to compare through,
-/// no atomic rename). Fail closed on an unreadable entry or a symlink (the
-/// read follows it on this port).
+/// no atomic rename). An UNREADABLE entry fails closed. A SYMLINK does NOT:
+/// the comparison reads through `std::fs::read`, which FOLLOWS the link, and
+/// the replace then removes the link and installs a regular file — the Unix
+/// arm refuses a symlink here instead (`atomic::unix`'s `O_NOFOLLOW` read), and
+/// this divergence is stated in `docs/CONSISTENCY.md`'s residuals.
 ///
 /// An ENTRY THAT IS ABSENT is a `Mismatch`, never an error, matching the Unix
 /// port's contract: the caller read the destination, so a live entry that is

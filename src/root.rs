@@ -20,11 +20,13 @@
 //!   store holding it) is dropped: two SIMULTANEOUS owners over overlapping
 //!   state are refused, while a released root can be re-owned.
 //!
-//! The store's mutations are additionally descriptor-relative (see
-//! [`crate::atomic`]'s `_fd` primitives): every mutation resolves
-//! paths component-wise relative to the owned root's open directory
-//! descriptor with `openat(O_NOFOLLOW)`, so a symlink injected into a path
-//! component can never redirect a mutation outside the owned root.
+//! The store's mutations are additionally descriptor-relative ON UNIX (see
+//! [`crate::atomic`]'s `_fd` primitives): every mutation resolves paths
+//! component-wise relative to the owned root's open directory descriptor with
+//! `openat(O_NOFOLLOW)`, so a symlink injected into a path component can never
+//! redirect a mutation outside the owned root. The Windows port is path-based
+//! (`crate::atomic::COMPONENT_CONFINED` is `false` there), so this confinement
+//! is the UNIX arm's.
 
 use crate::error::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
