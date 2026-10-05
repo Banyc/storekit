@@ -1,7 +1,7 @@
 //! Far-side shell-quoting contract for `SshTransport`.
 //!
-//! THE HARNESS — an `ssh` SHIM ON `PATH`. There is no real `ssh`/`sshd` on the
-//! machines these tests run on, so the transport is pointed (through the
+//! THE HARNESS — an `ssh` SHIM ON `PATH`. The harness uses a shim rather than a
+//! real `ssh`/`sshd` so the far side is HERMETIC and byte-exact, so the transport is pointed (through the
 //! hermetic [`SysEnv`] snapshot every child receives) at a shim `ssh` that
 //! takes the remote command string the transport constructed — the FINAL
 //! argument, `bash -c '<script>'` — and runs it in a designated working

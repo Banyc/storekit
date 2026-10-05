@@ -104,8 +104,9 @@ predicates as "spellings the crate cannot address", NOT as a `valid_name` oracle
 They report the spellings the crate reserves for its OWN bookkeeping — the
 `.sync-aside.` claim-aside prefix, the `.<name>.operation.lock` record, the
 application lock record `operation.lock`, case aliases of any of those, crate
-temp shapes, and the Win32 trailing-dot/space aliases of a lock record (refused
-on every platform, so an id does not mean different things on different hosts).
+temp shapes, and the Win32 trailing-dot/space aliases of a lock record OR a crate
+temp (all refused on every platform, so an id does not mean different things on
+different hosts).
 `is_reserved_name` / `is_reserved_path` are NARROWER — the byte-exact reserved
 MATCH. They deliberately leave the application lock record and the case/trailing-
 dot aliases alone, so they are NOT on their own the answer to "may I use this
@@ -456,7 +457,7 @@ two wrappers read the variable.
   printed skip reason: the atomic replace's sweep over EVERY pre-rename stage, the
   concurrent-controller ssh case, and the every-boundary swap case. One widens its
   own exhaustive sweep instead
-  (`valid_name_agrees_with_the_independent_characterization`). The default run
+  (`valid_name_agrees_with_the_restated_rule`). The default run
   covers sampled shapes; the widened run covers all of them. (The search
   `rg -n slow_tests_enabled src` returns SIX hits: those four, the definition, and
   one `use`.)
@@ -466,9 +467,10 @@ two wrappers read the variable.
 
 TWO clippy commands, and the second is not optional: `--all-targets` compiles the HOST
 only, and `cargo check --target …` runs no lints, so a `#[cfg(windows)]`-only module is
-invisible to both. On Linux, `remote_lock` — which stands up a REAL `sshd` — is
-part of `cargo test`, while the `ssh_farside_*` suites drive the far-side
-protocol through a `PATH` shim, not a real `ssh`.
+invisible to both. `remote_lock` — which stands up a REAL `sshd`, and is
+`#![cfg(unix)]` rather than Linux-only — is part of `cargo test` wherever one is
+available, while the `ssh_farside_*` suites drive the far-side protocol through a
+`PATH` shim, not a real `ssh`.
 
 ## Rules for changing this crate
 

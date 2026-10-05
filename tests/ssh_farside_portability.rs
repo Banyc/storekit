@@ -4,8 +4,8 @@
 //! behaviour silently depending on the remote's userland.
 //!
 //! THE HARNESS — an `ssh` SHIM ON `PATH` (the same harness
-//! `tests/ssh_farside_quoting.rs` uses). There is no real `ssh`/`sshd` in the
-//! unit-test environment, so the transport is pointed (through the hermetic
+//! `tests/ssh_farside_quoting.rs` uses). It drives a shim rather than a real
+//! `ssh`/`sshd` so the far side is HERMETIC, so the transport is pointed (through the hermetic
 //! [`SysEnv`] snapshot every child receives) at a shim `ssh` that takes the
 //! remote command string the transport constructed — the FINAL argument,
 //! `bash -c '<script>'` — and runs it in a designated working directory:

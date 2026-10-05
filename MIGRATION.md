@@ -40,7 +40,7 @@ domain), and the receiver-marker adoption (done).
 
 | `deploy` | `storekit` | Adaptation |
 |---|---|---|
-| `store/atomic/{mod,unix,windows}.rs` | `atomic::*` | Every root-relative mutation takes `&RootedRelativePath`, parsed once at the boundary. The path-based helpers `set_private`, `sync_parent_dir`, `ensure_private_dir`, `ensure_private_dir_durable` and `remove_dir_all_path` are gone from the PUBLIC surface (they remain `pub(crate)`, serving the crate's own paths) — a consumer uses the `_fd` twins. `write_atomic_replace(&Path)` is public for the unconfined, absolute-path case. |
+| `store/atomic/{mod,unix,windows}.rs` | `atomic::*` | Every root-relative mutation takes `&RootedRelativePath`, parsed once at the boundary. The path-based helpers `set_private`, `sync_parent_dir`, `ensure_private_dir_durable` and `remove_dir_all_path` are gone from the PUBLIC surface: the first three remain `pub(crate)` for the crate's own paths, `remove_dir_all_path` is `#[cfg(test)]` with no production caller, and `ensure_private_dir` exists on the WINDOWS port only — a consumer uses the `_fd` twins. `write_atomic_replace(&Path)` is public for the unconfined, absolute-path case. |
 | `deploy/lock/{mod,unix,windows}.rs` | `lock::FileLock` | 1:1. |
 | `store/local/owned_root.rs` | `root::OwnedRoot` + `EndpointKey` | Domain cut: the crate owns `EndpointKey`/`LOCAL_ENDPOINT_MARKER`. |
 | `identity::*` (`id_newtype!`, `valid_name`, `valid_hex_digest`) | `id::*` | 1:1. The macro names `serde` through the crate, so the call site needs no `serde` dependency. |

@@ -459,7 +459,11 @@ mod tests {
         }
     }
 
-    /// The independent characterization of the name rule: a value is a safe
+    /// A SECOND WRITING of the name rule, checked against `valid_name` for
+    /// divergence below. It is NOT an oracle anchored outside the rule — a wrong
+    /// rule copied into both places would pass — so read the test as a
+    /// consistency check between two copies, not as an independent certification.
+    /// A value is a safe
     /// filesystem ASCII single path segment iff it is non-empty, at most
     /// [`crate::atomic::NAME_MAX`] bytes, uses only `[a-zA-Z0-9._-]`, is not a
     /// `.`/`..` traversal component, never starts with `-` (a leading dash
@@ -636,13 +640,13 @@ mod tests {
     }
 
     /// An exhaustive (rather than random) check that `valid_name` agrees with
-    /// its independent characterization over every string up to the allowed
+    /// its second writing, over every string up to the allowed
     /// alphabet's length limit: one character by default, three characters
     /// when the full suite is requested. The alphabet includes the
     /// traversal (`/`, `\`, `.`), the leading-dash, and the separator classes
     /// so every rejection rule is exercised.
     #[test]
-    fn valid_name_agrees_with_the_independent_characterization() {
+    fn valid_name_agrees_with_the_restated_rule() {
         let max_len = if crate::test_support::slow_tests_enabled() {
             3
         } else {
