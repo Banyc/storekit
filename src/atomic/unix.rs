@@ -1499,10 +1499,10 @@ pub fn write_atomic_if_match_fd(
     rel: &RootedRelativePath,
     expected: &[u8],
     bytes: &[u8],
-    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CompareReplace> {
     let rel = rel.as_path();
-    match replace_core(root, rel, Some(expected), true, bytes, fault)? {
+    // No fault seam: this primitive has no caller that injects one.
+    match replace_core(root, rel, Some(expected), true, bytes, &mut |_| None)? {
         CoreReplace::Replaced(outcome) => Ok(CompareReplace::Replaced(outcome)),
         CoreReplace::Mismatch => Ok(CompareReplace::Mismatch),
     }

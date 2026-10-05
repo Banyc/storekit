@@ -127,7 +127,7 @@ fn fifo_child() {
         crate::atomic::write_atomic_cas_fd(&owned, rel, b"x")
     });
     probe("ifmatch", || {
-        crate::atomic::write_atomic_if_match_fd(&owned, rel, b"x", b"y", &mut |_| None)
+        crate::atomic::write_atomic_if_match_fd(&owned, rel, b"x", b"y")
     });
 
     println!("{DONE_MARKER} platform={}", std::env::consts::OS);

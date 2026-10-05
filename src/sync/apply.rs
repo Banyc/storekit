@@ -8954,7 +8954,6 @@ impl LocalSide {
             rel,
             expected,
             bytes,
-            &mut |_| None,
         )? {
             crate::atomic::CompareReplace::Mismatch => return Ok(CheckedWrite::Mismatch),
             crate::atomic::CompareReplace::Replaced(ReplaceOutcome::ReplacedDurable) => {}

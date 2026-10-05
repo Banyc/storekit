@@ -973,7 +973,6 @@ pub fn write_atomic_if_match_fd(
     rel: &RootedRelativePath,
     expected: &[u8],
     bytes: &[u8],
-    fault: &mut dyn FnMut(ReplaceStage) -> Option<Error>,
 ) -> Result<CompareReplace> {
     let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
@@ -986,7 +985,7 @@ pub fn write_atomic_if_match_fd(
         }
         Err(e) => return Err(Error::store(format!("read {}: {e}", path.display()))),
     }
-    let outcome = write_atomic_replace(&path, bytes, fault)?;
+    let outcome = write_atomic_replace(&path, bytes, &mut |_| None)?;
     Ok(CompareReplace::Replaced(outcome))
 }
 
