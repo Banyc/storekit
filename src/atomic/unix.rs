@@ -30,10 +30,10 @@
 //! `std::fs`/`std::fs::Permissions`, so an INTERMEDIATE symlink in that path
 //! IS followed. They are [`set_private`] (crate-internal) and the PUBLIC,
 //! deliberately-named [`write_atomic_replace`] (`set_private` serves the
-//! unconfined replace),
-//! [`sync_parent_dir`], [`ensure_private_dir_durable`], and
-//! [`copy_tree_verbatim`]. The component confinement claimed below belongs to
-//! the `_fd` surface only, never to these.
+//! unconfined replace) and [`copy_tree_verbatim`], plus the two crate-internal
+//! durable helpers [`sync_parent_dir`] and [`ensure_private_dir_durable`]. The
+//! component confinement claimed below belongs to the `_fd` surface only, never
+//! to these.
 //!
 //! The `_fd` tree copy [`copy_dir_recursive_fd`] is a PARTIAL exception and
 //! is called out here so the list above is not read as exhaustive: it takes an

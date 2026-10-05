@@ -68,8 +68,10 @@ Named, scoped, not pursued:
   (spellings, aliases, macros, builders, module routes, `extern "C"`, raw syscall
   numbers, third-party code). What the crate enforces is bounded: the symbols it
   funnels — including the `libc` symbols its wrappers call, which is what closes the
-  cross-module alias route — are denied by the compiler on both targets in every module
-  without the allow; every production `libc` reference is either inside a funnel module
+  cross-module alias route — are denied by the compiler in every module without the
+  allow, on each target that EXPORTS the symbol (the six `libc::…at` symbols the Unix
+  wrappers call do not resolve on Windows, so those entries are inert there; see the
+  resolution residual below); every production `libc` reference is either inside a funnel module
   or NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
   own call counts are pinned. The pin records a review, not a proof. Completeness of
   the SYMBOL SET is a review responsibility.
@@ -96,7 +98,8 @@ Named, scoped, not pursued:
   diagnostic that the gate's `-D warnings` does not cover, so it can rot silently; a
   symbol the funnel DOES use is caught only by the closure test, which checks the LIST,
   not the resolution (`cargo clippy --all-targets --target x86_64-pc-windows-msvc` exits
-  0 while naming the six funnel-used `libc::…at` symbols and 77 other entries). On
+  0 while naming 87 entries: the six funnel-used `libc::…at` symbols, 77 other `libc`
+  entries, and four `std::os::unix::*` ones). On
   Windows those six do not resolve, so those entries are inert there; FIFTEEN other
   `libc` entries DO resolve and are live denies (the crate calls none of them on that
   target). Some wider-set entries name symbols no supported target exports at all

@@ -326,7 +326,7 @@ simplification; removing one means adding back the logic it removes.
   descriptor-relative manifest walk would lift this;
   it is not implemented, and this bullet is the statement of the real limit.
   The descriptor-relative
-  REMOVAL walk (`crate::atomic::remove_dir_contents_fd`) holds one descriptor
+  REMOVAL walk (`atomic::unix::remove_dir_contents_fd`, private) holds one descriptor
   per level and is NOT limited by the path limit, so removal supports deeper
   trees than the walk that describes them — but that advantage is itself
   bounded by the descriptor limit, the assumption bullet above ("the process's

@@ -7,10 +7,10 @@
 //! unlinks, replaces, renames, or truncates the record breaks that, so the
 //! crate must have no reachable path to such a mutation.
 //!
-//! Earlier passes each enumerated the call sites they could find and
-//! missed one (a second symlink implementation, the raw rename primitive
-//! under the guarded rename, a raw truncating open, and the Windows
-//! transport's direct `std::fs` seams). Enumeration is the wrong shape.
+//! Enumeration is the wrong shape, and was tried: the call sites found by hand
+//! each missed one of these — a second symlink implementation, the raw rename
+//! primitive under the guarded rename, a raw truncating open, and the Windows
+//! transport's direct `std::fs` seams.
 //! This module makes the guard STRUCTURAL instead:
 //!
 //! * [`refuse_lock_record`] is the ONE spelling authority. Every
@@ -4914,7 +4914,7 @@ impl S {
     /// NO test that fails when it regresses to an EXACT-module
     /// match: the only symbol `src/atomic/guard.rs` contributes to the real
     /// closure is already on the deny list, so replacing the prefix test with
-    /// equality left all 690 tests green.
+    /// equality left the whole suite green.
     ///
     /// This arm drives the closure over a SYNTHETIC source set — an
     /// allow-bearing parent module (`src/prod/parent/mod.rs`, which is how a
