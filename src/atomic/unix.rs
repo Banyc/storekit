@@ -226,6 +226,14 @@ pub fn write_atomic_replace(
         ));
     }
     drop(tmp_file);
+    // Private BEFORE visible and BEFORE the fsync: the temp carries 0o600
+    // before the rename — no reader ever observes the marker with the wider
+    // create-time mode — and this corrective chmod PRECEDES the `sync_all()`
+    // below, so that fsync covers the mode change rather than leaving it
+    // unflushed.
+    if let Err(e) = set_private(&tmp) {
+        return Err(discard_temp(e, &tmp));
+    }
     // Stage 2: the temp fsync. A failure (or an injected
     // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
     // temp the replace wrote is unlinked before the `Err` returns, so no
@@ -250,11 +258,6 @@ pub fn write_atomic_replace(
         ));
     }
     drop(tmp_file);
-    // Private BEFORE visible: the temp carries 0o600 before the rename, so
-    // no reader ever observes the marker with default permissions.
-    if let Err(e) = set_private(&tmp) {
-        return Err(discard_temp(e, &tmp));
-    }
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
     // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
     // visible target is wholly OLD and the temp is unlinked.
@@ -1405,6 +1408,24 @@ fn replace_core(
         ));
     }
     drop(f);
+    // Private BEFORE visible and BEFORE the fsync: the temp carries 0o600
+    // before the rename — no reader ever observes the marker with the wider
+    // create-time mode — and this corrective chmod PRECEDES the `sync_all()`
+    // below, so that fsync covers the mode change rather than leaving it
+    // unflushed.
+    let f = match openat_no_follow_path(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
+    };
+    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        drop(f);
+        return Err(discard_temp_fd(
+            Error::store(format!("chmod {}: {e}", rel.display())),
+            &parent_fd,
+            &tmp_name,
+        ));
+    }
+    drop(f);
     // Stage 2: the temp fsync. A failure (or an injected
     // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
     // temp the replace wrote is unlinked before the `Err` returns, so no
@@ -1420,21 +1441,6 @@ fn replace_core(
         drop(f);
         return Err(discard_temp_fd(
             Error::store(format!("fsync {}: {e}", rel.display())),
-            &parent_fd,
-            &tmp_name,
-        ));
-    }
-    drop(f);
-    // Private BEFORE visible: the temp carries 0o600 before the rename, so
-    // no reader ever observes the marker with default permissions.
-    let f = match openat_no_follow_path(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
-        Ok(fd) => std::fs::File::from(fd),
-        Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
-    };
-    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        drop(f);
-        return Err(discard_temp_fd(
-            Error::store(format!("chmod {}: {e}", rel.display())),
             &parent_fd,
             &tmp_name,
         ));
