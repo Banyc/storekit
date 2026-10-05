@@ -462,10 +462,9 @@ mod tests {
     /// A SECOND WRITING of the rule — the same conditions written out again, which
     /// rustfmt happens to format differently — checked against `valid_name` for
     /// BEHAVIOURAL divergence by the test below. It is NOT an oracle anchored
-    /// outside the rule, and the test compares OUTPUTS over an exhaustive
-    /// small alphabet rather than comparing the two texts: a wrong rule present in
-    /// both would pass, and a behaviour-preserving edit to one is not noticed at
-    /// all. What it does catch is an edit that CHANGES one writing's verdict.
+    /// outside the rule: a wrong rule present in both would pass, and the test
+    /// compares OUTPUTS over a small alphabet rather than the two texts, so only an
+    /// edit that CHANGES one writing's verdict over that alphabet is caught.
     /// A value is a safe
     /// filesystem ASCII single path segment iff it is non-empty, at most
     /// [`crate::atomic::NAME_MAX`] bytes, uses only `[a-zA-Z0-9._-]`, is not a
@@ -642,13 +641,15 @@ mod tests {
         }
     }
 
-    /// An exhaustive (rather than random) check that `valid_name` still agrees with
-    /// the duplicate text kept beside it (see `is_safe_segment`: this is a drift
-    /// guard, not a second writing), over every string up to the allowed
-    /// alphabet's length limit: one character by default, three characters
-    /// when the full suite is requested. The alphabet includes the
-    /// traversal (`/`, `\`, `.`), the leading-dash, and the separator classes
-    /// so every rejection rule is exercised.
+    /// An exhaustive (rather than random) check that `valid_name` and its second
+    /// writing (`is_safe_segment`) return the same verdict, over every string up to
+    /// the alphabet's length limit: one character by default, three when the full
+    /// suite is requested. The alphabet includes the traversal (`/`, `\`, `.`), the
+    /// leading-dash and the separator classes, so the CHARSET, traversal and
+    /// leading-dash rules are exercised. It does NOT reach three of `valid_name`'s
+    /// rules — the empty-name rule (no length 0), the `NAME_MAX` rule (no string
+    /// that long) and the `is_unaddressable_name` rule (no reserved spelling fits
+    /// in three characters) — and their mutations would survive it.
     #[test]
     fn valid_name_agrees_with_the_restated_rule() {
         let max_len = if crate::test_support::slow_tests_enabled() {

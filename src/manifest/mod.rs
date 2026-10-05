@@ -102,9 +102,9 @@
 //! fail-closed over-refusal, and it is the residual this rule accepts rather
 //! than letting the two views — or two hosts — disagree about the same tree.
 //!
-//! CORRECTION (this revision): the paragraph above was written when the fold
-//! was `str::to_lowercase`, and the claim that the fold's only cost is a
-//! fail-closed over-refusal was FALSE of that fold. `to_lowercase` UNDER-folds
+//! A `str::to_lowercase` fold would be WRONG here, and the reason is worth stating
+//! because it is the trap this rule exists to avoid: the claim that a fold's only
+//! cost is a fail-closed over-refusal is false of that one. `to_lowercase` UNDER-folds
 //! a case-insensitive host (`ß` stays `ß` instead of `ss`, `ﬁ` stays `ﬁ`
 //! instead of `fi`, FINAL SIGMA stays itself instead of `σ`, long s stays `ſ`
 //! instead of `s`), so a target component the kernel resolved onto a symlink
@@ -119,7 +119,7 @@
 //! families, and the three Greek precomposed perispomeni+ypogegrammeni pairs
 //! are covered end to end by the `greek_*` tests in
 //! `tests/casefold_confinement.rs`. The Linux `ext4 -O casefold` half was NOT
-//! re-run in this environment (no casefold host was available), so the claim for that
+//! re-run on a casefold host, so the claim for that
 //! host rests only on the fold being the Unicode C+F caseless match and is
 //! left UNVERIFIED here rather than asserted. The over-refusal residual above
 //! is now true, and the added over-refusal is exactly the extra spellings those

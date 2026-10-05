@@ -1178,10 +1178,10 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 /// across a recursive call; collecting the names first preserves the order
 /// but lets the walk own its iteration explicitly, on the heap.
 ///
-/// COST: O(entries) heap for the WIDEST directory of the walk (measured on one
-/// host, and reported rather than reproducible from this repository: ~50 B per
-/// name, so 200 000 entries is ~13.7 MB and 7.86 s to collect in one process),
-/// freed when the frame drops. This is a stated cost, not a leak:
+/// COST: O(entries) heap for the WIDEST directory of the walk — one buffered name
+/// per entry, freed when the frame drops. The per-name and total figures this
+/// bullet used to carry were a measurement of one host, are not reproducible from
+/// this repository, and did not even agree with each other; the SHAPE is the claim. This is a stated cost, not a leak:
 /// the alternative (a live `DIR*` per level) holds a descriptor AND a `DIR`
 /// buffer per level and cannot be resumed after an error part-way through one
 /// directory's iteration. No cap is imposed; a caller with a directory of
@@ -2706,9 +2706,8 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// under it is swept. A copied ENTRY name is the opposite: a temp-shaped entry
 /// name would be a live file the sweep destroys, so [`refuse_unlandable_name`]
 /// REFUSES it. Memory: [`dir_entry_names`] buffers EVERY entry name of a
-/// directory into a `Vec` before iterating (measured on one host and reported, like
-/// the figure above: ~50 B/entry, 200 000 entries took 7.86 s in one process and
-/// ~13.7 MB), so the walk's peak heap is
+/// directory into a `Vec` before iterating (O(entries), like the figure-free note
+/// above), so the walk's peak heap is
 /// O(entries) in the widest directory, not O(depth). No cap is imposed: a cap
 /// would be an arbitrary refusal of a legal tree, and the cost is linear and
 /// freed as each frame drops.

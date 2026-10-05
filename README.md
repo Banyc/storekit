@@ -225,72 +225,39 @@ fsync the parent directory entry.
 
 ## What a snapshot costs
 
-Three costs a checkpoint tool must budget for, all measured on a 350 MB tree
-unless stated otherwise.
+Three SHAPE facts a checkpoint tool must budget for. No figures are quoted anywhere in
+this section: every number it used to carry was a measurement taken outside this
+repository, and a number a reader cannot re-run from here is a claim that drifts.
 
-**PROVENANCE NOTE.** Most figures in this README are REPORTED measurements, not ones a
-reader can re-run from this repository: no benchmark or fixture ships here. The
-resident-memory bound in `manifest`'s module docs, the append byte accounting with
-`strace`, and the fresh-destination and `canonicalize_tree` figures were taken by the
-consuming tool (`deploy`) on its own hosts and tree; the Linux and macOS incremental
-figures were re-measured in a release build of this crate on its own hosts (load ≈0.3
-Linux / ≈1.4 macOS). The path-limit figures below ARE reproducible: grow a 1-byte chain
-and ask `canonicalize_tree` after each level, exactly as stated with them.
+**Memory is O(largest entry), not O(changed bytes).** `Remote::write` takes `data: &[u8]`
+and the read side materializes the whole entry, so peak memory tracks the LARGEST single
+file, for snapshot and for restore alike. The SSH path derives a size-aware deadline from
+the payload; the LOCAL path has neither a deadline nor streaming. Keep the largest entry
+under the process's budget, or move large blobs outside the synced tree and ship them with
+a tool that streams. A streaming transport API would remove the bound; it is a deliberate
+future direction, and adding one is a transport-layer redesign this crate does not
+undertake.
 
-**Memory is O(largest entry), not O(changed bytes).** `Remote::write` takes
-`data: &[u8]` and the read side materializes the whole entry, so a single
-350 MB file costs peak RSS 362,064 KB (macOS) / 362,860 KB (Linux) for
-snapshot AND for restore — a 4 GB file needs roughly 4 GB of addressable
-memory in the process doing the transfer. The two destination kinds are NOT
-equally protected against a slow link: the SSH path derives a size-aware
-deadline from the payload (`upload_deadline` / `transfer_deadline(bytes,
-min_rate, command_deadline)`), while the LOCAL path has neither a deadline
-nor streaming. Workaround: keep the largest entry under the process's memory
-budget, or move large blobs outside the synced tree and ship them with a
-tool that streams. A streaming transport API would remove the bound; it is a
-deliberate future direction, and adding one would be a transport-layer redesign
-that this crate does not undertake.
+**A snapshot scans and hashes the WHOLE tree** — O(bytes scanned), not O(bytes changed).
+Content addressing deduplicates the STORE, but there is no dirty tracking and no reuse of a
+previously computed manifest: `canonicalize_tree` reads every file to hash it, and
+`install_file` reads the whole source again to write it. Reusing a previous manifest, or
+skipping the second read, would change that; neither is built here.
 
-**A snapshot still scans and hashes the WHOLE tree, so it is O(bytes
-scanned), not O(bytes changed).** Content addressing makes the STORE
-deduplicated — equal content is stored once — but there is no dirty tracking
-and no reuse of the previous manifest: `canonicalize_tree`
-(`crate::manifest`) reads every file to hash it, and `install_file`
-(`crate::sync::apply`) reads the whole source again to write it. Measured on
-the 350 MB tree, changing one 4-byte file: 1.327 s before -> 1.384 s after
-(macOS); 2.739 s -> 2.690 s (Linux). A periodic checkpoint therefore pays
-O(total bytes scanned) every run, which is a design cost of the
-manifest-and-hash model, not a bug; an implementation that reused a
-previously computed manifest or skipped the second read would change it, and
-neither is built here.
+**A deep tree is worse than linear, and the shape depends on fresh vs incremental.** A
+LOCAL path-based destination re-verifies a path's ancestry before each mutation — O(depth)
+per probe — so a depth-D chain with ONE changed leaf is super-linear in D, and a FRESH
+D-entry destination is worse still: each install pays its own O(D) probe, and one probe is
+O(D) syscalls. A checkpoint tool that recreates its destination per snapshot should budget
+cubic-or-worse. `canonicalize_tree` itself is not the cost; the engine's per-path
+verification is. A descriptor-relative walk would lift this, and it is not built.
 
-**A deep tree is worse than the incremental measurement suggested, and the
-shape depends on fresh vs incremental.** A LOCAL path-based destination
-re-verifies a path's ancestry before mutating it, at O(depth) per probe. A
-depth-D chain with ONE changed leaf is therefore SUPER-LINEAR in D, and the
-measured exponent is PLATFORM-DEPENDENT: ≈2.0 on Linux (measured 99 / 373 /
-1472 ms at D = 100 / 200 / 400; ratios 3.77 / 3.95) but ≈2.5 on macOS
-(measured 0.64 / 3.44 / 21.2 s at the same depths; ratios 5.4 / 6.2; the
-consumer's earlier 0.63 / 3.38 / 21.6 s agree). The single O(D^2) label was
-wrong on macOS — budget for worse than quadratic. A FRESH destination installs
-all D entries, and EACH install pays its own ancestry probe: one probe is O(D)
-syscalls, each resolving up to D components, so one install is O(D^2) and a
-fresh D-entry destination is O(D^3). The measured shape is AT LEAST cubic — the
-consumer's 4.855 s / 41.39 s / 582.1 s give ratios 8.5 and 14.1 for two
-doublings, where a purely cubic curve predicts 8. `canonicalize_tree` alone is
-cheap (2.76 ms / 6.53 ms /
-25.4 ms), so the engine's per-path verification is the cost, and a checkpoint
-tool that recreates its destination per snapshot should budget cubic-OR-WORSE. The
-incremental figures, the fresh-destination figures and the `canonicalize_tree` figures
-are attributed in the PROVENANCE NOTE above.
-
-## A fresh destination
+## Destination provisioning
 
 A `PUSH` provisions its destination before reading the destination manifest: the
-destination ROOT and the caller's `Layout::bootstrap_dirs` are created, so a
-fresh remote destination works without the caller pre-creating it and
-`Layout::empty()` is enough. A `PULL` into a local destination creates that root
-lazily, on the first mutation.
+destination ROOT and the caller's `Layout::bootstrap_dirs` are created, so a fresh remote
+destination works without the caller pre-creating it and `Layout::empty()` is enough. A
+`PULL` into a local destination creates that root lazily, on the first mutation.
 
 ## Platform
 
@@ -321,7 +288,9 @@ simplification; removing one means adding back the logic it removes.
   macOS included: the WINDOWS replace is the ONE non-atomic case, because Windows `rename` does not overwrite an
   existing target and the target is therefore removed first (a reader can observe a
   transient absence). A caller needing power-loss recovery there owns that step. Wherever this crate calls a
-  write DURABLE, this is the claim it means.
+  write DURABLE or names POWER LOSS, this is the claim it means — so a site that
+  says a write survives power loss without repeating the platform does not
+  overclaim: the assumption is the one home for the reach.
 - **The name-mutation devices target UNIX.** *Buys:* one funnel, one deny list, one
   pin, and no per-target discussion. On Windows the crate's I/O is `windows_sys`, so a
   `libc` entry is inert only on a target that does not EXPORT the symbol. Run the
@@ -366,16 +335,9 @@ simplification; removing one means adding back the logic it removes.
   level, so the bound is `floor((PATH_MAX - 1 - base_len)/2)`, where `base_len`
   is the length in BYTES of the base path AS IT RESOLVES on the filesystem: the
   kernel accepts at most `PATH_MAX - 1` bytes for a path, on both platforms.
-  Worked examples, each measured by growing a 1-byte chain and asking
-  `canonicalize_tree` after every level: on Linux (`PATH_MAX` 4096) a 34-byte
-  resolved base admits depth 2030 — the path at that depth is 4094 bytes and
-  the next reachable length, 4096, is refused; on macOS (`PATH_MAX` 1024) a
-  72-byte resolved base admits 475, where 1022 bytes is accepted and 1024 is
-  refused. A 1-byte base is the case `floor((PATH_MAX - 2)/2)`. A
-  descriptor-relative manifest walk would lift this;
-  it is not implemented, and this bullet is the statement of the real limit.
-  The descriptor-relative
-  REMOVAL walk (`atomic::unix::remove_dir_contents_fd`, private) holds one descriptor
+  (The worked depths this bullet used to quote were measurements of one host's
+  kernel and are not reproduced here.) A descriptor-relative manifest walk
+  would lift this and is not built; removal walks descriptor-relative one level
   per level and is NOT limited by the path limit, so removal supports deeper
   trees than the walk that describes them — but that advantage is itself
   bounded by the descriptor limit, the assumption bullet above ("the process's

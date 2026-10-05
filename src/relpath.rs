@@ -531,8 +531,8 @@ mod tests {
     /// legal component and stays accepted — pinning this crate's name
     /// fidelity. The genuine unsafe spellings are still refused.
     ///
-    /// THIS ARM RUNS HERE (macOS is Unix). The Windows arm below is compiled
-    /// only on Windows and is NOT run in this environment.
+    /// The Unix arm: it runs wherever this suite runs on a Unix host. The Windows
+    /// arm below is compiled only on Windows and never executed by this suite.
     #[cfg(unix)]
     #[test]
     fn unix_backslash_is_an_ordinary_name_byte() {
@@ -557,9 +557,9 @@ mod tests {
         }
     }
 
-    /// WINDOWS (compiled only on Windows; NOT run in this environment —
-    /// Windows is type-checked only, so this is an UNVERIFIED-at-runtime
-    /// assertion, not a measured result).
+    /// WINDOWS (compiled only on Windows, and never executed by this suite — the
+    /// port is type-checked only, so this is an UNVERIFIED-at-runtime assertion
+    /// rather than a measured result).
     ///
     /// FLIPPED: this test previously asserted that `parse` ACCEPTED
     /// `a\b` and `a\b\c.json` because the Windows path model treats `\` as a
