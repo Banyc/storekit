@@ -57,8 +57,14 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs:
 
 /// Whether an error from [`open_lock_file`] is the REPARSE-POINT refusal (rather
 /// than a real open failure), so the caller can name the condition.
+///
+/// The refusal is the error THIS MODULE constructs when the opened handle carries
+/// `FILE_ATTRIBUTE_REPARSE_POINT`, and a constructed error has no OS code. A real
+/// `CreateFileW`/`GetFileInformationByHandle` failure always carries one (for
+/// example `ERROR_INVALID_PARAMETER`, which std maps to the same `InvalidInput`),
+/// so both halves are required — the Unix arm is the same shape, naming `ELOOP`.
 pub(crate) fn is_symlink_open_error(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::InvalidInput
+    e.kind() == std::io::ErrorKind::InvalidInput && e.raw_os_error().is_none()
 }
 
 /// Try to acquire the exclusive, non-blocking advisory lock over the whole

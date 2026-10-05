@@ -64,7 +64,8 @@ caller.
 Names not UTF-8 or not NFC · names or targets containing CR, LF or TAB ·
 absolute or escaping symlink targets · a relative target that walks through a
 symlink component (the kernel follows it, so a lexical collapse past it is not
-its resolution) · hard links · devices, sockets, FIFOs ·
+its resolution) · hard links (on a UNIX source; the local Windows walk cannot see
+`nlink`) · devices, sockets, FIFOs ·
 reserved-name collisions · overlapping roots, decided per operation rather than
 once: a `sync` requires its SOURCE and DESTINATION to be DISJOINT — a strict
 ancestor/descendant nesting is refused WHEN THE REMOTE SIDE IS LOCAL — a far-side root,
@@ -77,7 +78,9 @@ root-confined tree copy (`atomic::copy_dir_recursive_fd`) refuses an
 overlapping source and destination (equal included) by directory IDENTITY ·
 a DESTINATION root or entry reached through a symlink component (every PARENT
 component of an in-root mutation, and the FINAL component of a root open or an
-open/create-new) — with two stated exceptions: the atomic REPLACE cannot follow
+open/create-new) — ON UNIX ONLY: the Windows port is path-based, so a symlink in a
+path component is followed there and `atomic::COMPONENT_CONFINED` is `false` — with
+two stated exceptions: the atomic REPLACE cannot follow
 the final entry (it installs with `renameat`), and a SOURCE spelling may resolve
 its own intermediate symlink components, which the fd tree copy reads once —
 where a destination's lock cannot be taken, a component swapped between the
@@ -293,7 +296,9 @@ lazily, on the first mutation.
 
 Linux and macOS are supported and exercised. The far side of a remote transfer
 may be GNU or BSD userland; both are exercised. The Windows implementation
-type-checks but is not exercised, and is described as unverified.
+type-checks but is not exercised, and is described as unverified — and it is not only
+untested: some rules are UNIX-only by construction, and each such claim says so where it
+is made (`atomic::COMPONENT_CONFINED`, the local walk's hard-link check).
 
 The Windows check compiles the WHOLE target, tests included:
 `cargo check --all-targets --target x86_64-pc-windows-msvc`. A signature change
@@ -456,8 +461,10 @@ takes responsibility for exactly this, and no more.
   no newly counted symbol is a review responsibility (on UNIX an argument that adds a
   `libc::…` constant IS noticed — it moves the libc pin — while on Windows the funnel's
   `custom_flags` sites spell `windows_sys` constants, which that pin does not count).
-* **Guaranteed as an API.** Root confinement (a relative symlink target cannot leave
-  the root, and neither can a mutation named by `(&RootDir, &RootedRelativePath)`), the
+  * **Guaranteed as an API.** Root confinement ON UNIX — a relative symlink target
+  cannot leave the root, and neither can a mutation named by
+  `(&RootDir, &RootedRelativePath)`; the Windows port is path-based, so a symlink in a
+  path component is followed there (`atomic::COMPONENT_CONFINED` is `false`) — the
   atomic replace's commit points and its reported durability, lock mutual exclusion
   with a record never destroyed by adoption, validated ids and paths, manifest fidelity
   and wire injectivity, the ownership binding, and the typed error kinds.
