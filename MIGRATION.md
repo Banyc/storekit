@@ -1,4 +1,7 @@
-# Migrating `~/code/deploy` onto `storekit`
+# Migrating the consumers onto `storekit`
+
+`deploy` came first and is DONE (below). `ckpt` came second and is DONE (last section).
+Each migration's acceptance bar was the same: the consumer's own tests pass, UNEDITED.
 
 The crate was extracted from `deploy`, so the migration is mostly deletion: swap
 `deploy`'s copies of the substrate for the crate's, keep everything that is
@@ -188,3 +191,49 @@ beforehand; the adoption test now fails on the pre-change tree and passes after.
 
 - the Windows runtime (`deploy`'s Windows port is type-checked only, and the
   crate's Windows test target compiles but has never executed).
+
+# `ckpt` (DONE)
+
+`ckpt` is a record book — sessions holding ctf flags holding verification hits — laid out
+as `<root>/sessions/<a>/<b>/meta.json`, `.../flags/<a>/<b>/{meta.json,hits.log}` and
+`<root>/by-flag/<a>/<b>`, with every id a 40-character lowercase hex object name. It has no
+locking and a true `O_APPEND` log, and both are contracts rather than omissions. It had no
+`storekit` dependency before this migration.
+
+## What it adopts, and what each adoption cost
+
+| `ckpt` site | `storekit` item | the difference the migration had to preserve |
+|---|---|---|
+| `Store::read_record`, `sparse::read_owned_file` | `atomic::path_kind_fd` + `atomic::read_fd` | a MISSING file or ancestor must stay an ABSENCE (`Ok(None)`), so the absence check happens before the read; a file, symlink or foreign entry in its place must stay a `Corrupt` naming that path. `ckpt`'s own `nlink > 1` check stays: the atomic layer does not check hard links. |
+| `sparse::write_new_file` | `atomic::path_kind_fd` + `atomic::write_atomic_cas_fd` | the substrate treats an IDENTICAL re-write as an idempotent success; `ckpt` must REPORT a name that already holds a file, so its pre-check runs first. Files are now written mode `0o600` and fsynced (temp, file, parent), where `std::fs::write` used the umask with no fsync — a recorded tightening. |
+| `sparse::ensure_directory`, `create_record_dir`, `require_directory` | `atomic::path_kind_fd` + `atomic::create_dir_fd` | NOT `ensure_private_dir_durable_fd`: that chmods an existing directory to `0o700`, and `ckpt` leaves modes alone. |
+| `sparse::entries` | `atomic::path_kind_fd` + `atomic::read_dir_fd` | the two-character/38-character shard split, the dotfile skip and the `Missing` policy stay in `ckpt`; the substrate knows nothing about the layout. |
+| `store::take_back_mapping` | `atomic::remove_file_fd` | a missing entry is still a successful take-back. |
+| the owned root | `atomic::RootDir`, `RootedRelativePath` | the root is CANONICALIZED first: `RootDir::open` refuses a symlinked root while `ckpt` permits a root that is "a link the caller chose". |
+
+Adopting the `_fd` primitives also RETIRES a stated `ckpt` limitation: its old checks were
+made "before a path is used rather than while it is open", so a symlink swapped in
+mid-operation was outside them. The substrate acts through one descriptor.
+
+## What it deliberately does not adopt
+
+* **No lock.** A hit appended by one process must be visible to the next read of another,
+  and a lock would also drop a non-dot record that `ckpt`'s own shard walk reports as a
+  foreign entry.
+* **No `AppendTail`.** It is a whole-file compare-and-replace with a stated lost-update
+  hazard; `hits.log` is a true `O_APPEND` whose point is that concurrent verifications both
+  land. The two concurrency tests are the guards.
+* **No `sync`/`manifest`/`transport`/tree copy.** Nothing is cached and the files ARE the
+  index.
+* **No `id_newtype!`.** Its construction stores the input VERBATIM, while `ckpt`
+  canonicalizes to lowercase and ACCEPTS an uppercase spelling; `ckpt`'s rule is also
+  strictly narrower (40 lowercase hex) than the substrate's. `ckpt` keeps its own `Id`.
+
+## Validation
+
+`ckpt`'s `tests/record_book.rs` (108) and `tests/cli.rs` (17) are BYTE-IDENTICAL to the
+pre-migration revision and all pass; the in-crate unit tests are unchanged. `tests/substrate_fit.rs`
+cites every adopted item by name (as a function value, so a signature change breaks the
+build), so the coupling is compile-enforced rather than implied. `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test` and
+`cargo check --all-targets --target x86_64-pc-windows-msvc` are green after every slice.
