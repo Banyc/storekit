@@ -68,6 +68,41 @@ its entry corrected, in the round that lands it.
 | `IdentityProbe` | TEST-ONLY |
 | Source audit traversal | TEST-ONLY |
 | Child-process orchestration | TEST-ONLY |
+| Prose sweep: stale comments and docs (opt-in) | OPEN — `prose-sweep`: every claim in the declared slice is re-derived or deleted |
+
+## Prose sweep (opt-in)
+
+Not a state machine: a cleanup program over this inventory's prose and the rest
+of the crate's comments and docs.
+
+**Rule.** A claim survives only when it was RE-DERIVED from the symbols it
+names in the same round and corrected there. Prose nobody re-derived is
+DELETED, not kept by default. Every keep, correction, and deletion is recorded
+in `docs/PROSE-DISPOSITIONS.md` (one row per covering section), together with
+the symbols it was derived from, so a later reader can see what was opted in
+and what was removed rather than assumed.
+
+**Slices** — each is a declared, committed scope; a slice touches only its own
+files and appends its own ledger rows.
+
+1. `docs/HIDDEN-STATE-MACHINES.md`.
+2. `docs/CONSISTENCY.md`, `docs/API-CONSTRAINTS.md`.
+3. `README.md`, `EXTRACTION.md`, `MIGRATION.md`.
+4. Module docs (`//!`) of `src/**`, sub-sliced per module.
+5. Item docs (`///`) of public items in `src/**`, sub-sliced per module.
+6. Inline comments (`//`, `/* */`) in `src/**`, sub-sliced per file.
+
+A slice is done when every comment/doc site in its files is dispositioned and
+the diff matches the ledger. Reviewers check the ledger and the re-derivation,
+not the prose's style.
+
+**Pending dispositions.** `src/sync/apply.rs`, `prepare`'s doc paragraph: "so a
+refusal leaves no residue" is false on the SSH path (`prepare_identity` creates
+the mux directory and possibly the known-hosts pin before the strict source
+read). `lock_with_in_root_lock`'s doc and its module-docs twin: a destination
+parent directory that holds the in-root record is refused by `delete_verdict`
+as a `ResidueBelow` CONFLICT, not "reported as residue". Both are corrected or
+deleted by the slice that covers that file; neither is re-opened here.
 
 ## Store substrate
 
