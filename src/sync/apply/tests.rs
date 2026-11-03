@@ -4756,8 +4756,8 @@ fn root_spelling_normalizes_and_refuses_a_symlinked_root() {
     fs::create_dir_all(real.join("sub")).unwrap();
     let with_slash = PathBuf::from(format!("{}/", real.display()));
 
-    let plain = LocalSide::open(&real, false).unwrap();
-    let slashed = LocalSide::open(&with_slash, false).unwrap();
+    let plain = LocalSide::open(&real, LocalRole::Source).unwrap();
+    let slashed = LocalSide::open(&with_slash, LocalRole::Source).unwrap();
     assert_eq!(plain.root_path, slashed.root_path);
     assert_eq!(plain.manifest().unwrap(), slashed.manifest().unwrap());
 
@@ -4767,7 +4767,7 @@ fn root_spelling_normalizes_and_refuses_a_symlinked_root() {
     for spelling in [&link, &link_slash] {
         assert!(
             matches!(
-                LocalSide::open(spelling, false),
+                LocalSide::open(spelling, LocalRole::Source),
                 Err(Error::Materialization { .. })
             ),
             "{spelling:?} must refuse a symlinked root"
@@ -4789,7 +4789,7 @@ fn parent_component_symlink_refuses_a_local_symlink_target_read() {
     symlink(&outside, local_root.join("sub")).unwrap();
     symlink("legit-target", local_root.join("good")).unwrap();
 
-    let local = LocalSide::open(&local_root, true).unwrap();
+    let local = LocalSide::open(&local_root, LocalRole::Destination).unwrap();
     let err = local
         .read_link(&RootedRelativePath::parse(Path::new("sub/link")).unwrap())
         .expect_err("a parent-component symlink must refuse the target read");
@@ -5469,7 +5469,7 @@ fn manifest_refuses_a_pinned_root_that_disappeared() {
     let dir = fixture_tmpdir(&env()).unwrap();
     let root = dir.path().join("root");
     fs::create_dir_all(&root).unwrap();
-    let side = LocalSide::open(&root, true).unwrap();
+    let side = LocalSide::open(&root, LocalRole::Destination).unwrap();
     fs::remove_dir_all(&root).unwrap();
     assert!(
         matches!(side.manifest(), Err(Error::Materialization { .. })),
@@ -5691,7 +5691,7 @@ fn a_pull_publishes_by_atomic_rename_not_an_in_place_write() {
 fn a_racily_created_non_empty_destination_root_is_not_adopted() {
     let dir = fixture_tmpdir(&env()).unwrap();
     let root = dir.path().join("root");
-    let side = LocalSide::open(&root, true).unwrap();
+    let side = LocalSide::open(&root, LocalRole::Destination).unwrap();
     // The manifest pass describes the absent destination as the empty tree.
     assert!(side.manifest().unwrap().entries.is_empty());
     // A racer creates a NON-EMPTY directory at the path.
@@ -5703,10 +5703,66 @@ fn a_racily_created_non_empty_destination_root_is_not_adopted() {
 
     // An EMPTY racer-created directory is exactly what the sync would create.
     let empty_root = dir.path().join("empty-root");
-    let side = LocalSide::open(&empty_root, true).unwrap();
+    let side = LocalSide::open(&empty_root, LocalRole::Destination).unwrap();
     assert!(side.manifest().unwrap().entries.is_empty());
     fs::create_dir_all(&empty_root).unwrap();
     assert!(side.root_for_mutation().is_ok(), "an empty root is adopted");
+}
+
+/// The LOCAL ROLE is the authority, not a boolean mechanism. An ABSENT root is
+/// an ERROR for a source (it may be neither described as empty nor created),
+/// and the EMPTY tree for a destination, which describes nothing and creates
+/// the root only at its first mutation — so describing an absent destination
+/// still creates nothing.
+#[test]
+fn a_source_refuses_an_absent_local_root_while_a_destination_treats_it_as_empty() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path().join("root");
+
+    let source = LocalSide::open(&root, LocalRole::Source).unwrap();
+    assert!(!source.is_destination());
+    assert!(
+        matches!(source.manifest(), Err(Error::Materialization { .. })),
+        "an absent SOURCE root is an error, never an empty tree"
+    );
+    assert!(
+        matches!(
+            source.destination_manifest(),
+            Err(Error::Materialization { .. })
+        ),
+        "the destination-shaped read must not smuggle in the destination rule"
+    );
+    assert!(
+        source.root_for_mutation().is_err(),
+        "a source must not create (or open) an absent root"
+    );
+    assert!(!root.exists(), "the refused source created nothing");
+
+    let destination = LocalSide::open(&root, LocalRole::Destination).unwrap();
+    assert!(destination.is_destination());
+    assert!(
+        destination.manifest().unwrap().entries.is_empty(),
+        "an absent destination is the empty tree"
+    );
+    assert!(
+        destination
+            .destination_manifest()
+            .unwrap()
+            .meta
+            .entries
+            .is_empty()
+    );
+    assert!(
+        !root.exists(),
+        "describing an absent destination as empty creates nothing"
+    );
+    destination
+        .root_for_mutation()
+        .expect("a destination creates its root lazily");
+    assert!(
+        root.is_dir(),
+        "the destination's first mutation creates the root"
+    );
 }
 
 /// A directory blocked by ANY conflict reason (here `AppendNotAFile`)
@@ -7522,7 +7578,7 @@ fn the_remote_and_local_live_kind_classifiers_agree_on_a_fifo() {
         std::io::Error::last_os_error()
     );
 
-    let local = LocalSide::open(&root, false).unwrap();
+    let local = LocalSide::open(&root, LocalRole::Source).unwrap();
     let local_side = Side::Local(&local);
     // A PATH-BASED `Side::Remote`: the same shape the SSH transport has (a
     // non-confined, path-based destination) without a live sshd.
@@ -7939,7 +7995,7 @@ fn a_drop_claim_that_leaves_the_aside_hands_the_claim_back_and_the_caller_names_
         &dst.join(".sync-aside.999.0/.sync-aside.999.1/stranded"),
         b"precious",
     );
-    let local = LocalSide::open(&dst, true).unwrap();
+    let local = LocalSide::open(&dst, LocalRole::Destination).unwrap();
     let side = Side::Local(&local);
     let policy = ReplaceAll;
     let mut applier = applier_over(&side, &side, &policy, &diff);
@@ -13382,6 +13438,52 @@ fn composed_ownership_requires_a_local_destination_in_the_root_check() {
     );
 }
 
+/// The DESTINATION SHAPE is DERIVED, not recorded: it follows the direction
+/// and the transport's localness on all four combinations. For a PUSH the
+/// destination is the transport's root and its localness, for a PULL the
+/// destination is the pinned local root and is always local. This is the
+/// witness for the two methods the locking paths read instead of the two
+/// fields `Prepared` used to carry.
+#[test]
+fn the_derived_destination_shape_follows_the_direction_and_the_transport() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(&dst).unwrap();
+    let normalized_dst = normalize_root(&dst);
+
+    for (direction, remote_is_local) in [
+        (Direction::Push, true),
+        (Direction::Push, false),
+        (Direction::Pull, true),
+        (Direction::Pull, false),
+    ] {
+        // The LOCAL root and the transport's root swap roles with the
+        // direction; the DESTINATION is `dst` either way.
+        let (local_root, transport_root) = match direction {
+            Direction::Push => (&src, &dst),
+            Direction::Pull => (&dst, &src),
+        };
+        let remote = RecordingRemote::over(transport(transport_root), remote_is_local);
+        let prepared = prepare(direction, local_root, &remote, false).unwrap();
+        assert_eq!(
+            prepared.dest_root(),
+            normalized_dst.as_path(),
+            "the derived destination root for {direction:?} (remote local: {remote_is_local})"
+        );
+        assert_eq!(
+            prepared.dest_is_local(),
+            match direction {
+                Direction::Push => remote_is_local,
+                Direction::Pull => true,
+            },
+            "the derived destination localness for {direction:?} (remote local: \
+             {remote_is_local})"
+        );
+    }
+}
+
 /// The FAR-SIDE ownership seam's DEFAULT is FAIL-CLOSED. A transport that
 /// does not override [`Remote::lock_far_side`] (here the [`RecordingRemote`]
 /// double, which declares itself remote but has no far-side locking) cannot be
@@ -14113,6 +14215,94 @@ fn the_destination_lock_record_is_a_reserved_spelling() {
     }
 }
 
+/// The SOURCE PLAN is the ONE place the drift is decided and [`fail_run`] the
+/// ONE place it is attached. Unchanged confirms; a changed or unreadable
+/// re-read is a typed [`Error::Integrity`] carrying the existing messages; the
+/// attachment preserves the partial report when the engine succeeded and
+/// appends the drift to the engine's own `restore_failures` when it had
+/// already failed.
+#[test]
+fn the_source_plan_confirms_unchanged_and_hands_its_drift_to_fail_run() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let planned_root = dir.path().join("planned");
+    let changed_root = dir.path().join("changed");
+    write(&planned_root.join("a"), b"AAA");
+    write(&planned_root.join("b"), b"BBB");
+    write(&changed_root.join("a"), b"CHANGED");
+    write(&changed_root.join("b"), b"BBB");
+    write(&changed_root.join("c"), b"NEW");
+    let planned = canonicalize_tree(&planned_root).unwrap();
+    let changed = canonicalize_tree(&changed_root).unwrap();
+
+    // UNCHANGED: the same manifest confirms.
+    SourcePlan(planned.clone())
+        .confirm(Ok(planned.clone()))
+        .expect("an unchanged source confirms");
+
+    // CHANGED: the drift is an INTEGRITY failure naming the paths that moved.
+    let drift = SourcePlan(planned.clone())
+        .confirm(Ok(changed.clone()))
+        .expect_err("a changed source must fail");
+    assert!(matches!(drift, Error::Integrity(_)), "got {drift:?}");
+    let text = drift.to_string();
+    assert!(
+        text.contains("the SOURCE changed during the run")
+            && text.contains("violating the caller's quiescence precondition"),
+        "the drift names the precondition: {text}"
+    );
+    assert!(
+        text.contains("changed paths: a, c"),
+        "the drift names exactly the paths that moved: {text}"
+    );
+
+    // UNREADABLE: a re-read that cannot be repeated is itself the failure.
+    let unreadable = SourcePlan(planned.clone())
+        .confirm(Err(Error::materialization("probe refused")))
+        .expect_err("an unreadable source must fail");
+    let text = unreadable.to_string();
+    assert!(
+        text.contains("the run could not confirm the SOURCE was quiescent"),
+        "the unreadable re-read names the precondition: {text}"
+    );
+    assert!(
+        text.contains("probe refused"),
+        "the probe's own message must survive: {text}"
+    );
+    let unreadable_text = unreadable.to_string();
+
+    // ATTACH, engine OK: the partial report survives and the drift is the
+    // failure.
+    let report = SyncReport {
+        applied: vec!["b".to_string()],
+        ..SyncReport::default()
+    };
+    let attached = fail_run(Ok(report.clone()), drift).expect_err("a drift fails the run");
+    assert_eq!(attached.report().applied, vec!["b".to_string()]);
+    assert!(
+        attached.restore_failures().is_empty(),
+        "a successful engine reports no restore failure: {:?}",
+        attached.restore_failures()
+    );
+
+    // ATTACH, engine already failed: the engine's error stays primary and the
+    // drift rides along in `restore_failures`.
+    let engine = SyncError {
+        error: Error::materialization("engine failed"),
+        report: Box::new(report),
+        restore_failures: vec!["engine context".to_string()],
+    };
+    let attached = fail_run(Err(engine), unreadable).expect_err("a drift fails the run");
+    assert!(
+        attached.error().to_string().contains("engine failed"),
+        "the engine's own error must stay primary: {attached:?}"
+    );
+    assert_eq!(
+        attached.restore_failures(),
+        ["engine context".to_string(), unreadable_text].as_slice(),
+        "the drift is attached VERBATIM as the engine's second restore failure"
+    );
+}
+
 /// THE SOURCE-QUIESCENCE PRECONDITION, enforced rather than trusted. A source
 /// writer rewrites an entry that has ALREADY been read and installed, so the
 /// transfer and the destination verification both succeed — yet the tree the
@@ -14737,7 +14927,7 @@ fn a_widened_residue_path_is_not_reported_transient() {
         &canonicalize_tree(&src).unwrap(),
         &canonicalize_tree(&dst).unwrap(),
     );
-    let local = LocalSide::open(root, true).unwrap();
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
     let side = Side::Local(&local);
     let policy = ReplaceAll;
     let mut applier = applier_over(&side, &side, &policy, &diff);
@@ -14831,7 +15021,7 @@ fn a_commit_resolves_only_its_own_attempt() {
         &canonicalize_tree(&src).unwrap(),
         &canonicalize_tree(&dst).unwrap(),
     );
-    let local = LocalSide::open(root, true).unwrap();
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
     let side = Side::Local(&local);
     let policy = ReplaceAll;
     let mut applier = applier_over(&side, &side, &policy, &diff);
@@ -14894,7 +15084,7 @@ fn an_unknown_location_names_a_path_without_an_attempt() {
         &canonicalize_tree(&src).unwrap(),
         &canonicalize_tree(&dst).unwrap(),
     );
-    let local = LocalSide::open(root, true).unwrap();
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
     let side = Side::Local(&local);
     let policy = ReplaceAll;
     let mut applier = applier_over(&side, &side, &policy, &diff);
@@ -14942,7 +15132,7 @@ fn an_unconfirmed_move_records_one_possibility_and_no_confirmed_residue() {
         &canonicalize_tree(&src).unwrap(),
         &canonicalize_tree(&dst).unwrap(),
     );
-    let local = LocalSide::open(root, true).unwrap();
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
     let side = Side::Local(&local);
     let policy = ReplaceAll;
     let mut applier = applier_over(&side, &side, &policy, &diff);
@@ -15011,7 +15201,7 @@ fn an_unconfirmed_move_records_one_possibility_and_no_confirmed_residue() {
 #[test]
 fn the_confinement_predicate_conjoins_the_side_and_the_platform() {
     let dir = fixture_tmpdir(&env()).unwrap();
-    let local = LocalSide::open(dir.path(), true).unwrap();
+    let local = LocalSide::open(dir.path(), LocalRole::Destination).unwrap();
     let remote = transport(dir.path());
     let local_side = Side::Local(&local);
     let remote_side = Side::Remote(&remote);
@@ -15046,7 +15236,7 @@ fn the_ancestry_memo_is_off_for_a_path_based_destination_on_this_platform() {
     let dir = fixture_tmpdir(&env()).unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join("a/b")).unwrap();
-    let local = LocalSide::open(root, true).unwrap();
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
     let remote = transport(root);
     let local_side = Side::Local(&local);
     let remote_side = Side::Remote(&remote);
@@ -15120,7 +15310,7 @@ fn an_extraneous_child_below_a_prohibited_ancestor_may_not_be_deleted() {
         "the fixture must present `d/f` as destination-only: {diff:?}"
     );
 
-    let local = LocalSide::open(root, true).unwrap();
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
     let side = Side::Local(&local);
     let policy = ReplaceAll;
     let mut applier = applier_over(&side, &side, &policy, &diff);

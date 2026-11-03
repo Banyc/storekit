@@ -2301,41 +2301,38 @@ pub fn sync(
     // checked for liveness BEFORE the run's result is returned, so a connection
     // that died mid-run is reported rather than read as a clean success.
     let mut far_side: Option<Box<dyn FarSideLockSession>> = None;
+    // ONE binding check for every ownership form that CARRIES a preflight.
+    // The check runs BEFORE the token is destructured, so a mismatched token is
+    // refused on exactly the same path as before (nothing acquired, nothing
+    // mutated, the far-side session dropped with the token), and `Unowned`
+    // carries no binding to check.
+    if let Some(prepared) = ownership.binding()
+        && let Err(error) = prepared.matches(direction, local_root, remote)
+    {
+        return Err(SyncError::from(error));
+    }
     let (prepared, locks) = match ownership {
-        DestinationOwnership::Locked(locked) => {
-            if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
-                return Err(SyncError::from(error));
-            }
-            (
-                locked.prepared,
-                Some(HeldLocks {
-                    _sibling: Some(locked.guard),
-                    _in_root: None,
-                }),
-            )
-        }
+        DestinationOwnership::Locked(locked) => (
+            locked.prepared,
+            Some(HeldLocks {
+                _sibling: Some(locked.guard),
+                _in_root: None,
+            }),
+        ),
         // The COMPOSED token holds the sibling record AND the caller's in-root
         // `Layout::lock`; both guards travel into the run so BOTH flock
         // exclusions live until the run returns.
-        DestinationOwnership::LockedWithInRoot(locked, InRootLock(in_root)) => {
-            if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
-                return Err(SyncError::from(error));
-            }
-            (
-                locked.prepared,
-                Some(HeldLocks {
-                    _sibling: Some(locked.guard),
-                    _in_root: Some(in_root),
-                }),
-            )
-        }
+        DestinationOwnership::LockedWithInRoot(locked, InRootLock(in_root)) => (
+            locked.prepared,
+            Some(HeldLocks {
+                _sibling: Some(locked.guard),
+                _in_root: Some(in_root),
+            }),
+        ),
         // The FAR-SIDE token holds the remote record through a persistent
         // session; there is no LOCAL sibling record, so `locks` is `None` and
         // the session is held directly above.
         DestinationOwnership::LockedRemote(locked) => {
-            if let Err(error) = locked.prepared.matches(direction, local_root, remote) {
-                return Err(SyncError::from(error));
-            }
             far_side = Some(locked.session);
             (locked.prepared, None)
         }
@@ -2568,6 +2565,20 @@ pub struct LockedRemoteDestination {
 }
 
 impl DestinationOwnership {
+    /// The preflight binding this token carries; [`DestinationOwnership::Unowned`]
+    /// carries none.
+    ///
+    /// This is the ONE place [`sync`] reads the binding from, so every owning
+    /// form is checked by the SAME call rather than once per match arm.
+    fn binding(&self) -> Option<&Prepared> {
+        match self {
+            DestinationOwnership::Locked(locked) => Some(&locked.prepared),
+            DestinationOwnership::LockedWithInRoot(locked, _) => Some(&locked.prepared),
+            DestinationOwnership::LockedRemote(locked) => Some(&locked.prepared),
+            DestinationOwnership::Unowned => None,
+        }
+    }
+
     /// ACQUIRE the destination's operation lock for a run in `direction`
     /// against `local_root` and `remote`, or REFUSE — the ONLY way to obtain
     /// [`DestinationOwnership::Locked`].
@@ -2589,7 +2600,7 @@ impl DestinationOwnership {
     ) -> Result<DestinationOwnership> {
         let prepared = prepare(direction, local_root, remote, true)?;
         require_endpoint_identity(remote)?;
-        let guard = lock_destination(direction, prepared.dest_is_local, &prepared.dest_root)?;
+        let guard = lock_destination(direction, prepared.dest_is_local(), prepared.dest_root())?;
         Ok(DestinationOwnership::Locked(LockedDestination {
             prepared,
             guard,
@@ -2645,14 +2656,14 @@ impl DestinationOwnership {
         // the far-side record is created, so a run refused for its SOURCE (or an
         // unreachable host) leaves no far-side lock record behind.
         let prepared = prepare(direction, local_root, remote, false)?;
-        if prepared.dest_is_local {
+        if prepared.dest_is_local() {
             return Err(Error::preflight_kind(
                 PreflightKind::LocalDestinationViaRemoteLock,
                 format!(
                     "refusing to acquire a FAR-SIDE lock for {}: it names a LOCAL destination (a \
                  PULL's destination is always local), whose record is on this host. Use \
                  `DestinationOwnership::lock` for a local destination.",
-                    prepared.dest_root.display()
+                    prepared.dest_root().display()
                 ),
             ));
         }
@@ -2664,20 +2675,20 @@ impl DestinationOwnership {
         require_endpoint_identity(remote)?;
         // ONE authority for the record's spelling: the SAME derivation the local
         // case uses, applied to the far-side root spelling.
-        let Some(record) = destination_lock_path(&prepared.dest_root) else {
+        let Some(record) = destination_lock_path(prepared.dest_root()) else {
             return Err(Error::preflight_kind(
                 PreflightKind::RemoteDestinationUnlockable,
                 format!(
                     "refusing to own the remote destination {}: no operation-lock record can be placed \
                  as a SIBLING of that root on the far side. If the caller holds the destination for \
                  the run, pass `DestinationOwnership::Unowned`.",
-                    prepared.dest_root.display()
+                    prepared.dest_root().display()
                 ),
             ));
         };
         let op_id = format!(
             "storekit {direction:?} of {} (client pid {})",
-            prepared.dest_root.display(),
+            prepared.dest_root().display(),
             std::process::id()
         );
         // Fail closed: the transport default for `lock_far_side` refuses, so a
@@ -2763,11 +2774,11 @@ impl DestinationOwnership {
         // created, so the refusal leaves no residue. This is also what keeps a
         // PULL's "a fully-refused pull creates NOTHING, not even the root" and
         // the lazy-root adoption rule intact.
-        require_existing_root(prepared.dest_is_local, &prepared.dest_root)?;
+        require_existing_root(prepared.dest_is_local(), prepared.dest_root())?;
         // CANONICAL ORDER, step 1 of 2: the sibling record (outside the root).
-        let guard = lock_destination(direction, prepared.dest_is_local, &prepared.dest_root)?;
+        let guard = lock_destination(direction, prepared.dest_is_local(), prepared.dest_root())?;
         // CANONICAL ORDER, step 2 of 2: the caller's in-root layout record.
-        let in_root = acquire_in_root_lock(direction, &prepared.dest_root, in_root_lock)?;
+        let in_root = acquire_in_root_lock(direction, prepared.dest_root(), in_root_lock)?;
         Ok(DestinationOwnership::LockedWithInRoot(
             LockedDestination { prepared, guard },
             InRootLock(in_root),
@@ -2789,24 +2800,22 @@ impl DestinationOwnership {
 /// comparison alone cannot see it, because `None` compares equal to `None`).
 ///
 /// [`Self::dest_root`] and [`Self::dest_is_local`] are the DERIVED
-/// DESTINATION SHAPE. They are recorded at acquisition and read by the locking
-/// and provisioning paths ([`DestinationOwnership::lock`],
-/// [`DestinationOwnership::lock_remote`],
+/// DESTINATION SHAPE. They are NOT fields and NOT a compared axis of
+/// [`Prepared::matches`]: both are computed from the five compared axes, and
+/// are read by the locking and provisioning paths
+/// ([`DestinationOwnership::lock`], [`DestinationOwnership::lock_remote`],
 /// [`DestinationOwnership::lock_with_in_root_lock`], [`lock_destination`],
-/// and [`require_existing_root`]); they are NOT a compared axis of
-/// [`Prepared::matches`]. A replay cannot change the derived destination shape
-/// without changing one of the five compared axes: a PUSH's shape IS the
-/// transport's root spelling and localness (already compared as
+/// and [`require_existing_root`]). A replay cannot change the derived
+/// destination shape without changing one of the five compared axes: a PUSH's
+/// shape IS the transport's root spelling and localness (compared as
 /// [`Self::remote_root`] and [`Self::remote_is_local`]), and a PULL's shape IS
-/// the pinned local root and `true` (already compared as the token's own
+/// the pinned local root and `true` (compared as the token's own
 /// [`Self::local`] root). The remote's localness is therefore a DIFFERENT
-/// field from [`Self::dest_is_local`], which describes the DESTINATION and is
+/// axis from [`Self::dest_is_local`], which describes the DESTINATION and is
 /// legitimately `true` for a PULL.
 struct Prepared {
     direction: Direction,
     local: LocalSide,
-    dest_root: PathBuf,
-    dest_is_local: bool,
     /// `normalize_root(remote.root())` at acquisition: the remote's PATH
     /// spelling, recorded for BOTH directions (the destination for a PUSH, the
     /// source for a PULL).
@@ -2829,6 +2838,22 @@ struct Prepared {
 }
 
 impl Prepared {
+    /// The DESTINATION's root spelling, DERIVED from the direction and the
+    /// compared axes rather than recorded: a PUSH mutates the transport's root
+    /// ([`Self::remote_root`]) and a PULL the pinned local root
+    /// ([`LocalSide::root_path`]).
+    fn dest_root(&self) -> &Path {
+        dest_root_for(self.direction, &self.local.root_path, &self.remote_root)
+    }
+
+    /// Whether the DESTINATION is a path on THIS host, DERIVED like
+    /// [`Self::dest_root`]: a PULL's destination is always local, a PUSH's is
+    /// as local as its transport ([`Self::remote_is_local`]). This describes
+    /// the DESTINATION, not the transport (see [`Self::remote_is_local`]).
+    fn dest_is_local(&self) -> bool {
+        dest_is_local_for(self.direction, self.remote_is_local)
+    }
+
     /// Whether this preflight was taken for exactly this run. A token acquired
     /// for another direction, another LOCAL root, another transport PATH
     /// spelling, another transport ENDPOINT, or another transport LOCALNESS is
@@ -2848,7 +2873,7 @@ impl Prepared {
                     "the destination ownership was taken for a {:?} run of {} into {} but called for a {:?} run; acquire ownership for the run you are about to make",
                     self.direction,
                     self.local.root_path.display(),
-                    self.dest_root.display(),
+                    self.dest_root().display(),
                     direction
                 ),
             ));
@@ -2928,6 +2953,30 @@ impl Prepared {
     }
 }
 
+/// The ONE derivation of the DESTINATION ROOT from a direction and the
+/// compared axes. [`prepare`] needs it BEFORE a [`Prepared`] exists (to refuse
+/// an unlockable destination before a token is minted) and
+/// [`Prepared::dest_root`] needs it afterwards, so both read this one place.
+fn dest_root_for<'a>(
+    direction: Direction,
+    local_root: &'a Path,
+    remote_root: &'a Path,
+) -> &'a Path {
+    match direction {
+        Direction::Push => remote_root,
+        Direction::Pull => local_root,
+    }
+}
+
+/// The ONE derivation of the DESTINATION's LOCALNESS: a PULL's destination is
+/// the pinned local root, so it is always local; a PUSH's is the transport's.
+fn dest_is_local_for(direction: Direction, remote_is_local: bool) -> bool {
+    match direction {
+        Direction::Push => remote_is_local,
+        Direction::Pull => true,
+    }
+}
+
 /// Render a transport's LOCALNESS for a refusal.
 fn describe_localness(is_local: bool) -> &'static str {
     if is_local { "LOCAL" } else { "NON-LOCAL" }
@@ -2998,19 +3047,26 @@ fn prepare(
     // Pin the local root BEFORE the manifests: the manifest walk and the
     // mutations must describe the same inode (checked on Unix after the walk,
     // with the residual race documented on the module).
-    let local = LocalSide::open(local_root, direction == Direction::Pull)?;
+    let local = LocalSide::open(
+        local_root,
+        match direction {
+            Direction::Push => LocalRole::Source,
+            Direction::Pull => LocalRole::Destination,
+        },
+    )?;
     // Relate the two roots BEFORE the first mutation. A local remote is a path
     // on THIS host, so the two roots can be compared exactly; a remote one
     // cannot be resolved here and is documented as undecidable.
     refuse_overlapping_roots(&local, remote)?;
-    let dest_root = match direction {
-        Direction::Push => normalize_root(remote.root()),
-        Direction::Pull => local.root_path.clone(),
-    };
-    let dest_is_local = match direction {
-        Direction::Push => remote.is_local(),
-        Direction::Pull => true,
-    };
+    // The DERIVED destination shape, read through the SAME derivation the
+    // token's [`Prepared::dest_root`]/[`Prepared::dest_is_local`] use. It is
+    // needed HERE, before a `Prepared` exists, to refuse an unlockable
+    // destination before any lock record is created. The transport's root
+    // SPELLING is read ONCE and recorded below, so the shape derived here (and
+    // locked) and the axis [`Prepared::matches`] compares cannot disagree.
+    let transport_root = normalize_root(remote.root());
+    let dest_root = dest_root_for(direction, &local.root_path, &transport_root).to_path_buf();
+    let dest_is_local = dest_is_local_for(direction, remote.is_local());
     // (1) REFUSE an unlockable destination BEFORE preparing a transport
     // identity or creating a lock record: a refusal must leave no residue, and
     // the refusal is a pure decision that needs no transport. `lock` runs the
@@ -3056,14 +3112,12 @@ fn prepare(
     // the remote's PATH spelling, its ENDPOINT identity, and its LOCALNESS.
     // This is what `matches` re-checks before the run mutates anything. A push
     // records the DESTINATION's; a pull records the SOURCE's.
-    let remote_root = normalize_root(remote.root());
+    let remote_root = transport_root;
     let remote_identity = remote.endpoint_identity();
     let remote_is_local = remote.is_local();
     Ok(Prepared {
         direction,
         local,
-        dest_root,
-        dest_is_local,
         remote_root,
         remote_identity,
         remote_is_local,
@@ -4034,6 +4088,51 @@ struct HeldLocks {
     _in_root: Option<FileLock>,
 }
 
+/// The SOURCE manifest the run was planned against, read by the ENTRY POINT
+/// BEFORE the destination lock was taken and before the destination was
+/// provisioned, so a run refused for an unrepresentable SOURCE has created
+/// nothing. The run consumes it at the END against a re-read, which is the
+/// crate's whole enforcement of the caller's source-quiescence obligation.
+struct SourcePlan(TreeMetadata);
+
+impl SourcePlan {
+    /// Consume the plan against the post-run read. `Err` is the DRIFT (the
+    /// source changed, or the re-read itself failed); the messages are the
+    /// existing ones verbatim.
+    ///
+    /// The crate cannot lock a source, so it VERIFIES the obligation instead:
+    /// a silent plan/transfer skew becomes a LOUD failure naming the paths that
+    /// moved, and a source read that cannot be repeated is itself a failure —
+    /// an unconfirmed quiescence is not quiescence.
+    fn confirm(self, later: Result<TreeMetadata>) -> Result<()> {
+        match later {
+            Ok(current) if current == self.0 => Ok(()),
+            Ok(current) => Err(source_changed_error(&self.0, &current)),
+            Err(probe) => Err(Error::integrity(format!(
+                "the run could not confirm the SOURCE was quiescent: re-reading the source manifest after the transfer failed: {probe}"
+            ))),
+        }
+    }
+}
+
+/// THE ONE way a run-level condition discovered AFTER the engine returned is
+/// attached to its [`SyncResult`]: the engine's partial report survives, and a
+/// run that had already failed keeps its own error while the new condition
+/// rides along in its `restore_failures`.
+fn fail_run(result: SyncResult, error: Error) -> SyncResult {
+    Err(match result {
+        Ok(report) => SyncError {
+            error,
+            report: Box::new(report),
+            restore_failures: Vec::new(),
+        },
+        Err(mut failure) => {
+            failure.restore_failures.push(error.to_string());
+            failure
+        }
+    })
+}
+
 fn run(
     source: &Side<'_>,
     dest: &Side<'_>,
@@ -4049,14 +4148,14 @@ fn run(
     // so its in-root `Layout::lock` is held exactly as long as its sibling
     // record.
     let _lock = locks;
-    // The RAW source manifest the plan is made against, kept for the
-    // SOURCE-quiescence check at the END of the run. It was read by the ENTRY
+    // The RAW source manifest the plan is made against, typed as the plan the
+    // end-of-run SOURCE-quiescence check consumes. It was read by the ENTRY
     // POINT, BEFORE the destination lock was taken and before the destination
     // was provisioned, so a run refused for an unrepresentable SOURCE has
     // created nothing. It must be the manifest BEFORE the reserved-namespace
     // strip below, so a change to a reserved spelling is not hidden from the
     // comparison.
-    let source_plan = source_meta.clone();
+    let source_plan = SourcePlan(source_meta.clone());
     // PROVISION A REMOTE DESTINATION BEFORE ITS MANIFEST IS READ. The
     // destination of a PUSH is a `Side::Remote`; its `provision_layout`
     // creates the destination ROOT and the caller's bootstrap directories
@@ -4273,43 +4372,14 @@ fn run(
     // ENFORCE THE SOURCE-QUIESCENCE PRECONDITION, as far as the crate can
     // observe it. The caller owes a source that does not move during the run
     // and the crate cannot lock it, so rather than trust the obligation the
-    // crate VERIFIES it: re-read the source manifest and compare it to the one
-    // the plan was made against, turning a silent plan/transfer skew into a
-    // LOUD failure that names the paths that moved. A source read that cannot
-    // be repeated is itself a failure — an unconfirmed quiescence is not
-    // quiescence.
-    match source.manifest() {
-        Ok(current) if current == source_plan => result,
-        Ok(current) => {
-            let error = source_changed_error(&source_plan, &current);
-            Err(match result {
-                Ok(report) => SyncError {
-                    error,
-                    report: Box::new(report),
-                    restore_failures: Vec::new(),
-                },
-                Err(mut failure) => {
-                    failure.restore_failures.push(error.to_string());
-                    failure
-                }
-            })
-        }
-        Err(probe) => {
-            let error = Error::integrity(format!(
-                "the run could not confirm the SOURCE was quiescent: re-reading the source manifest after the transfer failed: {probe}"
-            ));
-            Err(match result {
-                Ok(report) => SyncError {
-                    error,
-                    report: Box::new(report),
-                    restore_failures: Vec::new(),
-                },
-                Err(mut failure) => {
-                    failure.restore_failures.push(error.to_string());
-                    failure
-                }
-            })
-        }
+    // crate VERIFIES it: re-read the source manifest and hand it to the plan,
+    // which turns a silent plan/transfer skew into a LOUD failure that names
+    // the paths that moved. A source read that cannot be repeated is itself a
+    // failure. Either way the engine's own result (and, on failure, its partial
+    // report) is preserved by [`fail_run`].
+    match source_plan.confirm(source.manifest()) {
+        Ok(()) => result,
+        Err(error) => fail_run(result, error),
     }
 }
 
@@ -9314,21 +9384,31 @@ fn root_relative_path() -> RootedRelativePath {
 /// creates nothing.
 struct LocalSide {
     root_path: PathBuf,
-    /// Whether this side is the local DESTINATION. Only a destination may have
-    /// a missing root created, and only at the first mutation; a missing
-    /// SOURCE root is an error.
-    ensure: bool,
+    /// Which side of the run this local tree is. Only a DESTINATION may have a
+    /// missing root created, and only at the first mutation; a missing SOURCE
+    /// root is an error.
+    role: LocalRole,
     /// The pinned root descriptor, opened at construction when the root exists
     /// and otherwise on the first mutation that needs it.
     root: OnceCell<crate::atomic::RootDir>,
 }
 
+/// Which side of the run the local tree is on, as a two-valued DESTRUCTIVE
+/// choice rather than a flag: `ensure` named the mechanism (create it) and not
+/// the authority (a destination may). A [`LocalRole::Source`] may never create
+/// or describe an absent root as empty.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalRole {
+    Source,
+    Destination,
+}
+
 impl LocalSide {
     /// Construct the local side and PIN the root descriptor when it exists.
-    fn open(root_path: &Path, ensure: bool) -> Result<LocalSide> {
+    fn open(root_path: &Path, role: LocalRole) -> Result<LocalSide> {
         let side = LocalSide {
             root_path: normalize_root(root_path),
-            ensure,
+            role,
             root: OnceCell::new(),
         };
         match std::fs::symlink_metadata(&side.root_path) {
@@ -9355,6 +9435,12 @@ impl LocalSide {
         Ok(side)
     }
 
+    /// Whether this local tree is the run's DESTINATION, the ONE authority for
+    /// "may create / may describe an absent root as empty".
+    fn is_destination(&self) -> bool {
+        self.role == LocalRole::Destination
+    }
+
     /// The manifest of the local tree.
     ///
     /// A DESTINATION that does not exist yet is the EMPTY tree. This is the
@@ -9375,7 +9461,7 @@ impl LocalSide {
                 "local tree root {} is not a directory",
                 self.root_path.display()
             ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.ensure => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.is_destination() => {
                 // A destination that was ABSENT when this side was opened is the
                 // empty tree. But if a descriptor was already pinned, the path
                 // named a real directory at open and has since disappeared:
@@ -9414,7 +9500,7 @@ impl LocalSide {
                 "local tree root {} is not a directory",
                 self.root_path.display()
             ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.ensure => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.is_destination() => {
                 if self.root.get().is_some() {
                     return Err(Error::materialization(format!(
                         "local tree root {} disappeared after its descriptor was pinned; refusing to describe it as an empty tree",
@@ -9510,7 +9596,7 @@ impl LocalSide {
     /// (`self.root_path`), the one name the applier is entitled to adopt.
     #[allow(clippy::disallowed_methods)]
     fn root_for_mutation(&self) -> Result<&crate::atomic::RootDir> {
-        if self.root.get().is_none() && self.ensure {
+        if self.root.get().is_none() && self.is_destination() {
             if self.root_path.exists() {
                 let mut entries = std::fs::read_dir(&self.root_path).map_err(|e| {
                     Error::store(format!("read local root {}: {e}", self.root_path.display()))
