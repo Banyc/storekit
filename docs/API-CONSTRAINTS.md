@@ -57,12 +57,14 @@ unverified. Resolved as **N** (the weak path is legitimate and its NAME states i
 **C** (the path is constrained so it cannot be reached by accident), or **R** (a
 residual, named AT the item with its reach).
 
-- **C — the wire assembler's completeness precondition.** `canonicalize_remote_entries`
-  needs the caller to have checked the walk's exit status, which its signature did not
-  carry. The public entry points are `canonicalize_remote_entries_checked(output, root,
-  exited_zero)` and `…_destination_checked(...)`, and both refuse `false` with the typed
-  `MaterializationKind::IncompleteListing` BEFORE assembly; the raw forms are
-  `pub(crate)`, and the crate's own remote path passes `out.success()`.
+- **C — the wire assembler's completeness precondition.** The raw assemblers take
+  `CompleteListing`, whose only constructor refuses a non-zero walk exit with the typed
+  `MaterializationKind::IncompleteListing` BEFORE assembly, so the exit status cannot be
+  omitted from the signature. The public entry points are
+  `canonicalize_remote_entries_checked(output, root, exited_zero)` and
+  `…_destination_checked(...)`, and both refuse `false` with the same typed
+  refusal; the raw forms are `pub(crate)`, and the crate's own remote path passes
+  `out.success()`.
 - **N — the unconfined atomic replace.** `atomic::write_atomic_replace(path: &Path)` is
   public and its NAME states the weakness: the UNCONFINED, absolute-path form. Its
   justification is the CONSUMER's call shape, not this crate's production.
