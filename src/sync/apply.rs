@@ -935,7 +935,7 @@
 //! * **A case pair the destination cannot represent is refused up front.**
 //!   [`Applier::refuse_unrepresentable_case_aliases`] groups source entries by
 //!   case-folded name and, when a transfer is at stake, ASKS THE DESTINATION
-//!   what it is with a probe ([`Applier::dest_case_insensitive`]: create a
+//!   what it is with a probe ([`Applier::case_sensitivity`]: create a
 //!   unique mixed-case directory in the reserved namespace, look it up with the
 //!   case flipped, remove it — a `create_dir_all`, an existence lookup, and a
 //!   `remove` on the destination root, at most once per run). On a
@@ -4430,7 +4430,7 @@ fn run(
         dest_residue,
         dest_unsupported,
         aliased_dest: BTreeMap::new(),
-        dest_case_insensitive: None,
+        dest_case_sensitivity: CaseSensitivity::Unprobed,
         // The destination ROOT is verified like any other directory the run
         // TOUCHED: the run always examines it (and creates it when absent), so
         // an unplanned entry AT the root — not only under a transferred
@@ -4586,10 +4586,11 @@ struct Applier<'a, 'b> {
     aliased_dest: BTreeMap<String, String>,
     /// The destination filesystem's case sensitivity, probed at most ONCE per
     /// run and only when a source entry could case-fold onto another entry
-    /// (see [`Applier::refuse_unrepresentable_case_aliases`]). `None` until
-    /// probed, or when the destination root is absent (the probe would create
-    /// it) and the per-directory name verification is left to catch the fold.
-    dest_case_insensitive: Option<bool>,
+    /// (see [`Applier::refuse_unrepresentable_case_aliases`]). `Unprobed`
+    /// until probed; an ABSENT destination root is NOT a state here (the probe
+    /// would create it), so the caller asks `root_present()` before probing and
+    /// the per-directory name verification is left to catch the fold.
+    dest_case_sensitivity: CaseSensitivity,
     /// The manifest paths of the destination DIRECTORIES this run TOUCHED:
     /// installed into, created, or removed from — ALWAYS including the
     /// destination ROOT (`""`), which the run examines on every path. A
@@ -6624,7 +6625,7 @@ impl Applier<'_, '_> {
         // a case-sensitivity probe of the destination — the probe creates and removes
         // one directory inside the destination root, and those touches ARE counted in
         // `SyncReport::transfers`, which counts every attempted mutation (see
-        // `dest_case_insensitive`). Report the member(s)
+        // `case_sensitivity`). Report the member(s)
         // that cannot be represented, so the sync never silently loses one and
         // never destroys the entry the other aliases.
         self.refuse_unrepresentable_case_aliases()?;
@@ -8556,7 +8557,7 @@ impl Applier<'_, '_> {
     /// represented.
     ///
     /// The destination's case sensitivity is ASKED OF THE FILESYSTEM with a
-    /// probe ([`Applier::dest_case_insensitive`]), never assumed from a
+    /// probe ([`Applier::case_sensitivity`]), never assumed from a
     /// platform. The probe runs only when a source entry could fold onto
     /// another source entry or onto an existing destination entry, so an
     /// ordinary sync pays nothing. On a case-SENSITIVE destination nothing is
@@ -8624,7 +8625,7 @@ impl Applier<'_, '_> {
         // probe below. Without this, the refusal was skipped entirely and the
         // pair folded during the transfer, one member silently overwriting the
         // other.
-        if self.dest.root_present() && !self.dest_case_insensitive()? {
+        if self.dest.root_present() && !self.case_sensitivity()?.is_insensitive() {
             return Ok(());
         }
         for (key, members) in &source_groups {
@@ -8672,60 +8673,27 @@ impl Applier<'_, '_> {
     /// Its mutations ARE counted in [`SyncReport::transfers`] (the attempt-first
     /// accounting is uniform) and its own failures are named in
     /// [`SyncReport::indeterminate`] — so `transfers == 0` still means no
-    /// mutation was attempted. The result is cached for the run.
-    fn dest_case_insensitive(&mut self) -> Result<bool> {
-        if let Some(probed) = self.dest_case_insensitive {
-            return Ok(probed);
+    /// mutation was attempted. The answer is cached for the run: a probed state
+    /// is returned without probing again, and only `Unprobed` asks.
+    fn case_sensitivity(&mut self) -> Result<CaseSensitivity> {
+        match self.dest_case_sensitivity {
+            CaseSensitivity::Unprobed => {}
+            probed => return Ok(probed),
         }
-        let (name, flipped) = loop {
-            let candidate = case_probe_name();
-            let flipped = flip_ascii_case(&candidate);
-            let rel = RootedRelativePath::parse(Path::new(&candidate))?;
-            let flipped_rel = RootedRelativePath::parse(Path::new(&flipped))?;
-            // Neither spelling may already name an entry: on a case-SENSITIVE
-            // filesystem an unrelated entry at the flipped spelling would
-            // otherwise make the probe report a false "case-insensitive".
-            if !self.dest.exists(&rel)? && !self.dest.exists(&flipped_rel)? {
-                break (candidate, flipped);
-            }
-        };
-        let rel = RootedRelativePath::parse(Path::new(&name))?;
-        let flipped_rel = RootedRelativePath::parse(Path::new(&flipped))?;
-        self.guard_destination(&rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-        let attempt = self.begin_mutation(&name, MutationKind::Content);
-        match self.dest.create_dir_all(&rel) {
-            Ok(()) => self.commit_mutation(attempt),
-            Err(error) => return Err(error),
-        }
-        let insensitive = match self.dest.exists(&flipped_rel) {
-            Ok(value) => value,
+        let probe = CaseProbe::create(self)?;
+        let sensitivity = match probe.answer(self) {
+            Ok(true) => CaseSensitivity::Insensitive,
+            Ok(false) => CaseSensitivity::Sensitive,
             Err(error) => {
-                let _ = self.remove_probe(&rel);
+                // Best effort: a probe that cannot be removed is residue the
+                // next run reports.
+                let _ = probe.remove(self);
                 return Err(error);
             }
         };
-        self.remove_probe(&rel)?;
-        self.dest_case_insensitive = Some(insensitive);
-        Ok(insensitive)
-    }
-
-    /// Remove the case-sensitivity probe directory, recording a leftover as
-    /// residue (it still exists, so its transient state is reported rather than
-    /// silently leaked).
-    fn remove_probe(&mut self, rel: &RootedRelativePath) -> Result<()> {
-        let path = manifest_spelling(rel);
-        self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
-        let attempt = self.begin_mutation(&path, MutationKind::Content);
-        match self.dest.remove_residue_dir(rel) {
-            Ok(()) => {
-                self.commit_mutation(attempt);
-                Ok(())
-            }
-            Err(error) => {
-                self.note_residue(&path);
-                Err(error)
-            }
-        }
+        probe.remove(self)?;
+        self.dest_case_sensitivity = sensitivity;
+        Ok(sensitivity)
     }
 
     /// The extraneous directories whose subtree contains residue, plus every
@@ -8743,6 +8711,85 @@ impl Applier<'_, '_> {
             }
         }
         guards
+    }
+}
+
+/// The destination filesystem's case sensitivity as this run knows it. Only
+/// `Unprobed` can ask the filesystem, so a probed answer is returned instead of
+/// probing again; "the destination root is absent, so no probe was possible"
+/// is the CALLER's condition (`root_present()`), not a state here, because the
+/// probe was never asked.
+#[derive(Clone, Copy)]
+enum CaseSensitivity {
+    Unprobed,
+    Sensitive,
+    Insensitive,
+}
+
+impl CaseSensitivity {
+    fn is_insensitive(self) -> bool {
+        matches!(self, Self::Insensitive)
+    }
+}
+
+/// ONE created destination case-sensitivity probe: the mixed-case directory and
+/// the flipped spelling that resolves to it exactly when the destination is
+/// case-insensitive. Only [`CaseProbe::create`] builds one, so it cannot be
+/// answered or removed without having been created, and [`CaseProbe::remove`]
+/// consumes it, so it cannot be removed twice.
+struct CaseProbe {
+    rel: RootedRelativePath,
+    flipped: RootedRelativePath,
+}
+
+impl CaseProbe {
+    /// Choose a free probe name, create the probe directory in the destination
+    /// root, and return the created probe.
+    fn create(applier: &mut Applier) -> Result<CaseProbe> {
+        let (rel, flipped) = loop {
+            let candidate = case_probe_name();
+            let flipped = flip_ascii_case(&candidate);
+            let rel = RootedRelativePath::parse(Path::new(&candidate))?;
+            let flipped_rel = RootedRelativePath::parse(Path::new(&flipped))?;
+            // Neither spelling may already name an entry: on a case-SENSITIVE
+            // filesystem an unrelated entry at the flipped spelling would
+            // otherwise make the probe report a false "case-insensitive".
+            if !applier.dest.exists(&rel)? && !applier.dest.exists(&flipped_rel)? {
+                break (rel, flipped_rel);
+            }
+        };
+        let path = manifest_spelling(&rel);
+        applier.guard_destination(&rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
+        let attempt = applier.begin_mutation(&path, MutationKind::Content);
+        match applier.dest.create_dir_all(&rel) {
+            Ok(()) => applier.commit_mutation(attempt),
+            Err(error) => return Err(error),
+        }
+        Ok(CaseProbe { rel, flipped })
+    }
+
+    /// Whether the flipped spelling of this probe resolves to it.
+    fn answer(&self, applier: &Applier) -> Result<bool> {
+        applier.dest.exists(&self.flipped)
+    }
+
+    /// Remove the probe directory, recording a leftover as residue (it still
+    /// exists, so its transient state is reported rather than silently leaked).
+    fn remove(self, applier: &mut Applier) -> Result<()> {
+        let CaseProbe { rel, .. } = self;
+        let path = manifest_spelling(&rel);
+        applier.guard_destination(&rel, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
+        let attempt = applier.begin_mutation(&path, MutationKind::Content);
+        match applier.dest.remove_residue_dir(&rel) {
+            Ok(()) => {
+                applier.commit_mutation(attempt);
+                Ok(())
+            }
+            Err(error) => {
+                applier.note_residue(&path);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -8974,7 +9021,7 @@ struct CaseMember {
 }
 
 /// A unique, hidden, MIXED-CASE probe name for the destination
-/// case-sensitivity probe ([`Applier::dest_case_insensitive`]). It carries the
+/// case-sensitivity probe ([`CaseProbe::create`]). It carries the
 /// process id and a process-scoped counter so concurrent syncs cannot collide,
 /// and it lives in the RESERVED [`ASIDE_PREFIX`] namespace, so a probe
 /// interrupted between creation and cleanup is residue the next run reports and

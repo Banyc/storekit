@@ -591,17 +591,19 @@ compare, and the local compare-to-`renameat` window remains.
 
 ### Case-sensitivity probe and fold gate
 
-**Where.** `sync::apply::{dest_case_insensitive, remove_probe,
-refuse_unrepresentable_case_aliases, CaseMember}`;
+**Where.** `sync::apply::{case_sensitivity, refuse_unrepresentable_case_aliases,
+CaseSensitivity, CaseProbe, CaseMember}`;
 `aliased_dest`; `refuse_address_folded_onto_another_name`.
 
 **States.** Unprobed; probed insensitive; probed sensitive. Probe directory
 absent, created, found by flipped spelling, removed, or left as residue. Source
 entry aliased or not; conflict recorded or not.
 
-**Carrier.** `dest_case_insensitive: Option<bool>`, `aliased_dest:
+**Carrier.** `CaseSensitivity { Unprobed, Sensitive, Insensitive }`
+(`Applier::dest_case_sensitivity`), `aliased_dest:
 BTreeMap<String, String>`, and a reserved `.sync-aside.case-probe...` directory
-on disk.
+on disk carried by a created `CaseProbe { rel, flipped }` — both spellings
+parsed once — until it is removed.
 
 **Transitions.** Group source and destination names by fold; probe only when a
 transfer is at stake and the destination root exists; create a mixed-case probe
@@ -609,8 +611,12 @@ directory, look it up with the case flipped, remove it, and cache the answer.
 An aliased on-disk spelling is recorded so it and its subtree cannot be removed.
 
 **Watch.** An absent destination root cannot be probed without creating it, so
-the pair is conservatively refused without probing. The probe's own create and
-remove are counted mutations and can leave residue.
+the pair is conservatively refused without probing; that is the CALLER's
+condition (`root_present()`), not a probe state, so no state can claim a probe
+that never ran. `Unprobed` is the only askable state, so an answered probe
+cannot be asked again, and `CaseProbe` is created before it can be answered or
+removed and consumed by removal, so neither can happen twice. The probe's own
+create and remove are counted mutations and can leave residue.
 
 ### Verification passes
 

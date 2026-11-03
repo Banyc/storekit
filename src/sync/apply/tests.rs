@@ -15102,7 +15102,7 @@ fn applier_over<'a, 'b>(
         dest_residue: BTreeSet::new(),
         dest_unsupported: Vec::new(),
         aliased_dest: BTreeMap::new(),
-        dest_case_insensitive: None,
+        dest_case_sensitivity: CaseSensitivity::Unprobed,
         touched_dirs: BTreeSet::from([String::new()]),
         listings: std::cell::RefCell::new(BTreeMap::new()),
         ancestry_dirs: std::cell::RefCell::new(BTreeSet::new()),
