@@ -42,7 +42,7 @@
 //! for a root-confined landing, and the deliberately-named, tolerant
 //! `copy_tree_verbatim` for a clone that is NOT landing into a store root), the JSON
 //! readers (`read_json`, `read_json_fd`), and the crate-internal durable helpers
-//! (`set_private`, `sync_parent_dir` — `pub(crate)`, deliberately not public). Two
+//! (`sync_parent_dir` — `pub(crate)`, deliberately not public). Two
 //! more are the consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the
 //! OWNED ROOT itself (the empty and `.` child spellings are refused, so residue at the
 //! root was otherwise unreachable) and [`is_crate_temp_name`] recognises the crate's
@@ -92,9 +92,8 @@
 //! `renameat` and replaces the final entry without ever following it; see
 //! [`unix`]'s module docs — plus the POSIX parent-directory fsync
 //! durability). That component confinement covers the `_fd` surface only:
-//! [`unix`]'s PATH-BASED free functions (`set_private`,
-//! `write_atomic_replace`, `sync_parent_dir`,
-//! `ensure_private_dir_durable`, `copy_tree_verbatim`)
+//! [`unix`]'s PATH-BASED free functions (`write_atomic_replace`,
+//! `sync_parent_dir`, `ensure_private_dir_durable`, `copy_tree_verbatim`)
 //! take an ordinary path and are NOT covered — see [`unix`]'s module docs for
 //! the exact split.
 //! `windows` is the path-based implementation with documented weaker
@@ -146,11 +145,17 @@ use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
+mod dirchain;
 mod guard;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
+
+// The durable-directory-chain typestate shared by both ports. `DirChain`
+// cannot be built as `Created` outside `CreatedChain::commit`, so a caller
+// cannot report a created chain before the platform's durable commit runs.
+pub(crate) use dirchain::{ChainCommit, CreatedChain, DirChain};
 
 // THE one lock-record guard authority and its unforgeable capability. The
 // `guard` module's fields are private, so no other module can build a
@@ -271,7 +276,7 @@ pub use windows::*;
 ///   `ELOOP` on a symlink there for EVERY primitive of that surface, reads
 ///   included. That is the confinement an operation can rely on INSTEAD of a
 ///   live path check. The property does NOT extend to [`unix`]'s PATH-BASED
-///   free functions (`set_private`, `write_atomic_replace`, `sync_parent_dir`,
+///   free functions (`write_atomic_replace`, `sync_parent_dir`,
 ///   `ensure_private_dir_durable`, `copy_tree_verbatim`): those take an ordinary
 ///   path, so an intermediate
 ///   symlink in it IS followed — see [`unix`]'s module docs for the split.
@@ -588,6 +593,17 @@ pub(crate) fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
     std::ffi::OsString::from(temp_name_string(&file_name.to_string_lossy()))
 }
 
+/// Best-effort removal of a temp NAME.
+///
+/// This is the ONE path-based temp unlink, shared by [`discard_temp`]'s
+/// cleanup reporter and by the linear path temps' `Drop` (`atomic::unix`'s
+/// `PathTemp` and `atomic::windows`'s `WindowsTemp`). Keeping the raw
+/// `std::fs::remove_file` here is what keeps the guard's count pin a single
+/// reviewed site while the guards own the obligation.
+pub(crate) fn remove_temp(tmp: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(tmp)
+}
+
 /// Best-effort removal of a FAILED atomic replace's temp file.
 ///
 /// `original` is the failure that triggered the cleanup. The unlink is
@@ -602,11 +618,12 @@ pub(crate) fn temp_file_name(file_name: &OsStr) -> std::ffi::OsString {
 /// post-rename parent-fsync failure ([`ReplaceOutcome::ReplacedDurabilityUnknown`])
 /// is therefore NOT a cleanup point.
 ///
-/// The PATH-BASED replace's cleanup, used in PRODUCTION on every port now that
-/// [`write_atomic_replace`] is public and production on Unix too. The
-/// descriptor-relative twin is `atomic::unix::discard_temp_fd`.
+/// The PATH-BASED replace's explicit cleanup, used in PRODUCTION on every port
+/// now that [`write_atomic_replace`] is public and production on Unix too. The
+/// descriptor-relative twin is `atomic::unix::discard_temp_fd`; the linear
+/// temp's `Drop` is the same unlink through [`remove_temp`].
 fn discard_temp(original: Error, tmp: &Path) -> Error {
-    match std::fs::remove_file(tmp) {
+    match remove_temp(tmp) {
         Ok(()) => original,
         Err(e) => original.with_context(format!(
             "additionally failed to unlink the failed replace's temp {}: {e}",

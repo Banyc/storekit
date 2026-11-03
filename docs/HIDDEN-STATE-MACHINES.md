@@ -41,8 +41,9 @@ the local operation lock, and its lifetime is that lock's lifetime.
 
 ### Atomic-replace commit machine
 
-**Where.** `src/atomic/unix.rs::{write_atomic_replace, replace_core}`;
-`src/atomic/windows.rs::write_atomic_replace`;
+**Where.** `src/atomic/unix.rs::{write_atomic_replace, PathTemp, replace_core,
+Temp, write_atomic_cas_fd}`;
+`src/atomic/windows.rs::{write_atomic_replace, WindowsTemp}`;
 `src/atomic/mod.rs::{ReplaceOutcome, ReplaceStage}`.
 
 **States.** Old target visible; temp created/written; temp private; temp
@@ -51,16 +52,29 @@ renamed (new content visible); parent fsynced (new content durable). A
 pre-rename failure is an `Err` with the old content visible; a post-rename
 parent fsync failure is `ReplaceOutcome::ReplacedDurabilityUnknown`.
 
-**Carrier.** Stage-local code plus the temp and target entries. `ReplaceStage`
-names the fault points, not the whole state.
+**Carrier.** The LINEAR temp value: `PathTemp` (path-based Unix), `Temp`
+(descriptor-relative Unix), `WindowsTemp` (Windows). Each holds its temp name
+as an `Option` and its create-time `File` handle; `Published` is what a
+successful publish returns, so a post-publish temp unlink is unrepresentable.
+`ReplaceStage` names the fault points, not the whole state.
 
-**Transitions.** The Unix path-based and fd-based forms share the stage order;
-the Windows form removes the target before the rename, so its rename stage has a
-transient-absence state and no parent-directory commit point.
+**Transitions.** The stage methods consume and return the temp: `create` →
+`write` → `make_private` → `sync` → `publish`/`publish_no_replace`. The Unix
+write, chmod, and fsync go through the create-time handle, never a descriptor
+reopened by name; `publish` takes the name out first, so `Drop` can only unlink
+a live pre-publish temp. Every pre-publish exit removes the temp: an explicit
+`discard` (carrying both the original failure and a cleanup failure) or the
+`Drop` backstop for a `?` return. The Windows form removes the target before
+the rename, so its rename stage has a transient-absence state and no
+parent-directory commit point.
 
 **Watch.** The two commit points are reported distinctly. Every pre-rename
-failure path that has created a temp must discard it; the post-rename failure is
-not a cleanup point.
+failure path that has created a temp must discard it; the post-rename failure
+is not a cleanup point. The Unix CAS (`write_atomic_cas_fd`) installs with
+`linkat` without replacement, chmods the installed entry, then fsyncs the
+parent; its temp handle is closed before the link, matching the pre-typestate
+descriptor lifetime. The pre-rename stages' chmod/fsync receivers are pinned
+by the source audit in `atomic::guard`'s tests.
 
 ### Compare-and-swap replace
 
@@ -77,27 +91,36 @@ comparison result between them is not represented by a type.
 `renameat`. On a destination without a server-side compare, a writer inside that
 window is lost and nothing signals it.
 
-### Copy undo journal and two-phase copy
+### Copy mode journal and two-phase copy
 
-**Where.** `src/atomic/unix.rs::{CopyUndo, copy_dir_recursive_fd}`;
-`src/atomic/unix.rs::copy_tree_verbatim`.
+**Where.** `src/atomic/unix.rs::{CopyModes, PlannedMode,
+copy_dir_recursive_fd}`; `src/atomic/unix.rs::copy_tree_verbatim`.
 
-**States.** Undo journal armed; per-directory restore mode planned; walk
-creates or widens directories; final modes applied deepest-first; journal
-disarmed. A failed copy is supposed to restore every mode the journal recorded.
+**States.** Journal collecting `PlannedMode { restore, final_mode }` entries;
+walk creates or widens directories; `commit` applies the final modes
+deepest-first (the copy root last) and clears the journal; a failure in the walk
+or in `commit` leaves the entries in place, so the journal's `Drop` restores
+every mode deepest-first. A successful `commit` has consumed the journal; a
+failed copy is supposed to restore every mode the journal recorded.
 
-**Carrier.** `CopyUndo.armed: bool`, `CopyUndo.modes: Vec<(PathBuf, u32)>`, the
-walk's `dirs` vector, and the heap frame stack.
+**Carrier.** `CopyModes.root`, `CopyModes.modes: Vec<PlannedMode>` (one record
+per destination directory, with the FIRST record for a path winning), and the
+walk's heap frame stack. There is no `armed` flag and no parallel `dirs`
+vector: the consuming `commit` IS the disarm, and the final mode lives in the
+same `PlannedMode` as the restore mode.
 
-**Transitions.** A created directory is journaled with the removable `0o700`; a
-pre-existing directory is journaled with its original mode. Success applies the
-exact modes and disarms.
+**Transitions.** A created directory is planned with the removable `0o700`
+restore mode and the source's final mode; a pre-existing directory is planned
+with its original mode. Success applies the exact modes and clears the
+obligations.
 
-**Watch.** `CopyUndo::disarm` runs before the source-shape recheck in
-`copy_dir_recursive_fd`. A source-shape failure therefore returns `Err` with the
-intended modes already applied and the journal disarmed. `copy_tree_verbatim`
-has no undo journal at all; a failed verbatim copy leaves a partial destination
-by design.
+**Watch.** `commit` runs before the source-shape recheck in
+`copy_dir_recursive_fd`; a source-shape failure therefore returns `Err` with the
+intended modes already applied and the journal consumed. The root-final
+ordering is part of `commit` (the deepest-first sort leaves the shallowest copy
+root last) and is pinned by the root-mode assertion and the mid-commit
+failpoint test. `copy_tree_verbatim` has no journal at all; a failed verbatim
+copy leaves a partial destination by design.
 
 ### Iterative removal walk
 
@@ -124,18 +147,36 @@ listing before descending into a claimed or partial subtree.
 
 ### Durable directory-chain creation
 
-**Where.** `atomic::unix::{ensure_private_dir_durable,
-ensure_private_dir_durable_fd}`; the Windows twin in `atomic::windows`.
+**Where.** `atomic::dirchain::{DirChain, CreatedChain, ChainCommit,
+CreatedProof}`; `atomic::unix::{ensure_private_dir_durable,
+ensure_private_dir_durable_fd, PathChain, UnixChain}`; the Windows twin in
+`atomic::windows`.
 
-**States.** Chain absent; missing components collected deepest-first; components
-created top-down at `0o700`; each created component's parent fsynced; caller's
-parent fsynced; chain durable.
+**States.** Chain absent; missing components collected deepest-first;
+components created top-down at `0o700`; a `CreatedChain` assembled from the
+port's state and the indices it created; its `commit` fsyncs the created
+entries deepest-first and then the parent-of-parent entry, and only then
+returns `DirChain::Created`; `DirChain::AlreadyPresent` when nothing was
+created.
 
-**Carrier.** The `missing` vector and the live filesystem. The function returns
-whether it created anything.
+**Carrier.** `CreatedChain.chain` (a SEALED `ChainCommit`: `PathChain`,
+`UnixChain`, or `WindowsChain`), `CreatedChain.created`, and the live
+filesystem. `CreatedProof` is private to `dirchain` and `ChainCommit`'s
+`Sealed` supertrait is nameable only there, so an in-crate module cannot hand
+`commit` a no-op chain; the only `Created` producer is a port's commit. The
+Windows commit is the documented no-op, so its `Created` verdict carries no
+durability claim (the proof means "commit ran and returned `Ok`").
+
+**Transitions.** Both `ensure_private_dir_durable` spellings return `bool` at
+the boundary as `DirChain::is_created()`; the internal `_chain` fns return the
+`DirChain` itself, and `write_atomic_replace`, `replace_core`, and `symlink_fd`
+call the chain body directly (running its commit) without consuming the
+verdict. `FileLock::acquire` and the public `_fd` entry point use the bool.
 
 **Watch.** A creation or chmod failure mid-chain returns without undoing the
 components already created. The caller sees a partial chain, not a rollback.
+The created-entry order is deepest-first and the parent-of-parent fsync is a
+separate commit step; the `commit-dir-entry*` probes pin both.
 
 ### Owned-root registry
 

@@ -55,6 +55,116 @@ pub(crate) fn set_private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The witness that a temp was successfully published under its final name.
+/// It carries no temp name, so a post-publish temp unlink is unrepresentable.
+struct Published;
+
+/// A linear, PATH-BASED temp for this port's [`write_atomic_replace`].
+///
+/// The temp exists from [`create`](Self::create) until a stage method consumes
+/// it. Every pre-publish failure calls [`discard`](Self::discard), preserving
+/// the old [`discard_temp`](super::discard_temp) error contract (original
+/// failure plus the cleanup failure); a `?`/plain drop of a live temp is the
+/// best-effort `Drop` unlink. A successful publish consumes the temp, so a
+/// post-publish temp unlink is unrepresentable. Windows needs the file handle
+/// CLOSED before any unlink, so every exit drops it first.
+struct WindowsTemp {
+    /// `Some` while the temp name is ours and must be removed.
+    path: Option<PathBuf>,
+    /// The create-time handle, held until [`publish`](Self::publish): the
+    /// write and the fsync go through the descriptor `O_EXCL` created, so no
+    /// stage can be redirected to another file by a name swapped beside it.
+    /// Windows needs the handle CLOSED before any unlink/rename, so every exit
+    /// that moves the name drops it first.
+    file: Option<std::fs::File>,
+}
+
+impl WindowsTemp {
+    fn create(path: PathBuf) -> Result<Self> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Self {
+                path: Some(path),
+                file: Some(file),
+            }),
+            // A failed CREATE means the temp was never created (or the name
+            // belongs to another writer): nothing to clean up.
+            Err(e) => Err(Error::store(format!("create {}: {e}", path.display()))),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("a live temp owns its path")
+    }
+
+    /// The temp's OWN create handle: the write and the fsync use this receiver
+    /// instead of reopening the temp by name.
+    fn file(&self) -> &std::fs::File {
+        self.file
+            .as_ref()
+            .expect("a live temp owns its create handle")
+    }
+
+    fn write(self, bytes: &[u8]) -> Result<Self> {
+        let written = {
+            let mut file = self.file();
+            file.write_all(bytes)
+        };
+        if let Err(e) = written {
+            let shown = self.path().to_path_buf();
+            return Err(self.discard(Error::store(format!("write {}: {e}", shown.display()))));
+        }
+        Ok(self)
+    }
+
+    fn sync(self) -> Result<Self> {
+        let path = self.path().to_path_buf();
+        let synced = self.file().sync_all();
+        if let Err(e) = synced {
+            return Err(self.discard(Error::store(format!("fsync {}: {e}", path.display()))));
+        }
+        Ok(self)
+    }
+
+    fn publish(mut self, target: &Path) -> Result<Published> {
+        let path = self.path.take().expect("a live temp owns its path");
+        // Windows cannot rename or remove an OPEN file: close the create
+        // handle before the target removal and the rename (the write and the
+        // fsync already went through it).
+        drop(self.file.take());
+        // Windows `rename` does not overwrite an existing target: remove it
+        // first (the replace is NOT atomic — a reader can observe a transient
+        // absence). A post-remove failure can no longer leave the OLD content
+        // visible — the documented weaker guarantee of this port.
+        let _ = std::fs::remove_file(target);
+        match std::fs::rename(&path, target) {
+            Ok(()) => Ok(Published),
+            Err(e) => Err(discard_temp(
+                Error::store(format!("rename {}: {e}", target.display())),
+                &path,
+            )),
+        }
+    }
+
+    fn discard(mut self, original: Error) -> Error {
+        drop(self.file.take());
+        let path = self.path.take().expect("a live temp owns its path");
+        discard_temp(original, &path)
+    }
+}
+
+impl Drop for WindowsTemp {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = self.path.take() {
+            let _ = super::remove_temp(&path);
+        }
+    }
+}
+
 /// Durably replace a mutable marker file: write a UNIQUE temp file in the
 /// same directory, fsync it, rename over the target. On Windows the
 /// replace is NOT atomic (`rename` does not overwrite — the target is
@@ -108,50 +218,16 @@ pub fn write_atomic_replace(
     if let Some(e) = fault(ReplaceStage::Write) {
         return Err(e);
     }
-    let mut tmp_file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-    {
-        Ok(f) => f,
-        // A failed CREATE means the temp was never created (or the name
-        // belongs to another writer): nothing to clean up.
-        Err(e) => return Err(Error::store(format!("create {}: {e}", tmp.display()))),
-    };
-    if let Err(e) = tmp_file.write_all(bytes) {
-        // Close the temp before unlinking and remove the stray the failed
-        // write left behind.
-        drop(tmp_file);
-        return Err(discard_temp(
-            Error::store(format!("write {}: {e}", tmp.display())),
-            &tmp,
-        ));
-    }
-    drop(tmp_file);
+    let temp = WindowsTemp::create(tmp)?;
+    let temp = temp.write(bytes)?;
     // Stage 2: the temp fsync. A failure (or an injected
     // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
     // temp the replace wrote is unlinked before the `Err` returns, so no
     // stray entry survives.
     if let Some(e) = fault(ReplaceStage::Sync) {
-        return Err(discard_temp(e, &tmp));
+        return Err(temp.discard(e));
     }
-    let tmp_file = match std::fs::File::open(&tmp) {
-        Ok(f) => f,
-        Err(e) => {
-            return Err(discard_temp(
-                Error::store(format!("open {}: {e}", tmp.display())),
-                &tmp,
-            ));
-        }
-    };
-    if let Err(e) = tmp_file.sync_all() {
-        drop(tmp_file);
-        return Err(discard_temp(
-            Error::store(format!("fsync {}: {e}", tmp.display())),
-            &tmp,
-        ));
-    }
-    drop(tmp_file);
+    let temp = temp.sync()?;
     // Stage 3: the rename — COMMIT POINT 1. Windows `rename` does not
     // overwrite an existing target: remove it first (the replace is NOT
     // atomic — a reader can observe a transient absence). A failure (or an
@@ -159,15 +235,9 @@ pub fn write_atomic_replace(
     // temp is unlinked. (A post-remove failure can no longer leave the OLD
     // content visible — the documented weaker guarantee of this port.)
     if let Some(e) = fault(ReplaceStage::Rename) {
-        return Err(discard_temp(e, &tmp));
+        return Err(temp.discard(e));
     }
-    let _ = std::fs::remove_file(path);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        return Err(discard_temp(
-            Error::store(format!("rename {}: {e}", path.display())),
-            &tmp,
-        ));
-    }
+    let _published = temp.publish(path)?;
     // Stage 4: the parent-directory fsync — Windows has no directory fsync
     // (a directory cannot be opened as a file); the rename is the only
     // commit point. The injected [`ReplaceStage::DirSync`] fault still
@@ -193,11 +263,36 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The Windows durable-commit body for [`CreatedChain`]. Windows has no
+/// directory fsync (a directory cannot be opened as a file), so this commit is
+/// the documented NO-OP: it makes no durability claim. It exists so the
+/// created-chain typestate is the same vocabulary on both ports. The tuple
+/// field is private and [`new`](Self::new) is the only constructor, so another
+/// module cannot pass a hand-built no-op chain to [`CreatedChain::commit`].
+pub(super) struct WindowsChain(());
+
+impl WindowsChain {
+    pub(super) fn new() -> Self {
+        Self(())
+    }
+}
+
+impl ChainCommit for WindowsChain {
+    fn commit_created_entries(&self, _created: &[usize]) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// DURABLE private directory creation: create `path` (and every missing
 /// ancestor). On Windows there is no parent-directory fsync (the durable
 /// commit is a no-op) — the documented weaker guarantee of the Windows
-/// port. Returns `true` when this call created at least one directory.
+/// port. Returns `true` when this call created at least one directory; the
+/// `Created` verdict can only come from [`CreatedChain::commit`].
 pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
+    ensure_private_dir_durable_chain(path).map(|chain| chain.is_created())
+}
+
+fn ensure_private_dir_durable_chain(path: &Path) -> Result<DirChain> {
     refuse_reserved_mutation(path, Sanction::Residue)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
@@ -216,11 +311,10 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
             Err(e) => return Err(Error::store(format!("stat {}: {e}", cur.display()))),
         }
     }
-    if missing.is_empty() {
-        return Ok(false);
-    }
     // Create the chain TOP-DOWN (parents before their children). A racing
-    // creation of an ancestor is tolerated.
+    // creation of an ancestor is tolerated. Every missing component is passed
+    // to the chain (the old `bool` reported "the chain was non-empty", not
+    // which `create_dir` won a race), preserving that answer exactly.
     for component in missing.iter().rev() {
         match std::fs::create_dir(component) {
             Ok(()) => {}
@@ -230,7 +324,8 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
             }
         }
     }
-    Ok(true)
+    let created: Vec<usize> = (0..missing.len()).collect();
+    CreatedChain::new(WindowsChain::new(), created).commit()
 }
 
 /// THE TOLERANT, VERBATIM TREE COPY (the Windows twin of the Unix
@@ -1036,10 +1131,11 @@ pub fn ensure_private_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result
 
 /// Path-based DURABLE private-directory creation (see
 /// [`ensure_private_dir_durable`] — the durable commit is a no-op on
-/// Windows).
+/// Windows). The `Created` verdict still comes from [`CreatedChain::commit`],
+/// so this port uses the same vocabulary as Unix.
 pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
     let rel = rel.as_path();
-    ensure_private_dir_durable(&rel_join(root, rel)?)
+    ensure_private_dir_durable_chain(&rel_join(root, rel)?).map(|chain| chain.is_created())
 }
 
 /// A no-op: this port has no directory fsync (see the module docs).
@@ -1525,7 +1621,9 @@ fn read_dir_entries(entries: std::fs::ReadDir) -> Result<Vec<DirEntry>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, path_kind_fd, write_atomic_replace,
+        DirChain, Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir,
+        ensure_private_dir_durable, ensure_private_dir_durable_chain,
+        ensure_private_dir_durable_fd, path_kind_fd, rel_join, write_atomic_replace,
     };
     use crate::relpath::RootedRelativePath;
     use std::path::{Path, PathBuf};
@@ -1572,6 +1670,51 @@ mod tests {
             Some(PathKind::Dir)
         );
         assert_eq!(path_kind_fd(&root, &rp("missing")).unwrap(), None);
+    }
+
+    /// The durable-chain verdict is reachable on THIS port too: a fresh chain
+    /// reports `Created`/`true`, the same chain again reports
+    /// `AlreadyPresent`/`false`. The Windows commit is the documented no-op,
+    /// so the verdict carries no durability claim here, but the `DirChain`
+    /// producer and the bool boundary must still agree — the same assertions
+    /// the host port runs.
+    #[test]
+    fn durable_dir_chain_verdict_distinguishes_present_from_created() {
+        let (dir, root) = owned_root();
+        let rel = rp("a/b");
+        let chain_path = rel_join(&root, rel.as_path()).unwrap();
+
+        // The public entry point returns true for a fresh chain and false when
+        // the chain already exists.
+        assert!(
+            ensure_private_dir_durable_fd(&root, &rel).unwrap(),
+            "the fd entry point's bool is the Created verdict's derived view"
+        );
+        assert!(
+            dir.path().join("a/b").is_dir(),
+            "the fresh chain must exist on disk"
+        );
+        assert!(
+            !ensure_private_dir_durable_fd(&root, &rel).unwrap(),
+            "the public bool is false when nothing was created"
+        );
+
+        // The chain itself distinguishes the two verdicts.
+        let verdict = ensure_private_dir_durable_chain(&chain_path).unwrap();
+        assert!(
+            matches!(verdict, DirChain::AlreadyPresent),
+            "an all-existing chain must report AlreadyPresent: {verdict:?}"
+        );
+        assert!(
+            !ensure_private_dir_durable(&chain_path).unwrap(),
+            "the path-based wrapper agrees with the same verdict"
+        );
+        let fresh_path = rel_join(&root, rp("c/d").as_path()).unwrap();
+        let verdict = ensure_private_dir_durable_chain(&fresh_path).unwrap();
+        assert!(
+            matches!(verdict, DirChain::Created(_)),
+            "a fresh chain must report Created: {verdict:?}"
+        );
     }
 
     /// A symlink is `Symlink` — never its target's kind — when Windows lets

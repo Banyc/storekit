@@ -34,11 +34,14 @@ use std::path::Path;
 /// `lock::FileLock::acquire` (the newly opened lock record);
 /// `sync::apply`'s `set_local_mode`; the `atomic::unix` fd-bound helpers
 /// (`open_verbatim_source`, `replace_core`, `write_atomic_cas_fd`,
-/// `ensure_private_dir_fd`, `ensure_private_dir_durable_fd_path`,
+/// `ensure_private_dir_fd`, `ensure_private_dir_durable_fd_chain`,
 /// `set_private_fd`, `create_destination_chain`, `copy_dir_recursive_fd`,
-/// `set_dir_mode_fd`); and `transport::LocalTransport`'s `write_confined` /
+/// `set_dir_mode_fd`), the linear temps' `Temp::make_private`/`Temp::sync` and
+/// `PathTemp::make_private`/`PathTemp::sync` (on the create-time handle); and
+/// `transport::LocalTransport`'s `write_confined` /
 /// `set_mode_confined`. Every receiver is a descriptor obtained from an
-/// `O_NOFOLLOW` `openat`/`dup`, or the newly opened lock-record [`File`].
+/// `O_NOFOLLOW` `openat`/`dup`, the temp's create handle, or the newly opened
+/// lock-record [`File`].
 ///
 /// [`std::fs::set_permissions`]: std::fs::set_permissions
 /// [`File`]: std::fs::File

@@ -2708,15 +2708,20 @@ mod tests {
             ("src/atomic/unix.rs", "libc::F_GETPATH", 1),
             ("src/atomic/unix.rs", "libc::O_APPEND", 1),
             ("src/atomic/unix.rs", "libc::O_CLOEXEC", 8),
-            ("src/atomic/unix.rs", "libc::O_CREAT", 5),
+            // The linear temp centralizes the two `O_WRONLY | O_CREAT |
+            // O_EXCL` creation spellings (`replace_core` and
+            // `write_atomic_cas_fd`) into ONE `Temp::create`, so each of those
+            // three flags loses one production reference. No flag or create
+            // site was otherwise changed.
+            ("src/atomic/unix.rs", "libc::O_CREAT", 4),
             ("src/atomic/unix.rs", "libc::O_DIRECTORY", 18),
-            ("src/atomic/unix.rs", "libc::O_EXCL", 3),
+            ("src/atomic/unix.rs", "libc::O_EXCL", 2),
             ("src/atomic/unix.rs", "libc::O_NOFOLLOW", 8),
             ("src/atomic/unix.rs", "libc::O_NONBLOCK", 2),
-            ("src/atomic/unix.rs", "libc::O_RDONLY", 29),
+            ("src/atomic/unix.rs", "libc::O_RDONLY", 27),
             ("src/atomic/unix.rs", "libc::O_RDWR", 1),
             ("src/atomic/unix.rs", "libc::O_TRUNC", 2),
-            ("src/atomic/unix.rs", "libc::O_WRONLY", 5),
+            ("src/atomic/unix.rs", "libc::O_WRONLY", 4),
             ("src/atomic/unix.rs", "libc::PATH_MAX", 1),
             ("src/atomic/unix.rs", "libc::S_IFDIR", 4),
             ("src/atomic/unix.rs", "libc::S_IFLNK", 1),
@@ -6039,6 +6044,124 @@ impl S {
         None
     }
 
+    /// Locate an INHERENT method `ty::name` anywhere in a parsed file's item
+    /// tree. The durable replace's temp syscalls now live in the linear temp's
+    /// stage methods, so the audit follows the call one level into that type
+    /// instead of losing the pin when the raw syscall left the replace body.
+    fn find_inherent_method<'a>(
+        items: &'a [syn::Item],
+        ty: &str,
+        name: &str,
+    ) -> Option<&'a syn::ImplItemFn> {
+        for item in items {
+            match item {
+                syn::Item::Impl(item_impl) => {
+                    if item_impl.trait_.is_some() {
+                        continue;
+                    }
+                    let is_ty = match &*item_impl.self_ty {
+                        syn::Type::Path(path) => path
+                            .path
+                            .segments
+                            .last()
+                            .is_some_and(|segment| unraw(&segment.ident) == ty),
+                        _ => false,
+                    };
+                    if is_ty {
+                        for impl_item in &item_impl.items {
+                            if let syn::ImplItem::Fn(function) = impl_item
+                                && unraw(&function.sig.ident) == name
+                            {
+                                return Some(function);
+                            }
+                        }
+                    }
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, inner)) = &module.content
+                        && let Some(found) = find_inherent_method(inner, ty, name)
+                    {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Which expression a method call runs on, for the receiver-sensitive part
+    /// of the durable-replace audit. A `sync_all`/`set_permissions` is only
+    /// evidence for the TEMP when its receiver is the create handle; a call on
+    /// a descriptor reopened by name is exactly the pre-fix shape this audit
+    /// must refuse.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HandleReceiver {
+        /// The linear temp's OWN create handle: `self.file()` (or the
+        /// `self.file` field). This is the descriptor `O_EXCL`/`create_new`
+        /// produced, so a chmod/fsync on it cannot be redirected by a name.
+        OwnCreateHandle,
+        /// A descriptor reopened beside the temp by name
+        /// (`File::open`/`openat_no_follow_path`/`openat_readable_regular`).
+        ReopenedByName,
+        /// Anything else (a local binding, a parent directory, ...). The rule
+        /// is SYNTACTIC and does not resolve local aliases.
+        Other,
+    }
+
+    /// Does `expr` root in a by-name reopen of an entry?
+    fn roots_in_reopen(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::MethodCall(call) => roots_in_reopen(&call.receiver),
+            syn::Expr::Field(field) => roots_in_reopen(&field.base),
+            syn::Expr::Try(try_expr) => roots_in_reopen(&try_expr.expr),
+            syn::Expr::Call(call) => callee_path(&call.func)
+                .and_then(|path| path_segments(path).last().cloned())
+                .is_some_and(|last| {
+                    matches!(
+                        last.as_str(),
+                        "open"
+                            | "openat_no_follow_path"
+                            | "openat_no_follow_io"
+                            | "openat_readable_regular"
+                    )
+                }),
+            _ => false,
+        }
+    }
+
+    /// Does `expr` contain the temp's own create-handle accessor (`self.file()`
+    /// or the `self.file` field) as its receiver root or on the method chain?
+    /// A LOCAL alias is deliberately not resolved: the audited stages must spell
+    /// the create handle directly, and the audit states that limit below rather
+    /// than pretending to see through bindings.
+    fn roots_in_create_handle(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::MethodCall(call) => {
+                (unraw(&call.method) == "file"
+                    && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident("self")))
+                    || roots_in_create_handle(&call.receiver)
+            }
+            syn::Expr::Field(field) => {
+                (matches!(&field.member, syn::Member::Named(name) if unraw(name) == "file")
+                    && matches!(&*field.base, syn::Expr::Path(path) if path.path.is_ident("self")))
+                    || roots_in_create_handle(&field.base)
+            }
+            syn::Expr::Try(try_expr) => roots_in_create_handle(&try_expr.expr),
+            _ => false,
+        }
+    }
+
+    fn handle_receiver(expr: &syn::Expr) -> HandleReceiver {
+        if roots_in_create_handle(expr) {
+            HandleReceiver::OwnCreateHandle
+        } else if roots_in_reopen(expr) {
+            HandleReceiver::ReopenedByName
+        } else {
+            HandleReceiver::Other
+        }
+    }
+
     /// The sync-capable calls one named replace body makes, each with the
     /// visit order that decides "before"/"after the rename". A single monotone
     /// counter over the two call node kinds makes the relative order of a
@@ -6048,9 +6171,19 @@ impl S {
     struct ReplaceSyncWalk {
         next: usize,
         rename_at: Option<usize>,
-        sync_all_at: Vec<usize>,
+        /// `(visit order, receiver)` for every `sync_all` method call.
+        sync_all_at: Vec<(usize, HandleReceiver)>,
+        /// `(visit order, receiver)` for every `set_permissions` method call.
+        set_permissions_at: Vec<(usize, HandleReceiver)>,
+        /// `File::open(...)` calls (the parent-directory reopen).
         file_open_at: Vec<usize>,
+        /// Any call that reopens an entry by name, in the audited temp stages.
+        reopen_at: Vec<usize>,
         fsync_dir_fd_at: Vec<usize>,
+        temp_create_at: Vec<usize>,
+        temp_sync_at: Vec<usize>,
+        temp_make_private_at: Vec<usize>,
+        temp_publish_at: Vec<usize>,
     }
 
     impl ReplaceSyncWalk {
@@ -6064,8 +6197,18 @@ impl S {
     impl<'ast> syn::visit::Visit<'ast> for ReplaceSyncWalk {
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
             let at = self.bump();
-            if unraw(&call.method) == "sync_all" {
-                self.sync_all_at.push(at);
+            match unraw(&call.method).as_str() {
+                "sync_all" => self.sync_all_at.push((at, handle_receiver(&call.receiver))),
+                "set_permissions" => self
+                    .set_permissions_at
+                    .push((at, handle_receiver(&call.receiver))),
+                // The linear temp's stage methods. `write_atomic_replace` and
+                // `replace_core` call these instead of spelling the raw temp
+                // syscalls in their own bodies.
+                "sync" => self.temp_sync_at.push(at),
+                "make_private" => self.temp_make_private_at.push(at),
+                "publish" | "publish_no_replace" => self.temp_publish_at.push(at),
+                _ => {}
             }
             syn::visit::visit_expr_method_call(self, call);
         }
@@ -6077,7 +6220,16 @@ impl S {
                 match segments.last().map(String::as_str) {
                     Some("rename" | "renameat_fd") => self.rename_at = Some(at),
                     Some("fsync_dir_fd") => self.fsync_dir_fd_at.push(at),
+                    Some(
+                        "open"
+                        | "openat_no_follow_path"
+                        | "openat_no_follow_io"
+                        | "openat_readable_regular",
+                    ) => self.reopen_at.push(at),
                     _ => {}
+                }
+                if segments.len() >= 2 && segments[segments.len() - 2..] == ["Temp", "create"] {
+                    self.temp_create_at.push(at);
                 }
                 let tail = &segments[segments.len().saturating_sub(2)..];
                 if tail == ["File", "open"] {
@@ -6088,29 +6240,43 @@ impl S {
         }
     }
 
-    /// SOURCE-SHAPE AUDIT: the DURABLE atomic replace paths must CALL a real
-    /// temp-file sync and a real parent-directory sync, and those calls must be
-    /// INSIDE the named function bodies — not merely present in the file. The
-    /// replace's fault hooks RETURN BEFORE each real syscall
-    /// (`ReplaceStage::Sync` before the temp `sync_all`, `ReplaceStage::DirSync`
-    /// before the parent open + `sync_all` / before `fsync_dir_fd`), so
-    /// deleting the real `sync_all`/`fsync_dir_fd` while still returning
-    /// `ReplaceOutcome::ReplacedDurable` used to be invisible: no test executed
-    /// or observed those syscalls, and the ordering probes asserted the RENAME
-    /// only (the path-based variant had no stage-4 probe at all).
+    /// SOURCE-SHAPE AUDIT (receiver-sensitive): the DURABLE atomic replace and
+    /// CAS paths must call a real temp-file sync and a real parent-directory
+    /// sync, and those calls must be INSIDE the named function bodies — not
+    /// merely present in the file, and not aimed at some OTHER descriptor.
+    ///
+    /// WHY RECEIVER-SENSITIVE: the earlier audit only required a `sync_all`
+    /// token inside `PathTemp::sync`/`Temp::sync`, so opening the PARENT there
+    /// and syncing it passed while the temp went unsynced. The stage bodies now
+    /// call `self.file().sync_all()` and `self.file().set_permissions(...)` on
+    /// the temp's OWN create handle, and this audit checks that receiver shape
+    /// ([`HandleReceiver`]): a reopen by name (`File::open`,
+    /// `openat_no_follow_path`, ...) is classified [`HandleReceiver::ReopenedByName`]
+    /// and does NOT satisfy the assertion. The private-mode stage and
+    /// `write_atomic_cas_fd` — neither audited before — are covered too.
     ///
     /// WHAT THIS PROVES: within the parsed body of `write_atomic_replace`
-    /// (path-based) there is a `sync_all()` call BEFORE the rename and a
-    /// `File::open(...)` call plus a `sync_all()` call AFTER it; within the
-    /// parsed body of `replace_core` (fd-based) there is a `sync_all()` call
-    /// BEFORE the `renameat_fd` and an `fsync_dir_fd(...)` call AFTER it. So
-    /// the call is present and WOULD RUN when that stage is reached, and
-    /// removing it — or moving it out of the named body — makes this test fail.
+    /// (path-based) the linear temp's `make_private` and `sync` run BEFORE its
+    /// `publish`, a `File::open(...)` call plus a `sync_all()` call run AFTER
+    /// the publish, and `PathTemp::make_private`/`PathTemp::sync` call
+    /// `set_permissions`/`sync_all` on `self.file()` with NO reopen, while
+    /// `PathTemp::publish` calls the real `rename`; within the parsed body of
+    /// `replace_core` (fd-based) the same stage order holds, `fsync_dir_fd(...)`
+    /// runs AFTER the publish, and `Temp::make_private`/`Temp::sync` use the
+    /// create handle while `Temp::publish` calls the real `renameat_fd`;
+    /// `write_atomic_cas_fd` creates, syncs, publishes, chmods the installed
+    /// entry, and fsyncs the parent IN THAT ORDER. So the syscalls are present
+    /// and WOULD RUN when the stage is reached, and removing one — or aiming it
+    /// at a reopened name — makes this test fail.
     ///
     /// WHAT THIS DOES NOT PROVE: that the syscall RAN or that it succeeded.
     /// No in-process test can observe a fsync reaching the device; this audit
-    /// pins presence and position in the source. The dynamic REACH half — that
-    /// a successful durable replace actually records the post-rename
+    /// pins presence, position, and receiver SHAPE in the source. The receiver
+    /// rule is SYNTACTIC: it does not resolve a local alias (`let f =
+    /// self.file(); f.sync_all()`) or a helper fn that returns the handle. The
+    /// negative control below pins that limit, and the audited stages spell
+    /// `self.file()` directly rather than relying on it. The dynamic REACH half
+    /// — that a successful durable replace actually records the post-rename
     /// parent-fsync probe — is asserted in
     /// `atomic::unix::tests::a_missing_parent_chain_is_committed_durably_before_the_rename`
     /// and
@@ -6146,50 +6312,264 @@ impl S {
             syn::visit::Visit::visit_block(&mut audit, &function.block);
             audit
         };
+        let walk_method = |ty: &str, name: &str| -> ReplaceSyncWalk {
+            let function = find_inherent_method(&unix.file.items, ty, name).unwrap_or_else(|| {
+                panic!(
+                    "`{ty}::{name}` must exist in src/atomic/unix.rs; this audit pins the linear \
+                     temp's stage body, so a rename must update the audit rather than silently \
+                     lose the pin"
+                )
+            });
+            let mut audit = ReplaceSyncWalk::default();
+            syn::visit::Visit::visit_block(&mut audit, &function.block);
+            audit
+        };
 
-        // PATH-BASED `write_atomic_replace`: `tmp_file.sync_all()` BEFORE the
-        // rename, then `File::open(parent)` + `dir.sync_all()` AFTER it.
+        // A SYNTHETIC body's call shape, for the receiver-sensitivity
+        // controls below. The same walker runs, so the controls pin the RULE
+        // rather than the current source only.
+        let walk_body = |source: &str| -> ReplaceSyncWalk {
+            let block: syn::Block =
+                syn::parse_str(source).expect("the synthetic audit body must parse");
+            let mut audit = ReplaceSyncWalk::default();
+            syn::visit::Visit::visit_block(&mut audit, &block);
+            audit
+        };
+
+        // RECEIVER-SENSITIVITY CONTROL, negative: a sync on a descriptor
+        // reopened by NAME is not the temp's create handle. Before the receiver
+        // check, `File::open(&temp)?.sync_all()` passed as the "temp fsync".
+        for reopened in [
+            "{ std::fs::File::open(\"t\").unwrap().sync_all().unwrap(); }",
+            "{ openat_no_follow_path(p, n, 0, 0).unwrap().sync_all().unwrap(); }",
+            "{ let f = std::fs::File::open(\"t\").unwrap(); f.sync_all().unwrap(); }",
+        ] {
+            let audit = walk_body(reopened);
+            assert!(
+                !audit.sync_all_at.is_empty(),
+                "the control body must contain a `sync_all`: {reopened}"
+            );
+            assert!(
+                audit
+                    .sync_all_at
+                    .iter()
+                    .all(|(_, receiver)| *receiver != HandleReceiver::OwnCreateHandle),
+                "a `sync_all` on a by-name reopen (or a local alias of one) must NOT be classified \
+                 as the temp's create handle, or this audit would pass for the pre-fix shape: \
+                 {reopened} => {audit:?}"
+            );
+        }
+        // RECEIVER-SENSITIVITY CONTROL, positive: the create-handle accessor is
+        // recognized. A LOCAL alias of the handle is deliberately NOT resolved
+        // — the rule is syntactic — and the audited stages therefore spell
+        // `self.file()` directly; this states the limit instead of claiming it
+        // sees through bindings.
+        let audit = walk_body("{ self.file().sync_all().unwrap(); }");
+        assert!(
+            audit
+                .sync_all_at
+                .iter()
+                .any(|(_, receiver)| *receiver == HandleReceiver::OwnCreateHandle),
+            "a `sync_all` on `self.file()` must be classified as the temp's create handle: \
+             {audit:?}"
+        );
+        let audit = walk_body("{ let f = self.file(); f.sync_all().unwrap(); }");
+        assert!(
+            audit
+                .sync_all_at
+                .iter()
+                .all(|(_, receiver)| *receiver != HandleReceiver::OwnCreateHandle),
+            "the receiver rule does not resolve a local alias, and must not pretend to: \
+             {audit:?}"
+        );
+
+        // PATH-BASED `write_atomic_replace`: the temp's `make_private` and
+        // `sync` BEFORE its `publish`, then `File::open(parent)` +
+        // `dir.sync_all()` AFTER it. The real temp chmod/fsync/rename live in
+        // the temp's stage methods, audited immediately below.
         let audit = walk("write_atomic_replace");
-        let rename = audit.rename_at.unwrap_or_else(|| {
-            panic!("write_atomic_replace must call the install (`rename`) inside its body")
+        let make_private = audit
+            .temp_make_private_at
+            .first()
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "write_atomic_replace must call the linear temp's `make_private` inside its \
+                     body"
+                )
+            });
+        let temp_sync = audit.temp_sync_at.first().copied().unwrap_or_else(|| {
+            panic!("write_atomic_replace must call the linear temp's `sync` inside its body")
+        });
+        let publish = audit.temp_publish_at.first().copied().unwrap_or_else(|| {
+            panic!("write_atomic_replace must call the linear temp's `publish` inside its body")
         });
         assert!(
-            audit.sync_all_at.iter().any(|at| *at < rename),
-            "write_atomic_replace must call `sync_all()` on the TEMP file BEFORE the rename; the \
-             `ReplaceStage::Sync` fault hook returns before the real syscall, so removing it while \
-             still returning `ReplacedDurable` must fail here: {audit:?}"
+            make_private < temp_sync,
+            "write_atomic_replace must make the temp PRIVATE before syncing it, or the fsync does \
+             not cover the mode change: {audit:?}"
         );
         assert!(
-            audit.file_open_at.iter().any(|at| *at > rename),
-            "write_atomic_replace must OPEN THE PARENT directory AFTER the rename, or there is no \
-             directory to fsync; the `ReplaceStage::DirSync` fault hook returns before the real \
+            temp_sync < publish,
+            "write_atomic_replace must sync the TEMP before publishing it; the \
+             `ReplaceStage::Sync` fault hook returns before the real syscall, so removing the \
+             sync while still returning `ReplacedDurable` must fail here: {audit:?}"
+        );
+        assert!(
+            audit.file_open_at.iter().any(|at| *at > publish),
+            "write_atomic_replace must OPEN THE PARENT directory AFTER the publish, or there is \
+             no directory to fsync; the `ReplaceStage::DirSync` fault hook returns before the real \
              open, so removing it while still reporting a durable outcome must fail here: \
              {audit:?}"
         );
         assert!(
-            audit.sync_all_at.iter().any(|at| *at > rename),
-            "write_atomic_replace must call `sync_all()` on the PARENT DIRECTORY AFTER the rename, \
-             or `ReplacedDurable` ('the parent-directory fsync succeeded') is a false claim and \
-             deleting the real parent fsync is invisible: {audit:?}"
+            audit.sync_all_at.iter().any(|(at, _)| *at > publish),
+            "write_atomic_replace must call `sync_all()` on the PARENT DIRECTORY AFTER the \
+             publish, or `ReplacedDurable` ('the parent-directory fsync succeeded') is a false \
+             claim and deleting the real parent fsync is invisible: {audit:?}"
+        );
+        let temp_sync = walk_method("PathTemp", "sync");
+        assert!(
+            temp_sync
+                .sync_all_at
+                .iter()
+                .any(|(_, receiver)| *receiver == HandleReceiver::OwnCreateHandle),
+            "PathTemp::sync must call `sync_all()` on the temp's OWN create handle \
+             (`self.file()`); a sync on any other descriptor — including a reopened temp name — \
+             leaves the temp unsynced: {temp_sync:?}"
+        );
+        assert!(
+            temp_sync.reopen_at.is_empty(),
+            "PathTemp::sync must not reopen the temp by name; the fsync must address the \
+             descriptor `O_EXCL` created: {temp_sync:?}"
+        );
+        let temp_private = walk_method("PathTemp", "make_private");
+        assert!(
+            temp_private
+                .set_permissions_at
+                .iter()
+                .any(|(_, receiver)| *receiver == HandleReceiver::OwnCreateHandle),
+            "PathTemp::make_private must chmod the temp's OWN create handle, not a reopened name: \
+             {temp_private:?}"
+        );
+        assert!(
+            temp_private.reopen_at.is_empty(),
+            "PathTemp::make_private must not reopen the temp by name: {temp_private:?}"
+        );
+        let temp_publish = walk_method("PathTemp", "publish");
+        assert!(
+            temp_publish.rename_at.is_some(),
+            "PathTemp::publish must call the real `rename`, or the path-based replace never commits \
+             point 1: {temp_publish:?}"
         );
 
-        // FD-BASED `replace_core`: `f.sync_all()` BEFORE the renameat, then
-        // `fsync_dir_fd(&parent_fd)` AFTER it.
+        // FD-BASED `replace_core`: the same stage order, then
+        // `fsync_dir_fd(&parent_fd)` AFTER the publish. The real temp
+        // chmod/fsync/rename live in the temp's stage methods.
         let audit = walk("replace_core");
-        let rename = audit.rename_at.unwrap_or_else(|| {
-            panic!("replace_core must call the install (`renameat_fd`) inside its body")
+        let make_private = audit
+            .temp_make_private_at
+            .first()
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("replace_core must call the linear temp's `make_private` inside its body")
+            });
+        let temp_sync = audit.temp_sync_at.first().copied().unwrap_or_else(|| {
+            panic!("replace_core must call the linear temp's `sync` inside its body")
+        });
+        let publish = audit.temp_publish_at.first().copied().unwrap_or_else(|| {
+            panic!("replace_core must call the linear temp's `publish` inside its body")
         });
         assert!(
-            audit.sync_all_at.iter().any(|at| *at < rename),
-            "replace_core must call `sync_all()` on the TEMP file BEFORE the renameat; the \
-             `ReplaceStage::Sync` fault hook returns before the real syscall, so removing it while \
-             still returning `ReplacedDurable` must fail here: {audit:?}"
+            make_private < temp_sync,
+            "replace_core must make the temp PRIVATE before syncing it: {audit:?}"
         );
         assert!(
-            audit.fsync_dir_fd_at.iter().any(|at| *at > rename),
-            "replace_core must call `fsync_dir_fd(&parent_fd)` AFTER the renameat, or \
+            temp_sync < publish,
+            "replace_core must sync the TEMP before publishing it; the `ReplaceStage::Sync` fault \
+             hook returns before the real syscall, so removing the sync while still returning \
+             `ReplacedDurable` must fail here: {audit:?}"
+        );
+        assert!(
+            audit.fsync_dir_fd_at.iter().any(|at| *at > publish),
+            "replace_core must call `fsync_dir_fd(&parent_fd)` AFTER the publish, or \
              `ReplacedDurable` ('the parent-directory fsync succeeded') is a false claim and \
              deleting the real fsync is invisible: {audit:?}"
+        );
+        let temp_sync = walk_method("Temp", "sync");
+        assert!(
+            temp_sync
+                .sync_all_at
+                .iter()
+                .any(|(_, receiver)| *receiver == HandleReceiver::OwnCreateHandle),
+            "Temp::sync must call `sync_all()` on the temp's OWN create handle (`self.file()`); a \
+             sync on any other descriptor leaves the temp unsynced: {temp_sync:?}"
+        );
+        assert!(
+            temp_sync.reopen_at.is_empty(),
+            "Temp::sync must not reopen the temp by name; the fsync must address the descriptor \
+             `O_EXCL` created: {temp_sync:?}"
+        );
+        let temp_private = walk_method("Temp", "make_private");
+        assert!(
+            temp_private
+                .set_permissions_at
+                .iter()
+                .any(|(_, receiver)| *receiver == HandleReceiver::OwnCreateHandle),
+            "Temp::make_private must chmod the temp's OWN create handle, not a reopened name: \
+             {temp_private:?}"
+        );
+        assert!(
+            temp_private.reopen_at.is_empty(),
+            "Temp::make_private must not reopen the temp by name: {temp_private:?}"
+        );
+        let temp_publish = walk_method("Temp", "publish");
+        assert!(
+            temp_publish.rename_at.is_some(),
+            "Temp::publish must call the real `renameat_fd`, or the fd-based replace never commits \
+             point 1: {temp_publish:?}"
+        );
+
+        // THE CAS PATH, which the earlier audit did not cover at all: create,
+        // write, sync, install without replacement, chmod the INSTALLED entry
+        // (the temp was created 0o600), then fsync the parent — in that order.
+        let audit = walk("write_atomic_cas_fd");
+        let create = audit.temp_create_at.first().copied().unwrap_or_else(|| {
+            panic!("write_atomic_cas_fd must create the linear temp through `Temp::create`")
+        });
+        let temp_sync = audit.temp_sync_at.first().copied().unwrap_or_else(|| {
+            panic!("write_atomic_cas_fd must call the linear temp's `sync` inside its body")
+        });
+        let publish = audit.temp_publish_at.first().copied().unwrap_or_else(|| {
+            panic!(
+                "write_atomic_cas_fd must call the linear temp's `publish_no_replace` inside its \
+                 body"
+            )
+        });
+        assert!(
+            create < temp_sync,
+            "write_atomic_cas_fd must create the temp before syncing it: {audit:?}"
+        );
+        assert!(
+            temp_sync < publish,
+            "write_atomic_cas_fd must fsync the TEMP before installing it; the CAS install is the \
+             only content commit point: {audit:?}"
+        );
+        let chmod = audit
+            .set_permissions_at
+            .iter()
+            .map(|(at, _)| *at)
+            .find(|at| *at > publish)
+            .unwrap_or_else(|| {
+                panic!(
+                    "write_atomic_cas_fd must chmod the INSTALLED file after \
+                     `publish_no_replace`, or the CAS never applies the private mode: {audit:?}"
+                )
+            });
+        assert!(
+            audit.fsync_dir_fd_at.iter().any(|at| *at > chmod),
+            "write_atomic_cas_fd must fsync the parent directory AFTER the install AND the \
+             private chmod (the CAS durability commit point): {audit:?}"
         );
     }
 }

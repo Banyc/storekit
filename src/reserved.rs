@@ -345,9 +345,11 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   spelling but unsound for authorizing a mutation, because it would grant
 ///   ownership of a different on-disk entry a live holder owns.
 /// * the PATH-BASED helpers the manifest/retention machinery uses take an
-///   ordinary path. `set_private`,
-///   `ensure_private_dir_durable`, the PATH-BASED `write_atomic_replace`, and
-///   the descriptor-relative `set_private_fd` now consult the guard too. The
+///   ordinary path. `ensure_private_dir_durable`, the PATH-BASED
+///   `write_atomic_replace`, and the descriptor-relative `set_private_fd`
+///   consult the guard too (the Unix path-based chmod helper was removed when
+///   the replace's temp chmod moved onto its create-time handle; the Windows
+///   port keeps its documented no-op `set_private`). The
 ///   local transport's crate-INTERNAL staged-publish workers
 ///   (`durable_create_new`, `remove_file_if_inner`) run INSIDE the funnel:
 ///   each takes a [`crate::atomic::GuardedRel`] capability that

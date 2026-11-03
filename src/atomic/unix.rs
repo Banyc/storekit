@@ -28,12 +28,13 @@
 //! NOT COVERED by that component confinement: the module's PATH-BASED free
 //! functions take an ordinary [`Path`] and resolve it with
 //! `std::fs`/`std::fs::Permissions`, so an INTERMEDIATE symlink in that path
-//! IS followed. They are [`set_private`] (crate-internal) and the PUBLIC,
-//! deliberately-named [`write_atomic_replace`] (`set_private` serves the
-//! unconfined replace) and [`copy_tree_verbatim`], plus the two crate-internal
-//! durable helpers [`sync_parent_dir`] and [`ensure_private_dir_durable`]. The
-//! component confinement claimed below belongs to the `_fd` surface only, never
-//! to these.
+//! IS followed. They are the PUBLIC, deliberately-named
+//! [`write_atomic_replace`] and [`copy_tree_verbatim`], plus the two
+//! crate-internal durable helpers [`sync_parent_dir`] and
+//! [`ensure_private_dir_durable`]. The component confinement claimed below
+//! belongs to the `_fd` surface only, never to these. The replace's temp chmod
+//! and fsync are NOT in this class even on the path-based form: they run on the
+//! temp's create-time handle, not on a path.
 //!
 //! The `_fd` tree copy [`copy_dir_recursive_fd`] is a PARTIAL exception and
 //! is called out here so the list above is not read as exhaustive: it takes an
@@ -82,7 +83,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use super::*;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -125,6 +126,15 @@ fn probe_commit_entry(prefix: &str) {
 #[cfg(not(test))]
 fn probe_commit_entry(_prefix: &str) {}
 
+/// Record the created chain's PARENT-OF-PARENT entry fsync (the entry that
+/// names the directory HOLDING the new path). A no-op outside test builds.
+#[cfg(test)]
+fn probe_commit_ancestor(prefix: &str) {
+    replace_order_probe::record(format!("commit-dir-entry-ancestor {prefix}"));
+}
+#[cfg(not(test))]
+fn probe_commit_ancestor(_prefix: &str) {}
+
 /// Record the atomic replace's `renameat` for the ordering probe.
 #[cfg(test)]
 fn probe_rename() {
@@ -141,14 +151,125 @@ fn probe_fsync_replace_parent() {
 #[cfg(not(test))]
 fn probe_fsync_replace_parent() {}
 
-/// CRATE-INTERNAL, and PATH-BASED like the unconfined replace it serves: this
-/// helper takes an ordinary path, so an intermediate symlink is followed. The
-/// confined spelling is [`set_private_fd`]; this one is not public (API
-/// constraint #1 removed the public path-based `set_private`).
-pub(crate) fn set_private(path: &Path) -> Result<()> {
-    refuse_reserved_mutation(path, Sanction::None)?;
-    crate::platform::chmod(path, 0o600)
-        .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
+/// The witness that a temp was successfully published under its final name.
+/// It carries no temp name, so a post-publish temp unlink is unrepresentable:
+/// the temp value was consumed by the publish, and the name now IS the
+/// destination.
+struct Published;
+
+/// A linear, PATH-BASED temp for the unconfined [`write_atomic_replace`].
+///
+/// The temp exists from [`create`](Self::create) until one of the stage
+/// methods consumes it. Every pre-publish failure calls
+/// [`discard`](Self::discard), which preserves the old
+/// [`discard_temp`](super::discard_temp) error contract (original failure plus
+/// the cleanup failure). A `?`/plain drop of a live temp is the best-effort
+/// `Drop` unlink, so a pre-publish exit can never silently leak the name; a
+/// successful publish takes the name out of the temp first, so `Drop` can
+/// never unlink the committed destination.
+struct PathTemp {
+    /// `Some` while the temp name is ours and must be removed.
+    path: Option<PathBuf>,
+    /// The create-time handle, held until [`publish`](Self::publish): the
+    /// write, the 0o600 chmod, and the fsync all go through the descriptor
+    /// `O_EXCL` created, so no stage can be redirected to another inode by a
+    /// name swapped beside it.
+    file: Option<std::fs::File>,
+}
+
+impl PathTemp {
+    fn create(path: PathBuf) -> Result<Self> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Self {
+                path: Some(path),
+                file: Some(file),
+            }),
+            // A failed CREATE means the temp was never created (or the name
+            // belongs to another writer): nothing to clean up.
+            Err(e) => Err(Error::store(format!("create {}: {e}", path.display()))),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("a live temp owns its path")
+    }
+
+    /// The temp's OWN create handle. Every stage that can look the temp up by
+    /// name instead (write, chmod, fsync) uses this receiver, so the stages
+    /// address the inode `O_EXCL` created rather than whatever the name holds
+    /// at that moment. The name-based lookups are reserved for `publish`.
+    fn file(&self) -> &std::fs::File {
+        self.file
+            .as_ref()
+            .expect("a live temp owns its create handle")
+    }
+
+    fn write(self, bytes: &[u8]) -> Result<Self> {
+        let written = {
+            let mut file = self.file();
+            file.write_all(bytes)
+        };
+        if let Err(e) = written {
+            let shown = self.path().to_path_buf();
+            return Err(self.discard(Error::store(format!("write {}: {e}", shown.display()))));
+        }
+        Ok(self)
+    }
+
+    fn make_private(self) -> Result<Self> {
+        let path = self.path().to_path_buf();
+        let chmodded = self
+            .file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = chmodded {
+            return Err(self.discard(Error::store(format!("chmod {}: {e}", path.display()))));
+        }
+        Ok(self)
+    }
+
+    fn sync(self) -> Result<Self> {
+        let path = self.path().to_path_buf();
+        let synced = self.file().sync_all();
+        if let Err(e) = synced {
+            return Err(self.discard(Error::store(format!("fsync {}: {e}", path.display()))));
+        }
+        Ok(self)
+    }
+
+    fn publish(mut self, target: &Path) -> Result<Published> {
+        let path = self.path.take().expect("a live temp owns its path");
+        // The rename is a NAME operation (the create handle cannot rename),
+        // and the handle is closed first: the temp's open descriptor is not
+        // needed past the fsync, and closing it before the name moves keeps
+        // the descriptor lifetime identical to the pre-typestate replace.
+        drop(self.file.take());
+        match std::fs::rename(&path, target) {
+            Ok(()) => Ok(Published),
+            Err(e) => Err(discard_temp(
+                Error::store(format!("rename {}: {e}", target.display())),
+                &path,
+            )),
+        }
+    }
+
+    fn discard(mut self, original: Error) -> Error {
+        drop(self.file.take());
+        let path = self.path.take().expect("a live temp owns its path");
+        discard_temp(original, &path)
+    }
+}
+
+impl Drop for PathTemp {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = self.path.take() {
+            let _ = super::remove_temp(&path);
+        }
+    }
 }
 /// The PATH-BASED, UNCONFINED durable atomic replace: write a UNIQUE hidden
 /// temp in the target's directory, chmod it 0o600, fsync it, rename it into
@@ -197,7 +318,8 @@ pub fn write_atomic_replace(
         // has its own entry fsynced into its parent BEFORE the temp write and
         // the rename, so the replace's durability claim covers the WHOLE chain
         // `create_dir_all` left the created directories' entries unsynced.
-        ensure_private_dir_durable(parent)?;
+        // The commit runs inside the chain; its verdict is not needed here.
+        ensure_private_dir_durable_chain(parent)?;
     }
     let tmp = temp_name_for(path);
     // Stage 1: the temp create/write. A failure (or an injected
@@ -206,71 +328,30 @@ pub fn write_atomic_replace(
     if let Some(e) = fault(ReplaceStage::Write) {
         return Err(e);
     }
-    let mut tmp_file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-    {
-        Ok(f) => f,
-        // A failed CREATE means the temp was never created (or the name
-        // belongs to another writer): nothing to clean up.
-        Err(e) => return Err(Error::store(format!("create {}: {e}", tmp.display()))),
-    };
-    if let Err(e) = tmp_file.write_all(bytes) {
-        // Close the temp before unlinking (Windows cannot delete an open
-        // file) and remove the stray the failed write left behind.
-        drop(tmp_file);
-        return Err(discard_temp(
-            Error::store(format!("write {}: {e}", tmp.display())),
-            &tmp,
-        ));
-    }
-    drop(tmp_file);
+    let temp = PathTemp::create(tmp)?;
+    let temp = temp.write(bytes)?;
     // Private BEFORE visible and BEFORE the fsync: the temp carries 0o600
     // before the rename — no reader ever observes the marker with the wider
     // create-time mode — and this corrective chmod PRECEDES the `sync_all()`
     // below, so that fsync covers the mode change rather than leaving it
-    // unflushed.
-    if let Err(e) = set_private(&tmp) {
-        return Err(discard_temp(e, &tmp));
-    }
+    // unflushed. Both run on the CREATE HANDLE, not a reopened name.
+    let temp = temp.make_private()?;
     // Stage 2: the temp fsync. A failure (or an injected
     // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
     // temp the replace wrote is unlinked before the `Err` returns, so no
     // stray entry survives.
     if let Some(e) = fault(ReplaceStage::Sync) {
-        return Err(discard_temp(e, &tmp));
+        return Err(temp.discard(e));
     }
-    let tmp_file = match std::fs::File::open(&tmp) {
-        Ok(f) => f,
-        Err(e) => {
-            return Err(discard_temp(
-                Error::store(format!("open {}: {e}", tmp.display())),
-                &tmp,
-            ));
-        }
-    };
-    if let Err(e) = tmp_file.sync_all() {
-        drop(tmp_file);
-        return Err(discard_temp(
-            Error::store(format!("fsync {}: {e}", tmp.display())),
-            &tmp,
-        ));
-    }
-    drop(tmp_file);
+    let temp = temp.sync()?;
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
     // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
     // visible target is wholly OLD and the temp is unlinked.
     if let Some(e) = fault(ReplaceStage::Rename) {
-        return Err(discard_temp(e, &tmp));
+        return Err(temp.discard(e));
     }
     probe_rename();
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        return Err(discard_temp(
-            Error::store(format!("rename {}: {e}", path.display())),
-            &tmp,
-        ));
-    }
+    let _published = temp.publish(path)?;
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
     // the rename. FAIL-CLOSED but EXPLICIT: a failed open, a failed sync,
     // or an injected [`ReplaceStage::DirSync`] fault means the NEW content
@@ -336,8 +417,49 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 ///
 /// Returns `true` when this call created at least one directory (and therefore
 /// ran the syncs), `false` when everything already existed (the fast path of
-/// every later append: nothing created, nothing to sync).
+/// every later append: nothing created, nothing to sync). The verdict itself
+/// is [`DirChain`] inside [`ensure_private_dir_durable_chain`]; this public
+/// signature keeps the historical `bool` for the callers that only branch on
+/// "did anything get created".
 pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
+    ensure_private_dir_durable_chain(path).map(|chain| chain.is_created())
+}
+
+/// The PATH-BASED durable-commit body for [`CreatedChain`]: it owns the
+/// created components (shallowest first) and the parent whose entry is the
+/// parent-of-parent commit.
+pub(super) struct PathChain {
+    /// The components this call created, shallowest first (creation order).
+    components: Vec<PathBuf>,
+    /// The created path's own parent: the entry naming the directory HOLDING
+    /// the new path, which an earlier UNSYNCED creation (the store open) may
+    /// have made.
+    parent: Option<PathBuf>,
+}
+
+impl ChainCommit for PathChain {
+    fn commit_created_entries(&self, created: &[usize]) -> Result<()> {
+        // Durable commit of every NEW directory entry, DEEPEST FIRST: the new
+        // directory's own entry, then up the created chain, then the
+        // parent-of-parent entry.
+        for &i in created.iter().rev() {
+            probe_commit_entry(&self.components[i].to_string_lossy());
+            sync_parent_dir(&self.components[i])?;
+        }
+        if let Some(parent) = &self.parent
+            && !parent.as_os_str().is_empty()
+        {
+            probe_commit_ancestor(&parent.to_string_lossy());
+            sync_parent_dir(parent)?;
+        }
+        Ok(())
+    }
+}
+
+/// The path-based body of [`ensure_private_dir_durable`], returning the
+/// [`DirChain`] verdict so the created chain's `commit` is the ONE producer of
+/// `Created`.
+fn ensure_private_dir_durable_chain(path: &Path) -> Result<DirChain> {
     refuse_reserved_mutation(path, Sanction::Residue)?;
     // Walk from `path` up to the deepest ancestor that already exists,
     // collecting the MISSING chain (pushed deepest-first).
@@ -356,14 +478,11 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
             Err(e) => return Err(Error::store(format!("stat {}: {e}", cur.display()))),
         }
     }
-    if missing.is_empty() {
-        return Ok(false);
-    }
     // Create the chain TOP-DOWN (parents before their children) with the
     // private 0o700 chmod, exactly as `create_dir_all` would — one component
     // at a time so the caller knows what was created. A
     // racing creation of an ancestor is tolerated (it exists; the chmod is
-    // idempotent). NOTE: the chmod must be 0o700 (never [`set_private`]'s
+    // idempotent). NOTE: the chmod must be 0o700 (never the file chmod's
     // 0o600) — a directory without its execute bit denies every subsequent
     // stat of its children.
     for component in missing.iter().rev() {
@@ -377,21 +496,21 @@ pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
         crate::platform::chmod(component, 0o700)
             .map_err(|e| Error::store(format!("chmod {}: {e}", component.display())))?;
     }
-    // Durable commit of every NEW directory entry: fsync the parent of each
-    // created component (deepest first — the new dir's own entry), and then
-    // the parent of the new path's PARENT — the `targets/` entry inside the
-    // base — which an earlier UNSYNCED creation (the store open) may have
-    // made: the first append is the first chance to make it durable.
-    for component in missing.iter().rev() {
-        probe_commit_entry(&component.to_string_lossy());
-        sync_parent_dir(component)?;
-    }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        sync_parent_dir(parent)?;
-    }
-    Ok(true)
+    // `missing` is deepest-first; the chain records the created components
+    // shallowest-first (creation order) and `commit` visits them
+    // deepest-first. Every missing component is claimed as created (the old
+    // `bool` reported "the missing chain was non-empty", not which `create_dir`
+    // won a race); a racing `AlreadyExists` is still safe to fsync.
+    let components: Vec<PathBuf> = missing.into_iter().rev().collect();
+    let created: Vec<usize> = (0..components.len()).collect();
+    CreatedChain::new(
+        PathChain {
+            components,
+            parent: path.parent().map(Path::to_path_buf),
+        },
+        created,
+    )
+    .commit()
 }
 
 /// THE TOLERANT, VERBATIM TREE COPY — the weak, deliberately-NAMED sibling of
@@ -1234,6 +1353,152 @@ fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Er
     }
 }
 
+/// A linear, DESCRIPTOR-RELATIVE temp for [`replace_core`] and
+/// [`write_atomic_cas_fd`].
+///
+/// The temp exists from [`create`](Self::create) until one of the stage
+/// methods consumes it. Every pre-publish failure calls
+/// [`discard`](Self::discard), preserving the old [`discard_temp_fd`] error
+/// contract; a `?`/plain drop of a live temp is the best-effort `Drop`
+/// unlink, so a pre-publish exit can never silently leak the name. A
+/// successful [`publish`](Self::publish) / [`publish_no_replace`](Self::publish_no_replace)
+/// consumes the temp value, so a post-publish temp unlink is unrepresentable
+/// (the name now IS the destination).
+struct Temp<'a> {
+    parent: &'a OwnedFd,
+    /// `Some` while the temp name is ours and must be removed.
+    name: Option<OsString>,
+    /// The create-time handle, held until [`publish`](Self::publish): the
+    /// write, the 0o600 chmod, and the fsync all go through the descriptor
+    /// `O_EXCL` created, so no stage can be redirected to another inode by a
+    /// name swapped beside it.
+    file: Option<std::fs::File>,
+}
+
+/// The two post-link states of a no-replace publish. A racing winner is never
+/// clobbered; both states mean the temp name was removed (best-effort) and the
+/// destination exists.
+enum NoReplacePublish {
+    /// `linkat` created the destination name from our temp.
+    Installed,
+    /// `linkat` found the destination name already present; its entry was not
+    /// touched.
+    AlreadyPresent,
+}
+
+impl<'a> Temp<'a> {
+    fn create(parent: &'a OwnedFd, name: OsString) -> Result<Self> {
+        // A failed CREATE means the temp was never created (or the name
+        // belongs to another writer): nothing to clean up, so the error
+        // propagates as-is.
+        let tmp_fd = openat_no_follow_path(
+            parent,
+            Path::new(&name),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )?;
+        Ok(Self {
+            parent,
+            name: Some(name),
+            file: Some(std::fs::File::from(tmp_fd)),
+        })
+    }
+
+    /// The temp's OWN create handle. Every stage that can look the temp up by
+    /// name instead (write, chmod, fsync) uses this receiver, so the stages
+    /// address the inode `O_EXCL` created rather than whatever the name holds
+    /// at that moment. The name-based lookups are reserved for the publish.
+    fn file(&self) -> &std::fs::File {
+        self.file
+            .as_ref()
+            .expect("a live temp owns its create handle")
+    }
+
+    fn write(self, bytes: &[u8], shown: &Path) -> Result<Self> {
+        let written = {
+            let mut file = self.file();
+            file.write_all(bytes)
+        };
+        if let Err(e) = written {
+            return Err(self.discard(Error::store(format!("write {}: {e}", shown.display()))));
+        }
+        Ok(self)
+    }
+
+    fn make_private(self, shown: &Path) -> Result<Self> {
+        let chmodded = self
+            .file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = chmodded {
+            return Err(self.discard(Error::store(format!("chmod {}: {e}", shown.display()))));
+        }
+        Ok(self)
+    }
+
+    fn sync(self, shown: &Path) -> Result<Self> {
+        let synced = self.file().sync_all();
+        if let Err(e) = synced {
+            return Err(self.discard(Error::store(format!("fsync {}: {e}", shown.display()))));
+        }
+        Ok(self)
+    }
+
+    fn publish(mut self, target: &OsStr) -> Result<Published> {
+        let name = self.name.take().expect("a live temp owns its name");
+        // The rename is a NAME operation (a descriptor cannot be renamed) and
+        // the temp's open handle is not needed past the fsync; close it first
+        // so the descriptor lifetime is identical to the pre-typestate replace.
+        drop(self.file.take());
+        match renameat_fd(self.parent, &name, self.parent, target, Sanction::None) {
+            Ok(()) => Ok(Published),
+            Err(e) => Err(discard_temp_fd(e, self.parent, &name)),
+        }
+    }
+
+    fn publish_no_replace(mut self, target: &OsStr, shown: &Path) -> Result<NoReplacePublish> {
+        let name = self.name.take().expect("a live temp owns its name");
+        // As in `publish`: the linkat addresses the NAME, and the fsynced
+        // create handle is closed first (the pre-typestate CAS did the same
+        // before linking).
+        drop(self.file.take());
+        let installed = match linkat_fd(self.parent, &name, self.parent, target) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                return Err(discard_temp_fd(
+                    Error::store(format!("install {}: {e}", shown.display())),
+                    self.parent,
+                    &name,
+                ));
+            }
+        };
+        // The install is done (our content, or the racing winner's): removing
+        // the temp name is the protocol's own bookkeeping, so a failure there
+        // must NOT turn a committed CAS into an error — best-effort, as before.
+        let _ = unlinkat_fd(self.parent, &name, Sanction::None);
+        if installed {
+            Ok(NoReplacePublish::Installed)
+        } else {
+            Ok(NoReplacePublish::AlreadyPresent)
+        }
+    }
+
+    fn discard(mut self, original: Error) -> Error {
+        drop(self.file.take());
+        let name = self.name.take().expect("a live temp owns its name");
+        discard_temp_fd(original, self.parent, &name)
+    }
+}
+
+impl Drop for Temp<'_> {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(name) = self.name.take() {
+            let _ = unlinkat_fd(self.parent, &name, Sanction::None);
+        }
+    }
+}
+
 /// The descriptor-relative atomic replace: the same four-stage protocol as
 /// `write_atomic_replace`, but the path resolves COMPONENT-WISE relative
 /// to `root` with `openat(O_NOFOLLOW)`. Every PARENT component is refused
@@ -1374,7 +1639,7 @@ fn replace_core(
         // `ReplaceOutcome::ReplacedDurable`] claim is true for the WHOLE chain,
         // not only for the final entry's parent. The non-durable helper used
         // to leave the created directories' entries unsynced.
-        ensure_private_dir_durable_fd_path(root, parent_rel)?;
+        ensure_private_dir_durable_fd_chain(root, parent_rel)?;
     }
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
     // The FIRST compare: fail before writing a temp if the destination already
@@ -1391,82 +1656,50 @@ fn replace_core(
     if let Some(e) = fault(ReplaceStage::Write) {
         return Err(e);
     }
-    // A failed CREATE means the temp was never created (or the name belongs
-    // to another writer): nothing to clean up, so the error propagates as-is.
-    let tmp_fd = openat_no_follow_path(
-        &parent_fd,
-        Path::new(&tmp_name),
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    )?;
-    let mut f = std::fs::File::from(tmp_fd);
-    if let Err(e) = f.write_all(bytes) {
-        drop(f);
-        return Err(discard_temp_fd(
-            Error::store(format!("write {}: {e}", rel.display())),
-            &parent_fd,
-            &tmp_name,
-        ));
-    }
-    drop(f);
+    let temp = Temp::create(&parent_fd, tmp_name)?;
+    let temp = temp.write(bytes, rel)?;
     // Private BEFORE visible and BEFORE the fsync: the temp carries 0o600
     // before the rename — no reader ever observes the marker with the wider
     // create-time mode — and this corrective chmod PRECEDES the `sync_all()`
     // below, so that fsync covers the mode change rather than leaving it
-    // unflushed.
-    let f = match openat_no_follow_path(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
-        Ok(fd) => std::fs::File::from(fd),
-        Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
-    };
-    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        drop(f);
-        return Err(discard_temp_fd(
-            Error::store(format!("chmod {}: {e}", rel.display())),
-            &parent_fd,
-            &tmp_name,
-        ));
-    }
-    drop(f);
+    // unflushed. Both run on the CREATE HANDLE, not on a reopened name: the
+    // chmod and the fsync address the inode `O_EXCL` created.
+    let temp = temp.make_private(rel)?;
     // Stage 2: the temp fsync. A failure (or an injected
     // [`ReplaceStage::Sync`] fault) is a PRE-RENAME `Err`: the dot-prefixed
     // temp the replace wrote is unlinked before the `Err` returns, so no
     // stray entry survives.
     if let Some(e) = fault(ReplaceStage::Sync) {
-        return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
+        return Err(temp.discard(e));
     }
-    let f = match openat_no_follow_path(&parent_fd, Path::new(&tmp_name), libc::O_RDONLY, 0) {
-        Ok(fd) => std::fs::File::from(fd),
-        Err(e) => return Err(discard_temp_fd(e, &parent_fd, &tmp_name)),
-    };
-    if let Err(e) = f.sync_all() {
-        drop(f);
-        return Err(discard_temp_fd(
-            Error::store(format!("fsync {}: {e}", rel.display())),
-            &parent_fd,
-            &tmp_name,
-        ));
-    }
-    drop(f);
+    let temp = temp.sync(rel)?;
     // The SECOND compare, immediately before the rename: shrink the
     // compare-and-swap window to the `renameat` itself. A writer that changed
     // the live entry while the temp was being written is REFUSED here, with
     // the temp unlinked and the live entry untouched.
-    if let Some(expected) = expected
-        && !live_matches(&parent_fd, file_name, expected)?
-    {
-        let _ = unlinkat_fd(&parent_fd, &tmp_name, Sanction::None);
-        return Ok(CoreReplace::Mismatch);
+    if let Some(expected) = expected {
+        match live_matches(&parent_fd, file_name, expected) {
+            Ok(true) => {}
+            // The live entry moved: the linear temp's `Drop` unlinks the temp
+            // name before this return (best-effort, exactly like the old
+            // explicit `unlinkat`).
+            Ok(false) => return Ok(CoreReplace::Mismatch),
+            // An OBSERVATION failure (a symlink appeared at the live entry, it
+            // became unreadable, ...) also abandons the temp, and the linear
+            // temp makes that cleanup structural. The pre-typestate core
+            // propagated this error with `?` and LEAKED the temp name; see the
+            // commit body's stated delta.
+            Err(e) => return Err(temp.discard(e)),
+        }
     }
     // Stage 3: the atomic rename — COMMIT POINT 1. A failure (or an
     // injected [`ReplaceStage::Rename`] fault) is a PRE-RENAME `Err`: the
     // visible target is wholly OLD and the temp is unlinked.
     if let Some(e) = fault(ReplaceStage::Rename) {
-        return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
+        return Err(temp.discard(e));
     }
     probe_rename();
-    if let Err(e) = renameat_fd(&parent_fd, &tmp_name, &parent_fd, file_name, Sanction::None) {
-        return Err(discard_temp_fd(e, &parent_fd, &tmp_name));
-    }
+    let _published = temp.publish(file_name)?;
     // Stage 4: the parent-directory open + fsync — COMMIT POINT 2, AFTER
     // the rename. FAIL-CLOSED but EXPLICIT (see [`write_atomic_replace`]).
     if let Some(e) = fault(ReplaceStage::DirSync) {
@@ -1544,58 +1777,23 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8
     // and no reader ever sees a torn record), unlink the temp name, then
     // fsync the parent directory.
     let tmp_name = temp_file_name(file_name);
-    // A failed CREATE means the temp was never created (or the name belongs
-    // to another writer): nothing to clean up, so the error propagates as-is.
-    let tmp_fd = openat_no_follow_path(
-        &parent_fd,
-        Path::new(&tmp_name),
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        0o600,
-    )?;
-    let mut f = std::fs::File::from(tmp_fd);
-    if let Err(e) = f.write_all(bytes) {
-        drop(f);
-        return Err(discard_temp_fd(
-            Error::store(format!("write {}: {e}", rel.display())),
-            &parent_fd,
-            &tmp_name,
-        ));
-    }
-    if let Err(e) = f.sync_all() {
-        drop(f);
-        return Err(discard_temp_fd(
-            Error::store(format!("fsync {}: {e}", rel.display())),
-            &parent_fd,
-            &tmp_name,
-        ));
-    }
-    drop(f);
-    let installed = match linkat_fd(&parent_fd, &tmp_name, &parent_fd, file_name) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => {
-            return Err(discard_temp_fd(
-                Error::store(format!("install {}: {e}", rel.display())),
-                &parent_fd,
-                &tmp_name,
-            ));
+    let temp = Temp::create(&parent_fd, tmp_name)?;
+    let temp = temp.write(bytes, rel)?;
+    let temp = temp.sync(rel)?;
+    match temp.publish_no_replace(file_name, rel)? {
+        NoReplacePublish::Installed => {}
+        NoReplacePublish::AlreadyPresent => {
+            // Lost the race: the winner's content must match ours or refuse.
+            let f = openat_readable_regular(&parent_fd, Path::new(file_name), libc::O_RDONLY)?;
+            let existing = read_fd_to_end(&f)?;
+            if existing != bytes {
+                return Err(Error::conflict(format!(
+                    "refusing to replace existing {} with different content",
+                    rel.display()
+                )));
+            }
+            return Ok(());
         }
-    };
-    // The install is done (our content, or the racing winner's): removing the
-    // temp name is the protocol's own bookkeeping, so a failure there must NOT
-    // turn a committed CAS into an error — best-effort, as before.
-    let _ = unlinkat_fd(&parent_fd, &tmp_name, Sanction::None);
-    if !installed {
-        // Lost the race: the winner's content must match ours or refuse.
-        let f = openat_readable_regular(&parent_fd, Path::new(file_name), libc::O_RDONLY)?;
-        let existing = read_fd_to_end(&f)?;
-        if existing != bytes {
-            return Err(Error::conflict(format!(
-                "refusing to replace existing {} with different content",
-                rel.display()
-            )));
-        }
-        return Ok(());
     }
     // Private BEFORE visible: chmod the installed file, then fsync the
     // parent directory (THE DURABILITY COMMIT POINT — fail closed, see
@@ -1649,14 +1847,67 @@ pub fn ensure_private_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result
 /// new path's own parent — all through directory fds. Returns `true` when
 /// this call created at least one directory.
 pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
-    ensure_private_dir_durable_fd_path(root, rel.as_path())
+    ensure_private_dir_durable_fd_chain(root, rel.as_path()).map(|chain| chain.is_created())
+}
+
+/// The Unix durable-commit body for [`CreatedChain`]: it owns the open
+/// directory descriptors and the root, so the fsync loop can run after the
+/// calling function has finished building the chain.
+pub(super) struct UnixChain<'a> {
+    root: &'a RootDir,
+    /// One opened descriptor per component, shallowest first (the same
+    /// descriptor the creation loop observed or made).
+    dirs: Vec<OwnedFd>,
+    /// The root-relative spelling of each component up to and including its
+    /// index, used only by the test ordering probe.
+    prefixes: Vec<String>,
+}
+
+impl<'a> UnixChain<'a> {
+    pub(super) fn new(root: &'a RootDir, dirs: Vec<OwnedFd>, prefixes: Vec<String>) -> Self {
+        Self {
+            root,
+            dirs,
+            prefixes,
+        }
+    }
+}
+
+impl ChainCommit for UnixChain<'_> {
+    fn commit_created_entries(&self, created: &[usize]) -> Result<()> {
+        // Durable commit of every NEW directory entry, DEEPEST FIRST: fsync
+        // the parent of each created component (the new dir's own entry), then
+        // the parent of the new path's own parent (the entry that names the
+        // directory HOLDING the new path).
+        for &i in created.iter().rev() {
+            probe_commit_entry(&self.prefixes[i]);
+            if i == 0 {
+                fsync_dir_fd(self.root.as_fd())?;
+            } else {
+                fsync_dir_fd(&self.dirs[i - 1])?;
+            }
+        }
+        if self.dirs.len() >= 2 {
+            if self.dirs.len() >= 3 {
+                probe_commit_ancestor(&self.prefixes[self.dirs.len() - 3]);
+                fsync_dir_fd(&self.dirs[self.dirs.len() - 3])?;
+            } else {
+                probe_commit_ancestor("<root>");
+                fsync_dir_fd(self.root.as_fd())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// [`ensure_private_dir_durable_fd`] for an INTERNAL, already-validated
-/// `&Path` (a parent derived from a [`RootedRelativePath`]).
-fn ensure_private_dir_durable_fd_path(root: &RootDir, rel: &Path) -> Result<bool> {
+/// `&Path` (a parent derived from a [`RootedRelativePath`]), returning the
+/// [`DirChain`] verdict.
+fn ensure_private_dir_durable_fd_chain(root: &RootDir, rel: &Path) -> Result<DirChain> {
     let comps = rel_components(rel);
     let mut dirs: Vec<OwnedFd> = Vec::with_capacity(comps.len());
+    let mut prefixes: Vec<String> = Vec::with_capacity(comps.len());
+    let mut prefix = String::new();
     let mut cur: OwnedFd = root
         .as_fd()
         .try_clone()
@@ -1716,34 +1967,17 @@ fn ensure_private_dir_durable_fd_path(root: &RootDir, rel: &Path) -> Result<bool
             cur.try_clone()
                 .map_err(|e| Error::store(format!("dup dir: {e}")))?,
         );
-    }
-    if created.is_empty() {
-        return Ok(false);
-    }
-    // Durable commit of every NEW directory entry: fsync the parent of each
-    // created component (deepest first), then the parent of the new path's
-    // own parent (the entry that names the directory HOLDING the new path).
-    for &i in created.iter().rev() {
-        let prefix = comps[..=i]
-            .iter()
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        probe_commit_entry(&prefix);
-        if i == 0 {
-            fsync_dir_fd(root.as_fd())?;
-        } else {
-            fsync_dir_fd(&dirs[i - 1])?;
+        if i > 0 {
+            prefix.push('/');
         }
+        prefix.push_str(&String::from_utf8_lossy(comp));
+        prefixes.push(prefix.clone());
     }
-    if comps.len() >= 2 {
-        if comps.len() >= 3 {
-            fsync_dir_fd(&dirs[comps.len() - 3])?;
-        } else {
-            fsync_dir_fd(root.as_fd())?;
-        }
-    }
-    Ok(true)
+    // The chain's `commit` is the ONLY producer of `DirChain::Created`; the
+    // caller's bool is derived from it, so a future edit cannot return `true`
+    // before the fsync loop ran.
+    let chain = CreatedChain::new(UnixChain::new(root, dirs, prefixes), created);
+    chain.commit()
 }
 
 /// The descriptor-relative parent-directory fsync: fsync the directory
@@ -1776,10 +2010,10 @@ pub fn sync_parent_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()
 /// and only [`PathKind::File`] is accepted.
 pub fn set_private_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
     let rel = rel.as_path();
-    // The PATH-BASED `set_private` already consults the guard; this
-    // descriptor-relative twin must too, so the two cannot disagree about the
-    // record's spelling. A chmod preserves the inode (no holder split), but
-    // consistency at the ONE authority is the point.
+    // The descriptor-relative chmod consults the ONE guard on the FULL path, so
+    // it cannot disagree with every other mutation about the record's spelling.
+    // A chmod preserves the inode (no holder split), but consistency at the ONE
+    // authority is the point.
     refuse_reserved_mutation(rel, Sanction::None)?;
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     let f = std::fs::File::from(openat_readable_regular(
@@ -2107,7 +2341,7 @@ pub fn symlink_fd(root: &RootDir, target: &Path, rel: &RootedRelativePath) -> Re
     refuse_reserved_mutation(rel, Sanction::None)?;
     let parent_rel = rel.parent().unwrap_or(Path::new(""));
     if !parent_rel.as_os_str().is_empty() {
-        ensure_private_dir_durable_fd_path(root, parent_rel)?;
+        ensure_private_dir_durable_fd_chain(root, parent_rel)?;
     }
     let (parent_fd, name) = parent_fd_of(root.as_fd(), rel)?;
     match unlinkat_fd_io(&parent_fd, name, Sanction::None) {
@@ -2439,13 +2673,13 @@ fn fd_entry_identity(fd: &OwnedFd) -> std::io::Result<crate::atomic::guard::Entr
 /// (component-wise, `O_NOFOLLOW`, through the shared directory-creation
 /// authority [`open_or_create_dir`]), and report:
 ///
-/// * the mode of the FINAL component if it ALREADY EXISTED (so the undo journal
+/// * the mode of the FINAL component if it ALREADY EXISTED (so the mode journal
 ///   can put it back), and
 /// * the root-relative paths of the components THIS call created (shallowest
 ///   first), so the journal knows which directories are the call's own.
 ///
 /// A pre-existing FINAL directory is reported with its ORIGINAL mode and is
-/// NOT chmodded here; the caller records that mode in its undo journal before
+/// NOT chmodded here; the caller records that mode in its mode journal before
 /// widening the directory. The ancestors are created at the store-private
 /// `0o700`; a created final is chmodded to `0o700` for the same reason
 /// [`ensure_private_dir_fd`] does (the `mkdirat` mode is subject to the process
@@ -2481,52 +2715,119 @@ fn create_destination_chain(root: &RootDir, dst_rel: &Path) -> Result<(Option<u3
     Ok((final_preexisting_mode, created))
 }
 
-/// The copy's UNDO JOURNAL for destination directory modes. Every
-/// directory whose mode the call changes — or creates — is recorded with the
-/// mode to restore if the call FAILS, and `Drop` restores them deepest-first.
-/// This is what makes a FAILED copy leave a destination the crate can remove
-/// itself ([`remove_dir_all_fd`]) instead of a `0o200` directory nothing can
-/// open, and what keeps a fold-equal source's own mode byte-identical after a
-/// failed copy.
-///
-/// `Drop` is the right shape: the copy has many `?` returns, and a guard makes
-/// the restore run on EVERY one without each error path remembering to. A
-/// successful copy DISARMS the journal once the exact final modes are applied,
-/// so the guard never fights the finalize.
-struct CopyUndo<'a> {
-    root: &'a RootDir,
-    /// `(rel, mode_to_restore_on_failure)`: a directory the call CREATED
-    /// restores to the removable `0o700`; one that PRE-EXISTED restores to its
-    /// original mode.
-    modes: Vec<(PathBuf, u32)>,
-    armed: bool,
+/// One destination directory's planned modes: the mode to put back if the copy
+/// FAILS, and the exact source mode the SUCCESSFUL copy installs.
+struct PlannedMode {
+    rel: PathBuf,
+    /// A directory the call CREATED restores to the removable `0o700`; one
+    /// that PRE-EXISTED restores to its original mode.
+    restore: u32,
+    /// The source's mode, applied deepest-first by [`CopyModes::commit`].
+    final_mode: u32,
 }
 
-impl<'a> CopyUndo<'a> {
+/// The copy's SINGLE mode journal for destination directories: every mode the
+/// walk widened or created, and every mode the successful finalize must
+/// install. Owning both records in one entry is what removes the old parallel
+/// `modes`/`dirs` vectors and the `armed` flag that only code shape kept in
+/// sync.
+///
+/// `Drop` restores the planned modes deepest-first if [`commit`](Self::commit)
+/// did not complete; `commit` applies the intended final modes deepest-first
+/// (the copy root is the shallowest, so it lands last) and then clears the
+/// obligations. This is what makes a FAILED copy leave a destination the crate
+/// can remove itself ([`remove_dir_all_fd`]) instead of a `0o200` directory
+/// nothing can open, and what keeps a fold-equal source's own mode
+/// byte-identical after a failed copy.
+struct CopyModes<'a> {
+    root: &'a RootDir,
+    modes: Vec<PlannedMode>,
+}
+
+/// A TEST-ONLY failpoint between the mode applications of
+/// [`CopyModes::commit`], so a test can drive a MID-COMMIT failure: the walk
+/// has completed and the finalize has begun, which the walk-failure tests
+/// cannot reach. Compiled out of production builds.
+#[cfg(test)]
+mod copy_commit_failpoint {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Arm the failpoint: the `index`-th `set_dir_mode_fd` call (0-based)
+    /// fails BEFORE it runs. The returned guard disarms on drop, so a panicking
+    /// test cannot leak the arm into another test.
+    pub(super) fn fail_at(index: usize) -> Disarm {
+        FAIL_AT.with(|slot| slot.set(Some(index)));
+        Disarm
+    }
+
+    pub(super) fn reached(index: usize) -> bool {
+        FAIL_AT.with(|slot| slot.get().is_some_and(|armed| index >= armed))
+    }
+
+    pub(super) struct Disarm;
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            FAIL_AT.with(|slot| slot.set(None));
+        }
+    }
+}
+
+impl<'a> CopyModes<'a> {
     fn new(root: &'a RootDir) -> Self {
         Self {
             root,
             modes: Vec::new(),
-            armed: true,
         }
     }
 
-    /// Record the mode to restore for `rel` if the call fails. The FIRST record
-    /// for a path wins, so a later re-plan cannot overwrite the true original.
-    fn plan(&mut self, rel: &Path, restore_mode: u32) {
-        if !self.modes.iter().any(|(planned, _)| planned == rel) {
-            self.modes.push((rel.to_path_buf(), restore_mode));
+    /// Record both modes for `rel`. The FIRST record for a path wins, so a
+    /// later re-plan cannot overwrite the true original restore mode.
+    fn plan(&mut self, rel: &Path, restore: u32, final_mode: u32) {
+        if self.modes.iter().any(|planned| planned.rel == rel) {
+            return;
         }
+        self.modes.push(PlannedMode {
+            rel: rel.to_path_buf(),
+            restore,
+            final_mode,
+        });
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
+    /// Consume the journal and apply every intended final mode deepest-first
+    /// (the copy root last). On a failure the journal still holds every
+    /// obligation, so `Drop` restores them; on success it is cleared, so the
+    /// guard never fights the finalize. This is the disarm: there is no bool
+    /// a future edit can forget to flip.
+    fn commit(mut self) -> Result<()> {
+        self.modes
+            .sort_by_key(|planned| std::cmp::Reverse(planned.rel.components().count()));
+        for (index, planned) in self.modes.iter().enumerate() {
+            #[cfg(not(test))]
+            let _ = index;
+            // The test-only failpoint fires HERE, after the journal is fully
+            // populated and after any earlier final mode was applied, so the
+            // mid-commit failure path is reachable by a test.
+            #[cfg(test)]
+            if copy_commit_failpoint::reached(index) {
+                return Err(Error::store(
+                    "injected copy-mode commit failure (test failpoint)",
+                ));
+            }
+            set_dir_mode_fd(self.root, &planned.rel, planned.final_mode)?;
+        }
+        self.modes.clear();
+        Ok(())
     }
 }
 
-impl Drop for CopyUndo<'_> {
+impl Drop for CopyModes<'_> {
     fn drop(&mut self) {
-        if !self.armed {
+        if self.modes.is_empty() {
             return;
         }
         let mut modes = std::mem::take(&mut self.modes);
@@ -2534,9 +2835,9 @@ impl Drop for CopyUndo<'_> {
         // them. Best-effort: the call is already returning an error, and a
         // concurrent removal may make a restore fail — the original error is
         // what the caller must see.
-        modes.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
-        for (rel, mode) in modes {
-            let _ = set_dir_mode_fd(self.root, &rel, mode);
+        modes.sort_by_key(|planned| std::cmp::Reverse(planned.rel.components().count()));
+        for planned in modes {
+            let _ = set_dir_mode_fd(self.root, &planned.rel, planned.restore);
         }
     }
 }
@@ -2654,7 +2955,7 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// source directory failed with `EACCES`; keeping the exact final modes while
 /// fixing that is a deliberate, documented difference.)
 ///
-/// A FAILED COPY RESTORES EVERY MODE IT CHANGED ([`CopyUndo`], an RAII
+/// A FAILED COPY RESTORES EVERY MODE IT CHANGED ([`CopyModes`], an RAII
 /// journal): the widened walk modes are for the walk only, so an error return
 /// puts a PRE-EXISTING destination directory back to its original mode and a
 /// directory the call CREATED back to the removable `0o700`. A destination
@@ -2663,8 +2964,8 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// the crate's own [`remove_dir_all_fd`] — no `chmod` first. A PRE-EXISTING
 /// destination keeps ITS OWN mode (the caller's choice, which the call does not
 /// second-guess); a caller merging into a read-only directory owns its
-/// removability. On SUCCESS the exact modes are applied and the journal is
-/// disarmed.
+/// removability. On SUCCESS the exact modes are applied by the consuming
+/// `commit`, which also consumes the restore obligation.
 ///
 /// FIDELITY IS TO THE MANIFEST MODEL, NOT TO EVERY INODE ATTRIBUTE. The copy
 /// carries content, modes (including the special bits), and symlink targets —
@@ -2743,7 +3044,7 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// into a fresh staging path it owns and rename it into place itself, and must
 /// treat ANY `Err` as "the destination may hold a partial subtree at
 /// `dst_rel`". A destination the call CREATED is removable with the crate's own
-/// [`remove_dir_all_fd`]: the undo journal restores every mode the call changed
+/// [`remove_dir_all_fd`]: the mode journal restores every mode the call changed
 /// before the error return. A PRE-EXISTING destination keeps its own mode, so a
 /// caller merging into a read-only directory owns its removability. A partial
 /// tree is also never mistakable for a complete one — it is missing entries, so
@@ -2964,21 +3265,21 @@ pub fn copy_dir_recursive_fd(
     );
 
     // Create the destination chain (guarded, component-wise O_NOFOLLOW) and
-    // record an UNDO JOURNAL of every directory mode this call changes, so a
-    // failure restores them. A PRE-EXISTING final directory is added
-    // to the journal with its ORIGINAL mode before it is widened, so a failed
-    // copy puts it back exactly; a directory this call CREATED is added with
-    // the removable 0o700.
+    // record the ONE mode journal for every directory this call changes, so a
+    // failure restores them and a success installs the exact source modes. A
+    // PRE-EXISTING final directory is recorded with its ORIGINAL restore mode
+    // before it is widened, so a failed copy puts it back exactly; a directory
+    // this call CREATED is recorded with the removable 0o700. The journal also
+    // carries the intended FINAL mode, so the old parallel `dirs` vector and
+    // the separate root-final line are gone.
     let (final_preexisting_mode, _created_ancestors) = create_destination_chain(root, dst_rel)?;
-    let mut undo = CopyUndo::new(root);
-    undo.plan(dst_rel, final_preexisting_mode.unwrap_or(0o700));
+    let mut modes = CopyModes::new(root);
+    modes.plan(dst_rel, final_preexisting_mode.unwrap_or(0o700), root_mode);
     // Widen the FINAL directory during the walk so a read-only SOURCE root can
     // receive children; the journal restores the original mode on failure and
     // the finalize applies the source's exact mode on success.
     set_dir_mode_fd(root, dst_rel, (root_mode | 0o200) & 0o7777)?;
 
-    // `(dst_rel, final_mode)` for the deepest-first finalize.
-    let mut dirs: Vec<(PathBuf, u32)> = Vec::new();
     let names = dir_entry_names(&src_root_fd)?;
     let mut stack: Vec<Frame> = vec![Frame {
         dst_rel: dst_rel.to_path_buf(),
@@ -3007,13 +3308,12 @@ pub fn copy_dir_recursive_fd(
                 // Guarded create (mkdir semantics, refusing a residue/lock
                 // spelling), then widen during the walk so a read-only source
                 // directory can receive children. The created directory is
-                // the call's own, so the undo journal restores it to 0o700 on a
+                // the call's own, so the journal restores it to 0o700 on a
                 // failure (making the partial tree removable) and the finalize
                 // gives it the source's exact mode on success.
                 create_dir_fd_path(root, &child_rel)?;
-                undo.plan(&child_rel, 0o700);
+                modes.plan(&child_rel, 0o700, mode);
                 set_dir_mode_fd(root, &child_rel, (mode | 0o200) & 0o7777)?;
-                dirs.push((child_rel.clone(), mode));
                 let child_fd = openat_no_follow_io_path(
                     &top.src_dir,
                     Path::new(name_str),
@@ -3149,18 +3449,13 @@ pub fn copy_dir_recursive_fd(
         }
     }
 
-    // Restore every directory's exact mode, deepest-first, then the root of
-    // the copy last (it is the shallowest). The pre-existing final directory's
-    // original mode was saved in the journal, so on SUCCESS it takes the
-    // source's mode exactly as before.
-    dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.components().count()));
-    for (rel, mode) in dirs {
-        set_dir_mode_fd(root, &rel, mode)?;
-    }
-    set_dir_mode_fd(root, dst_rel, root_mode)?;
-    // The exact modes are in place; an error from here on leaves them intended,
-    // so the undo journal must not fight the finalize.
-    undo.disarm();
+    // Apply every directory's exact mode, deepest-first, then the root of the
+    // copy last (it is the shallowest). The journal holds the pre-existing
+    // final directory's original restore mode AND the intended source mode, so
+    // a success takes the source's mode exactly as before. `commit` consumes
+    // the journal: after it returns, a later error (the source-shape recheck
+    // below) leaves the intended modes in place and no restore fights them.
+    modes.commit()?;
 
     // SOURCE-QUIESCENCE DETECTION (the copy's analogue of `sync`'s end-of-run
     // source re-read). The containment verdict for every copied link was made
@@ -3727,16 +4022,19 @@ fn read_dir_of_opened_fd(dir_fd: &OwnedFd, shown: &Path) -> Result<Vec<DirEntry>
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PathKind, ReplaceOutcome, ReplaceStage, RootDir, RootedRelativePath, Sanction,
-        copy_dir_recursive_fd, copy_tree_verbatim, ensure_private_dir_durable,
+        DirChain, Error, PathKind, PathTemp, ReplaceOutcome, ReplaceStage, RootDir,
+        RootedRelativePath, Sanction, Temp, copy_dir_recursive_fd, copy_tree_verbatim,
+        ensure_private_dir_durable, ensure_private_dir_durable_chain,
+        ensure_private_dir_durable_fd, ensure_private_dir_durable_fd_chain,
         fsync_tree_recursive_fd, openat_no_follow, parent_fd_of, path_kind_fd, read_dir_fd,
         read_fd, read_link_fd, read_root_dir_fd, remove_dir_all_fd, remove_dir_all_path,
         remove_dir_fd, remove_file_fd, remove_owned_lock_record_fd, remove_residue_dir_all_fd,
-        remove_residue_file_fd, rename_residue_paths, renameat_fd, renameat_paths,
-        replace_order_probe, set_private, set_private_fd, symlink_fd, write_atomic_cas_fd,
-        write_atomic_replace, write_atomic_replace_fd, write_file_fd,
+        remove_residue_file_fd, rename_residue_paths, renameat_fd, renameat_paths, replace_core,
+        replace_order_probe, set_private_fd, symlink_fd, temp_file_name, temp_name_for,
+        write_atomic_cas_fd, write_atomic_replace, write_atomic_replace_fd, write_file_fd,
     };
     use crate::error::{ReservedKind, StoreKind};
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
@@ -4210,6 +4508,33 @@ mod tests {
         }
     }
 
+    /// The linear temps own the cleanup obligation directly. Dropping one
+    /// WITHOUT publishing unlinks the temp name for BOTH forms (the
+    /// path-based temp and the descriptor-relative temp); the replace stage
+    /// sweeps above exercise the same `Drop` through real replace failures.
+    /// Before the linear type the obligation lived in each exit path, so there
+    /// was no value whose drop could be witnessed here.
+    #[test]
+    fn an_unpublished_linear_temp_unlinks_its_name_on_drop() {
+        let (dir, root) = owned_root();
+        let fd_name = temp_file_name(OsStr::new("marker.json"));
+        let temp = Temp::create(root.as_fd(), fd_name).unwrap();
+        drop(temp);
+        assert_eq!(
+            entry_names(dir.path()),
+            Vec::<String>::new(),
+            "the descriptor-relative temp's Drop must unlink its name"
+        );
+
+        let path_temp = PathTemp::create(temp_name_for(&dir.path().join("marker.json"))).unwrap();
+        drop(path_temp);
+        assert_eq!(
+            entry_names(dir.path()),
+            Vec::<String>::new(),
+            "the path-based temp's Drop must unlink its name"
+        );
+    }
+
     /// A REAL failure of COMMIT POINT 1 (no fault hook): the destination is an
     /// existing DIRECTORY, so the rename fails. The temp is unlinked and the
     /// directory the rename could not replace is untouched.
@@ -4399,6 +4724,64 @@ mod tests {
         assert_eq!(read_fd(&root, rel).unwrap(), b"OLD".to_vec());
     }
 
+    /// The SECOND COMPARE's OBSERVATION failure is a pre-rename exit that must
+    /// clean up the temp. The first compare passed and the temp was written,
+    /// chmodded, and fsynced; then the live entry becomes a SYMLINK, so the
+    /// second `live_matches` errors (ELOOP) instead of answering mismatch.
+    ///
+    /// BEHAVIOUR DELTA, pinned here: the pre-typestate core propagated that
+    /// error with `?` and LEAKED the temp name; the linear `Temp` discards it on
+    /// every pre-publish exit. The destination is never touched. The seam is
+    /// the existing per-stage fault hook: the mutation runs at
+    /// [`ReplaceStage::Sync`], which is AFTER the temp was written and BEFORE
+    /// the second compare, so no extra test hook is needed.
+    #[test]
+    fn a_second_compare_error_unlinks_the_temp_and_leaves_the_destination() {
+        let (dir, root) = owned_root();
+        let target = dir.path().join("marker.json");
+        std::fs::write(&target, b"OLD").unwrap();
+        let mut swapped = false;
+        let err = replace_core(
+            &root,
+            Path::new("marker.json"),
+            Some(b"OLD"),
+            true,
+            b"NEW",
+            &mut |stage| {
+                if stage == ReplaceStage::Sync {
+                    // Between the first compare (already passed) and the second:
+                    // replace the live regular file with a symlink. The live
+                    // compare opens O_NOFOLLOW, so its observation FAILS (it is
+                    // not a mismatch: the entry is no longer a readable regular
+                    // file).
+                    std::fs::remove_file(&target).unwrap();
+                    std::os::unix::fs::symlink("elsewhere", &target).unwrap();
+                    swapped = true;
+                }
+                None
+            },
+        )
+        .expect_err("a second-compare observation failure must surface as an Err");
+        assert!(swapped, "the fault hook must have run at the Sync stage");
+        assert!(
+            err.to_string().contains("open marker.json"),
+            "the Err must be the second compare's observation failure, got: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the CAS must never follow or touch the entry it refused"
+        );
+        assert_eq!(
+            entry_names(dir.path()),
+            only("marker.json"),
+            "every pre-publish exit must unlink the temp; the pre-typestate core LEAKED it on this \
+             observation error"
+        );
+    }
+
     /// The iterative path-based copy must visit entries in the SAME order as
     /// the recursion it replaced: depth-first pre-order, descending into a
     /// subdirectory the moment it is encountered — NOT "every file first,
@@ -4512,22 +4895,45 @@ mod tests {
             .iter()
             .position(|event| event == "rename")
             .unwrap_or_else(|| panic!("the rename must be recorded: {events:?}"));
-        for expected in ["commit-dir-entry newdir", "commit-dir-entry newdir/sub"] {
-            let at = events
-                .iter()
-                .position(|event| event == expected)
-                .unwrap_or_else(|| {
-                    panic!(
-                    "the created directory entry {expected:?} was never fsynced into its parent, \
-                     so a power loss (on Linux — the durability assumption) could lose it while the
-                     replace reports ReplacedDurable: {events:?}"
+        // DEEPEST-FIRST, exactly: `newdir` was created before `newdir/sub`,
+        // but the durable commit visits the created entries from the bottom up.
+        // Reversing `created.iter().rev()` in `UnixChain::commit` leaves both
+        // entries committed before the rename and would pass a set-membership
+        // assertion; this sequence pins the order.
+        let commits: Vec<&String> = events
+            .iter()
+            .filter(|event| event.starts_with("commit-dir-entry "))
+            .collect();
+        assert_eq!(
+            commits,
+            vec!["commit-dir-entry newdir/sub", "commit-dir-entry newdir"],
+            "the created chain must be committed DEEPEST-FIRST (the new dir's own entry, then up \
+             the created chain): {events:?}"
+        );
+        // The parent-of-parent fsync is a separate entry: deleting its block in
+        // `UnixChain::commit` leaves every assertion above green, so it is
+        // witnessed by its own probe.
+        let ancestor_at = events
+            .iter()
+            .position(|event| event.starts_with("commit-dir-entry-ancestor "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the parent-of-parent entry was never fsynced, so the chain's own parent \
+                     directory entry is not made durable: {events:?}"
                 )
-                });
-            assert!(
-                at < rename_at,
-                "{expected:?} must be committed BEFORE the rename: {events:?}"
-            );
-        }
+            });
+        assert!(
+            ancestor_at < rename_at,
+            "the parent-of-parent entry must be committed BEFORE the rename: {events:?}"
+        );
+        assert!(
+            commits
+                .iter()
+                .filter_map(|event| events.iter().position(|candidate| candidate == *event))
+                .all(|at| at < ancestor_at),
+            "the created entries are committed deepest-first and THEN the parent-of-parent \
+             entry: {events:?}"
+        );
         assert!(
             events
                 .iter()
@@ -4556,22 +4962,40 @@ mod tests {
             .iter()
             .position(|event| event == "rename")
             .unwrap_or_else(|| panic!("the rename must be recorded: {events:?}"));
-        let commits: Vec<usize> = events
+        let commits: Vec<&String> = events
             .iter()
-            .enumerate()
-            .filter(|(_, event)| event.starts_with("commit-dir-entry "))
-            .map(|(at, _)| at)
+            .filter(|event| event.starts_with("commit-dir-entry "))
             .collect();
-        assert!(
-            commits.len() >= 2,
+        assert_eq!(
+            commits.len(),
+            2,
             "both created directories must have their entry fsynced before the rename: {events:?}"
         );
-        for at in commits {
-            assert!(
-                at < rename_at,
-                "every created directory entry must be committed BEFORE the rename: {events:?}"
-            );
-        }
+        assert!(
+            commits[0].ends_with("pnew/sub") && commits[1].ends_with("pnew"),
+            "the created chain must be committed DEEPEST-FIRST (`pnew/sub`, then `pnew`): \
+             {events:?}"
+        );
+        let ancestor_at = events
+            .iter()
+            .position(|event| event.starts_with("commit-dir-entry-ancestor "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the path-based chain's parent-of-parent entry was never fsynced: {events:?}"
+                )
+            });
+        assert!(
+            commits
+                .iter()
+                .filter_map(|event| events.iter().position(|candidate| candidate == *event))
+                .all(|at| at < ancestor_at && at < rename_at),
+            "every created directory entry must be committed before the parent-of-parent entry \
+             and the rename: {events:?}"
+        );
+        assert!(
+            ancestor_at < rename_at,
+            "the parent-of-parent entry must be committed BEFORE the rename: {events:?}"
+        );
         assert!(
             events
                 .iter()
@@ -4901,37 +5325,6 @@ mod tests {
         assert_eq!(file_mode, 0o600, "a regular file is narrowed to 0o600");
     }
 
-    /// The PATH-BASED `set_private` consults the ONE guard on the FULL path.
-    /// Its descriptor-relative twin runs its OWN guard, so
-    /// `set_private_fd_refuses_the_lock_record` stays green when this line is
-    /// deleted — this test is what notices the path-based guard. Pre-fix the
-    /// chmod narrowed the record to 0o600 and returned `Ok(())`. The guard's
-    /// lock-record refusal is `Error::Conflict`, not a message substring.
-    #[test]
-    fn set_private_refuses_the_lock_record() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let record = dir.path().join("operation.lock");
-        std::fs::write(&record, b"HELD").unwrap();
-        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err =
-            set_private(&record).expect_err("the path-based chmod must refuse the lock record");
-        assert!(
-            matches!(err, Error::Conflict(_)),
-            "the lock authority's refusal is the TYPED conflict, got: {err:?}"
-        );
-        assert_eq!(
-            std::fs::read(&record).unwrap(),
-            b"HELD".to_vec(),
-            "the record's content must be untouched"
-        );
-        let mode = std::fs::metadata(&record).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(
-            mode, 0o644,
-            "the refused chmod must leave the record's mode untouched"
-        );
-    }
-
     /// The PATH-BASED `ensure_private_dir_durable` runs the guard with
     /// [`Sanction::Residue`], which skips the RESIDUE authority but still runs
     /// the LOCK authority — so a residue spelling is permitted here while a
@@ -4953,11 +5346,81 @@ mod tests {
         assert!(!record.exists(), "the refused call must create nothing");
     }
 
-    /// The descriptor-relative `set_private_fd` consults the SAME guard as
-    /// the path-based `set_private`. A chmod preserves the inode, so this is
-    /// not a holder split, but the two spellings of the primitive must not
-    /// disagree about the record. Pre-fix `set_private_fd` chmodded the record
-    /// and returned `Ok(())`.
+    /// The durable-chain verdict is not a dead bool: an all-existing chain
+    /// reports `AlreadyPresent`/`false` and commits nothing, while a fresh
+    /// chain reports `Created`/`true` after its commit ran. Both the
+    /// path-based and the descriptor-relative spellings are covered, and the
+    /// public `bool` boundary is asserted as the verdict's derived view.
+    #[test]
+    fn durable_dir_chain_verdict_distinguishes_present_from_created() {
+        let (dir, root) = owned_root();
+
+        // FD-BASED: a fresh chain creates and commits.
+        let fresh = rp("a/b");
+        let verdict = ensure_private_dir_durable_fd_chain(&root, fresh.as_path()).unwrap();
+        assert!(
+            matches!(verdict, DirChain::Created(_)),
+            "a fresh chain must report Created: {verdict:?}"
+        );
+        // The SAME chain again creates nothing, so it must commit nothing.
+        replace_order_probe::begin();
+        let verdict = ensure_private_dir_durable_fd_chain(&root, fresh.as_path()).unwrap();
+        let events = replace_order_probe::take();
+        assert!(
+            matches!(verdict, DirChain::AlreadyPresent),
+            "an all-existing chain must report AlreadyPresent: {verdict:?}"
+        );
+        assert!(
+            !ensure_private_dir_durable_fd(&root, &fresh).unwrap(),
+            "the public bool is false when nothing was created"
+        );
+        assert!(
+            events.is_empty(),
+            "AlreadyPresent must not run the durable commit: {events:?}"
+        );
+        // The public boundary on a FRESH chain: true, and the next call false.
+        let fresh_bool = rp("bool/fresh");
+        assert!(
+            ensure_private_dir_durable_fd(&root, &fresh_bool).unwrap(),
+            "the public bool is the Created verdict's derived view"
+        );
+        assert!(
+            !ensure_private_dir_durable_fd(&root, &fresh_bool).unwrap(),
+            "the public bool is false on the second call"
+        );
+
+        // PATH-BASED twin.
+        let path_chain = dir.path().join("p/q");
+        let verdict = ensure_private_dir_durable_chain(&path_chain).unwrap();
+        assert!(
+            matches!(verdict, DirChain::Created(_)),
+            "a fresh path chain must report Created: {verdict:?}"
+        );
+        replace_order_probe::begin();
+        let verdict = ensure_private_dir_durable_chain(&path_chain).unwrap();
+        let events = replace_order_probe::take();
+        assert!(
+            matches!(verdict, DirChain::AlreadyPresent),
+            "an all-existing path chain must report AlreadyPresent: {verdict:?}"
+        );
+        assert!(!ensure_private_dir_durable(&path_chain).unwrap());
+        assert!(
+            events.is_empty(),
+            "AlreadyPresent must not run the durable commit: {events:?}"
+        );
+        let path_bool = dir.path().join("p/fresh");
+        assert!(
+            ensure_private_dir_durable(&path_bool).unwrap(),
+            "the path-based public bool is the Created verdict's derived view"
+        );
+        assert!(!ensure_private_dir_durable(&path_bool).unwrap());
+    }
+
+    /// The descriptor-relative `set_private_fd` consults the ONE lock-record
+    /// guard. A chmod preserves the inode, so this is not a holder split, but
+    /// the chmod primitive must not disagree with every other mutation about
+    /// the record. Pre-fix `set_private_fd` chmodded the record and returned
+    /// `Ok(())`.
     #[test]
     fn set_private_fd_refuses_the_lock_record() {
         let (dir, root) = owned_root();
@@ -5378,7 +5841,25 @@ mod tests {
     fn copy_dir_recursive_fd_carries_content_modes_and_symlinks() {
         use std::os::unix::fs::PermissionsExt;
         let (base, root, src) = out_of_root_fixture();
+        // Make the source ROOT read-only too, so the final 0o555 differs from
+        // the widened walk mode (0o555 | 0o200 = 0o755). With the fixture's
+        // default root mode (0o755) the finalize and the widening agree and the
+        // root assertion below could not tell them apart.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let source_root_mode = std::fs::symlink_metadata(&src)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            source_root_mode, 0o555,
+            "the source root must be read-only for this assertion to distinguish the final mode \
+             from the widened walk mode"
+        );
         copy_dir_recursive_fd(&root, &src, &rp("dst")).unwrap();
+        // The copy holds no source handle past this point; put the source back
+        // so the temporary directory can be reclaimed.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(
             std::fs::read(base.path().join("root/dst/file.txt")).unwrap(),
@@ -5405,6 +5886,17 @@ mod tests {
             "a read-only directory keeps its mode"
         );
         assert_eq!(mode_of("dst/bin"), 0o4755, "setuid is carried");
+        assert_eq!(
+            mode_of("dst"),
+            source_root_mode,
+            "the copy root takes the source root's mode (the journal's root-final entry)"
+        );
+        assert_ne!(
+            mode_of("dst"),
+            (source_root_mode | 0o200) & 0o7777,
+            "the copy root must NOT keep the widened walk mode; this is what proves the \
+             root-final entry actually ran last"
+        );
         // A plain file's mode is whatever the SOURCE has (the test process's
         // umask decides it), so compare against the source rather than a
         // hardcoded 0o644 — the copy must carry the EXACT source mode.
@@ -5420,6 +5912,135 @@ mod tests {
 
         // A subtree fsync must accept the copied tree (and skip the symlink).
         fsync_tree_recursive_fd(&root, &rp("dst")).unwrap();
+    }
+
+    /// A FAILED copy restores EVERY planned directory mode: the pre-existing
+    /// copy root goes back to its ORIGINAL mode (not the source's, and not the
+    /// widened walk mode), and a directory the call CREATED goes back to the
+    /// removable `0o700`. The failure is forced by a crate-temp-shaped name
+    /// INSIDE the created child, so the child was already created and widened
+    /// when the walk refused the name. This is the journal's own witness for
+    /// the WALK-failure path: if `Drop` stops restoring, the two assertions
+    /// fail. The MID-COMMIT failure path is the separate
+    /// `a_mid_commit_failure_restores_every_planned_directory_mode`.
+    #[test]
+    fn failed_copy_restores_every_planned_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        let src = base.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/kept"), b"kept").unwrap();
+        std::fs::write(src.join("sub/.victim.tmp.1.2"), b"live").unwrap();
+        // A read-only source directory is widened during the walk (0o555 ->
+        // 0o755), so the restored mode is observably different from the walk
+        // mode on both the copy root and the created child.
+        std::fs::set_permissions(src.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dst_root = base.path().join("root");
+        std::fs::create_dir(&dst_root).unwrap();
+        let dst = dst_root.join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let root = RootDir::open(&dst_root).expect("open the owned root");
+
+        let err = copy_dir_recursive_fd(&root, &src, &rp("dst"))
+            .expect_err("the crate-temp-shaped source entry must refuse the copy");
+        assert!(
+            err.to_string().contains("unaddressable") && err.to_string().contains("recovery sweep"),
+            "the failure must be the temp-name refusal, got: {err}"
+        );
+
+        let mode_of = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(
+            mode_of(&dst),
+            0o751,
+            "a PRE-EXISTING copy root must be restored to its ORIGINAL mode, not the source's"
+        );
+        assert_eq!(
+            mode_of(&dst.join("sub")),
+            0o700,
+            "a directory the copy CREATED must be restored to the removable 0o700, not the source's"
+        );
+
+        // Leave the root writable so the tempdir can remove the partial tree.
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A MID-COMMIT failure still restores every planned directory mode. The
+    /// walk completes (so the journal is fully populated and the finalize has
+    /// started), then the test failpoint fails the SECOND `set_dir_mode_fd`:
+    /// the deepest directory's final mode was already applied, so a `commit`
+    /// that cleared the obligations before applying them would leave it at the
+    /// source mode and the root at the widened walk mode. The journal must keep
+    /// every obligation on `Err` and `Drop` must put every directory back.
+    #[test]
+    fn a_mid_commit_failure_restores_every_planned_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        let src = base.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/kept"), b"kept").unwrap();
+        // Read-only source directories are widened during the walk (0o555 ->
+        // 0o755), so the restored mode is observably different from both the
+        // walk mode and the source mode.
+        std::fs::set_permissions(src.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dst_root = base.path().join("root");
+        std::fs::create_dir(&dst_root).unwrap();
+        let dst = dst_root.join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let root = RootDir::open(&dst_root).expect("open the owned root");
+
+        // Deepest-first, `dst/sub` is index 0 and the copy root `dst` is index
+        // 1, so this applies `dst/sub`'s final mode and then fails before the
+        // root's.
+        let failpoint = super::copy_commit_failpoint::fail_at(1);
+        let result = copy_dir_recursive_fd(&root, &src, &rp("dst"));
+        drop(failpoint);
+        let err = result.expect_err(
+            "the injected mid-commit failure must surface as an Err; `Ok` here means `commit` \
+             consumed/cleared the journal before it applied the planned modes, so the failpoint \
+             was never reached",
+        );
+        assert!(
+            err.to_string()
+                .contains("injected copy-mode commit failure"),
+            "the failure must be the injected commit failure, got: {err}"
+        );
+
+        let mode_of = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!(
+            mode_of(&dst),
+            0o751,
+            "a mid-commit failure must restore the PRE-EXISTING copy root's original mode; a \
+             commit that disarmed before applying would leave the widened walk mode here"
+        );
+        assert_eq!(
+            mode_of(&dst.join("sub")),
+            0o700,
+            "a mid-commit failure must restore the CREATED child to the removable 0o700, even \
+             though its final mode had already been applied"
+        );
+
+        // Leave the trees removable so the tempdir can reclaim them.
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(src.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// A symlink injected into a DESTINATION component of the copy is refused
