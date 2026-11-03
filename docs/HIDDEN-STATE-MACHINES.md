@@ -185,13 +185,16 @@ separate commit step; the `commit-dir-entry*` probes pin both.
 **States.** Unregistered; registered under `(EndpointKey, canonical root)`;
 refcounted by clones; released when the last clone drops.
 
-**Carrier.** The process-global `Mutex<BTreeMap<...>>` plus the `Arc` registration
-token.
+**Carrier.** The process-global `Mutex<BTreeMap<...>>` plus ONE
+`Arc<OwnedRootRegistration>` per root. The registration is the single owner of
+that root's `(endpoint, canonical)` pair: `OwnedRoot` holds nothing else, every
+clone shares the one `Arc`, and the accessors read the registration's copy.
 
 **Transitions.** `OwnedRoot::parse` checks the path is a real directory, not a
 symlink, not the filesystem root, then refuses an equal/ancestor/descendant root
-on the same endpoint before inserting. `OwnedRootRegistration::drop` removes the
-registration.
+on the same endpoint before inserting the checked pair into the registry and
+building the token from it. `OwnedRootRegistration::drop` removes the
+registration, which happens on the LAST clone's drop.
 
 **Watch.** The registry is process-global and in-memory. It does not survive a
 restart, and it does not coordinate with another process that owns the same
@@ -199,23 +202,31 @@ directory.
 
 ### Residue handle lifecycle
 
-**Where.** `src/sync/residue.rs::{Residue, Residue::detect, Residue::recover_to,
-Residue::discard}`.
+**Where.** `src/sync/residue.rs::{Residue, ResidueAside, Residue::detect,
+Residue::operation_lock, Residue::recover_to, Residue::discard}`.
 
 **States.** Not a residue; missing; present but not a regular entry; genuine
 residue. Recovery target absent or occupied. Recovered; discarded; nested
 residue refused.
 
-**Carrier.** A `Residue` value is a proof about a path observed at `detect`
-time; the live filesystem is re-read at each operation.
+**Carrier.** A private `ResidueAside` — the spelling proof, whose only
+constructor is `ResidueAside::parse` and whose one refusal is `NotResidue` —
+plus the root it is spelled under. The live filesystem is re-read at each
+operation.
 
-**Transitions.** Recovery takes the destination operation lock, revalidates the
-aside, refuses an occupied target, renames, fsyncs the parent, and reads the
-result back. Discard takes the same lock, revalidates the spelling, and removes
-a file/symlink or a directory strand, refusing a nested residue.
+**Transitions.** `Residue::detect` parses the aside's spelling, proves it is a
+residue, opens the root, and probes the live kind. Both operations acquire the
+destination operation lock through `Residue::operation_lock` (one message
+spelling, one `storekit residue <verb> at <root> (pid <pid>)` op id), then
+re-read existence and kind: recovery refuses an occupied target, renames,
+fsyncs the parent, and reads the result back; discard removes a file/symlink or
+a directory strand, refusing a nested residue. The substrate's lock-record guard
+refuses a lock-record spelling.
 
-**Watch.** A `Residue` is not a lease on the path. `discard` is the explicit
-destructive decision; the implicit removal primitives refuse a residue.
+**Watch.** A `Residue` is not a lease on the path. The spelling is proven once,
+by construction, so no operation re-derives it; only existence and kind are
+re-established. `discard` is the explicit destructive decision; the implicit
+removal primitives refuse a residue.
 
 ## Sync engine
 

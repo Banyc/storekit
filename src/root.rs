@@ -115,21 +115,17 @@ static OWNED_ROOTS: Mutex<BTreeMap<EndpointKey, BTreeSet<PathBuf>>> = Mutex::new
 /// releasing the ownership while any clone is alive).
 #[derive(Clone, Debug)]
 pub struct OwnedRoot {
-    /// The canonical, non-root, non-symlink directory.
-    canonical: PathBuf,
-    /// The resolved endpoint this root is owned on.
-    endpoint: EndpointKey,
-    /// The REFCOUNTED registration token: the registration is released when
-    /// the LAST clone of this root drops (clones share the token). This
-    /// field is a KEEP-ALIVE token — clones share the [`Arc`], and the
-    /// release happens in the token's own `Drop` (never by reading this
-    /// field), so the field is intentionally never read directly.
-    #[allow(dead_code)] // keep-alive token: its Drop releases the ownership registration
+    /// The REFCOUNTED registration: the ONE owner of this root's
+    /// `(endpoint, canonical)` identity. Clones share the [`Arc`], every
+    /// accessor reads this pair, and the release happens in its own `Drop`
+    /// (the LAST clone's) — so the pair the accessors report and the pair the
+    /// release uses can never disagree.
     registration: Arc<OwnedRootRegistration>,
 }
 
-/// The refcounted registration token: holds the (endpoint, canonical)
-/// pair whose registration it releases on the LAST drop.
+/// The refcounted registration identity: holds the ONE copy of the
+/// (endpoint, canonical) pair the accessors read and the registration is
+/// released from on the LAST drop.
 #[derive(Debug)]
 struct OwnedRootRegistration {
     endpoint: EndpointKey,
@@ -211,8 +207,6 @@ impl OwnedRoot {
             .or_default()
             .insert(canonical.clone());
         Ok(OwnedRoot {
-            canonical: canonical.clone(),
-            endpoint: endpoint.clone(),
             registration: Arc::new(OwnedRootRegistration {
                 endpoint: endpoint.clone(),
                 canonical,
@@ -222,12 +216,12 @@ impl OwnedRoot {
 
     /// The canonical owned directory.
     pub fn canonical(&self) -> &Path {
-        &self.canonical
+        &self.registration.canonical
     }
 
     /// The resolved endpoint this root is owned on.
     pub fn endpoint(&self) -> &EndpointKey {
-        &self.endpoint
+        &self.registration.endpoint
     }
 }
 
@@ -374,5 +368,37 @@ mod tests {
             err.to_string().contains("filesystem root"),
             "the refusal must name the non-root rule, got: {err}"
         );
+    }
+
+    /// The registration is ONE object: a clone reports the SAME endpoint and
+    /// canonical root as the original (both accessors read the one
+    /// `Arc<OwnedRootRegistration>`), and the registration is released by the
+    /// LAST drop, not by any earlier one.
+    #[test]
+    fn clones_share_one_registration_identity() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let root = dir.path().join("owned");
+        std::fs::create_dir_all(&root).unwrap();
+        let endpoint = case_endpoint("clone-identity");
+        let original = OwnedRoot::parse(&endpoint, &root).unwrap();
+        let clone = original.clone();
+
+        assert_eq!(clone.endpoint(), original.endpoint());
+        assert_eq!(clone.canonical(), original.canonical());
+        assert_eq!(clone.canonical(), std::fs::canonicalize(&root).unwrap());
+        assert!(
+            std::sync::Arc::ptr_eq(&original.registration, &clone.registration),
+            "clones must share the one registration, not carry private copies"
+        );
+
+        // Dropping one clone does NOT release the registration...
+        drop(clone);
+        let err = OwnedRoot::parse(&endpoint, &root)
+            .expect_err("the root is still owned while one clone lives");
+        assert!(err.to_string().contains("overlaps"), "{err}");
+
+        // ...the LAST drop does: the released root can be re-owned.
+        drop(original);
+        OwnedRoot::parse(&endpoint, &root).expect("a released root can be re-owned");
     }
 }

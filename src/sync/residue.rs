@@ -62,36 +62,27 @@
 
 use crate::atomic::{self, PathKind, RootDir};
 use crate::error::{Error, ReservedKind, Result, StoreKind};
+use crate::lock::FileLock;
 use crate::relpath::RootedRelativePath;
 use std::path::{Path, PathBuf};
 
-/// One stranded claim-aside at a LOCAL destination root, identified by its own
-/// root-relative path.
+/// The SPELLING PROOF of a residue: a validated root-relative path whose final
+/// component is a claim-aside spelling ([`crate::reserved::is_residue_name`]).
 ///
-/// A `Residue` is a PROOF that the path was a residue spelling at detection
-/// time; recovery and discard re-validate against the live filesystem, so a
-/// path that changed under the caller is refused rather than acted on blindly.
-#[derive(Clone, Debug)]
-pub struct Residue {
-    root: PathBuf,
-    aside: RootedRelativePath,
-}
+/// The proof is the TYPE, not an assertion re-run at every use:
+/// `ResidueAside::parse` is the ONLY constructor and carries the ONE
+/// `NotResidue` refusal, so a [`Residue`] cannot hold a spelling that is not a
+/// strand and no operation has a second spelling gate of its own to disagree
+/// with `detect`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResidueAside(RootedRelativePath);
 
-impl Residue {
-    /// Identify the residue at `aside`, a path RELATIVE to `root`.
-    ///
-    /// Refuses when `aside` is not a residue spelling
-    /// ([`crate::reserved::is_residue_name`] on the final component — a genuine
-    /// claim-aside, never a crate temp, which is `extraneous` and removable by
-    /// the crate's own sweep), when it does not exist, or when `root` itself is
-    /// not an openable directory. `aside` is validated as root-relative by the
-    /// underlying primitives (no absolute path, no `..`).
-    pub fn detect(root: impl AsRef<Path>, aside: impl AsRef<Path>) -> Result<Residue> {
-        let root = root.as_ref().to_path_buf();
-        // Parse the spelling ONCE, at this boundary: the validated type is the
-        // only thing the descriptor-relative primitives accept.
-        let aside = RootedRelativePath::parse(aside.as_ref())?;
-        let final_is_residue = aside
+impl ResidueAside {
+    /// Prove `rel` is a residue spelling, or refuse it with the ONE
+    /// `NotResidue` error: a genuine claim-aside, never a crate temp (which is
+    /// `extraneous` and removable by the crate's own sweep).
+    fn parse(rel: RootedRelativePath) -> Result<ResidueAside> {
+        let final_is_residue = rel
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(crate::reserved::is_residue_name);
@@ -103,15 +94,57 @@ impl Residue {
                      spelling (`.sync-aside.<pid>.<n>`) or another unaddressable spelling; a crate \
                      temp holds no original and is removed by the ordinary extraneous sweep",
                     crate::reserved::RESIDUE_BELOW,
-                    aside.display()
+                    rel.display()
                 ),
             ));
         }
+        Ok(ResidueAside(rel))
+    }
+
+    /// The proven root-relative spelling.
+    fn as_rel(&self) -> &RootedRelativePath {
+        &self.0
+    }
+
+    /// The proven root-relative spelling, as a path (for messages).
+    fn as_path(&self) -> &Path {
+        self.0.as_path()
+    }
+}
+
+/// One stranded claim-aside at a LOCAL destination root, identified by its own
+/// root-relative path.
+///
+/// A `Residue` holds a [`ResidueAside`] — the proof that the path was a residue
+/// spelling at detection time — and recovery and discard re-validate against
+/// the live filesystem, so a path that changed under the caller is refused
+/// rather than acted on blindly.
+#[derive(Clone, Debug)]
+pub struct Residue {
+    root: PathBuf,
+    aside: ResidueAside,
+}
+
+impl Residue {
+    /// Identify the residue at `aside`, a path RELATIVE to `root`.
+    ///
+    /// Refuses when `aside` is not a residue spelling (`ResidueAside::parse`:
+    /// [`crate::reserved::is_residue_name`] on the final component — a genuine
+    /// claim-aside, never a crate temp, which is `extraneous` and removable by
+    /// the crate's own sweep), when it does not exist, or when `root` itself is
+    /// not an openable directory. `aside` is validated as root-relative by the
+    /// underlying primitives (no absolute path, no `..`).
+    pub fn detect(root: impl AsRef<Path>, aside: impl AsRef<Path>) -> Result<Residue> {
+        let root = root.as_ref().to_path_buf();
+        // Parse and prove the spelling ONCE, at this boundary: the validated
+        // type is the only thing the descriptor-relative primitives accept, and
+        // the proof is what a `Residue` carries from here on.
+        let aside = ResidueAside::parse(RootedRelativePath::parse(aside.as_ref())?)?;
         let dir = RootDir::open(&root)?;
-        match atomic::path_kind_fd(&dir, &aside)? {
+        match atomic::path_kind_fd(&dir, aside.as_rel())? {
             None => Err(Error::not_found(format!(
                 "no residue at {} under {}",
-                aside.display(),
+                aside.as_path().display(),
                 root.display()
             ))),
             Some(PathKind::Other) => Err(Error::store_kind(
@@ -119,7 +152,7 @@ impl Residue {
                 format!(
                     "the residue at {} is not a regular file, a directory, or a symlink, so it cannot \
                  be recovered or discarded by name",
-                    aside.display()
+                    aside.as_path().display()
                 ),
             )),
             Some(_) => Ok(Residue { root, aside }),
@@ -129,6 +162,34 @@ impl Residue {
     /// The stranded aside's root-relative spelling.
     pub fn aside(&self) -> &Path {
         self.aside.as_path()
+    }
+
+    /// Derive the destination operation lock and ACQUIRE it, with the SAME
+    /// message spelling (the only difference is the verb) and the SAME
+    /// `storekit residue <verb> at <root> (pid <pid>)` op id for both
+    /// operations.
+    ///
+    /// A sync run holds the destination's operation lock for its whole
+    /// duration, so an operation on a strand takes the SAME lock through the
+    /// SAME authority ([`FileLock`]) for its own duration; a live holder is the
+    /// typed contention refusal.
+    fn operation_lock(&self, verb: &'static str) -> Result<FileLock> {
+        let lock_path = crate::sync::destination_lock_path(&self.root).ok_or_else(|| {
+            Error::preflight(format!(
+                "cannot {verb} the residue at {}: the destination root {} has no derivable \
+                 operation-lock path, so the operation cannot be serialized against a sync run",
+                self.aside.as_path().display(),
+                self.root.display()
+            ))
+        })?;
+        FileLock::acquire(
+            &lock_path,
+            &format!(
+                "storekit residue {verb} at {} (pid {})",
+                self.root.display(),
+                std::process::id()
+            ),
+        )
     }
 
     /// RECOVER: move the stranded aside back to `target` (also root-relative),
@@ -143,37 +204,21 @@ impl Residue {
     pub fn recover_to(&self, target: impl AsRef<Path>) -> Result<()> {
         // Parse the target ONCE, at this boundary.
         let target = RootedRelativePath::parse(target.as_ref())?;
-        // SERIALIZE against a cooperating writer. A sync run holds the
+        // SERIALIZE against a cooperating writer: a sync run holds the
         // destination's operation lock for its whole duration, so recovering a
-        // strand takes the SAME lock through the SAME authority
-        // ([`crate::lock::FileLock`]) for this recovery's duration. A live
-        // holder is the typed contention refusal — the check-then-rename window
-        // is therefore closed against a cooperating writer, as the module docs
-        // claim.
-        let lock_path = crate::sync::destination_lock_path(&self.root).ok_or_else(|| {
-            Error::preflight(format!(
-                "cannot recover the residue at {}: the destination root {} has no derivable \
-                 operation-lock path, so the recovery cannot be serialized against a sync run",
-                self.aside.display(),
-                self.root.display()
-            ))
-        })?;
-        let _operation_lock = crate::lock::FileLock::acquire(
-            &lock_path,
-            &format!(
-                "storekit residue recover at {} (pid {})",
-                self.root.display(),
-                std::process::id()
-            ),
-        )?;
+        // strand takes the SAME lock through the SAME authority for this
+        // recovery's duration. A live holder is the typed contention refusal —
+        // the check-then-rename window is therefore closed against a
+        // cooperating writer, as the module docs claim.
+        let _operation_lock = self.operation_lock("recover")?;
         let dir = RootDir::open(&self.root)?;
         // The aside must STILL be there. A `detect`-then-`recover` gap in which
         // something removed it is a refusal, not a silent success naming no
         // original.
-        if atomic::path_kind_fd(&dir, &self.aside)?.is_none() {
+        if atomic::path_kind_fd(&dir, self.aside.as_rel())?.is_none() {
             return Err(Error::not_found(format!(
                 "the residue {} no longer exists, so there is nothing to recover",
-                self.aside.display()
+                self.aside.as_path().display()
             )));
         }
         // A target that EXISTS as anything — a regular file, a directory, or a
@@ -191,7 +236,7 @@ impl Residue {
                      inspect them, then either keep the target and discard the residue, or move the \
                      target aside yourself and retry",
                     crate::reserved::RESIDUE_BELOW,
-                    self.aside.display(),
+                    self.aside.as_path().display(),
                     target.display()
                 ),
             ));
@@ -201,7 +246,7 @@ impl Residue {
         // residue-movement primitive: recovering a strand is the whole point of
         // this operation, so the aside's own residue spelling is permitted (the
         // public `renameat_paths` refuses it).
-        atomic::rename_residue_paths(&dir, &self.aside, &target)?;
+        atomic::rename_residue_paths(&dir, self.aside.as_rel(), &target)?;
         // The rename's DURABILITY: fsync the parent directory (the aside and the
         // target are siblings in ONE directory, so this covers both the removal
         // of the aside and the appearance of the target). A recovery a crash can
@@ -209,18 +254,18 @@ impl Residue {
         atomic::sync_parent_dir_fd(&dir, &target)?;
         // Read back: a rename that reported success but did not land would
         // otherwise be an `Ok` naming a recovered original that is not there.
-        if atomic::path_kind_fd(&dir, &self.aside)?.is_some() {
+        if atomic::path_kind_fd(&dir, self.aside.as_rel())?.is_some() {
             return Err(Error::store(format!(
                 "recovering the residue {} reported success, but a read-back confirms the aside \
                  is STILL present: the recovery did not land",
-                self.aside.display()
+                self.aside.as_path().display()
             )));
         }
         if atomic::path_kind_fd(&dir, &target)?.is_none() {
             return Err(Error::store(format!(
                 "recovering the residue {} reported success, but a read-back confirms the target \
                  {} is ABSENT: no original was restored",
-                self.aside.display(),
+                self.aside.as_path().display(),
                 target.display()
             )));
         }
@@ -236,61 +281,27 @@ impl Residue {
     /// (a residue inside the strand is a SEPARATE stranded original the caller
     /// must discard first). A missing aside is an idempotent success.
     pub fn discard(&self) -> Result<()> {
-        // SERIALIZE against a cooperating writer, EXACTLY as `recover_to`
-        // does. A sync run holds the destination's operation lock for its
-        // whole duration, so a discard takes the SAME lock through the SAME
-        // authority ([`crate::lock::FileLock`]) for this discard's duration.
-        // A live holder is the typed contention refusal. Without this, a
-        // cooperating second process could discard the claim-aside a LIVE run
-        // created between its claim-aside rename and its install/rollback —
-        // the run's rollback would then have nothing to restore, i.e. the
-        // caller's only copy is destroyed.
-        let lock_path = crate::sync::destination_lock_path(&self.root).ok_or_else(|| {
-            Error::preflight(format!(
-                "cannot discard the residue at {}: the destination root {} has no derivable \
-                 operation-lock path, so the discard cannot be serialized against a sync run",
-                self.aside.display(),
-                self.root.display()
-            ))
-        })?;
-        let _operation_lock = crate::lock::FileLock::acquire(
-            &lock_path,
-            &format!(
-                "storekit residue discard at {} (pid {})",
-                self.root.display(),
-                std::process::id()
-            ),
-        )?;
+        // SERIALIZE against a cooperating writer, EXACTLY as `recover_to` does:
+        // a sync run holds the destination's operation lock for its whole
+        // duration, so a discard takes the SAME lock through the SAME authority
+        // for this discard's duration. A live holder is the typed contention
+        // refusal. Without this, a cooperating second process could discard the
+        // claim-aside a LIVE run created between its claim-aside rename and its
+        // install/rollback — the run's rollback would then have nothing to
+        // restore, i.e. the caller's only copy is destroyed.
+        let _operation_lock = self.operation_lock("discard")?;
         let dir = RootDir::open(&self.root)?;
-        // Re-establish the ONE precondition against the spelling, so the pair
-        // shares it: a handle can only ever discard a residue, never ordinary
-        // content.
-        if !self
-            .aside
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(crate::reserved::is_residue_name)
-        {
-            return Err(Error::reserved(
-                ReservedKind::NotResidue,
-                format!(
-                    "{}: refusing to discard {} — its final component is not a residue \
-                     (`.sync-aside.<pid>.<n>` or another unaddressable spelling); a discard only ever \
-                     removes a stranded original, never ordinary content",
-                    crate::reserved::RESIDUE_BELOW,
-                    self.aside.display()
-                ),
-            ));
-        }
-        match atomic::path_kind_fd(&dir, &self.aside)? {
+        // The spelling is already PROVEN by the handle's `ResidueAside`, so the
+        // only thing to re-establish from the live filesystem is existence and
+        // kind (a `Residue` is not a lease).
+        match atomic::path_kind_fd(&dir, self.aside.as_rel())? {
             None => Ok(()),
-            Some(PathKind::Dir) => atomic::remove_residue_dir_all_fd(&dir, &self.aside),
+            Some(PathKind::Dir) => atomic::remove_residue_dir_all_fd(&dir, self.aside.as_rel()),
             // A file or symlink aside: one non-recursive unlink through the
             // sanctioned FILE primitive — the implicit `remove_file_fd` now
             // refuses a residue, and this strand is the ONE the caller has
-            // explicitly decided to discard. The aside is already proven to be
-            // a residue spelling by `detect`.
-            Some(_) => atomic::remove_residue_file_fd(&dir, &self.aside),
+            // explicitly decided to discard.
+            Some(_) => atomic::remove_residue_file_fd(&dir, self.aside.as_rel()),
         }
     }
 }
@@ -468,19 +479,18 @@ mod tests {
         );
     }
 
-    /// Discard refuses ordinary content and a lock record even when handed a
-    /// handle that never went through `detect`.
+    /// The SPELLING PROOF is the type: a non-residue spelling is refused where
+    /// the aside is NAMED (`ResidueAside::parse`, the only constructor), so no
+    /// handle can carry one and `discard` carries no spelling gate of its own
+    /// to disagree with `detect`. This is the single place the `NotResidue`
+    /// verdict can be produced.
     #[test]
-    fn discard_never_acts_on_ordinary_content_or_a_lock_record() {
+    fn the_spelling_proof_refuses_ordinary_content() {
         let dir = tmpdir();
         let root = dir.path();
         write(&root.join("ordinary"), b"data");
-        write(&root.join(".dest.operation.lock"), b"lock");
-        let forged = Residue {
-            root: root.to_path_buf(),
-            aside: RootedRelativePath::from_validated(PathBuf::from("ordinary")),
-        };
-        let err = forged.discard().unwrap_err();
+        let err = ResidueAside::parse(rp("ordinary"))
+            .expect_err("ordinary content cannot be proven a residue");
         assert!(
             matches!(
                 err,
@@ -491,13 +501,29 @@ mod tests {
             ),
             "{err:?}"
         );
+        // The proof is a VALUE: two parses of the same spelling are equal.
+        assert_eq!(
+            ResidueAside::parse(rp(".sync-aside.999.0")).unwrap(),
+            ResidueAside::parse(rp(".sync-aside.999.0")).unwrap()
+        );
+        // The refusal happens without consulting the filesystem.
         assert!(root.join("ordinary").is_file());
-        let forged = Residue {
-            root: root.to_path_buf(),
-            aside: RootedRelativePath::from_validated(PathBuf::from(".dest.operation.lock")),
-        };
-        assert!(forged.discard().is_err());
-        assert!(root.join(".dest.operation.lock").is_file());
+    }
+
+    /// A lock-record spelling is an unaddressable spelling that holds an entry,
+    /// so the handle can be detected — and the SUBSTRATE's lock-record guard,
+    /// not a spelling gate in `discard`, refuses the removal.
+    #[test]
+    fn discard_never_removes_a_lock_record() {
+        let dir = tmpdir();
+        let root = dir.path();
+        write(&root.join(".dest.operation.lock"), b"lock");
+        let residue = Residue::detect(root, Path::new(".dest.operation.lock")).unwrap();
+        assert!(residue.discard().is_err());
+        assert_eq!(
+            fs::read(root.join(".dest.operation.lock")).unwrap(),
+            b"lock"
+        );
     }
 
     /// `recover_to` HOLDS the destination operation lock (the SAME
