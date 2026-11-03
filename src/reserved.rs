@@ -351,11 +351,15 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   the replace's temp chmod moved onto its create-time handle; the Windows
 ///   port keeps its documented no-op `set_private`). The
 ///   local transport's crate-INTERNAL staged-publish workers
-///   (`durable_create_new`, `remove_file_if_inner`) run INSIDE the funnel:
-///   each takes a [`crate::atomic::GuardedRel`] capability that
+///   (`durable_create_new` and `RemoveIfRoute::remove_if`, with the linear
+///   `CreateNewTemp`/`Claimed` values they drive) run INSIDE the funnel:
+///   the two workers take a [`crate::atomic::GuardedRel`] capability that
 ///   `GuardedRel::new_for_owned_lock_record` mints only after the guard has
 ///   run, so their rename/remove/create on the crate's own temp/swap names is
-///   the funnel's own code, not a path around it. The production mutation
+///   the funnel's own code, not a path around it. The temps and claim asides
+///   those values own are the protocol's OWN names, so their `Drop` cleanup is
+///   exempt for its own naming reason (see the rule below).
+///   The production mutation
 ///   sites that do NOT consult the guard are a CLASS defined by RULE, not a
 ///   count: a site whose only protection is its OWN naming or its own
 ///   naming-check rather than the reserved-spelling guard. The members found so

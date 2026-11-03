@@ -1,14 +1,20 @@
 # Hidden state machines
 
 A state machine is a set of states plus the transitions between them. This
-inventory lists the machines in `storekit` whose state is not one Rust state
-type. Their state is carried by combinations of flags, counters, maps, sets,
-thread-locals, filesystem entries, process state, or generated far-side scripts.
-A machine can be tested and still be hidden in this sense: nothing in the type
-system prevents an unlisted transition.
+inventory covers the machines in `storekit` whose state crosses a boundary the
+type system does not close by itself: filesystem entries, an advisory lock held
+by the kernel, a child process's lifecycle, a far-side script's step order, or a
+run-scoped combination of sets and counters.
 
-Each entry names the authority, the state carrier, the states and transitions,
-and the point a reviewer must check. Symbols are cited by name; line numbers are
+Most entries now name an explicit CARRIER — a linear temp, a journal record, a
+sealed proof, or an enum that replaced a flag pair. Where that is so, the entry
+states what the type makes unrepresentable. Where it is not, the entry names the
+authority that still holds the state (kernel, process, far-side script,
+filesystem) and its residual. No entry claims a type enforces something it does
+not.
+
+Each entry names the authority, the carrier, the states and transitions, and the
+point a reviewer must check. Symbols are cited by name; line numbers are
 deliberately absent because they rot. Every statement is derived by reading the
 named symbols; none is a test result. Test-only machines are listed last.
 
@@ -37,7 +43,14 @@ removed, replaced, or renamed. `AdministrativeRecoveryGuard` is the separate
 capability state for breaking the record: it can be constructed only by taking
 the local operation lock, and its lifetime is that lock's lifetime.
 `retire_destination_lock` is the sanctioned removal path; its outcomes are
-`Retired`, `Absent`, `Held`, `DestinationLive`, and `NoRecordLocation`.
+`Retired`, `Absent`, `Held`, `DestinationLive`, and `NoRecordLocation`. The one
+state that stays EXTERNAL is `held by a live holder`: it is the KERNEL's
+advisory `flock` bit, and the typed observations of it are `LockAttempt` (one
+acquisition attempt's answer), the `Error::LockContended` refusal it maps to, and
+`RetireOutcome::Held` (the same bit read from the retirement side). No Rust value
+records that a holder EXISTS, and a
+non-cooperating process that never opens this inode is invisible — that is the
+residual, and it is why `Drop` never unlinks the record.
 
 ### Atomic-replace commit machine
 
@@ -58,8 +71,10 @@ as an `Option` and its create-time `File` handle; `Published` is what a
 successful publish returns, so a post-publish temp unlink is unrepresentable.
 `ReplaceStage` names the fault points, not the whole state.
 
-**Transitions.** The stage methods consume and return the temp: `create` →
-`write` → `make_private` → `sync` → `publish`/`publish_no_replace`. The Unix
+**Transitions.** The stage methods consume and return the temp: on Unix
+`create` → `write` → `make_private` → `sync` →
+`publish`/`publish_no_replace`; the Windows form has no private-mode stage
+(`create` → `write` → `sync` → `publish`). The Unix
 write, chmod, and fsync go through the create-time handle, never a descriptor
 reopened by name; `publish` takes the name out first, so `Drop` can only unlink
 a live pre-publish temp. Every pre-publish exit removes the temp: an explicit
@@ -74,7 +89,11 @@ is not a cleanup point. The Unix CAS (`write_atomic_cas_fd`) installs with
 `linkat` without replacement, chmods the installed entry, then fsyncs the
 parent; its temp handle is closed before the link, matching the pre-typestate
 descriptor lifetime. The pre-rename stages' chmod/fsync receivers are pinned
-by the source audit in `atomic::guard`'s tests.
+by the source audit in `atomic::guard`'s tests. What no value carries is the
+FILESYSTEM's answer to the rename and the parent fsync:
+`ReplaceOutcome::ReplacedDurable` versus
+`ReplaceOutcome::ReplacedDurabilityUnknown` is the crate's only record of it,
+and a crash inside that window is the kernel's and the filesystem's state.
 
 ### Compare-and-swap replace
 
@@ -89,7 +108,9 @@ comparison result between them is not represented by a type.
 
 **Watch.** The residual window is between the second comparison and
 `renameat`. On a destination without a server-side compare, a writer inside that
-window is lost and nothing signals it.
+window is lost and nothing signals it. The temp itself is the linear `Temp`, so
+a mismatch — and an observation failure at the second compare — drops the name
+structurally; what stays untyped is the window and the live filesystem.
 
 ### Copy mode journal and two-phase copy
 
@@ -130,15 +151,20 @@ copy leaves a partial destination by design.
 
 **States.** A directory frame is entered; its children are visited one at a
 time; a child's outcome is folded into its parent; a directory is removed only
-after its live listing is re-read as empty. A reserved child leaves the holding
-directory in place.
+after its live listing is re-read as empty. A reserved child, or a child the
+sanction does not address, leaves the holding directory in place.
 
-**Carrier.** The heap stack, `DirFrame.next`, `DirFrame.outcome`, `pending`, and
-`completed`. `pending` and `completed` are never both set by construction.
+**Carrier.** The heap stack of `DirFrame { path, rel, children, next, outcome }`
+and the walk's one-unit phase `Work::{Enter, Fold}`. The phase is the VARIANT,
+so "attempting an entry" and "folding a finished subtree" (the old
+`pending`/`completed` pair) cannot both hold.
 
 **Transitions.** A leaf is a single non-recursive unlink. A directory leaf is a
 non-recursive `rmdir` after an emptiness re-list. `Removal` is `Removed`,
-`ResidueLeft`, or `Blocked`.
+`ResidueLeft`, or `Blocked`, and `Removal::join` is the fold: `ResidueLeft`
+absorbs, `Blocked` upgrades only a `Removed` accumulator, and `Removed` is the
+unit — so a directory holding residue is never removed because its siblings
+went.
 
 **Watch.** The final directory removal is not recursive, so a child created
 after the last enumeration makes the removal fail loudly instead of being
@@ -241,41 +267,59 @@ LockedRemoteDestination, InRootLock, Prepared}`;
 valid for one run binding, or refused as a replay. A far-side session is alive
 or lost.
 
-**Carrier.** The enum arm plus the private `Prepared` fields: direction, pinned
-local root, destination root, destination localness, remote root spelling,
-remote endpoint identity, remote localness, and source manifest.
+**Carrier.** The enum arm plus the private `Prepared` fields: `direction`, the
+pinned `LocalSide` (its `root_path` plus the lazily pinned `RootDir`),
+`remote_root`, `remote_identity`, `remote_is_local`, and `source_meta`. The
+DESTINATION shape is not a field: `Prepared::dest_root()` and
+`Prepared::dest_is_local()` DERIVE it from the direction and those axes, so a
+recorded destination could never disagree with the binding that was checked.
 
-**Transitions.** A minting path runs the preflight, prepares the transport
-identity, reads the source manifest, records the transport binding, and takes
-the lock(s). `sync` re-checks all five compared axes before use, runs, then
-checks a far-side session's liveness before returning.
+**Transitions.** A minting path (`lock`, `lock_with_in_root_lock`, `lock_remote`)
+runs `prepare` — pin the local root, refuse overlapping roots, refuse an
+unlockable destination, prepare the transport identity, read the source
+manifest — then `require_endpoint_identity`, then takes the lock(s). `sync`
+reads the binding through `DestinationOwnership::binding()` (the ONE place it is
+read, `None` for `Unowned`), calls `Prepared::matches` before the token is
+destructured, runs, then checks a far-side session's `is_alive()` before
+returning.
 
-**Watch.** `Prepared::matches` compares direction, local root, remote root,
-endpoint identity, and remote localness. The derived destination shape is not a
-compared axis; it is implied by the other axes. A far-side lock is not a lease:
+**Watch.** `Prepared::matches` compares the direction AND the pinned local root
+(one check), the remote root spelling, the endpoint identity, and the remote
+localness — the last because two transports that both state `None` are
+otherwise indistinguishable. The destination shape is derived, not compared:
+`dest_root()`/`dest_is_local()` are functions of the compared axes, so a token
+cannot be replayed against a different tree. A far-side lock is not a lease:
 a lost connection releases it, and the post-run liveness check reports the run
 as failed.
 
 ### Run phase pipeline
 
 **Where.** `sync::{sync, run}`; `sync::apply::{Applier::run, run_steps,
-settle, derive_report}`.
+settle, VerifyPass, PreSettleVerified, derive_report}`.
 
 **States.** Preflight → lock → provision remote destination → destination
 manifest → reserved strip and diff → unsupported-destination preflight →
 containment check → `report_extraneous` → `transfer` → `finalize` →
-`verify(false)` → `remove_extraneous` → `settle` (`restore` then
-`verify(true)`) → `reconcile_residue` → `derive_report` → source re-read.
+`verify(VerifyPass::PreSettle)` → `remove_extraneous` → `settle` (`restore`
+then `verify(VerifyPass::PostSettle)`) → `reconcile_residue` →
+`derive_report` → source re-read.
 
-**Carrier.** The phase order and the `Applier` fields. There is no phase enum.
+**Carrier.** The phase order and the `Applier` fields; there is no phase enum.
+What IS typed is the two verification moments (`VerifyPass::{PreSettle,
+PostSettle}`) and the removal gate: `verify` returns `PreSettleVerified`, and
+`remove_extraneous` takes it, so no destruction can precede the pass that
+authorises it.
 
 **Transitions.** A failure inside `run_steps` still runs `settle`, residue
 reconciliation, and report derivation. Removal runs only after transfers and
-the first verification pass. The source is re-read after the run.
+the pre-settle pass, and only by presenting that pass's token; `settle` runs
+`verify(VerifyPass::PostSettle)` and discards its token because nothing is
+removed after it. The source is re-read after the run, by `SourcePlan::confirm`.
 
 **Watch.** The ordering is the safety property: transfer and verification
-complete before sanctioned destruction, and a failed run still accounts for what
-it mutated.
+complete before sanctioned destruction — now a requirement of the removal
+call's type rather than of two statements' order — and a failed run still
+accounts for what it mutated.
 
 ### Mode journal
 
@@ -314,49 +358,63 @@ report keeps it out of `transient_dirs` because `note_residue` names it in
 
 ### Pending-mutation accounting
 
-**Where.** `sync::apply::{PendingMutations, MutationKind, Outcome,
+**Where.** `sync::apply::{PendingMutations, MutationKind, MutationAttempt,
 begin_mutation, commit_mutation}`; `Applier::indeterminate`;
-`note_indeterminate`.
+`Applier::location_unknown`; `note_indeterminate`.
 
 **States.** Per path: idle; pending content; pending mode; both; reported
-indeterminate.
+indeterminate. Separately, a path with no begun attempt whose LOCATION could not
+be confirmed.
 
-**Carrier.** Two counters per path in a `BTreeMap`. `Outcome` separately records
-`Skipped` or `Transferred`.
+**Carrier.** `PendingMutations { content, mode }` per path in
+`Applier::indeterminate`, plus the `location_unknown: BTreeSet<String>` channel.
+`MutationAttempt<'p>` — carrying the path spelling and its `MutationKind` — is
+the `#[must_use]` token `begin_mutation` mints and `commit_mutation` consumes.
+`Outcome` separately records `Skipped` or `Transferred`.
 
 **Transitions.** `begin_mutation` counts the transfer and increments the counter
 for the attempted kind; a content attempt also drops the ancestry memo at that
-path. `commit_mutation` decrements only the same kind. A failed attempt is never
-decremented. `note_indeterminate` inserts a permanent content count without an
-attempt.
+path. `commit_mutation` decrements only the SAME kind, and is reachable only
+with the token, so no counter can be decremented that no attempt incremented. A
+failed attempt is never decremented. `note_indeterminate` inserts into
+`location_unknown` instead: it adds no counter and no transfer, so no commit
+can erase it.
 
 **Watch.** A mode restore clears only a mode attempt; it cannot resolve a failed
 write, create, rename, or removal. A path remains indeterminate while any begun
-attempt is uncommitted.
+attempt is uncommitted. The two channels are unioned only when the report is
+derived: an uncommitted attempt may or may not have landed, while an unknown
+location asserts neither spelling.
 
 ### Claim, rollback, and residue reconciliation
 
-**Where.** `sync::apply::{Claim, UnconfirmedMove, RenamedEntryLocation}`;
-`claim_aside`; `drop_claim`; `rollback_claim`; `discard_partial`; `rename_back`;
-`locate_after_failed_rename`; `record_stranded_entry`;
-`record_leftover_aside`; `note_residue`; `re_root_residue`;
-`reconcile_residue`.
+**Where.** `sync::apply::{Claim, ClaimDisposition, UnconfirmedMove,
+RenamedEntryLocation}`; `claim_aside`; `drop_claim`; `rollback_claim`;
+`discard_partial`; `rename_back`; `locate_after_failed_rename`;
+`account_failed_move`; `record_stranded_entry`; `record_leftover_aside`;
+`note_residue`; `re_root_residue`; `reconcile_residue`.
 
 **States.** Live at the original path; claimed by rename to an aside; aside
 dropped; aside rolled back; partial install discarded; rename landed at the
 destination; rename still at the source; location unknown. Residue candidate;
 confirmed residue; unconfirmed possibility.
 
-**Carrier.** `Claim` (original path and aside path, no kind), `UnconfirmedMove`,
-`dest_residue`, `claim_failures`, and live probes. `RenamedEntryLocation` names
-only the read-back result.
+**Carrier.** `Claim` (original path and aside path, no kind),
+`ClaimDisposition::{Dropped, LeftBehind { claim, cause }}` (the linear claim's
+only hand-back, and the only way a leftover aside can be recorded),
+`UnconfirmedMove`, `dest_residue`, `claim_failures`, and live probes.
+`RenamedEntryLocation` names only the read-back result.
 
 **Transitions.** A failed claim or rollback rename is read back before anything
-is named. A confirmed aside is residue; a confirmed-gone aside is not; an
-unconfirmable probe records a candidate consumed by `reconcile_residue`. The
-report-time reconciliation confirms candidates against the live destination and
-routes an unconfirmable one to `indeterminate` plus a restore failure naming
-both possible spellings.
+is named: `account_failed_move` is the ONE accounting for both renames —
+`Destination` re-roots the recorded residue, `Source` leaves it, `Unknown`
+pushes an `UnconfirmedMove` and asserts neither spelling — and the aside itself
+is named only when the read-back confirms it still holds the entry
+(`record_stranded_entry`). A confirmed aside is residue; a confirmed-gone aside
+is not; an unconfirmable probe records a candidate consumed by
+`reconcile_residue`. The report-time reconciliation confirms candidates against
+the live destination and routes an unconfirmable one to `indeterminate` plus a
+restore failure naming both possible spellings.
 
 **Watch.** The report's lists assert existence and contain only confirmed
 paths. The possibility channel asserts no location. A claim carries no kind, so
@@ -428,29 +486,40 @@ remove are counted mutations and can leave residue.
 ### Verification passes
 
 **Where.** `sync::apply::{verify, verify_names, verify_directory_listings,
-verify_claimed_untouched}`; `Applier::{verified, verify_failures, listings}`.
+verify_claimed_untouched, VerifyPass, PreSettleVerified, PassReport}`;
+`Applier::{verified, verify_failures, listings}`.
 
 **States.** Per path: unverified; content/kind verified; mode verified; name
-verified; failed; applied; skipped. The run has a pre-settle pass and a
-post-settle pass.
+verified; failed; applied; skipped. The run has TWO passes, `VerifyPass::PreSettle`
+and `VerifyPass::PostSettle`.
 
 **Carrier.** `verify: Vec<VerifyItem>`, `verified: BTreeSet`,
-`verify_failures: BTreeSet`, the mode journal's targets, and `touched_dirs`.
+`verify_failures: BTreeSet`, one `PassReport { failed, first_error }` per pass,
+the mode journal's targets (`mode_targets(include_restored)`), and
+`touched_dirs`. A pass that raises no new ERROR returns `PreSettleVerified`, the
+removal step's required token.
 
-**Transitions.** `verify` clears the listing cache, checks kind and content,
-checks mode targets, verifies names and ancestor names byte-exactly, verifies
-touched-directory listings, and re-confirms claimed-untouched entries. A path
-remains in `verified_now` only when every check in the pass passed; a later
-check removes it on failure, and failures are removed from the cumulative
-`verified` set.
+**Transitions.** `verify` clears the listing cache, checks kind and then content
+(hash or symlink target), checks the mode targets — including the modes a
+restore wrote back only on `PostSettle` — verifies names and ancestor names
+byte-exactly, verifies touched-directory listings, and re-confirms
+claimed-untouched entries. A path remains in `verified_now` only when every
+check in the pass passed; a later check removes it on failure, and failures are
+removed from the cumulative `verified` set.
 
 **Watch.** `verified` must mean the latest pass. A path that passed the first
 pass and failed the post-settle pass is not `applied`. A directory that cannot
-be enumerated faithfully is a run-level error, not a per-path conflict.
+be enumerated faithfully is a run-level error, not a per-path conflict. The
+token means the pass RAN: a path failed through an already-recorded conflict
+(`PassReport::fail_without_error`) raises no new error and still yields one — the
+conflict record, not the token, is what prohibits that path's removal. A
+`PostSettle` pass returns the same token type only because the signature is
+shared: `settle` discards it and no removal follows.
 
 ### Report partition
 
-**Where.** `sync::apply::{derive_report, apply_precedence}`.
+**Where.** `sync::apply::{derive_report, ReportClass, ReportClaims,
+ReportPartition}`.
 
 **States.** Each path may appear in `indeterminate`, `conflicts`, `residue`,
 `applied`, `skipped`, `extraneous`, or `verify_failures`. `transient_dirs` is
@@ -458,39 +527,47 @@ outside the partition and may share a path with `applied` or
 `verify_failures`.
 
 **Carrier.** The outcome map, mode journal, conflicts, residue set, extraneous
-set, and verification sets.
+set, and verification sets. `ReportClaims` holds one candidate set per class,
+`ReportClass`'s declaration order IS the precedence, and `ReportPartition` is
+the seven filed lists.
 
 **Transitions.** Apply the one precedence:
 
-`indeterminate` > `conflicts` > `residue` > `applied` > `skipped` >
-`extraneous` > `verify_failures`.
+`indeterminate` > `conflicts` > `residue` > `verify_failures` > `applied` >
+`skipped` > `extraneous`.
 
-A path named by a higher list is removed from every lower list. The unsupported
-destination annotation is filtered to paths the report already names.
+`ReportClaims::classes` takes the MIN class per path over `ReportClass`'s `Ord`,
+so the declaration is the single authority and a path claimed by a higher list
+is absent from every lower one. `transient_dirs` is disjoint from every class
+except `applied` and `verify_failures`. The unsupported destination annotation
+is filtered to paths the report already names.
 
 **Watch.** A successful `Ok` run may still carry `verify_failures`. `Ok` means
 the run completed, not that the destination is clean.
 
 ### Lazy local root
 
-**Where.** `sync::apply::{LocalSide, LocalSide::open, LocalSide::manifest,
-LocalSide::destination_manifest, LocalSide::root_dir,
+**Where.** `sync::apply::{LocalSide, LocalRole, LocalSide::open,
+LocalSide::manifest, LocalSide::destination_manifest, LocalSide::root_dir,
 LocalSide::root_for_mutation, LocalSide::confirm_pinned_root}`.
 
 **States.** Root absent and unpinned (destination only); present and pinned;
 present and unpinned then pinned; absent then adopted as empty or created;
 appeared non-empty and refused; disappeared after pinning and refused.
 
-**Carrier.** `LocalSide.root: OnceCell<RootDir>` plus `ensure: bool` and the live
-filesystem.
+**Carrier.** `LocalSide { root_path, role: LocalRole, root: OnceCell<RootDir> }`
+and the live filesystem. `LocalRole::{Source, Destination}` is the ONE authority
+for "may create" and for "an absent root is the empty tree"; `ensure: bool` is
+gone because it named the mechanism, not the side.
 
-**Transitions.** `open` pins an existing directory immediately. A destination
-root is created or adopted only at the first mutation; an empty directory is
-adopted, a non-empty one is refused. `confirm_pinned_root` compares the pinned
-inode with the path after a manifest walk.
+**Transitions.** `open` pins an existing directory immediately and refuses a
+non-directory. Only a DESTINATION root may stay unpinned: it is created or
+adopted at the first mutation, an empty directory is adopted, a non-empty one is
+refused, and `manifest` reads a missing one as the empty tree. A missing SOURCE
+root is an error. `confirm_pinned_root` compares the pinned inode with the path
+after a manifest walk.
 
-**Watch.** A missing source root is an error; an absent destination root is the
-empty tree. The destination root's own mode is not journaled, and a read-only
+**Watch.** The destination root's own mode is not journaled, and a read-only
 root fails loudly rather than being widened.
 
 ### Run-scoped caches
@@ -517,19 +594,28 @@ one path's own name and kind.
 
 ### Source-quiescence two-sample check
 
-**Where.** `sync::run`; `sync::apply::source_changed_error`.
+**Where.** `sync::run`; `sync::apply::{SourcePlan, SourcePlan::confirm,
+source_changed_error, fail_run}`.
 
 **States.** Plan read before locking; source stable at the post-run re-read;
-source added, removed, or changed; re-read failed.
+source added, removed, or changed; re-read failed. Separately: a run-level
+condition discovered AFTER the engine returned, which `fail_run` attaches.
 
-**Carrier.** `source_plan: TreeMetadata` and the second `source.manifest()` call.
+**Carrier.** `SourcePlan(TreeMetadata)` — the manifest the ENTRY POINT read
+BEFORE the destination lock and before provisioning — and the second
+`source.manifest()` call, which `confirm` consumes the plan against. `fail_run`
+is the ONE place an after-the-fact condition is attached: an `Ok` report becomes
+an `Err` carrying it, and an existing `SyncError` keeps its own error and gains
+a `restore_failures` entry.
 
-**Transitions.** After `Applier::run`, re-read the source and compare it to the
-plan. A difference fails the run and names the changed paths; a failed re-read
-also fails it.
+**Transitions.** After `Applier::run`, `SourcePlan::confirm(source.manifest())`
+compares the two reads. A difference fails the run and names the paths that
+moved; a failed re-read also fails it, as an unconfirmed quiescence.
 
-**Watch.** Two samples can refute quiescence, never prove it. A source that
-changes and changes back is indistinguishable from a stable one.
+**Watch.** Two samples can refute quiescence, never prove it. The crate cannot
+lock a source, so the obligation stays the caller's and the type only states
+that it was CHECKED; a source that changes and changes back is
+indistinguishable from a stable one.
 
 ### Manifest walk, wire assembly, and containment
 
@@ -575,25 +661,36 @@ walk's `root.join(rel)` versus the wire's manifest spelling).
 ### Create-new seven-stage install
 
 **Where.** `src/transport/mod.rs::{CreateNewStep, CreateNewFault,
-CreateNewVerdict, durable_create_new}`; `SshTransport::write_new_cmd`;
+CreateNewVerdict, CreateNewOptions, CreateNewTemp, Publish,
+durable_create_new}`; `SshTransport::write_new_cmd`;
 `SshTransport::try_write_new_sidecar_cmd`.
 
-**States.** Temp create; write; final chmod; file fsync; no-replace publish;
-temp unlink; parent fsync. The publish either creates the entry or reports
-`EEXIST`, which leads to verification and `AlreadyPresent` or `Conflict`.
+**States.** Temp create; write; final chmod; file fsync; no-replace publish
+(`Publish::Linked` or `Publish::NameTaken`, i.e. `EEXIST`); temp unlink; parent
+fsync. The publish either installs the entry or finds a winner, which leads to
+verification and `AlreadyPresent` or `Conflict`.
 
-**Carrier.** Stage-local code, the temp and destination entries, and a one-shot
-`AtomicBool` in `CreateNewFault`.
+**Carrier.** The local arm's LINEAR `CreateNewTemp { path: Option<PathBuf>,
+file: Option<File> }` plus the commit-point verdict `Publish::{Linked,
+NameTaken}`; `CreateNewStep` names the stages, `CreateNewFault` is a one-shot
+`AtomicBool` per fixture, and `CreateNewVerdict` (with `VerifiedExisting`) is the
+outcome.
 
-**Transitions.** A pre-install failure propagates; a conflict verifies the
-existing entry; an identical retry converges and still fsyncs the parent; a
-different winner is never replaced.
+**Transitions.** The stage methods consume and return `CreateNewTemp`, so
+reaching a later stage proves every earlier one ran. The commit TAKES THE NAME
+OUT before the `link(2)`, which disarms `Drop`; `publish` then releases the temp
+name best-effort in every outcome, so no caller arm owns a cleanup. A pre-install
+far-side failure propagates; a conflict verifies the existing entry; an identical
+retry converges and still fsyncs the parent; a different winner is never
+replaced.
 
-**Watch.** The local arm returns early after the temp exists at the `Write`,
-`Chmod`, `FileFsync`, `Publish`, and `Unlink` stages without unlinking it. The
-far-side scripts remove the temp on their pre-install failures. A local
-`Publish` fault leaves the temp; a local `Unlink` fault can leave both the
-published entry and its temp.
+**Watch.** The LOCAL cleanup obligation is structural: every pre-publish exit —
+each `?` and each injected `CreateNewStep` fault, `Publish` included — drops the
+temp and its `Drop` unlinks the name, so no local stage leaves a temp behind. The
+`Unlink` fault still fires after the commit and still reports an `Err` over a
+committed destination, but the temp it used to leave is already gone. The
+FAR-SIDE scripts are the external half: they remove their own temp on a
+pre-install failure, and no Rust type sees their intermediate state.
 
 ### Create-new verification ladder
 
@@ -607,9 +704,13 @@ constructed only after the opened inode is proven regular. For `Regular`: exact
 mode, content equivalence; readability is decided by the open/read step that
 produced `Unreadable`.
 
-**Carrier.** The single opened descriptor. A `Regular` carries that inode's raw
-mode (type bits included; the comparison masks `0o7777`) and its fd-read
-content, so the ladder evaluates one consistent observation in order.
+**Carrier.** `OpenedExisting`'s one armed observation, produced by the ONE
+open→fstat→read closure (`open_verify_local`, or the ssh framed helper):
+`Regular(OpenedRegular)` carries that inode's raw `mode` (type bits included;
+the comparison masks `0o7777`) and its fd-read `content`, so `verify_existing`
+evaluates one consistent observation in order and never re-derives a kind.
+`VerifiedExisting` is the ladder's verdict, and `verified_to_verdict` is its only
+route to `CreateNewVerdict`.
 
 **Transitions.** The first applicable class wins: not-regular before
 unreadable/mode/content; unreadable before mode; mode before content. `Ok` is
@@ -621,45 +722,60 @@ reason an after-open swap does not change the verdict.
 
 ### Sidecar mutex critical section
 
-**Where.** `src/transport/mod.rs::{SIDECAR_DEPTH, with_operation_lock_sidecar,
-SidecarHold, wait_for_sidecar_flock, ensure_operation_lock_sidecar_durable}`.
+**Where.** `src/transport/mod.rs::{SIDECAR_HELD, SidecarScope, SidecarHold,
+acquire_sidecar, with_operation_lock_sidecar, wait_for_sidecar_flock,
+ensure_operation_lock_sidecar_durable}`.
 
-**States.** Re-entrancy depth zero or positive; sidecar record absent, created,
-or existing; lock free, contended, or acquired; wait arm EWOULDBLOCK, EINTR,
-deadline, or other error; hold or release.
+**States.** This thread holds the sidecar or it does not; sidecar record absent,
+created, or existing; lock free, contended, or acquired; wait arm EWOULDBLOCK,
+EINTR, deadline, or other error; scope held or released.
 
-**Carrier.** `SIDECAR_DEPTH` is a thread-local `Cell<usize>`; `SidecarHold` is the
-RAII release; the record is a stable filesystem inode.
+**Carrier.** `SidecarScope::{Owned(SidecarHold), Nested}` is the acquisition's
+answer as a VALUE; `SIDECAR_HELD` is a thread-local `Cell<bool>` re-entrancy bit
+raised only once the `flock` is held; `SidecarHold` owns the read-only
+descriptor and is the RAII release. The record is a stable filesystem inode.
 
-**Transitions.** The public entry runs the reserved-spelling gate before the
-depth check. A nested call runs the closure directly. A non-nested call ensures
-the record, opens it read-only, waits against a monotonic deadline, raises the
-depth, and holds until drop. `Drop` restores the previous depth and unlocks.
+**Transitions.** `acquire_sidecar` runs the reserved-spelling gate FIRST
+(`refuse_reserved_mutation` with `Sanction::None`), before the re-entrancy answer
+and before creating anything; an already-holding thread gets `Nested` and runs
+its closure inside the outer section. Otherwise it ensures the record durably,
+opens it read-only, waits against a monotonic deadline, raises the bit, and
+returns `Owned`; `Drop` clears the bit and unlocks on every exit path, a panic
+included.
 
-**Watch.** The sidecar serializes mutations of the one record `Layout::lock`
-names; it is not destination ownership and does not exclude a sync's sibling
-record. The wait is bounded but a live holder is waited for, unlike
-`FileLock::acquire`.
+**Watch.** A mutation declares that it runs under this scope by carrying it
+(`RemoveIfRoute::Serialized`), rather than re-reading an ambient depth. The
+sidecar serializes mutations of the one record `Layout::lock` names; it is not
+destination ownership and does not exclude a sync's sibling record. The wait is
+bounded but a live holder is waited for, unlike `FileLock::acquire`, and it is
+ADVISORY: a non-cooperating writer that never opens the record is not excluded.
 
 ### Local compare-and-delete claim/restore
 
-**Where.** `src/transport/mod.rs::LocalTransport::remove_file_if_inner`;
-`RemoveIfVerdict`.
+**Where.** `src/transport/mod.rs::{LocalTransport::remove_file_if,
+RemoveIfRoute, Claimed}`; `RemoveIfVerdict`.
 
-**States.** Sidecar-held branch: read, match, remove, or mismatch. Claim branch:
-absent; claimed by rename; verified match; verified mismatch; removed;
-restored; conflict; error.
+**States.** Serialized branch: read, match (remove), or mismatch (the entry,
+inode included, is left untouched). Claim branch: absent; claimed by rename to an
+aside; verified match; verified mismatch; removed; restored; conflict; error.
 
-**Carrier.** `SIDECAR_DEPTH` selects the branch. The claim branch's temp name and
-its content are the intermediate state.
+**Carrier.** `RemoveIfRoute::{Serialized(SidecarScope), Claim}` — chosen ONCE by
+the caller from the mutation's OWN ownership (the identity-checked
+`GuardedRel`) and the thread's held bit. The claim branch's intermediate state is
+`Claimed { aside, content }`, a linear value whose `Drop` discards the aside
+exactly once.
 
-**Transitions.** Under the sidecar, the read-compare-remove is direct. Without
-it, rename to a unique claim temp, verify, unlink on match, or restore
-no-replace on mismatch. A concurrent winner is never replaced.
+**Transitions.** Under the sidecar the read-compare-unlink is direct and the
+scope stays bound for the whole arm. Without it, `Claimed::claim` renames to a
+unique sibling and reads the claimed inode (a `NotFound` rename is a genuine
+`Absent`), then `delete` on a match or `restore` no-replace on a mismatch. A
+concurrent winner is never replaced.
 
-**Watch.** In the claim branch a failed read or a failed restore reports an
-error after unlinking the claim temp. The moved record is the only copy lost in
-that transition; the comment states this explicitly.
+**Watch.** In the claim branch a failed read discards the claim and propagates.
+A failed no-replace restore propagates EXPLICITLY, and the moved claim —
+discarded by the same `Drop` on the way out — was the record's only copy; the
+slot is not blocked, the lease is the backstop. That deliberate destructive edge
+is the residual the comment on `Claimed::restore` states.
 
 ### Remote default compare-and-delete
 
@@ -708,69 +824,88 @@ property, not the order among siblings.
 
 ### Far-side lock session
 
-**Where.** `src/transport/ssh::{SshFarSideLock, spawn_far_side_lock,
-perl_hold_lock, far_side_lock_refusal, reap_bounded}`.
+**Where.** `src/transport/ssh::{SshFarSideLock, SessionState,
+spawn_far_side_lock, perl_hold_lock, far_side_lock_refusal, reap_bounded}`.
 
-**States.** Spawn; readiness reader; `LOCKOK`; holder live; released; exited
-with status; lost. Refusal states: contention, unrecognized record, holder
+**States.** Spawn; readiness reader; `LOCKOK`; holder live; released; exited with
+status; unanswerable. Refusal states: contention, unrecognized record, holder
 error, missing perl, ssh-before-command, acquisition timeout.
 
-**Carrier.** The local ssh child, the remote perl process, the first stdout line,
-and the child exit status. `SshFarSideLock` carries `released: bool` and cached
-`status`.
+**Carrier.** `SshFarSideLock { state: SessionState, stderr, record, local_pid }`
+where `SessionState::{Alive { child }, Released, Lost { status }, Unanswerable }`
+— exactly one holds, so released, lost, and unanswerable cannot be mixed and a
+live client cannot also carry an exit status. `stderr` is a DIAGNOSTIC channel,
+not lifecycle state; `holder::*` names the reserved exit codes and markers.
 
 **Transitions.** The remote holder creates the record, takes a non-blocking
 `flock`, refuses a foreign non-empty record, writes the header and op id, prints
-`LOCKOK`, then blocks on stdin. Closing stdin makes it unlock and exit. Release
-waits a bounded grace; if the client has not exited, it kills and reaps it.
+`LOCKOK`, then blocks on stdin. Closing stdin makes it unlock and exit; `release`
+waits a bounded grace, then kills and reaps. Every transition out of `Alive` is
+one-way: `is_alive` moves to `Lost` on an observed exit or to `Unanswerable` when
+the wait itself fails (fail closed), and `release` moves to `Released`; `Drop`
+releases.
 
 **Watch.** The session is a lock, not a lease. The run checks liveness after it
 finishes; a dead session makes the run fail even if every operation succeeded.
+Whether the holder actually holds the kernel `flock` is EXTERNAL: the readiness
+line is the only evidence, and the kernel releases the record when the client
+dies.
 
 ### Far-side script protocols
 
 **Where.** `SshTransport::{upload_bytes, write_new_cmd,
 try_write_new_sidecar_cmd, remove_file_if_sidecar_cmd, recover_sidecar_cmd}`;
-`perl_hold_lock`.
+`perl_hold_lock`; `transport::ssh::holder`; `RemotePublish`.
 
 **States.** Parent mkdir; temp allocation; payload on stdin; length verify;
 chmod; file fsync; publish by `link` or `rename`; temp unlink; parent fsync.
 Verdict frames `R`/`M`/`A`, `OK`/`MISMATCH`/`ABSENT`, and reserved exit codes.
 
 **Carrier.** Shell/perl locals, temp entries, and exit codes. No Rust type sees
-the intermediate filesystem state.
+the intermediate filesystem state; the Rust boundary only CLASSIFIES a status:
+`RemotePublish::{InstalledDurably, Existed, PreInstall}` for create-new, the
+sidecar verbs' verdict frames, and `holder::*` for the lock holder's reserved
+codes and readiness markers.
 
 **Transitions.** Uploads report a post-rename parent-fsync failure with the
 reserved post-rename exit; create-new reports a pre-install failure or a
 confirmed conflict; sidecar remove/recover report their verdict frame.
 
 **Watch.** The seven-step create-new order and the upload order are the remote
-realizations of the local primitives. A pre-install failure must not publish;
-a confirmed conflict must not replace the winner.
+realizations of the local primitives, and their STEP ORDER stays EXTERNAL — the
+crate reads one status, never a far-side state. A pre-install failure must not
+publish; a confirmed conflict must not replace the winner.
 
 ### Local process runner lifecycle
 
-**Where.** `transport::runner::{OwnedChild, RunnerConfig, ChildRunner::exec}`;
-`transport::runner::unix::exec`; `ProcessState`; `RunOutcome`; `RunError`;
-`DrainState`.
+**Where.** `transport::runner::{OwnedChild, ChildLifecycle, RunnerConfig,
+ChildRunner::exec}`; `transport::runner::unix::exec`; `ProcessState`;
+`RunOutcome`; `RunError`; `DrainState`.
 
 **States.** Spawned; running; exited but unreaped (zombie); timeout TERM;
 escalated KILL; owned-handle kill; foreground-only group check; reaped; drained.
 Error states: spawn, wait, background leftover, kill, reap.
 
-**Carrier.** `OwnedChild.reaped: bool`; the exec loop's `timed_out`,
-`sent_kill`, `sent_owned`, and `kill_error` locals; the process group and the
-zombie's allocated pid.
+**Carrier.** `OwnedChild { child, kill, lifecycle }` where
+`ChildLifecycle::{Live, Reaped(ExitStatus)}` is the reap state as a VALUE: the
+handle is reachable only through `live_child()`, `None` once reaped, so a signal
+after the reap is unrepresentable and the status is carried instead of
+discarded. The exec loop's `timed_out`, `sent_kill`, `sent_owned`, and
+`kill_error` remain locals of the one loop; the process group and the zombie's
+allocated pid are kernel state.
 
 **Transitions.** The wait loop peeks with `waitid(WNOWAIT)` so the direct child
 stays a zombie and holds its pgid. On timeout it TERMs and escalates to KILL;
 after exit it enumerates live group members, terminates any leftover, then reaps
-exactly once. `OwnedChild::drop` is the final backstop.
+exactly once, moving `ChildLifecycle` to `Reaped`. `OwnedChild::drop` is the
+final backstop and returns early once reaped.
 
 **Watch.** The foreground-only guarantee covers in-group descendants only. A
 `setsid` escapee is detected only while it holds an inherited pipe; a fully
 daemonized descendant is outside the contract. On Windows the group check and
-group kill do not exist.
+group kill do not exist. The process group's membership, the zombie's pid, and
+whether a descendant still lives are the KERNEL's state; `ChildLifecycle` and
+`DrainState` are the only typed observations of them.
 
 ### SSH subprocess runner
 
@@ -781,39 +916,53 @@ RunError}`; `SshRunnerSeam`.
 the child already reaped (collect the real result) or still running (kill, join,
 timeout); disconnected; leftover pipes.
 
-**Carrier.** `SpawnedChild.reaped: Arc<AtomicBool>`, the result channel, and the
-wait thread's join handle.
+**Carrier.** `SpawnedChild.status: Arc<WaitStatusCell>` holding
+`WaitStatus::{Running, Reaped}`, the kill closure's EXCLUSIVE handle to the owned
+child, the result channel, and the wait thread's join handle. The status cell is
+only the deadline HINT; the channel carries the authority (`WaitResult`).
 
-**Transitions.** `recv_timeout` selects the arm. A timeout with `reaped` set
-does not kill and receives the wait closure's real result; a timeout with
-`reaped` clear kills, joins, and reports a timeout. A disconnected channel kills
-and joins.
+**Transitions.** `recv_timeout` selects the arm. A timeout with
+`WaitStatus::Reaped` does not kill and receives the wait closure's real result; a
+timeout with `Running` kills, joins, and reports a timeout. A disconnected
+channel kills and joins.
 
-**Watch.** The timeout branch can block on `rx.recv()` after `reaped` is set; the
-wait closure's bounded drain is what makes that wait terminate. The deadline
-does not bound the whole call: termination grace and drain are additive.
+**Watch.** The timeout branch can block on `rx.recv()` after the status reads
+`Reaped`; the wait closure's bounded drain is what makes that wait terminate.
+The deadline does not bound the whole call: termination grace and drain are
+additive. Whether the child has actually been reaped is the KERNEL's state; the
+`WaitStatus` cell is the one typed mirror of it, and it is a hint, not the
+result.
 
 ### Host-identity preparation and pin cache
 
 **Where.** `transport::ssh::{SshTransport::prepare_identity,
-SshTransport::pin_known_hosts}`; `transport::ssh::hostkey`.
+SshTransport::pin_known_hosts, SshTransport::prepare_for_request, HostIdentity}`;
+`transport::ssh::hostkey`.
 
-**States.** Unprepared; mux directory absent or present. Identity source:
-explicit `known_hosts`, configured fingerprint, or neither (refused at
-construction). Pin cache absent; valid; stale/unreadable/mismatched; removed;
-keyscan fetched; matched; pinned; create-new failed.
+**States.** Identity classified ONCE at construction: `HostIdentity::KnownHosts`
+or `HostIdentity::Fingerprint { expected, pinned }` (the constructor refuses the
+both-set and the neither-set pair). Unprepared; mux directory absent or present.
+Pin absent; valid; stale/unreadable/mismatched; removed; keyscan fetched;
+matched; pinned; create-new failed.
 
-**Carrier.** `SshTransport.pinned_known_hosts: Mutex<Option<PathBuf>>`, the mux
-directory, and the pin cache file.
+**Carrier.** `SshTransport { identity: HostIdentity, known_hosts_cache_dir,
+... }`: the identity SOURCE is a value, so no operation re-checks the pair, and
+the pin's RESOLUTION is `HostIdentity::Fingerprint`'s
+`pinned: Mutex<Option<PathBuf>>`, set only by `prepare_identity`. The mux
+directory and the pin cache file are filesystem state.
 
-**Transitions.** Every request self-prepares. Preparation creates/chmods the mux
-directory and, for a fingerprint without an explicit known-hosts file, validates
-or re-pins the cache. `pin_known_hosts` removes a stale cache, runs
-`ssh-keyscan`, filters by fingerprint, and creates the pin with `create_new`.
+**Transitions.** Every request self-prepares (`prepare_for_request` →
+`prepare_identity`). Preparation creates/chmods the mux directory and calls
+`pin_known_hosts`, which validates or re-pins the cache; `ssh_args` refuses an
+unresolved pin rather than falling back to trust-on-first-use. `pin_known_hosts`
+removes a stale cache, runs `ssh-keyscan`, filters by fingerprint, and creates
+the pin with `create_new`.
 
 **Watch.** A concurrent re-pin that wins the `create_new` makes the loser return
 `EEXIST`; it does not re-validate and adopt the winner. The mux directory and
-pin files are preparation residue that the crate never removes.
+pin files are preparation residue that the crate never removes. What stays
+external is the HOST's key: the crate can only compare what `ssh-keyscan`
+reported against the configured fingerprint inside one run.
 
 ### Receiver identity and layout provisioning
 
