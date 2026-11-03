@@ -559,10 +559,17 @@
 //! itself for a run that must create nothing, and it would mutate the tree the
 //! run reads, destroying the "a fully-refused pull creates NOTHING, not even
 //! the root" and "two empty trees are a no-op" contracts (both pinned by
-//! tests). [`destination_lock_path`] therefore derives a dot-prefixed sibling
-//! record in the destination root's parent: taking the sync's own lock never
-//! creates or enters the tree the run is judging. The record reuses the
-//! reserved `operation.lock` FILE NAME, not the PATH of
+//! tests). BOTH of those two are scoped to the ENGINE and the PLAIN lock
+//! path, whose record location this placement governs; the COMPOSED form's
+//! in-root record is the named exception (part (c) of the write-footprint
+//! partition below), so a composed run over two empty trees transfers and
+//! applies nothing yet still creates that record (and any missing parent
+//! chain of it) inside the root before the DESTINATION manifest is read, which the run
+//! judges as residue or as a destination-only directory.
+//! [`destination_lock_path`] therefore derives a
+//! dot-prefixed sibling record in the destination root's parent: taking the
+//! sync's own lock never creates or enters the tree the run is judging. The
+//! record reuses the reserved `operation.lock` FILE NAME, not the PATH of
 //! [`crate::transport::Layout::lock`].
 //!
 //! PREMISE CHECK (what actually happens if an in-root record IS taken): an
@@ -624,20 +631,69 @@
 //!   deliberately NOT a change to [`crate::lock::FileLock`] or
 //!   [`crate::atomic::ensure_private_dir_durable`], which serve the transport's
 //!   sidecar locks where the private mode IS required.)
-//! * **A PULL's DESTINATION TREE is still created lazily and only by a
-//!   mutation.** (A PUSH instead PROVISIONS its remote destination root and
-//!   the caller's bootstrap directories before the destination manifest is
-//!   read — see [`sync`]'s "The destination root" section — which mutates the
-//!   destination's ROOT only, never anything inside it.) "A fully-refused pull
-//!   creates NOTHING" holds for the root and everything
-//!   under it: the record location is outside the root, so the run never
-//!   creates the ROOT itself. Three pieces of residue OUTSIDE the root can
-//!   outlive a blocked or later-failed run, and all three are named rather
-//!   than implied. The first two are created by the lock acquisition itself,
-//!   the third strictly earlier; a run refused by the OWNERSHIP check BEFORE
-//!   preparation (a remote destination reached through [`sync`]) still creates
-//!   nothing at all. This is the honest limit of the contract; it is stated
-//!   here rather than implied. The three are:
+//! * **A PULL's DESTINATION TREE is still created lazily: the ENGINE creates a
+//!   destination entry under it only by a MUTATION, and the COMPOSED ownership
+//!   form's in-root lock record is the named exception (part (c) below).** A
+//!   PUSH instead PROVISIONS its destination before the destination manifest
+//!   is read — see [`sync`]'s "The destination root" section — and that
+//!   provisioning creates the destination ROOT when it is absent (the local
+//!   `create_dir_all` and the remote `mkdir -p` each create any missing
+//!   ancestor of it as well), and — ONLY when the caller's
+//!   [`crate::transport::Layout`] declares them — the BOOTSTRAP DIRECTORIES
+//!   and, when [`crate::transport::Layout::receiver_marker`] is `Some`, the
+//!   receiver-id MARKER. The bootstrap directories and the marker are INSIDE
+//!   the root, so a PUSH refused later in the run (at the destination manifest,
+//!   at an unsupported destination entry, or at the containment verdict) has
+//!   therefore already created the ROOT when it was absent, and entries inside
+//!   it only when the layout declares them: with
+//!   [`crate::transport::Layout::empty()`] no entry inside the root is created,
+//!   and an existing root plus that layout leaves the provisioning nothing to
+//!   do at all. "A fully-refused pull creates NOTHING" holds for the ENGINE
+//!   and the PLAIN lock path: the engine creates nothing inside the root and
+//!   the plain record location is outside it, so that path does not create the
+//!   ROOT itself. The COMPOSED form's
+//!   in-root record is the named exception (part (c) below). The write
+//!   footprint a run REFUSED BEFORE the `Applier` exists can leave therefore
+//!   has THREE parts, all named here rather than implied. Part (a) is a PUSH's
+//!   provisioning: the destination ROOT when it is absent (and, with it, any
+//!   missing ancestor), plus the caller's bootstrap directories and, when
+//!   [`crate::transport::Layout::receiver_marker`] is `Some`, the receiver-id
+//!   marker — the bootstrap directories and the marker INSIDE the root, and
+//!   NEITHER of those two for an [`crate::transport::Layout::empty()`] layout,
+//!   which still gets the ROOT when it is absent. Part (b) is the residue the
+//!   SIBLING/PLAIN lock acquisition and the transport's preparation leave
+//!   OUTSIDE the root: three pieces can outlive a blocked or later-failed run,
+//!   the first two created by the lock acquisition itself and the third
+//!   strictly earlier. This is those mechanisms' outside-root contribution,
+//!   NOT the whole outside-root footprint: part (a)'s missing root ancestors
+//!   are outside the root too, a [`DestinationOwnership::lock_remote`]
+//!   destination leaves its FAR-SIDE record (named below) instead of the first
+//!   two, and an `Unowned` run takes no lock at all. Part (c) is the COMPOSED
+//!   ownership form's in-root record and its missing parent chain, created
+//!   INSIDE an EXISTING destination root by the acquisition ITSELF. Whether it
+//!   is never removed depends on the caller's record SPELLING, decided by the
+//!   ONE residue predicate ([`crate::reserved::is_residue_path`]): a spelling
+//!   that predicate classifies as residue is never removed; any ADDRESSABLE
+//!   spelling is ordinary destination-only content, classified extraneous and
+//!   removable under [`Extraneous::Delete`] — the acquisition does not make a
+//!   spelling residue or extraneous, the spelling's own classification does.
+//!   The mechanism is
+//!   [`DestinationOwnership::lock_with_in_root_lock`] calling
+//!   [`acquire_in_root_lock`], whose [`crate::lock::FileLock::acquire`] makes
+//!   the caller's named record and any missing component of its parent chain
+//!   ([`crate::atomic::ensure_private_dir_durable`]). The COMPOSED-form
+//!   paragraph below describes that same touch, and
+//!   `tests/composed_lock.rs::composed_in_root_record_is_residue_and_is_never_destroyed`
+//!   pins that `state/operation.lock` and `state/` survive even an
+//!   [`Extraneous::Delete`] run. A run refused by
+//!   the OWNERSHIP binding check ([`Prepared::matches`]) runs on an
+//!   ALREADY-MINTED token, so it has already run `prepare` and taken the lock;
+//!   it transfers or removes nothing inside the destination root. Which parts
+//!   of the footprint above a refusal leaves depends on the destination's lock
+//!   path: a REMOTE destination (`lock_remote`) creates no local parent chain
+//!   and no local sibling record — it leaves the transport's preparation
+//!   residue and its FAR-SIDE record instead. The three outside-root pieces
+//!   (part (b)) are:
 //!     * the root's PARENT chain, created at the platform default mode by
 //!       `create_lock_parent`;
 //!     * the persistent sibling record file
@@ -2025,8 +2081,11 @@ fn lock_destination(
 /// the COMPOSED ownership form, which takes an in-root record and must not
 /// create the root as a side effect of taking a lock.
 ///
-/// PURE: it creates nothing, so a refusal leaves no residue and happens BEFORE
-/// the sibling record is created. A destination the sibling check already
+/// PURE with respect to the destination ROOT and the LOCK RECORDS: it creates
+/// nothing, so a refusal creates no LOCK RECORD (the transport's preparation
+/// residue may already exist — see the module docs' write-footprint
+/// partition) and happens BEFORE the sibling record is created. A destination
+/// the sibling check already
 /// refused as REMOTE never reaches this (the composed form refuses remote
 /// destinations exactly as the plain form does). `dest_is_local` is checked
 /// again here only so the invariant is local to this function rather than
@@ -2736,23 +2795,29 @@ impl DestinationOwnership {
     /// avoid, and (for a PULL) it would then contradict the lazy-root adoption
     /// rule. This constructor therefore REFUSES a destination root that does
     /// not already exist (a typed [`Error::NotFound`]) or that is not a real
-    /// directory, BEFORE the sibling record is created, so the refusal leaves
-    /// nothing behind. A caller that wants the crate to provision the root
+    /// directory, BEFORE the sibling record is created, so the refusal creates
+    /// no LOCK RECORD (the transport's preparation residue may already exist —
+    /// see the module docs' write-footprint partition). A caller that wants the
+    /// crate to provision the root
     /// first must do so itself (for example with `Remote::provision_layout`).
     /// The in-root record's own missing parent directory INSIDE the existing
     /// root is still created (the lock helper creates a missing chain at the
     /// store-private mode), because refusing that would reject a legitimately
     /// empty store directory.
     ///
-    /// The in-root record is destination RESIDUE
-    /// ([`crate::reserved::is_residue_path`]: its final component is the
-    /// application lock record), so it is STRIPPED from the destination view
-    /// the run judges and never transferred or destroyed. Its PARENT
-    /// directory (if the lock created it) is ordinary content and may appear as
-    /// a destination-only directory; under [`Extraneous::Delete`] its removal
-    /// is refused because it holds residue, and it is reported as residue
-    /// rather than destroyed. See the module docs, "Why the lock record is a
-    /// SIBLING of the destination root".
+    /// The in-root record's treatment is decided by its SPELLING
+    /// ([`crate::reserved::is_residue_path`]). A final component in one of the
+    /// crate's residue spellings (the application-lock record and its aliases)
+    /// makes it destination RESIDUE: it is STRIPPED from the destination view
+    /// the run judges and never transferred or destroyed, and its PARENT
+    /// directory (if the lock created it) is refused removal under
+    /// [`Extraneous::Delete`] because it holds residue, reported as residue
+    /// rather than destroyed. An ADDRESSABLE caller-chosen spelling is NOT
+    /// residue: the record and any parent chain the lock created are ordinary
+    /// destination-only content, reported as extraneous and removed by an
+    /// [`Extraneous::Delete`] run, and a source entry at that path can replace
+    /// the record during the transfer. See the module docs, "Why the lock
+    /// record is a SIBLING of the destination root".
     ///
     /// The acquisition runs the same preflight as [`DestinationOwnership::lock`]
     /// (pin the local root, refuse overlapping roots, refuse an unlockable
@@ -2771,9 +2836,12 @@ impl DestinationOwnership {
         require_endpoint_identity(remote)?;
         // The composed form never creates the destination ROOT: refuse a root
         // that is absent (or not a directory) BEFORE the sibling record is
-        // created, so the refusal leaves no residue. This is also what keeps a
-        // PULL's "a fully-refused pull creates NOTHING, not even the root" and
-        // the lazy-root adoption rule intact.
+        // created, so the refusal creates no LOCK RECORD (the transport's
+        // preparation residue may already exist — see the module docs'
+        // write-footprint partition), and the in-root record is created inside
+        // a root that already exists. This is also what keeps the ROOT half of
+        // a PULL's "a fully-refused pull creates NOTHING, not even the root"
+        // and the lazy-root adoption rule intact.
         require_existing_root(prepared.dest_is_local(), prepared.dest_root())?;
         // CANONICAL ORDER, step 1 of 2: the sibling record (outside the root).
         let guard = lock_destination(direction, prepared.dest_is_local(), prepared.dest_root())?;
@@ -2787,7 +2855,9 @@ impl DestinationOwnership {
 }
 
 /// What a run determines BEFORE the destination lock is taken, so a refusal
-/// leaves no residue and the lock is held only for a run that will proceed.
+/// creates no LOCK RECORD (the transport's preparation residue may already
+/// exist — see the module docs' write-footprint partition) and the lock is held
+/// only for a run that will proceed.
 ///
 /// [`Prepared::matches`] compares exactly FIVE axes before the run mutates
 /// anything: the DIRECTION, the pinned LOCAL root, and the TRANSPORT BINDING's
@@ -3100,7 +3170,9 @@ fn prepare(
     // record is created and before `run` provisions the destination root. The
     // old order provisioned and locked first, so a run refused for its SOURCE
     // had already created the destination root and the sibling lock record. A
-    // refusal creates nothing. The manifest is read once and handed to `run` as
+    // refusal creates no destination ROOT and no LOCK RECORD (the transport's
+    // preparation residue may already exist — see the module docs'
+    // write-footprint partition). The manifest is read once and handed to `run` as
     // the plan (`run` re-reads it at the END for the source-quiescence check,
     // so the two samples still detect a source that moved during the run).
     let source = match direction {
@@ -4165,9 +4237,11 @@ fn run(
     // enforces, never relies on the caller": without it the destination
     // manifest read failed with `not a directory: <root>`. A PULL's
     // destination is a `Side::Local`, unchanged: its root stays created
-    // LAZILY by the first mutation, so a fully-refused pull still creates
-    // nothing. The failure names the stage rather than surfacing a bare
-    // transport error.
+    // LAZILY by the first mutation, so a fully-refused pull creates nothing
+    // through the ENGINE or the PLAIN lock path inside the root it judges. The
+    // composed form's in-root lock record is the named exception (see the
+    // module docs' write-footprint partition). The failure names the stage
+    // rather than surfacing a bare transport error.
     if let Side::Remote(remote) = dest
         && let Err(error) = remote.provision_layout()
     {
@@ -4762,19 +4836,98 @@ enum DeleteVerdict {
     Refused(DeleteRefusal),
 }
 
-impl Applier<'_, '_> {
-    fn run(&mut self) -> SyncResult {
-        let result = self.run_steps();
-        // THE one settle site: it runs on the success and the failure path.
-        let (settle_failures, verify_error) = self.settle();
-        // THE final reconciliation: confirm every residue candidate against the
-        // disk BEFORE the report is derived, so "every named path still EXISTS"
-        // holds by construction for every branch, present and future.
-        self.reconcile_residue();
-        let report = self.derive_report();
+/// The STEPS phase's outcome as a value. It is constructed from BOTH arms of
+/// `run_steps`, so a failed run has somewhere to travel instead of an early
+/// return, and `Settled` below cannot be built except from it. That makes the
+/// phases below this one unreachable for the APPLIER's own result, the
+/// mutating half of a run. It gates neither the report type, which
+/// `Applier::derive_report` still derives from `Applier` state alone, nor the
+/// results `sync` and its free `run` produce OUTSIDE this chain: their
+/// preflight returns `Err` before an `Applier` exists and before the engine
+/// transfers or removes any entry. That bounds the ENGINE, not the
+/// preparation, locking, and provisioning that surround it: those are stated
+/// where they live in `src/sync/apply.rs`'s module docs, and this entry does
+/// not restate them.
+/// `SourcePlan::confirm`/`fail_run` may attach the source-quiescence condition
+/// to this chain's result afterwards, and `sync`'s far-side liveness check may
+/// replace a clean result with a transport failure.
+#[must_use = "a run's steps outcome must travel through settle and reconciliation"]
+struct StepsRan(Result<()>);
+
+impl StepsRan {
+    fn new(result: Result<()>) -> Self {
+        Self(result)
+    }
+
+    /// THE one settle site: it runs on the success and the failure path,
+    /// because the phase it consumes carries both.
+    fn settle(self, applier: &mut Applier<'_, '_>) -> Settled {
+        let (settle_failures, verify_error) = applier.settle();
+        Settled {
+            steps: self,
+            settle_failures,
+            verify_error,
+        }
+    }
+}
+
+/// A run whose modes have been restored and re-verified, still owing the final
+/// residue reconciliation before the APPLIER's result can be assembled. It
+/// carries the steps outcome unchanged, so a failed run keeps its own error
+/// while the settle failures ride along.
+#[must_use = "a settled run must still be reconciled before it is reported"]
+struct Settled {
+    steps: StepsRan,
+    settle_failures: Vec<String>,
+    verify_error: Option<Error>,
+}
+
+impl Settled {
+    /// THE final reconciliation: confirm every residue candidate against the
+    /// disk BEFORE the report is derived, so "every named path still EXISTS"
+    /// holds by construction for every branch, present and future.
+    fn reconcile_residue(self, applier: &mut Applier<'_, '_>) -> Reconciled {
+        applier.reconcile_residue();
+        Reconciled(self)
+    }
+}
+
+/// A settled AND reconciled run: the only value `Reconciled::report` accepts,
+/// which is what makes the applier's post-transfer result reachable only
+/// through `settle` and `reconcile_residue`. It is NOT the only source of a
+/// `SyncReport` (`Applier::derive_report` derives one from whatever `Applier`
+/// state it is given), and `Reconciled::report` is not the only source of a
+/// `SyncResult` either: the preflight of `sync` and its free `run` returns
+/// `Err` before an `Applier` exists, `fail_run` wraps this chain's result
+/// afterwards, and `sync`'s far-side liveness check may replace a clean result
+/// with a transport failure.
+#[must_use = "a reconciled run must be reported"]
+struct Reconciled(Settled);
+
+impl Reconciled {
+    /// THE one place the APPLIER's `SyncResult` — report included — is
+    /// assembled, so no result `Applier::run` produces can have skipped
+    /// `settle` or `reconcile_residue`. It is not the only `SyncResult` a run
+    /// can return: the preflight of `sync` and its free `run` returns `Err`
+    /// before an `Applier` exists and before the engine transfers or removes
+    /// any entry. That bounds the ENGINE, not the preparation, locking, and
+    /// provisioning that surround it: those are stated where they live in
+    /// `src/sync/apply.rs`'s module docs, and this entry does not restate them.
+    /// After this returns,
+    /// `SourcePlan::confirm`/`fail_run` may attach the after-the-fact
+    /// source-quiescence condition without re-entering the chain, while
+    /// `sync`'s far-side liveness check may replace a clean result with a
+    /// transport failure.
+    fn report(self, applier: &mut Applier<'_, '_>) -> SyncResult {
+        let Settled {
+            steps: StepsRan(result),
+            settle_failures,
+            verify_error,
+        } = self.0;
+        let report = applier.derive_report();
         // Claim-rollback failures happened during the transfer; merge them with
         // the settle failures so a failed rollback is never swallowed.
-        let mut restore_failures = std::mem::take(&mut self.claim_failures);
+        let mut restore_failures = std::mem::take(&mut applier.claim_failures);
         restore_failures.extend(settle_failures);
         match result {
             Ok(()) => match verify_error {
@@ -4809,6 +4962,28 @@ impl Applier<'_, '_> {
                 })
             }
         }
+    }
+}
+
+impl Applier<'_, '_> {
+    fn run(&mut self) -> SyncResult {
+        // The run is a LINEAR chain of phase values: each phase consumes the
+        // previous one, so the `SyncResult` this returns — the applier's
+        // post-transfer result — cannot be produced without settling and
+        // reconciling, and a failed `run_steps` travels through those phases
+        // instead of returning early. The results this does NOT gate live
+        // outside it: the preflight of `sync` and its free `run` returns `Err`
+        // before an `Applier` exists and before the engine transfers or removes
+        // any entry. That bounds the ENGINE, not the preparation, locking, and
+        // provisioning that surround it: those are stated where they live in
+        // `src/sync/apply.rs`'s module docs, and this entry does not restate
+        // them. `fail_run` attaches the source-quiescence condition to this
+        // result afterwards, and `sync`'s far-side liveness check may replace
+        // a clean result with a transport failure.
+        StepsRan::new(self.run_steps())
+            .settle(self)
+            .reconcile_residue(self)
+            .report(self)
     }
 
     fn run_steps(&mut self) -> Result<()> {
@@ -9491,7 +9666,8 @@ fn root_relative_path() -> RootedRelativePath {
 /// on Unix the walk is confirmed to have described the pinned inode (see the
 /// module's root-pinning notes). For a destination the directory is CREATED
 /// just before the first mutation, so a sync whose every entry is refused
-/// creates nothing.
+/// creates no ROOT (the lock records and the transport's preparation residue are
+/// separate; see the module docs' write-footprint partition).
 struct LocalSide {
     root_path: PathBuf,
     /// Which side of the run this local tree is. Only a DESTINATION may have a

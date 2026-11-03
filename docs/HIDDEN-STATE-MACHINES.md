@@ -355,11 +355,38 @@ containment check → `report_extraneous` → `transfer` → `finalize` →
 then `verify(VerifyPass::PostSettle)`) → `reconcile_residue` →
 `derive_report` → source re-read.
 
-**Carrier.** The phase order and the `Applier` fields; there is no phase enum.
-What IS typed is the two verification moments (`VerifyPass::{PreSettle,
-PostSettle}`) and the removal gate: `verify` returns `PreSettleVerified`, and
-`remove_extraneous` takes it, so no destruction can precede the pass that
-authorises it.
+**Carrier.** The phase chain: three private values in `sync::apply` that each
+consume the one before them. `StepsRan` carries the `Result` of `run_steps` —
+it is constructed from BOTH arms, so a failed run has a value to travel in —
+`Settled` carries that result plus `settle`'s restore failures and post-settle
+verify error, and `Reconciled` carries the same after `reconcile_residue`.
+`Applier::run` is that chain, and the `SyncResult` it returns — report
+included — is assembled only in `Reconciled::report`, so the APPLIER's
+post-transfer result — the mutating half of a run — cannot be produced by a
+run of it that skipped `settle` or `reconcile_residue`, and a failed
+`run_steps` cannot return early. `derive_report` is still a private method
+that derives a `SyncReport` from whatever `Applier` state it is given — the
+tests call it directly on an applier that never ran a phase — so what the
+token gates is the applier chain's own result, not every `SyncReport`. The
+`Applier` fields are the run's record; the chain is its control flow.
+Separately typed: the two verification moments
+(`VerifyPass::{PreSettle, PostSettle}`) and the removal gate — `verify`
+returns `PreSettleVerified`, and `remove_extraneous` takes it, so no
+destruction can precede the pass that authorises it.
+
+Results reach the caller WITHOUT travelling that chain, all raised in `sync`
+(the entry point) and the free `run` function it drives. The PREFLIGHT can
+return `Err(SyncError::from(..))` BEFORE an `Applier` exists, and in that case
+the engine transfers or removes no entry. That bounds the ENGINE, not the
+preparation, locking, and provisioning that surround it: those are stated
+where they live in `src/sync/apply.rs`'s module docs, and this entry does not
+restate them. And after `applier.run()` returns,
+`SourcePlan::confirm` re-reads the source and
+`fail_run` attaches the after-the-fact source-quiescence condition to the
+applier's result — keeping its report and, on failure, its own error —
+without re-entering the chain. Last, `sync` checks the far-side lock session
+for liveness and, when the connection died mid-run, returns (or replaces the
+result with) a typed transport failure rather than a clean success.
 
 **Transitions.** A failure inside `run_steps` still runs `settle`, residue
 reconciliation, and report derivation. Removal runs only after transfers and
@@ -370,7 +397,23 @@ removed after it. The source is re-read after the run, by `SourcePlan::confirm`.
 **Watch.** The ordering is the safety property: transfer and verification
 complete before sanctioned destruction — now a requirement of the removal
 call's type rather than of two statements' order — and a failed run still
-accounts for what it mutated.
+accounts for what it mutated. The other two obligations are likewise typed,
+about the APPLIER's post-transfer result rather than about every report:
+`Reconciled::report` is the only place the APPLIER's post-transfer result —
+report included — is assembled, and it consumes a `Reconciled`, which only
+`Settled::reconcile_residue` produces, which only `StepsRan::settle` produces,
+so a run of the applier cannot return its own result before settling and
+reconciling, and a failed `run_steps` cannot return
+early — its `Err` travels through both phases. Outside the chain, and named
+so no reader infers it: the preflight of `sync` and its free `run` returns
+`Err` before an `Applier` exists and before any entry is transferred or
+removed; `SourcePlan::confirm` / `fail_run` may attach the after-the-fact
+source-quiescence condition to the
+applier's result without re-entering the chain; and `sync`'s far-side liveness
+check may replace a clean result with a transport failure. What the chain does
+not gate
+is the report type itself: `derive_report` derives one from whatever
+`Applier` state it is handed, which is how the tests call it.
 
 ### Mode journal
 
