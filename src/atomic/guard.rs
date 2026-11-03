@@ -2993,15 +2993,18 @@ mod tests {
             // the claim root and therefore permit residues.
             ("src/atomic/windows.rs", "remove_file", 7),
             ("src/atomic/windows.rs", "rename", 2),
-            // SIX production `remove_file` calls: FOUR are
-            // `durable_create_new`'s temp cleanup/unlink steps, and TWO are
-            // the compare-and-delete protocol's — the serialized
-            // read-compare-unlink and the ONE `Claimed::drop` that discards a
-            // claim aside. The count DROPPED from eight because the three
-            // hand-written claim-temp unlinks (verify-error, match-delete,
-            // restore-discard) became that single `Drop`; the claim spelling
-            // itself is unchanged.
-            ("src/transport/mod.rs", "remove_file", 6),
+            // FOUR production `remove_file` calls: TWO are
+            // `durable_create_new`'s temp lifecycle — the linear
+            // `CreateNewTemp`'s ONE `Drop` unlink (armed on every exit before
+            // the commit point) and the ONE best-effort release inside
+            // `CreateNewTemp::publish` — and TWO are the compare-and-delete
+            // protocol's: the serialized read-compare-unlink and the ONE
+            // `Claimed::drop` that discards a claim aside. The count DROPPED
+            // from six because the four hand-written create-new unlinks
+            // (create-error, verify-error, install-error, step 6) became those
+            // two — the same consolidation the claim temp went through; the
+            // temp spelling itself is unchanged.
+            ("src/transport/mod.rs", "remove_file", 4),
             ("src/transport/mod.rs", "rename", 1),
             ("src/transport/mod.rs", "hard_link", 1),
             ("src/transport/ssh/hostkey.rs", "remove_file", 1),

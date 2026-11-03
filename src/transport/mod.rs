@@ -1625,6 +1625,16 @@ impl CreateNewFault {
     }
 }
 
+/// The ONE construction of a one-shot stage-fault error — the text every
+/// injected [`CreateNewStep`] propagates. The stage is spelled by the enum's
+/// own `Debug`, so the message set is the stage set and no site can invent a
+/// fourth spelling.
+fn create_new_stage_fault(step: CreateNewStep) -> Error {
+    Error::transport(format!(
+        "test fault: create-new step {step:?} forced to fail (once)"
+    ))
+}
+
 /// The caller-chosen content-equivalence relation applied to an EXISTING
 /// entry during create-new verification: the create-new EEXIST path verifies
 /// the existing entry and the CALLER decides whether byte-exact equality is
@@ -1721,6 +1731,174 @@ pub(crate) struct CreateNewOptions<'a> {
     pub(crate) fault: Option<&'a CreateNewFault>,
 }
 
+/// The COMMIT-POINT outcome of [`CreateNewTemp::publish`]: the ONE
+/// `link(2)` either installed this attempt's inode under the destination name,
+/// or found a competitor's entry already holding that name. The temp is GONE
+/// in both cases, so no caller arm owns a cleanup obligation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Publish {
+    /// `link(2)` succeeded: the destination's inode IS the temp's inode, and
+    /// the temp NAME was released (best-effort) after the link.
+    Linked,
+    /// `link(2)` reported `EEXIST`: the destination already had a winner,
+    /// which is NEVER replaced — the caller verifies it
+    /// ([`verify_existing`]) — and the rejected candidate is already
+    /// discarded.
+    NameTaken,
+}
+
+/// The LOCAL create-new protocol's linear temp: the destination's unique
+/// dot-prefixed sibling name ([`crate::atomic::temp_name_for`]) plus the
+/// descriptor `create_new` opened.
+///
+/// LINEARITY IS THE CLEANUP. Every stage CONSUMES the value and hands it back,
+/// so reaching a later stage is proof every earlier one ran, and the value is
+/// DROPPED by any `?` or early `return` — including every injected
+/// [`CreateNewStep`] fault — and [`Drop`] unlinks the name. The exit paths of
+/// steps 1-4 therefore carry NO unlink of their own: a pre-publish failure
+/// cannot leave the temp behind.
+///
+/// The commit point TAKES THE NAME OUT ([`publish`](Self::publish) does it
+/// before the `link(2)`), which disarms [`Drop`] before anything is installed:
+/// the cleanup is then structurally incapable of unlinking a name after a
+/// commit. The post-link temp unlink is the explicit, best-effort step inside
+/// `publish`, because a cleanup failure must never turn a COMMITTED install
+/// into an error (a leftover temp is recognized residue —
+/// [`crate::atomic::is_crate_temp_name`] — never a torn record).
+struct CreateNewTemp {
+    /// `Some` while this invocation OWNS the temp name: `Drop` unlinks it.
+    /// Taken out at the commit point, after which the temp no longer has a
+    /// name this value may remove.
+    path: Option<PathBuf>,
+    /// The create-time handle, `Some` until the fsync stage completes: the
+    /// WRITE and the FSYNC address the inode `create_new` created, never a
+    /// name a concurrent actor could have re-spelled. The CHMOD stays the
+    /// crate's ONE path-based mode authority ([`crate::platform::chmod`]),
+    /// exactly as it was.
+    file: Option<std::fs::File>,
+}
+
+#[allow(clippy::disallowed_methods)]
+impl CreateNewTemp {
+    /// STEP 1 — CREATE: the crate's ONE bounded local temp name (the embedded
+    /// destination name is bounded to `NAME_MAX`, so a legal 255-byte
+    /// destination still has a usable temp), created NEW — `O_EXCL` never
+    /// truncates a stale temp a crashed controller left behind.
+    ///
+    /// A failed CREATE owns NO name: either the temp was never created or the
+    /// name belongs to another writer, so there is nothing to unlink and
+    /// `Drop` is never armed.
+    fn create(path: PathBuf) -> Result<Self> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Self {
+                path: Some(path),
+                file: Some(file),
+            }),
+            Err(e) => Err(Error::transport(format!("create {}: {e}", path.display()))),
+        }
+    }
+
+    /// The temp's own name — the ONE spelling this value may remove.
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("a live temp owns its name")
+    }
+
+    /// The temp's OWN create handle: the stages that write through it (the
+    /// byte write and the fsync) address the inode `O_EXCL` created, not a
+    /// name.
+    fn file(&mut self) -> &mut std::fs::File {
+        self.file
+            .as_mut()
+            .expect("a live temp holds its create-time handle")
+    }
+
+    /// STEP 2 — WRITE all bytes through the create-time descriptor.
+    fn write(mut self, data: &[u8]) -> Result<Self> {
+        use std::io::Write;
+        if let Err(e) = self.file().write_all(data) {
+            return Err(Error::transport(format!(
+                "write {}: {e}",
+                self.path().display()
+            )));
+        }
+        Ok(self)
+    }
+
+    /// STEP 3 — the FINAL MODE on the temp, BEFORE the fsync, so the published
+    /// inode carries the caller's mode, never the process umask.
+    fn chmod(self, mode: u32) -> Result<Self> {
+        if let Err(e) = crate::platform::chmod(self.path(), mode & 0o7777) {
+            return Err(Error::transport(format!(
+                "chmod {}: {e}",
+                self.path().display()
+            )));
+        }
+        Ok(self)
+    }
+
+    /// STEP 4 — file fsync: the temp's bytes and mode are durable. The
+    /// descriptor is closed here (it has no use past the fsync); the NAME is
+    /// still owned, so a failure in any later step still unlinks it.
+    fn fsync(mut self) -> Result<Self> {
+        let synced = self.file().sync_all();
+        drop(self.file.take());
+        if let Err(e) = synced {
+            return Err(Error::transport(format!(
+                "fsync {}: {e}",
+                self.path().display()
+            )));
+        }
+        Ok(self)
+    }
+
+    /// STEP 5 — the no-replace publish: `link(2)` the temp under `dest`.
+    ///
+    /// COMMIT: the name is TAKEN OUT BEFORE the link, so [`Drop`] is disarmed
+    /// at the commit point — nothing after it can unlink a name. `Ok(Linked)`
+    /// releases the temp name here (best-effort: the destination is committed,
+    /// so a cleanup failure is residue, never an install failure).
+    /// `Ok(NameTaken)` is the `EEXIST` conflict: the winner is NEVER replaced,
+    /// and this attempt's candidate is discarded here so the caller's
+    /// verify-only arm owns no cleanup. Any other link failure propagates.
+    fn publish(mut self, dest: &Path) -> Result<Publish> {
+        let path = self
+            .path
+            .take()
+            .expect("a live temp owns its name before the publish");
+        let linked = std::fs::hard_link(&path, dest);
+        // STEP 6 — the temp NAME is released in EVERY outcome: after a link it
+        // is a leftover spelling of a committed inode, on `EEXIST` it is a
+        // rejected candidate, and on any other failure it is a failed attempt.
+        let _ = std::fs::remove_file(&path);
+        match linked {
+            Ok(()) => Ok(Publish::Linked),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Publish::NameTaken),
+            Err(e) => Err(Error::transport(format!("install {}: {e}", dest.display()))),
+        }
+    }
+}
+
+impl Drop for CreateNewTemp {
+    /// The ONE structural cleanup: a temp that never reached the commit point
+    /// is unlinked here, so every `?`, every injected pre-publish fault, and a
+    /// plain drop clean up without an unlink at the exit site. Best-effort — a
+    /// cleanup failure is ignored exactly as the hand-written cleanups ignored
+    /// it, and a leftover temp is recognized residue, never a record. The
+    /// commit point takes the name out, so this can never unlink a name after
+    /// a publish.
+    #[allow(clippy::disallowed_methods)]
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// THE ONE CANONICAL CREATE-NEW PRIMITIVE — the durable install protocol for
 /// immutable records (commit markers, locks, the protocol marker, assignment
 /// and release records). Realized by [`LocalTransport::try_write_new`] on
@@ -1738,11 +1916,20 @@ pub(crate) struct CreateNewOptions<'a> {
 /// 5. **no-replace publish** — `link(2)` under the final name: `EEXIST` is
 ///    the conflict verdict (the winner is NEVER replaced), every other
 ///    failure propagates;
-/// 6. **unlink temp** — the temp name is removed (best-effort cleanup — the
+/// 6. **unlink temp** — the temp name is released (best-effort cleanup — a
+///    failure there never turns a committed install into an error; the
 ///    ERROR path propagates the REAL failure);
 /// 7. **parent-directory fsync** — the PARENT DIRECTORY is fsync'd (the step
 ///    the old code claimed but never performed) so the directory entry is
 ///    durable; a FAILED parent fsync is a propagated error.
+///
+/// Steps 1-4 hold the temp as the LINEAR [`CreateNewTemp`], so a
+/// pre-publish exit — each `?` and each injected [`CreateNewStep`] fault —
+/// drops it, and its `Drop` unlinks the name; none of those steps carries an
+/// unlink of its own. The commit point (step 5) takes the name out BEFORE the
+/// `link(2)`, so the cleanup cannot remove a name after a commit, and step 6's
+/// unlink is the explicit best-effort release of the temp's own spelling,
+/// performed by `publish` itself.
 ///
 /// Every state failure in every step PROPAGATES as an error — `Ok(Created)`
 /// therefore implies exact bytes (the fully-written inode), the final mode,
@@ -1764,8 +1951,10 @@ pub(crate) struct CreateNewOptions<'a> {
 /// This is a GUARDED mutation worker: its `guarded: GuardedRel<'_>` argument is
 /// the unforgeable capability `crate::atomic::guard` mints only after the
 /// reserved-spelling check passes, so the `std::fs` calls below are the
-/// funnel's own. The crate-root deny is relaxed for exactly this function; the
-/// count pin watches its call counts change.
+/// funnel's own. The crate-root deny is relaxed for exactly this function (and
+/// for the linear temp it drives, [`CreateNewTemp`] — a type private to this
+/// protocol, whose only callers are here); the count pin watches its call
+/// counts change.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn durable_create_new(
     base: &Path,
@@ -1773,83 +1962,52 @@ pub(crate) fn durable_create_new(
     data: &[u8],
     options: CreateNewOptions<'_>,
 ) -> Result<CreateNewVerdict> {
-    use std::io::Write;
-
     let p = base.join(guarded.as_path());
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
     }
-    // 1. create temp: the crate's ONE bounded local temp name inside the
-    //    destination directory (see [`crate::atomic::temp_name_for`]), with
-    //    create-new semantics (never truncates a stale temp a crashed
-    //    controller left behind). The embedded destination name is bounded to
-    //    `NAME_MAX`, so a legal 255-byte destination still has a usable temp.
-    let tmp = crate::atomic::temp_name_for(&p);
     let fail = |step: CreateNewStep| options.fault.is_some_and(|f| f.consume(step));
+    // 1. create temp — the crate's ONE bounded local temp name inside the
+    //    destination directory (see [`crate::atomic::temp_name_for`]), created
+    //    NEW. From here the temp is a LINEAR value: any `?` or early return
+    //    below drops it, and its `Drop` unlinks the name.
     if fail(CreateNewStep::CreateTemp) {
-        return Err(Error::transport(format!(
-            "test fault: create-new step {step:?} forced to fail (once)",
-            step = CreateNewStep::CreateTemp
-        )));
+        return Err(create_new_stage_fault(CreateNewStep::CreateTemp));
     }
-    let mut f = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(Error::transport(format!("create {}: {e}", tmp.display())));
-        }
-    };
+    let temp = CreateNewTemp::create(crate::atomic::temp_name_for(&p))?;
     // 2. write — all bytes.
     if fail(CreateNewStep::Write) {
-        return Err(Error::transport(format!(
-            "test fault: create-new step {step:?} forced to fail (once)",
-            step = CreateNewStep::Write
-        )));
+        return Err(create_new_stage_fault(CreateNewStep::Write));
     }
-    f.write_all(data)
-        .map_err(|e| Error::transport(format!("write {}: {e}", tmp.display())))?;
+    let temp = temp.write(data)?;
     // 3. final chmod — the FINAL MODE is applied to the temp BEFORE the
     //    fsync, so the published inode carries the caller's mode, never the
     //    process umask.
     if fail(CreateNewStep::Chmod) {
-        return Err(Error::transport(format!(
-            "test fault: create-new step {step:?} forced to fail (once)",
-            step = CreateNewStep::Chmod
-        )));
+        return Err(create_new_stage_fault(CreateNewStep::Chmod));
     }
-    crate::platform::chmod(&tmp, options.mode & 0o7777)
-        .map_err(|e| Error::transport(format!("chmod {}: {e}", tmp.display())))?;
+    let temp = temp.chmod(options.mode)?;
     // 4. file fsync — the temp file is durable.
     if fail(CreateNewStep::FileFsync) {
-        return Err(Error::transport(format!(
-            "test fault: create-new step {step:?} forced to fail (once)",
-            step = CreateNewStep::FileFsync
-        )));
+        return Err(create_new_stage_fault(CreateNewStep::FileFsync));
     }
-    f.sync_all()
-        .map_err(|e| Error::transport(format!("fsync {}: {e}", tmp.display())))?;
-    drop(f);
+    let temp = temp.fsync()?;
     // 5. no-replace publish — link(2) fails with EEXIST when a concurrent
     //    writer won; the winner is NEVER replaced. On EEXIST the existing
     //    entry is VERIFIED (verify-on-retry) through THE ONE CENTRALIZED
     //    lstat-based verification ([`verify_existing`] — a regular file with
     //    the EXACT required mode and the caller's accepted content
     //    equivalence → AlreadyPresent, the identical retry converges; every
-    //    other outcome → Conflict carrying the TYPED reason).
+    //    other outcome → Conflict carrying the TYPED reason). The publish is
+    //    the COMMIT: the temp name is gone when it returns, whatever the
+    //    outcome.
     if fail(CreateNewStep::Publish) {
-        return Err(Error::transport(format!(
-            "test fault: create-new step {step:?} forced to fail (once)",
-            step = CreateNewStep::Publish
-        )));
+        return Err(create_new_stage_fault(CreateNewStep::Publish));
     }
-    let verdict = match std::fs::hard_link(&tmp, &p) {
-        Ok(()) => CreateNewVerdict::Created,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+    let verdict = match temp.publish(&p)? {
+        Publish::Linked => CreateNewVerdict::Created,
+        Publish::NameTaken => {
             // The DESCRIPTOR-BOUND verification (the LOCAL side opens with
             // `O_NOFOLLOW` — a symlink at the destination makes the open
             // fail with ELOOP → NotRegularFile{Symlink}, so a symlink is
@@ -1859,7 +2017,7 @@ pub(crate) fn durable_create_new(
             // from the same opened inode) and the shared verdict
             // construction.
             let p2 = p.clone();
-            let verified = verify_existing(
+            verified_to_verdict(verify_existing(
                 || {
                     open_verify_local(
                         &p2,
@@ -1870,29 +2028,21 @@ pub(crate) fn durable_create_new(
                 data,
                 options.mode,
                 options.content,
-            );
-            match verified {
-                Ok(v) => verified_to_verdict(v),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(e);
-                }
-            }
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(Error::transport(format!("install {}: {e}", p.display())));
+            )?)
         }
     };
-    // 6. unlink temp — remove ONLY the temp this invocation created
-    //    (best-effort cleanup; the REAL failure above already propagated).
+    // 6. unlink temp — the unlink ITSELF already happened inside the publish
+    //    (structurally for every pre-publish exit, explicitly and
+    //    best-effort for the commit). The stage keeps its SEAM: the one-shot
+    //    `Unlink` fault fires HERE, after the commit and before the parent
+    //    fsync, exactly where the hand-written sequence propagated it — so the
+    //    faulted attempt still reports an `Err` over a COMMITTED destination.
+    //    What changed is only that the temp it used to leave beside the
+    //    destination is now already gone: the state the seam manufactured is
+    //    unrepresentable, not merely unobserved.
     if fail(CreateNewStep::Unlink) {
-        return Err(Error::transport(format!(
-            "test fault: create-new step {step:?} forced to fail (once)",
-            step = CreateNewStep::Unlink
-        )));
+        return Err(create_new_stage_fault(CreateNewStep::Unlink));
     }
-    let _ = std::fs::remove_file(&tmp);
     // 7. parent-directory fsync — the step the old code CLAIMED but never
     //    performed: fsync the PARENT DIRECTORY so the published directory
     //    entry survives a crash. FAIL-CLOSED: a failed open OR a failed
@@ -1906,10 +2056,7 @@ pub(crate) fn durable_create_new(
     ) && let Some(parent) = p.parent()
     {
         if fail(CreateNewStep::ParentFsync) {
-            return Err(Error::transport(format!(
-                "test fault: create-new step {step:?} forced to fail (once)",
-                step = CreateNewStep::ParentFsync
-            )));
+            return Err(create_new_stage_fault(CreateNewStep::ParentFsync));
         }
         let dir = std::fs::File::open(parent)
             .map_err(|e| Error::transport(format!("open dir {}: {e}", parent.display())))?;
@@ -5360,6 +5507,114 @@ mod tests {
             Just(CreateNewScenario::FailAt(CreateNewStep::Unlink)),
             Just(CreateNewScenario::FailAt(CreateNewStep::ParentFsync)),
         ]
+    }
+
+    /// EVERY pre-install fault stage leaves NO temp behind, and the
+    /// destination is exactly what that stage is allowed to leave: the linear
+    /// temp's `Drop` unlinks it on every exit before the publish, and the
+    /// publish releases the temp name itself.
+    ///
+    /// MEASURED ON THE HAND-WRITTEN SEQUENCE THIS REPLACES: FIVE of the six
+    /// stages failed this assertion. `Write`, `Chmod`, `FileFsync`, and
+    /// `Publish` returned through an early `Err` with the created temp still in
+    /// the destination directory, and `Unlink` (the cleanup step's OWN seam)
+    /// propagated after the link with the temp left beside the committed
+    /// destination. Only `CreateTemp` was clean, because it fails before the
+    /// temp exists.
+    ///
+    /// The `Unlink` seam is POST-COMMIT (the `link(2)` already installed the
+    /// record, exactly as before): it must still propagate the fault, and the
+    /// committed destination must survive it byte- and mode-exact. Every
+    /// earlier stage never reaches the link, so its destination directory must
+    /// be EMPTY — no destination and no temp under ANY spelling.
+    ///
+    /// The leak check is a SHAPE check, not a literal path comparison:
+    /// [`crate::atomic::temp_name_for`] mints a FRESH process-counter value on
+    /// every call, so the temp this primitive created is not the name a second
+    /// call in a test would spell. The crate's ONE temp-shape authority,
+    /// [`crate::atomic::is_crate_temp_name`], is what any leftover temp
+    /// spelling is recognized by (it is also what the recovery sweep uses), so
+    /// "no `temp_name_for` sibling remains" is asserted through it and
+    /// reinforced by the exact directory listing.
+    #[cfg(unix)]
+    #[test]
+    fn create_new_pre_install_fault_stages_leave_no_temp() {
+        const DATA: &[u8] = b"{\"generation\":7}";
+        const MODE: u32 = 0o644;
+        for step in [
+            CreateNewStep::CreateTemp,
+            CreateNewStep::Write,
+            CreateNewStep::Chmod,
+            CreateNewStep::FileFsync,
+            CreateNewStep::Publish,
+            CreateNewStep::Unlink,
+        ] {
+            let dir =
+                crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+            let root = dir.path().to_path_buf();
+            let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
+            let dest = root.join(rel.as_path());
+
+            let fault = CreateNewFault::new(step);
+            let err = durable_create_new(
+                &root,
+                guarded(&rel),
+                DATA,
+                CreateNewOptions {
+                    mode: MODE,
+                    content: ContentEquivalence::Exact,
+                    fault: Some(&fault),
+                },
+            )
+            .expect_err("every injected stage fault must propagate as Err");
+            assert!(
+                err.to_string().contains("forced to fail (once)"),
+                "{step:?}: the injected fault must be the propagated failure, got: {err}"
+            );
+
+            // The destination directory holds exactly the entries this stage
+            // may leave — and NONE of them may be a temp under ANY spelling.
+            let mut left: Vec<String> = std::fs::read_dir(dest.parent().unwrap())
+                .expect("the destination directory must be readable")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            for name in &left {
+                assert!(
+                    !crate::atomic::is_crate_temp_name(name),
+                    "{step:?} left the create-new temp {name} behind"
+                );
+            }
+            if step == CreateNewStep::Unlink {
+                assert_eq!(
+                    left,
+                    vec!["record.bin".to_string()],
+                    "the post-commit Unlink seam must leave ONLY the committed destination"
+                );
+                assert_eq!(
+                    std::fs::read(&dest).expect("the committed install must be readable"),
+                    DATA,
+                    "the post-commit Unlink seam must not disturb the committed bytes"
+                );
+                let meta = std::fs::metadata(&dest).unwrap();
+                assert_eq!(
+                    meta.permissions().mode() & 0o7777,
+                    MODE,
+                    "the post-commit Unlink seam must not disturb the installed mode"
+                );
+            } else {
+                assert!(
+                    left.is_empty(),
+                    "{step:?} is a pre-install stage: the destination directory must hold nothing \
+                     (no destination, no temp), but it holds: {left:?}"
+                );
+                assert!(
+                    std::fs::symlink_metadata(&dest).is_err(),
+                    "{step:?} must never install the destination"
+                );
+            }
+        }
     }
 
     #[cfg(test)]
