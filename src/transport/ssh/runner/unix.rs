@@ -9,8 +9,7 @@ use crate::transport::runner::{
 };
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 /// The Unix spawn: the child becomes its OWN process-group leader
@@ -74,11 +73,6 @@ pub(crate) fn spawn(
     // a bare `Child`'s own `Drop` would neither wait nor kill.
     let child: Arc<Mutex<Option<OwnedChild>>> =
         Arc::new(Mutex::new(Some(OwnedChild::new(child, Arc::new(RealKill)))));
-    // The typed "the child has already been reaped" fact the runner's deadline
-    // path reads to tell a deadline kill from a drain that merely gave up on a
-    // completed command. Armed the instant `try_wait` consumes the exit
-    // status, before the bounded post-exit drain begins.
-    let reaped = Arc::new(AtomicBool::new(false));
     let kill_child = child.clone();
     let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
         let mut guard = kill_child.lock().unwrap();
@@ -92,7 +86,16 @@ pub(crate) fn spawn(
         // child-runner): graceful TERM first, then — after the shared
         // grace — an escalated KILL, so a child that ignores TERM (and
         // any grandchild in the group) still dies.
-        let pgid = owned.child.id() as i32;
+        //
+        // The direct-child fallback goes through `live_child()`: once the
+        // wait thread has consumed the exit status the handle is
+        // unreachable, so a pid the OS recycled after the reap can never
+        // be signalled.
+        let direct = |owned: &mut OwnedChild| match owned.live_child() {
+            Some(child) => child.kill(),
+            None => Ok(()),
+        };
+        let pgid = owned.pid() as i32;
         match kill_process_group(pgid, libc::SIGTERM) {
             Ok(()) => {
                 std::thread::sleep(TERM_TO_KILL_GRACE);
@@ -104,21 +107,26 @@ pub(crate) fn spawn(
                     // The escalated group kill failed: fall back to the
                     // OWNED handle so the direct child still dies and the
                     // join reaps it; the failure is surfaced.
-                    Err(e) => owned.child.kill().or(Err(e)),
+                    Err(e) => direct(owned).or(Err(e)),
                 }
             }
             // The group is already gone (the child exited, or escaped via
             // setsid): fall back to the OWNED handle so a live direct
             // child is still terminated.
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => owned.child.kill(),
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => direct(owned),
             // A real group-kill failure: fall back to the owned handle so
             // the direct child still dies (the join then reaps it), and
             // surface the failure.
-            Err(e) => owned.child.kill().or(Err(e)),
+            Err(e) => direct(owned).or(Err(e)),
         }
     });
     let wait_child = child.clone();
-    let wait_reaped = reaped.clone();
+    // The deadline fact: the wait closure flips it to `Reaped` the instant it
+    // consumes the exit status — BEFORE the bounded drain — so a deadline that
+    // fires during the drain finds a child that had already exited and returns
+    // the closure's real result instead of fabricating a timeout.
+    let status: Arc<WaitStatusCell> = Arc::new(WaitStatusCell::new(WaitStatus::Running));
+    let wait_status_cell = status.clone();
     // Own the argv for the wait closure: the bounded-drain violation message
     // names the command (the local runner's `{argv:?}` wording).
     let argv = argv.to_vec();
@@ -131,14 +139,17 @@ pub(crate) fn spawn(
     // reading stdin mid-upload therefore blocks only until the deadline,
     // never indefinitely, and — crucially — the blocked write does not
     // pin the child out of the slot, so the deadline can still kill it.
-    let wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send> =
-        Box::new(move || {
+    let wait: WaitClosure = Box::new(move |tx: mpsc::Sender<WaitResult>| {
+        // The body below keeps its early-return (`?`) shape; EVERY exit —
+        // success, drain violation, wait error — still ends in exactly one
+        // result delivery.
+        let body = move || -> WaitResult {
             use std::io::Write;
             let mut stdin_pipe = wait_child
                 .lock()
                 .unwrap()
                 .as_mut()
-                .and_then(|c| c.child.stdin.take());
+                .and_then(|c| c.take_stdin());
             // Write the payload FIRST, saving any error: `?` here would
             // return BEFORE the child is collected — a write error (EPIPE
             // after the deadline kill, or a hung-remote pipe) would leave
@@ -174,20 +185,21 @@ pub(crate) fn spawn(
                     let owned = guard
                         .as_mut()
                         .expect("the wait thread is the sole consumer of the child slot");
-                    drained += drain_available(&mut owned.child.stdout, &mut stdout)
+                    drained += drain_available(owned.stdout_mut(), &mut stdout)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    drained += drain_available(&mut owned.child.stderr, &mut stderr)
+                    drained += drain_available(owned.stderr_mut(), &mut stderr)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    match owned.child.try_wait() {
+                    match owned.try_wait() {
                         Ok(Some(status)) => {
-                            // `try_wait` consumed the exit status: the child
-                            // is reaped, so mark the handle collected (never
-                            // signal the released pid) and arm the typed
-                            // deadline fact before the drain begins.
-                            let mut taken =
-                                guard.take().expect("the slot was occupied a moment ago");
-                            taken.mark_reaped();
-                            wait_reaped.store(true, Ordering::SeqCst);
+                            // `try_wait` consumed the exit status: the child is
+                            // REAPED and the handle's lifecycle is `Reaped`, so
+                            // nothing can signal the released pid. Record that in
+                            // the shared deadline fact BEFORE the bounded drain
+                            // begins, so the runner can tell "the child exited,
+                            // only the drain is still running" from "the child
+                            // was still running at the deadline".
+                            record_reap(&wait_status_cell);
+                            let taken = guard.take().expect("the slot was occupied a moment ago");
                             exited = Some((taken, status));
                         }
                         Ok(None) => {}
@@ -204,7 +216,7 @@ pub(crate) fn spawn(
                     // [`KILL_REAP_BOUND`] and the violation is reported, never a
                     // silent clean outcome.
                     let stdout_drain =
-                        drain_to_eof(&mut owned.child.stdout, &mut stdout, KILL_REAP_BOUND)
+                        drain_to_eof(owned.stdout_mut(), &mut stdout, KILL_REAP_BOUND)
                             .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     if matches!(stdout_drain, DrainState::BoundExpired) {
                         return Err(RunError::Background(format!(
@@ -212,7 +224,7 @@ pub(crate) fn spawn(
                         )));
                     }
                     let stderr_drain =
-                        drain_to_eof(&mut owned.child.stderr, &mut stderr, KILL_REAP_BOUND)
+                        drain_to_eof(owned.stderr_mut(), &mut stderr, KILL_REAP_BOUND)
                             .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     if matches!(stderr_drain, DrainState::BoundExpired) {
                         return Err(RunError::Background(format!(
@@ -260,10 +272,14 @@ pub(crate) fn spawn(
                 }
                 Ok(()) => wait_res,
             }
-        });
+        };
+        // Exactly ONE result per wait, whatever the body returned: the
+        // channel always carries the closure's real result.
+        let _ = tx.send(body());
+    });
     Ok(SpawnedChild {
         pid,
-        reaped,
+        status,
         kill,
         wait,
     })
@@ -308,6 +324,40 @@ mod real_seam_tests {
             out.stdout.len(),
             BYTES,
             "the whole read must be drained, not a truncated prefix"
+        );
+        assert!(out.status.success());
+    }
+
+    /// The pipe-holder case: the child EXITS (its exit status is consumed and
+    /// the shared status records `Reaped`) while a process that outlived it
+    /// still holds the output pipe, so the wait closure's real result — the
+    /// bounded drain's outcome — only arrives AFTER the caller's deadline. The
+    /// runner must NOT kill (the child had already exited: a kill could only
+    /// land on a survivor, not on the command the deadline was bounding) and
+    /// must return the command's REAL result, never a fabricated timeout: a
+    /// deadline that outlasts a completed command does not flip its outcome.
+    ///
+    /// The backgrounded subshell is the pipe holder: it inherits the child's
+    /// stdout, outlives the direct child, and writes its line a second later.
+    /// A runner that reported a timeout (or killed) after the reap would TERM
+    /// the group before the write and lose the line.
+    #[test]
+    fn a_pipe_holder_that_outlives_the_child_is_drained_after_reaped() {
+        let runner = real_runner(Duration::from_millis(300));
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            // The direct child exits at once; the subshell keeps the inherited
+            // stdout open for a second and then writes the marker line.
+            "(sleep 1; echo drained) & exit 0".to_string(),
+        ];
+        let out = runner
+            .run(OpKind::Remote, &argv, None, None)
+            .expect("a child that exited before the deadline must return its real result");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "drained",
+            "the bounded drain must collect the survivor's output after `Reaped`"
         );
         assert!(out.status.success());
     }

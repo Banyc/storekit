@@ -54,14 +54,6 @@ pub(crate) fn exec(
     let child = cmd
         .spawn()
         .map_err(|e| RunError::Spawn(format!("spawn {argv:?}: {e}")))?;
-    let pid = child.id();
-    // The parent records the pid synchronously at spawn time — before the
-    // timeout clock starts — so tests can assert the pid is gone after the
-    // outcome without a child-written pidfile (which would race the
-    // deadline kill).
-    if let Some(observer) = &config.spawn_observer {
-        observer(pid);
-    }
     // The platform-neutral [`OwnedChild`] backstop: every early error return
     // below drops this handle, whose `Drop` terminates and reaps the child.
     // A bare `std::process::Child`'s own `Drop` neither waits nor kills, so
@@ -69,11 +61,19 @@ pub(crate) fn exec(
     // live child. On Windows the group kill is a no-op — only the DIRECT child
     // is terminated, the documented weaker guarantee of this port.
     let mut child = OwnedChild::new(child, config.kill.clone());
+    let pid = child.pid();
+    // The parent records the pid synchronously at spawn time — before the
+    // timeout clock starts — so tests can assert the pid is gone after the
+    // outcome without a child-written pidfile (which would race the
+    // deadline kill).
+    if let Some(observer) = &config.spawn_observer {
+        observer(pid);
+    }
     // Reader threads: drain stdout/stderr to EOF (the pipes EOF when the
     // child — and any descendant that kept them — dies). Each thread sends
     // its buffer on a channel; the main loop collects them bounded.
-    let stdout_rx = spawn_reader(child.child.stdout.take());
-    let stderr_rx = spawn_reader(child.child.stderr.take());
+    let stdout_rx = spawn_reader(child.stdout_mut().take());
+    let stderr_rx = spawn_reader(child.stderr_mut().take());
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -82,7 +82,9 @@ pub(crate) fn exec(
     // child is reaped by the final `wait`). On timeout, terminate the OWNED
     // child (TerminateProcess); every kill failure is recorded.
     loop {
-        match child.child.try_wait() {
+        // `try_wait` records the status it consumes: from the reap on the
+        // lifecycle is `Reaped`, so nothing can reach the handle to signal it.
+        match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(e) => return Err(RunError::Wait(format!("wait {argv:?}: {e}"))),
@@ -91,8 +93,11 @@ pub(crate) fn exec(
         if !timed_out && now >= deadline {
             timed_out = true;
             // Terminate the OWNED child. No process group: a background
-            // descendant survives.
-            if let Err(e) = config.kill.kill_owned(&mut child.child) {
+            // descendant survives. The handle is reachable only while the
+            // child is LIVE (a reaped child's pid may already be recycled).
+            if let Some(live) = child.live_child()
+                && let Err(e) = config.kill.kill_owned(live)
+            {
                 kill_error = Some(format!("kill child {pid}: {e}"));
             }
         }

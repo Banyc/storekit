@@ -13,7 +13,6 @@ use super::*;
 use crate::transport::runner::{OwnedChild, RealKill};
 use std::io::Read;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -35,7 +34,6 @@ pub(crate) fn spawn(
         cmd.stdin(Stdio::piped());
     }
     let child = cmd.spawn()?;
-    let pid = child.id();
     // The child is shared EXCLUSIVELY between the runner's deadline path
     // and the wait thread through this slot (the same discipline as the
     // Unix seam): the wait thread polls `try_wait` with the slot locked and
@@ -53,12 +51,11 @@ pub(crate) fn spawn(
     // `Drop` neither waits nor kills. On Windows the backstop terminates only
     // the DIRECT child — a background descendant survives, the documented
     // weaker guarantee of this port.
-    let child: Arc<Mutex<Option<OwnedChild>>> =
-        Arc::new(Mutex::new(Some(OwnedChild::new(child, Arc::new(RealKill)))));
-    // The typed "the child has already been reaped" fact the runner's deadline
-    // path reads to tell a deadline kill from a drain that merely gave up on a
-    // completed command (see `SpawnedChild::reaped`).
-    let reaped = Arc::new(AtomicBool::new(false));
+    let owned = OwnedChild::new(child, Arc::new(RealKill));
+    // The pid is read off the OWNED handle synchronously at spawn time — the
+    // parent's own number, so the child never has to write a pidfile.
+    let pid = owned.pid();
+    let child: Arc<Mutex<Option<OwnedChild>>> = Arc::new(Mutex::new(Some(owned)));
     let kill_child = child.clone();
     let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
         let mut guard = kill_child.lock().unwrap();
@@ -68,19 +65,33 @@ pub(crate) fn spawn(
             return Ok(());
         };
         // No process groups on Windows: terminate the OWNED child
-        // (TerminateProcess). A background descendant survives.
-        owned.child.kill()
+        // (TerminateProcess). A background descendant survives. The handle is
+        // reachable only while the child is LIVE: once the wait thread has
+        // consumed the exit status the lifecycle is `Reaped` and `live_child`
+        // yields nothing, so a pid the OS recycled after the reap can never be
+        // signalled.
+        match owned.live_child() {
+            Some(child) => child.kill(),
+            None => Ok(()),
+        }
     });
     let wait_child = child.clone();
-    let wait_reaped = reaped.clone();
-    let wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send> =
-        Box::new(move || {
+    // The deadline fact: the wait closure flips it to `Reaped` the instant it
+    // consumes the exit status — BEFORE the reader buffers are collected — so
+    // a deadline that fires afterwards finds a child that had already exited
+    // and returns the closure's real result instead of fabricating a timeout.
+    let status: Arc<WaitStatusCell> = Arc::new(WaitStatusCell::new(WaitStatus::Running));
+    let wait_status_cell = status.clone();
+    let wait: WaitClosure = Box::new(move |tx: mpsc::Sender<WaitResult>| {
+        // The body below keeps its early-return shape; EVERY exit still ends
+        // in exactly one result delivery.
+        let body = move || -> WaitResult {
             use std::io::Write;
             let mut stdin_pipe = wait_child
                 .lock()
                 .unwrap()
                 .as_mut()
-                .and_then(|c| c.child.stdin.take());
+                .and_then(|c| c.take_stdin());
             // Write the payload FIRST, saving any error (the same
             // collect-before-surface discipline as the Unix seam).
             let write_res = match (&stdin, stdin_pipe.as_mut()) {
@@ -92,11 +103,11 @@ pub(crate) fn spawn(
             // Windows): they read to EOF and send the buffer on a channel.
             let stdout_rx = {
                 let mut guard = wait_child.lock().unwrap();
-                spawn_reader(guard.as_mut().and_then(|c| c.child.stdout.take()))
+                spawn_reader(guard.as_mut().and_then(|c| c.stdout_mut().take()))
             };
             let stderr_rx = {
                 let mut guard = wait_child.lock().unwrap();
-                spawn_reader(guard.as_mut().and_then(|c| c.child.stderr.take()))
+                spawn_reader(guard.as_mut().and_then(|c| c.stderr_mut().take()))
             };
             // Poll loop: `try_wait` with the slot locked; when the child
             // exits the slot is consumed (reaped) and the reader buffers
@@ -108,21 +119,26 @@ pub(crate) fn spawn(
                     let c = guard
                         .as_mut()
                         .expect("the wait thread is the sole consumer of the child slot");
-                    match c.child.try_wait() {
+                    match c.try_wait() {
                         Ok(Some(status)) => {
+                            // `try_wait` consumed the exit status and moved the
+                            // handle to `Reaped`: record that in the shared
+                            // deadline fact BEFORE the reader buffers are
+                            // collected (the bounded drain), so the runner can
+                            // tell "the child exited" from "the child was still
+                            // running at the deadline".
+                            record_reap(&wait_status_cell);
                             exited = guard.take().map(|c| (c, status));
                         }
                         Ok(None) => {}
                         Err(e) => return Err(RunError::Wait(format!("wait: {e}"))),
                     }
                 }
-                if let Some((mut owned, status)) = exited {
-                    // The child is reaped; mark the handle collected (never
-                    // signal the released pid) and arm the typed deadline fact
-                    // before the reader buffers are collected. Its handles are
-                    // closed, so the reader threads EOF and send their buffers.
-                    owned.mark_reaped();
-                    wait_reaped.store(true, Ordering::SeqCst);
+                if let Some((_owned, status)) = exited {
+                    // The child is REAPED and the handle cannot be signalled;
+                    // `Reaped` was announced above. Its handles are closed, so
+                    // the reader threads EOF and send their buffers. The taken
+                    // handle is dropped here.
                     let stdout = stdout_rx
                         .recv()
                         .map_err(|_| RunError::Wait("stdout reader failed".into()))?;
@@ -165,10 +181,13 @@ pub(crate) fn spawn(
                 }
                 Ok(()) => wait_res,
             }
-        });
+        };
+        // Exactly ONE result per wait, whatever the body returned.
+        let _ = tx.send(body());
+    });
     Ok(SpawnedChild {
         pid,
-        reaped,
+        status,
         kill,
         wait,
     })

@@ -10,7 +10,6 @@
 
 use crate::env::SysEnv;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -139,14 +138,68 @@ pub(crate) fn leftover_pipe_note(leftover_pipes: &Option<String>) -> String {
     }
 }
 
+/// The child's reap lifecycle as a typed shared FACT: the one thing the
+/// deadline path needs to know about the wait closure's progress.
+///
+/// `Reaped` means the exit status was consumed, so a child that exits but
+/// whose pipes a survivor keeps open has provably EXITED before its bounded
+/// drain gives up: the deadline did not interrupt the command, and its real
+/// result — never a fabricated `Timeout` — is what must be returned. The wait
+/// closure flips the status the instant it reaps, BEFORE the bounded drain;
+/// the fake seam flips it synchronously in `spawn` for the already-reaped
+/// scenarios, so that premise never depends on wait-thread scheduling.
+///
+/// It is only the deadline HINT; the result still travels on the wait channel.
+/// A `Running` read at the deadline classifies the outcome as a timeout even
+/// though the closure may reap a moment later — the documented rule, since the
+/// deadline fired while the child was still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitStatus {
+    Running,
+    Reaped,
+}
+
+/// The shared cell: written by the wait closure (and, in the fake seam,
+/// synchronously at spawn) and read once by the deadline path.
+type WaitStatusCell = std::sync::Mutex<WaitStatus>;
+
+/// The wait closure's real result, delivered on the runner's channel after the
+/// bounded drain. The status cell is only the deadline HINT; THIS is the
+/// authority every caller returns.
+type WaitResult = std::result::Result<std::process::Output, RunError>;
+
+/// The bounded-drain closure the wait thread runs: it records [`WaitStatus`]
+/// when it consumes the exit status and delivers exactly one [`WaitResult`] on
+/// the channel.
+type WaitClosure = Box<dyn FnOnce(std::sync::mpsc::Sender<WaitResult>) + Send>;
+
+/// Read the deadline fact. The fact is a plain enum with no invariant a panic
+/// could break, so a poisoned lock still reports the truth instead of
+/// escalating into another panic.
+fn wait_status(status: &WaitStatusCell) -> WaitStatus {
+    *status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record that the child's exit status was consumed. Called by the wait
+/// closure the instant it reaps — BEFORE the bounded drain — so a deadline
+/// that fires during the drain reads `Reaped` and returns the real result.
+fn record_reap(status: &WaitStatusCell) {
+    *status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = WaitStatus::Reaped;
+}
+
 /// A spawned child owned by one supervisor. The runner keeps the EXCLUSIVE
 /// handle to the live child — its `kill` requests the kill on the OWNED
 /// [`std::process::Child`] (never a detached pid) — and a reaping closure the
-/// wait thread runs. The closure returns once the child exits — including
-/// after a kill request — so the runner's join is a deterministic reap. Once
-/// the wait thread has reaped the child the handle is CONSUMED: a kill on it
-/// is a no-op by construction, so a pid the OS recycled to an unrelated
-/// process can never be signalled.
+/// wait thread runs. The closure records [`WaitStatus::Reaped`] as soon as the
+/// child's exit status is consumed and delivers its single result when it
+/// returns, so the runner's join is a deterministic reap. Once the wait thread
+/// has reaped the child the handle is CONSUMED: a kill on it is a no-op by
+/// construction, so a pid the OS recycled to an unrelated process can never
+/// be signalled.
 struct SpawnedChild {
     /// The child's pid, known to the PARENT synchronously at spawn time: the
     /// real seam reads it off the owned [`std::process::Child`] immediately
@@ -156,14 +209,14 @@ struct SpawnedChild {
     /// pid to a file (a child-written pidfile races the kill: the child can
     /// be killed before it writes).
     pid: u32,
-    /// Set by the wait closure the instant the child has been REAPED (its exit
-    /// status consumed), before the bounded post-exit drain begins. The
-    /// runner's deadline path reads it to tell the two cases that produce the
-    /// `-1` sentinel once the drain is bounded: the child was still RUNNING
-    /// when the deadline fired (killed), or it had already EXITED and only its
-    /// bounded post-exit drain gave up. A typed fact, never re-derived from a
-    /// message.
-    reaped: Arc<AtomicBool>,
+    /// The deadline-visible fact, updated by the wait closure the instant the
+    /// exit status is consumed, BEFORE the bounded drain. The fake seam sets
+    /// it synchronously in `spawn` where the old atomic was set, so the test
+    /// premise stays deterministic: a deadline that fires after the child was
+    /// reaped reads `Reaped` here regardless of how the scheduler interleaves
+    /// the wait thread, instead of sometimes observing a still-running child
+    /// and fabricating a `Timeout` for a command that had already exited.
+    status: Arc<WaitStatusCell>,
     /// Request the force-kill of the live child (SIGKILL on the owned
     /// handle). A no-op once the wait thread has reaped the child. The real
     /// seam locks the child slot shared with the wait thread and calls
@@ -171,11 +224,14 @@ struct SpawnedChild {
     /// against its own per-child control block.
     kill: Box<dyn Fn() -> std::io::Result<()> + Send>,
     /// Drain stdout/stderr and wait for the child; must return promptly once
-    /// the child exits (or is killed). ALWAYS reaps the child before
-    /// returning an error: a saved stdin-write error is surfaced only AFTER
-    /// the child was collected, so an error can never leave the child
+    /// the child exits (or is killed). Records `Reaped` in [`Self::status`]
+    /// right after consuming the exit status and then delivers exactly one
+    /// result on the channel — the status is only the deadline hint, the
+    /// channel still carries the real result. ALWAYS reaps the child before
+    /// the error is delivered: a saved stdin-write error is surfaced only
+    /// AFTER the child was collected, so an error can never leave the child
     /// uncollected (no return-before-reap).
-    wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send>,
+    wait: WaitClosure,
 }
 
 /// The subprocess seam behind [`SshRunner`]. The production implementation
@@ -348,13 +404,14 @@ impl SshRunner {
             .spawn(op, argv, stdin.map(<[u8]>::to_vec))
             .map_err(|e| RunError::Spawn(format!("spawn {:?}: {e}", argv)))?;
         // Split the owned handle into the kill request (the deadline path)
-        // and the wait closure (the wait thread). The kill and the wait share
-        // the child EXCLUSIVELY through the seam's handle, so the deadline
-        // path can kill while the wait thread is mid-wait and a kill after
-        // the wait has reaped the child is a no-op by construction.
+        // and the wait closure (the wait thread), plus the shared status the
+        // closure flips when it consumes the exit status. The kill and the
+        // wait share the child EXCLUSIVELY through the seam's handle, so the
+        // deadline path can kill while the wait thread is mid-wait and a kill
+        // after the wait has reaped the child is a no-op by construction.
         let SpawnedChild {
             pid,
-            reaped,
+            status,
             kill,
             wait,
         } = child;
@@ -369,42 +426,33 @@ impl SshRunner {
             observer(pid);
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let res = wait();
-            let _ = tx.send(res);
-        });
+        let handle = std::thread::spawn(move || wait(tx));
         match rx.recv_timeout(deadline) {
-            Ok(Ok(out)) => {
-                // Success: the wait thread reaped the child (its poll loop
-                // collected it) and sent the output. Join so the thread — and
-                // therefore the child's collection — is complete before we
-                // return.
+            Ok(res) => {
+                // The wait thread finished (reaped the child, drained, and
+                // delivered its result). Join so the thread — and therefore
+                // the child's collection — is complete before we return.
                 let _ = handle.join();
-                Ok(out)
-            }
-            Ok(Err(e)) => {
-                // The wait closure already reaped the child before returning
-                // the error (a saved stdin-write error is surfaced only after
-                // the child was collected), and the join collects the thread —
-                // so an error path never leaves an uncollected child either.
-                let _ = handle.join();
-                Err(e)
+                res
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if reaped.load(Ordering::SeqCst) {
-                    // The child had ALREADY EXITED when the deadline fired:
-                    // the deadline did not interrupt the command, it only
-                    // outlasted the bounded post-exit drain. Do NOT kill (the
-                    // handle is consumed — a kill is a no-op) and do NOT
-                    // report a timeout: collect the closure's REAL result. The
-                    // closure is bounded (the drain gives up at
-                    // [`crate::transport::runner::KILL_REAP_BOUND`]), so this
-                    // wait terminates, and the outcome for the same command no
-                    // longer flips between Timeout and Background depending on
-                    // the deadline. Because the child is reaped, `Background`
-                    // here always means "the command exited and a process that
-                    // outlived it held its pipes open", never "the command was
-                    // killed".
+                // The deadline fired: the shared status is the authority on
+                // what it interrupted.
+                if wait_status(&status) == WaitStatus::Reaped {
+                    // The exit status was consumed BEFORE the deadline fired,
+                    // so the deadline did not interrupt the command — it only
+                    // outlasted it (or its bounded output drain, which is
+                    // still running because a survivor holds a pipe open).
+                    // The handle is consumed, so a kill could only reach a
+                    // survivor: do NOT kill and do NOT report a timeout —
+                    // collect the closure's REAL result. This receive is
+                    // bounded by the closure's own post-exit drain bound
+                    // ([`crate::transport::runner::KILL_REAP_BOUND`]), not by
+                    // the caller's deadline: once the child has exited, the
+                    // deadline no longer decides the outcome. Because the
+                    // child is reaped first, `Background` here always means
+                    // "the command exited and a process that outlived it held
+                    // its pipes open", never "the command was killed".
                     let res = rx.recv().unwrap_or_else(|_| {
                         Err(RunError::Wait(
                             "the wait thread exited without a result".to_string(),
@@ -424,9 +472,9 @@ impl SshRunner {
                 // handle is a no-op by construction.
                 let _ = kill();
                 let _ = handle.join();
-                // The wait thread has now finished and queued its result: if
-                // it reported a pipe-holding process (the bounded drain gave
-                // up after the kill), carry that actionable fact into the
+                // The wait thread has now finished and delivered its result:
+                // if it reported a pipe-holding process (the bounded drain
+                // gave up after the kill), carry that actionable fact into the
                 // timeout. The outcome classification is the deadline kill —
                 // the leftover is secondary.
                 let leftover_pipes = match rx.try_recv() {
@@ -480,7 +528,7 @@ mod runner_property_tests {
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Instant;
 
     /// The stall point each generated operation must exhibit.
@@ -549,13 +597,14 @@ mod runner_property_tests {
         /// thread is a live waiter while the deadline races it.
         Wait,
         /// The child has ALREADY exited and been reaped when the runner holds
-        /// it, and the fake's wait closure then blocks BEFORE returning the
-        /// completion. For a self-completing stall the fake records the reap
-        /// in `spawn`, before the runner's deadline clock starts, so the
-        /// premise "the deadline fired after the reap" is deterministic; a
-        /// deadline reached in this window finds the reaped handle consumed
-        /// and a kill is a no-op — join-before-kill, the barrier property's
-        /// window reached via delay injection.
+        /// it, and the fake's wait closure then blocks BEFORE delivering the
+        /// result. For a self-completing stall the fake flips the shared
+        /// status to `Reaped` in `spawn`, before the runner's deadline clock
+        /// starts, so the premise "the deadline fired after the reap" is
+        /// deterministic; a deadline reached in this window reads `Reaped`,
+        /// finds the reaped handle consumed, and a kill is a no-op —
+        /// join-before-kill, the barrier property's window reached via delay
+        /// injection.
         AfterReap,
     }
 
@@ -723,16 +772,13 @@ mod runner_property_tests {
     struct ChildCtl {
         pid: u32,
         killed: AtomicBool,
-        /// Set the instant the wait has collected the child: from then on a
-        /// kill request on this handle is a NO-OP — the fake's mirror of the
-        /// real runner's consumed `Child` handle.
-        reaped: AtomicBool,
-        /// The same "the child has been reaped" fact the runner's deadline
-        /// path reads (the fake's mirror of `SpawnedChild::reaped`): armed the
-        /// instant the exit status is consumed, BEFORE the completion is
-        /// delivered, so the deadline path can tell "killed a running child"
-        /// from "the child had already exited".
-        collected: Arc<AtomicBool>,
+        /// The shared deadline fact (see [`WaitStatus`]): the fake's mirror of
+        /// the real seam's exit-status-consumed lifecycle. `Reaped` from the
+        /// instant the child was collected, so a kill request on this handle
+        /// is a NO-OP (the real runner's consumed `Child` handle) and the
+        /// deadline path reads the real result instead of fabricating a
+        /// timeout.
+        status: Arc<WaitStatusCell>,
         stall: Stall,
         /// Whether the op pipes a stdin payload: the write-error stall is
         /// meaningful only when there is something to write (the upload op).
@@ -760,11 +806,34 @@ mod runner_property_tests {
     }
 
     impl ChildCtl {
+        /// Record the single reap: flip the shared status to `Reaped` and, only
+        /// if it was still `Running`, push the log entry. A child already
+        /// reaped at spawn (the deterministic `AfterReap` premise — see
+        /// [`FakeSeam::spawn`]) therefore keeps that single entry. Returns
+        /// whether the status was flipped here.
+        fn reap_once(&self) -> bool {
+            {
+                let mut status = self
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *status == WaitStatus::Reaped {
+                    return false;
+                }
+                *status = WaitStatus::Reaped;
+            }
+            self.state.push(LogEntry::Reap { pid: self.pid });
+            true
+        }
+
         /// The wait closure body: finish immediately (Complete / NonZero /
         /// vacuous StdinWriteError), block until killed (Hang), or fail AFTER
-        /// the reap (StdinWriteError with a payload / WaitError); the caller
-        /// records the single reap and returns the stubbed output or error.
-        fn wait(&self) -> std::result::Result<std::process::Output, RunError> {
+        /// the reap (StdinWriteError with a payload / WaitError / Background);
+        /// the caller records the single reap and returns the stubbed output or
+        /// error. It flips the shared status to `Reaped` as soon as the exit
+        /// status is consumed and then delivers exactly one result — mirroring
+        /// the real seam's protocol.
+        fn wait(&self, tx: std::sync::mpsc::Sender<WaitResult>) {
             self.state.live_waiters.fetch_add(1, Ordering::SeqCst);
             // Injected scheduler delay at the WAIT stage: the wait thread is a
             // live waiter while the deadline races it — a delay inside the
@@ -774,26 +843,26 @@ mod runner_property_tests {
                 self.injected_delay();
             }
             let res = self.wait_inner();
-            // The child is fully reaped now — and the reaped flag is armed
+            // The child is fully reaped now — and the shared status is flipped
             // BEFORE the Reap becomes observable, so from the moment the log
             // shows the reap a kill request on this handle is a no-op (the
-            // real runner's consumed-handle no-op). The barrier parks the wait
-            // AFTER the reap but BEFORE the completion notification — the
-            // window the pid-reuse test exploits; only that test sets it.
+            // real runner's consumed-handle no-op) AND the runner's deadline
+            // path reads `Reaped` — the same order the real seam keeps
+            // (status first, then the bounded drain). The barrier parks the
+            // wait AFTER the reap but BEFORE the result — the window the
+            // pid-reuse test exploits; only that test sets it.
             //
             // EXACTLY ONE Reap is recorded per child: an `AfterReap`
             // self-completing child was already reaped at spawn (the
             // deterministic deadline-after-reap premise — see
-            // `FakeSeam::spawn`), so the `swap` keeps that single entry.
-            if !self.reaped.swap(true, Ordering::SeqCst) {
-                self.collected.store(true, Ordering::SeqCst);
-                self.state.push(LogEntry::Reap { pid: self.pid });
-            }
+            // `FakeSeam::spawn`), so `reap_once` keeps that single entry.
+            self.reap_once();
             // Injected scheduler delay at the AFTER-REAP stage: the child is
-            // reaped but the completion has not been delivered — a deadline
-            // reached in this window makes the runner's kill a no-op on the
-            // consumed handle (join-before-kill), the delay-probe mirror of
-            // the pid-reuse barrier.
+            // reaped but the result has not been delivered — a deadline
+            // reached in this window reads `Reaped`, so the runner does NOT
+            // kill (a kill on the consumed handle is a no-op) and returns the
+            // closure's real result; the delay-probe mirror of the pid-reuse
+            // barrier.
             if self.delay_at == DelayAt::AfterReap {
                 self.injected_delay();
             }
@@ -801,7 +870,7 @@ mod runner_property_tests {
             if let Some(barrier) = &self.after_reap_barrier {
                 barrier.wait();
             }
-            res
+            let _ = tx.send(res);
         }
 
         /// Inject the configured scheduler delay. `Tiny`/`None` sleep their
@@ -822,9 +891,10 @@ mod runner_property_tests {
                     let _ = self.deadline.wait(PAST_DELAY_FALLBACK);
                 }
                 // A `Past` delay at the AFTER-REAP stage cannot use the
-                // latch: the child is already reaped, so the runner does NOT
-                // kill (it waits for the closure's real result). A real sleep
-                // past the deadline still exercises the window.
+                // latch: the shared status already reads `Reaped`, so the
+                // runner does NOT kill (it waits for the closure's real
+                // result). A real sleep past the deadline still exercises the
+                // window.
                 DelaySize::Past => std::thread::sleep(self.delay),
                 DelaySize::None | DelaySize::Tiny => std::thread::sleep(self.delay),
             }
@@ -863,11 +933,11 @@ mod runner_property_tests {
                     }
                     assert!(
                         self.killed.load(Ordering::SeqCst),
-                        "stalled child {} was never killed: ctl={:?} killed={} reaped={} — runner must kill then reap on deadline",
+                        "stalled child {} was never killed: ctl={:?} killed={} status={:?} — runner must kill then reap on deadline",
                         self.pid,
                         (self as *const ChildCtl as usize),
                         self.killed.load(Ordering::SeqCst),
-                        self.reaped.load(Ordering::SeqCst),
+                        wait_status(&self.status),
                     );
                     Ok(output(0))
                 }
@@ -893,11 +963,11 @@ mod runner_property_tests {
                     Err(RunError::Wait("simulated wait failure".to_string()))
                 }
                 Stall::Background => {
-                    // The child exited and was reaped (the caller records the
-                    // single Reap — including the `reaped`/`collected` flags),
-                    // but the bounded post-exit drain gave up: the fake's
-                    // mirror of the real Unix seam's pipe-holding leftover.
-                    // The deadline never killed the child.
+                    // The child exited and was reaped (the caller flips the
+                    // shared status to `Reaped` before delivering this
+                    // result), but the bounded post-exit drain gave up: the
+                    // fake's mirror of the real Unix seam's pipe-holding
+                    // leftover. The deadline never killed the child.
                     Err(RunError::Background(
                         "command left processes holding its output pipes open".to_string(),
                     ))
@@ -980,8 +1050,7 @@ mod runner_property_tests {
             Arc::new(ChildCtl {
                 pid,
                 killed: AtomicBool::new(false),
-                reaped: AtomicBool::new(false),
-                collected: Arc::new(AtomicBool::new(false)),
+                status: Arc::new(WaitStatusCell::new(WaitStatus::Running)),
                 // Benign: the reused child's wait never runs in the test.
                 stall: Stall::Complete,
                 has_stdin: false,
@@ -1018,11 +1087,11 @@ mod runner_property_tests {
             if self.stall == Stall::SpawnError {
                 return Err(std::io::Error::other("simulated spawn failure"));
             }
+            let status: Arc<WaitStatusCell> = Arc::new(WaitStatusCell::new(WaitStatus::Running));
             let ctl = Arc::new(ChildCtl {
                 pid,
                 killed: AtomicBool::new(false),
-                reaped: AtomicBool::new(false),
-                collected: Arc::new(AtomicBool::new(false)),
+                status: status.clone(),
                 stall: self.stall,
                 has_stdin: stdin.is_some(),
                 keyscan_line: self.keyscan_line.clone(),
@@ -1035,30 +1104,28 @@ mod runner_property_tests {
             });
             // DETERMINISTIC deadline-after-reap premise. The `AfterReap`
             // placement models a child that has already exited and been reaped
-            // when the runner's deadline path inspects `reaped`: the wait
-            // closure then blocks past the deadline and the runner must return
-            // the closure's REAL result, never a fabricated `Timeout`. A
-            // child that exits on its own is therefore reaped HERE — before
-            // `spawn` returns and before the runner starts its deadline
-            // clock — so the premise holds however the scheduler interleaves
-            // the wait thread. Recording the reap in the wait closure instead
-            // would make the premise a RACE against the (2 ms) deadline: a
-            // descheduled wait thread loses it, the runner correctly observes
-            // a not-yet-reaped child and takes the documented kill path, and
-            // the deadline-after-reap assertion fails for a scheduling reason
-            // rather than a runner defect. `Hang` is excluded: a hung child
-            // exists only until the runner kills it, so it cannot be reaped
-            // before the deadline.
+            // when the runner's deadline fires: the wait closure then blocks
+            // past the deadline and the runner must return the closure's REAL
+            // result, never a fabricated `Timeout`. A child that exits on its
+            // own is therefore reaped HERE — the shared status is flipped to
+            // `Reaped` and the single Reap is logged before `spawn` returns and
+            // before the runner starts its deadline clock — so the premise
+            // holds however the scheduler interleaves the wait thread. Recording
+            // the reap in the wait closure instead would make the premise a
+            // RACE against the (2 ms) deadline: a descheduled wait thread loses
+            // it, the runner correctly observes a still-running child and takes
+            // the documented kill path, and the deadline-after-reap assertion
+            // fails for a scheduling reason rather than a runner defect.
+            // `Hang` is excluded: a hung child exists only until the runner
+            // kills it, so it cannot be reaped before the deadline.
             if self.delay_at == DelayAt::AfterReap && self.stall != Stall::Hang {
-                ctl.reaped.store(true, Ordering::SeqCst);
-                ctl.collected.store(true, Ordering::SeqCst);
-                self.state.push(LogEntry::Reap { pid });
+                ctl.reap_once();
             }
             // The kill handle: the runner's deadline path requests the kill
             // through THIS handle — never through a detached pid — and the
             // fake records it against the same child the wait reaps. On a
-            // child the wait already reaped (its reaped flag is armed) it is
-            // a NO-OP: nothing is recorded, so the log stays proof that a
+            // child the wait already reaped (the shared status reads `Reaped`)
+            // it is a NO-OP: nothing is recorded, so the log stays proof that a
             // reaped child is never killed.
             let kill_ctl = ctl.clone();
             let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
@@ -1068,7 +1135,7 @@ mod runner_property_tests {
                 // check: the dead-handle (join-before-kill) case must arm it
                 // too, and the fake records no kill for it.
                 kill_ctl.deadline.arm();
-                if kill_ctl.reaped.load(Ordering::SeqCst) {
+                if wait_status(&kill_ctl.status) == WaitStatus::Reaped {
                     return Ok(());
                 }
                 // Injected scheduler delay at the KILL stage: the runner has
@@ -1082,13 +1149,10 @@ mod runner_property_tests {
                 Ok(())
             });
             let wait_ctl = ctl;
-            let wait_reaped = wait_ctl.collected.clone();
-            let wait: Box<
-                dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send,
-            > = Box::new(move || wait_ctl.wait());
+            let wait: WaitClosure = Box::new(move |tx: mpsc::Sender<WaitResult>| wait_ctl.wait(tx));
             Ok(SpawnedChild {
                 pid,
-                reaped: wait_reaped,
+                status,
                 kill,
                 wait,
             })
@@ -1978,14 +2042,25 @@ mod runner_property_tests {
         // child-written pidfile.
         let SpawnedChild {
             pid,
-            reaped: _,
+            status,
             kill,
             wait,
         } = child;
-        let out = std::thread::spawn(wait)
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || wait(tx))
             .join()
-            .unwrap()
+            .expect("the wait thread must not panic");
+        // The wait closure delivers its single real result on the channel…
+        let out = rx
+            .recv()
+            .expect("a promptly-completing child must deliver its result")
             .expect("a promptly-completing child must reap normally");
+        // … and the shared status records that the exit status was consumed.
+        assert_eq!(
+            wait_status(&status),
+            WaitStatus::Reaped,
+            "a collected child must record its reap in the shared status"
+        );
         assert_eq!(
             out.status.code(),
             Some(7),
@@ -2032,10 +2107,7 @@ mod runner_property_tests {
         let child = platform::spawn(&env, OpKind::Exec, &argv, None)
             .expect("the real seam must spawn the child");
         let SpawnedChild {
-            pid,
-            reaped: _,
-            kill,
-            wait,
+            pid, kill, wait, ..
         } = child;
         // Abandon the handle: drop both Arcs without ever invoking the wait
         // closure, exactly as an early `?`-return inside the wait closure
@@ -2123,9 +2195,10 @@ mod runner_property_tests {
     /// closure's REAL result — never a deadline `Timeout`. This is the property
     /// half of the `-1`-meaning fix: a deadline that did not interrupt a
     /// running command is not a timeout. The premise is deterministic: the fake
-    /// records the reap in `spawn` (before the runner's deadline clock starts)
-    /// and the wait closure blocks past the deadline only then, so this branch
-    /// is exercised on every run regardless of scheduler load.
+    /// flips the shared status to `Reaped` in `spawn` (before the runner's
+    /// deadline clock starts) and the wait closure blocks past the deadline
+    /// only then, so this branch is exercised on every run regardless of
+    /// scheduler load.
     fn deadline_fires_after_reap(stall: Stall, at: DelayAt, size: DelaySize) -> bool {
         size == DelaySize::Past
             && at == DelayAt::AfterReap
@@ -2190,12 +2263,13 @@ mod runner_property_tests {
             );
         }
         if deadline_fires_after_reap(stall, at, size) {
-            // The premise is now deterministic: the fake records the reap in
-            // `spawn`, before the runner's deadline clock starts, so the
-            // runner must observe `reaped` and take the reaped path — a
-            // recorded kill would prove the premise did not hold (the child
-            // was not yet reaped at the deadline) and the classification
-            // below would be asserting a scheduling accident.
+            // The premise is now deterministic: the fake flips the shared
+            // status to `Reaped` in `spawn`, before the runner's deadline
+            // clock starts, so the runner must read `Reaped` and return the
+            // closure's real result — a recorded kill would prove the premise
+            // did not hold (the child was not yet reaped at the deadline) and
+            // the classification below would be asserting a scheduling
+            // accident.
             assert!(
                 state.kill_pids().is_empty(),
                 "the deadline fired after the reap, so no kill may be recorded ({label}): {:?}",
@@ -2304,13 +2378,10 @@ mod runner_property_tests {
             .spawn(OpKind::Exec, &argv, None)
             .expect("the fake must spawn the stalling child");
         // Split the handle exactly as the runner does: the kill request (the
-        // deadline path) and the wait closure (the wait thread). The pid is
-        // the parent's own, read synchronously at spawn.
+        // deadline path), the wait closure (the wait thread) and the shared
+        // status. The pid is the parent's own, read synchronously at spawn.
         let SpawnedChild {
-            pid,
-            reaped: _,
-            kill,
-            wait,
+            pid, kill, wait, ..
         } = child;
 
         // The runner's deadline path: request the kill through the OWNED
@@ -2319,7 +2390,8 @@ mod runner_property_tests {
 
         // The wait thread reaps the child, then parks on the barrier (reaped
         // but not yet completed).
-        let waiter = std::thread::spawn(wait);
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || wait(tx));
         // Same generous backstop as the fake Hang loop: under the FULL gate's
         // parallel load the wait thread can be descheduled for seconds after
         // the kill — the budget only needs to catch a genuinely stuck wait.
@@ -2378,12 +2450,14 @@ mod runner_property_tests {
             "the reused-pid spawn must be the last recorded event"
         );
 
-        // Release the reaped waiter and collect it.
+        // Release the reaped waiter and collect its single result.
         barrier.wait();
-        waiter
-            .join()
-            .expect("the wait thread must finish")
+        waiter.join().expect("the wait thread must finish");
+        let out = rx
+            .recv()
+            .expect("the reaped child must deliver its result")
             .expect("the reaped child returns its output");
+        assert_eq!(out.status.code(), Some(0));
         assert_eq!(state.live_waiters(), 0);
     }
 

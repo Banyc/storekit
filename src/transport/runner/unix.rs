@@ -277,7 +277,7 @@ pub(crate) fn exec(
         .spawn()
         .map_err(|e| RunError::Spawn(format!("spawn {argv:?}: {e}")))?;
     let mut owned = OwnedChild::new(child, config.kill.clone());
-    let pid = owned.child.id();
+    let pid = owned.pid();
     let pgid = pid as i32;
     // The parent records the pid synchronously at spawn time — before the
     // timeout clock starts — so tests can assert the pid is gone after
@@ -289,8 +289,8 @@ pub(crate) fn exec(
     // Non-blocking pipe read ends: the wait loop drains without blocking
     // and the post-reap EOF drain is bounded — a grandchild that keeps a
     // pipe open can never hang the outcome.
-    set_nonblocking(&mut owned.child.stdout).map_err(|e| RunError::Wait(e.to_string()))?;
-    set_nonblocking(&mut owned.child.stderr).map_err(|e| RunError::Wait(e.to_string()))?;
+    set_nonblocking(owned.stdout_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
+    set_nonblocking(owned.stderr_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
 
     let deadline = Instant::now() + timeout;
     let mut stdout: Vec<u8> = Vec::new();
@@ -312,9 +312,9 @@ pub(crate) fn exec(
         // `chunk / 1 ms` no matter how fast the link is. A silent child (no
         // progress) yields to the scheduler so the loop does not busy-spin.
         let mut drained = 0usize;
-        drained += drain_available(&mut owned.child.stdout, &mut stdout)
+        drained += drain_available(owned.stdout_mut(), &mut stdout)
             .map_err(|e| RunError::Wait(e.to_string()))?;
-        drained += drain_available(&mut owned.child.stderr, &mut stderr)
+        drained += drain_available(owned.stderr_mut(), &mut stderr)
             .map_err(|e| RunError::Wait(e.to_string()))?;
         if child_exited_unreaped(pid).map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))? {
             break;
@@ -357,8 +357,12 @@ pub(crate) fn exec(
             if since >= config.term_to_kill_grace * 2 && !sent_owned {
                 sent_owned = true;
                 // Last-resort direct kill on the OWNED handle: catches a
-                // child that escaped its group (e.g. setsid).
-                if let Err(e) = config.kill.kill_owned(&mut owned.child) {
+                // child that escaped its group (e.g. setsid). The handle is
+                // reachable only while the child is LIVE, so a reaped child
+                // (whose pid the OS may have recycled) is never signalled.
+                if let Some(child) = owned.live_child()
+                    && let Err(e) = config.kill.kill_owned(child)
+                {
                     kill_error = Some(format!("kill child {pid}: {e}"));
                 }
             }
@@ -463,7 +467,7 @@ pub(crate) fn exec(
     // (`setsid` AND closed descriptors) is outside the contract (see the
     // module doc) — commands must not daemonize.
     let drain_bound = config.reap_bound;
-    let stdout_drain = drain_to_eof(&mut owned.child.stdout, &mut stdout, drain_bound)
+    let stdout_drain = drain_to_eof(owned.stdout_mut(), &mut stdout, drain_bound)
         .map_err(|e| RunError::Wait(e.to_string()))?;
     if matches!(stdout_drain, DrainState::BoundExpired) {
         return Err(RunError::Background(format!(
@@ -471,7 +475,7 @@ pub(crate) fn exec(
                  commands are foreground-only"
         )));
     }
-    let stderr_drain = drain_to_eof(&mut owned.child.stderr, &mut stderr, drain_bound)
+    let stderr_drain = drain_to_eof(owned.stderr_mut(), &mut stderr, drain_bound)
         .map_err(|e| RunError::Wait(e.to_string()))?;
     if matches!(stderr_drain, DrainState::BoundExpired) {
         return Err(RunError::Background(format!(

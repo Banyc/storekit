@@ -106,7 +106,7 @@
 
 use crate::env::SysEnv;
 use std::path::PathBuf;
-use std::process::{Child, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -215,6 +215,22 @@ const DROP_KILL_SIGNAL: i32 = libc::SIGKILL;
 #[cfg(windows)]
 const DROP_KILL_SIGNAL: i32 = 0;
 
+/// A child's lifecycle as a VALUE: `Live` until the single reap consumes its
+/// exit status, `Reaped(status)` from then on. The variant — not a bare
+/// boolean beside the handle — is what makes "signal after the reap"
+/// unrepresentable: the only way a caller outside this type reaches the
+/// [`Child`] is [`OwnedChild::live_child`], which is `None` in the `Reaped`
+/// state, and the exit status is carried with the state instead of being
+/// discarded.
+#[derive(Debug)]
+pub(crate) enum ChildLifecycle {
+    /// The child has not been reaped: it is running or an uncollected zombie.
+    Live,
+    /// The child's exit status was consumed by the single reap. The pid is
+    /// released: nothing may signal it again.
+    Reaped(ExitStatus),
+}
+
 /// An owned child with a drop backstop, shared by BOTH real runners AND both
 /// platforms so the "every error path leaves no uncollected child" contract
 /// has ONE implementation. The local runner owns one directly; the SSH
@@ -225,26 +241,31 @@ const DROP_KILL_SIGNAL: i32 = 0;
 ///
 /// The handle is shared EXCLUSIVELY between a runner's deadline/kill path and
 /// its wait path. A child that exited is consumed by [`OwnedChild::wait`] (or
-/// marked with [`OwnedChild::mark_reaped`] when the reap already happened
-/// through `try_wait`), after which nothing may signal anything (a pid the OS
-/// recycled after the reap can never be hit — the drop backstop returns early,
-/// a guard with no reachable trigger on any runner path and therefore witnessed
-/// DIRECTLY by `a_reaped_owned_child_is_never_signalled_by_the_drop_backstop`).
+/// by [`OwnedChild::try_wait`], which records the status it consumed), and the
+/// [`ChildLifecycle`] moves to `Reaped` — after which no caller can reach the
+/// handle at all (`live_child()` is `None`) and the drop backstop returns
+/// early, so a signal after the reap is unrepresentable (a pid the OS recycled
+/// after the reap can never be hit). The guard has no reachable trigger on any
+/// runner path and is therefore witnessed DIRECTLY by
+/// `a_reaped_owned_child_is_never_signalled_by_the_drop_backstop`.
 ///
 /// The backstop's GROUP kill is a no-op on Windows (no process groups), so
 /// there it terminates the direct child only and reaps it, with the SAME
 /// one-authority backstop shape.
 pub(crate) struct OwnedChild {
-    /// The owned child. `pub(crate)` so a seam's wait closure can drain its
-    /// pipes and poll it; the handle is never signalled directly on Unix — the
-    /// kill path goes through [`KillSeam`] / `killpg` so a group, not a bare
-    /// pid, is signalled.
-    pub(crate) child: Child,
+    /// The owned child, PRIVATE to this type: the seams drain its pipes and
+    /// poll it through the accessors below, and reach the handle for a direct
+    /// signal only through [`OwnedChild::live_child`], so the handle of a
+    /// reaped child is unreachable. It is never signalled directly on Unix —
+    /// the kill path goes through [`KillSeam`] / `killpg` so a group, not a
+    /// bare pid, is signalled.
+    child: Child,
     kill: Arc<dyn KillSeam>,
-    /// Set once the exit status is consumed (or the OS has already reaped the
-    /// child): from then on nothing may signal anything (a pid the OS recycled
-    /// after the reap can never be hit — the drop backstop returns early).
-    reaped: bool,
+    /// LIVE until the single reap consumes the exit status, `Reaped(status)`
+    /// from then on: from the reap on nothing may signal anything (a pid the
+    /// OS recycled after the reap can never be hit — the drop backstop returns
+    /// early).
+    lifecycle: ChildLifecycle,
 }
 
 impl OwnedChild {
@@ -257,30 +278,90 @@ impl OwnedChild {
         OwnedChild {
             child,
             kill,
-            reaped: false,
+            lifecycle: ChildLifecycle::Live,
         }
     }
 
-    /// Reap the child (a blocking wait on an already-exited zombie returns
-    /// immediately with its status) and mark the handle reaped: from here on
-    /// nothing may signal anything — the pid is released by this call.
-    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        let st = self.child.wait()?;
-        self.reaped = true;
-        Ok(st)
+    /// The live child handle, or `None` once the exit status was consumed.
+    /// This is the ONLY route from outside this type to the [`Child`]: a
+    /// reaped child's handle cannot be reached, so it cannot be signalled.
+    pub(crate) fn live_child(&mut self) -> Option<&mut Child> {
+        match self.lifecycle {
+            ChildLifecycle::Live => Some(&mut self.child),
+            ChildLifecycle::Reaped(_) => None,
+        }
     }
 
-    /// Mark the handle collected after a `try_wait`/`waitid` peek ALREADY
-    /// reaped the child, so the kill and drop backstops never signal the
-    /// released pid.
-    pub(crate) fn mark_reaped(&mut self) {
-        self.reaped = true;
+    /// The child's pid, known to the parent synchronously at spawn time. Still
+    /// readable after the reap: it is a recorded number, not a handle, and
+    /// nothing in this crate signals it (every kill goes through
+    /// [`KillSeam`] with either the group id of a LIVE child or
+    /// [`OwnedChild::live_child`]'s handle).
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Take the stdin write end (the wait closure writes the payload from
+    /// inside itself, without holding the child slot).
+    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// The stdout read end, for the running-phase and bounded post-exit
+    /// drains. Available in BOTH lifecycle states: the post-exit drain runs
+    /// after the reap, when the child's own write end is already closed.
+    pub(crate) fn stdout_mut(&mut self) -> &mut Option<ChildStdout> {
+        &mut self.child.stdout
+    }
+
+    /// The stderr read end, for the running-phase and bounded post-exit
+    /// drains (see [`OwnedChild::stdout_mut`]).
+    pub(crate) fn stderr_mut(&mut self) -> &mut Option<ChildStderr> {
+        &mut self.child.stderr
+    }
+
+    /// Poll the child WITHOUT blocking. A `Some(status)` consumes the exit
+    /// status, so the lifecycle moves `Live` → `Reaped(status)` in this call:
+    /// the kernel released the pid and nothing may signal it again. On a
+    /// handle that is already `Reaped`, the recorded status is reported again
+    /// (the handle is never polled), exactly as [`Child::try_wait`] reports a
+    /// status it already consumed.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if let ChildLifecycle::Reaped(status) = self.lifecycle {
+            return Ok(Some(status));
+        }
+        match self.child.try_wait()? {
+            Some(status) => {
+                self.lifecycle = ChildLifecycle::Reaped(status);
+                Ok(Some(status))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Reap the child — the SINGLE blocking reap (on an already-exited zombie
+    /// it returns immediately with its status) — and record the status in the
+    /// lifecycle: from here on nothing may signal anything, because the pid is
+    /// released by this call. On a handle that is already `Reaped`, the
+    /// recorded status is returned and the child is NOT waited on again.
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        if let ChildLifecycle::Reaped(status) = self.lifecycle {
+            return Ok(status);
+        }
+        let status = self.child.wait()?;
+        self.lifecycle = ChildLifecycle::Reaped(status);
+        Ok(status)
+    }
+
+    /// Whether the single reap already happened (the lifecycle is `Reaped`).
+    pub(crate) fn is_reaped(&self) -> bool {
+        matches!(self.lifecycle, ChildLifecycle::Reaped(_))
     }
 }
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if self.reaped {
+        if self.is_reaped() {
             return;
         }
         // Final backstop: never abandon a live child. Kill the whole group
@@ -294,8 +375,9 @@ impl Drop for OwnedChild {
         let _ = self.kill.kill_owned(&mut self.child);
         let budget = Instant::now() + DROP_REAP_BOUND;
         while Instant::now() < budget {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                self.reaped = true;
+            // `try_wait` records the status it consumes, so a successful
+            // backstop reap leaves the lifecycle `Reaped` as well.
+            if let Ok(Some(_)) = self.try_wait() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -1038,33 +1120,33 @@ mod tests {
             .expect("spawn a child in its own process group")
     }
 
-    /// WITNESS for the `if self.reaped { return; }` guard in
+    /// WITNESS for the `if self.is_reaped() { return; }` guard in
     /// [`OwnedChild::drop`].
     ///
     /// The guard protects against signalling a pid the OS RECYCLED after the
-    /// reap: [`OwnedChild::wait`] (and [`OwnedChild::mark_reaped`]) release the
-    /// pid, and a `killpg`/`kill` on the released number could land on an
-    /// unrelated process. The state it guards is therefore UNREACHABLE by
-    /// design on the runner's own paths — every path signals only BEFORE the
-    /// reap — so no reachable-path test can cover it; this test pins the guard
-    /// DIRECTLY, through the module's own reap path, and asserts the drop
-    /// backstop does NOT signal.
+    /// reap: [`OwnedChild::wait`] (like [`OwnedChild::try_wait`]) moves the
+    /// lifecycle to [`ChildLifecycle::Reaped`] and releases the pid, and a
+    /// `killpg`/`kill` on the released number could land on an unrelated
+    /// process. The state it guards is therefore UNREACHABLE by design on the
+    /// runner's own paths — every path signals only BEFORE the reap — so no
+    /// reachable-path test can cover it; this test pins the guard DIRECTLY,
+    /// through the module's own reap path, and asserts the drop backstop does
+    /// NOT signal.
     ///
-    /// The REAPED arm calls [`OwnedChild::wait`] (chosen over `mark_reaped`
-    /// because it consumes the exit status, so the pid is really reaped, not
-    /// merely declared so) and drops the handle: the recording seam must record
-    /// NO group kill and NO direct kill. The CONTROL arm drops an UN-REAPED
-    /// handle with the same fixture: it must record exactly one group kill (the
-    /// drop signal) and one direct kill, proving the silence above is the
-    /// guard's doing and not the seam's. Deleting the guard makes the REAPED
-    /// arm's assertions fail.
+    /// The REAPED arm calls [`OwnedChild::wait`] (it consumes the exit status,
+    /// so the pid is really reaped, not merely declared so) and drops the
+    /// handle: the recording seam must record NO group kill and NO direct
+    /// kill. The CONTROL arm drops an UN-REAPED handle with the same fixture:
+    /// it must record exactly one group kill (the drop signal) and one direct
+    /// kill, proving the silence above is the guard's doing and not the seam's.
+    /// Deleting the guard makes the REAPED arm's assertions fail.
     #[test]
     fn a_reaped_owned_child_is_never_signalled_by_the_drop_backstop() {
-        // REAPED: `wait` consumes the exit status and sets the guard, so the
-        // drop backstop must return before it touches the seam. The seam is
-        // INERT (records without signalling) precisely because the pid under
-        // test is released: even with the guard deleted this witness cannot
-        // signal a recycled pid.
+        // REAPED: `wait` consumes the exit status and moves the lifecycle to
+        // `Reaped`, so the drop backstop must return before it touches the
+        // seam. The seam is INERT (records without signalling) precisely
+        // because the pid under test is released: even with the guard deleted
+        // this witness cannot signal a recycled pid.
         let reaped_seam = RecordingKill::recording(false);
         {
             let mut owned = OwnedChild::new(spawn_grouped("exit 0"), reaped_seam.clone());
@@ -1088,7 +1170,7 @@ mod tests {
         let control_seam = RecordingKill::recording(true);
         let pid = {
             let owned = OwnedChild::new(spawn_grouped("exec sleep 30"), control_seam.clone());
-            let pid = owned.child.id();
+            let pid = owned.pid();
             drop(owned);
             pid
         };
@@ -1105,6 +1187,57 @@ mod tests {
         assert!(
             wait_until_not_live(pid, GONE_BUDGET),
             "the control's child {pid} must be collected by the drop backstop, not left live"
+        );
+    }
+
+    /// The lifecycle as a VALUE: the handle is reachable only while the child
+    /// is LIVE, the single reap records the exit status it consumed, and the
+    /// drop backstop of a reaped handle signals nothing (the pid was released
+    /// by the reap, so a signal could land on a recycled pid).
+    ///
+    /// The seam is INERT (records without signalling) for the same reason as
+    /// the control-arm witness above: the child under test is already reaped,
+    /// so a deleted guard could otherwise signal a recycled pid.
+    #[test]
+    fn a_reaped_child_has_no_live_handle_and_is_never_signalled() {
+        let seam = RecordingKill::recording(false);
+        let mut owned = OwnedChild::new(spawn_grouped("exit 0"), seam.clone());
+        assert!(!owned.is_reaped(), "a freshly spawned child is live");
+        assert!(
+            owned.live_child().is_some(),
+            "a live child must expose its handle"
+        );
+
+        let status = owned.wait().expect("a promptly-exiting child must reap");
+        assert_eq!(status.code(), Some(0), "the exit status must be preserved");
+        assert!(
+            owned.is_reaped(),
+            "the reap must move the lifecycle to Reaped"
+        );
+        assert!(
+            owned.live_child().is_none(),
+            "a reaped child must not expose its handle: a signal on the released pid is unrepresentable"
+        );
+        // The reap is SINGLE: `try_wait` reports the status it already
+        // consumed instead of polling the released pid again.
+        assert_eq!(
+            owned
+                .try_wait()
+                .expect("a reaped child still reports its status"),
+            Some(status),
+            "the consumed exit status must be the recorded one"
+        );
+
+        drop(owned);
+        assert_eq!(
+            seam.group_calls(),
+            Vec::new(),
+            "the drop backstop must not signal a reaped child's group"
+        );
+        assert_eq!(
+            seam.owned_calls(),
+            0,
+            "the drop backstop must not signal a reaped child directly"
         );
     }
 }
