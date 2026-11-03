@@ -38,7 +38,7 @@ its entry corrected, in the round that lands it.
 | Owned-root registry | TYPED |
 | Residue handle lifecycle | TYPED |
 | Destination-ownership token and preflight binding | TYPED |
-| Run phase pipeline | OPEN — `run-phases` |
+| Run phase pipeline | TYPED — `StepsRan` → `Settled` → `Reconciled`; `Applier::run` is the chain |
 | Mode journal | TYPED |
 | Pending-mutation accounting | TYPED |
 | Claim, rollback, and residue reconciliation | TYPED |
