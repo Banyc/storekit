@@ -388,6 +388,52 @@ while (!flock($fh, LOCK_EX | LOCK_NB)) {{{{\n\
     )
 }
 
+/// The ONE configured source of a host's identity, classified ONCE at the
+/// construction boundary.
+///
+/// The constructor takes a `known_hosts` file and a `host_key_fingerprint`,
+/// whose four combinations admit exactly two usable states: both is ambiguous
+/// (the ssh arguments would silently prefer the file) and neither is
+/// trust-on-first-use (disabled). [`SshTransport::new`] refuses the other two,
+/// so the invariant lives in THIS TYPE: no operation re-checks the pair and no
+/// operation can observe a state the constructor refused.
+enum HostIdentity {
+    /// A dedicated known-hosts file, used with `StrictHostKeyChecking=yes`.
+    /// Nothing is ever pinned into it.
+    KnownHosts(PathBuf),
+    /// A pre-verified host-key fingerprint: the fetched key must match
+    /// `expected`, and the verified key is pinned into a managed known-hosts
+    /// file (`pinned`, set only by [`SshTransport::prepare_identity`] — never at
+    /// construction, so building the transport has no side effects).
+    Fingerprint {
+        expected: String,
+        pinned: std::sync::Mutex<Option<PathBuf>>,
+    },
+}
+
+impl HostIdentity {
+    /// The managed known-hosts file holding the pinned key, when this identity
+    /// is fingerprint-based AND the pin has already resolved.
+    fn pinned(&self) -> Option<PathBuf> {
+        match self {
+            HostIdentity::KnownHosts(_) => None,
+            HostIdentity::Fingerprint { pinned, .. } => {
+                pinned.lock().ok().and_then(|guard| guard.clone())
+            }
+        }
+    }
+
+    /// The configured fingerprint (`None` for a known-hosts file). Part of the
+    /// mux identity, so two DIFFERENT fingerprints never derive one socket even
+    /// before either pin resolves.
+    fn expected_fingerprint(&self) -> Option<&str> {
+        match self {
+            HostIdentity::KnownHosts(_) => None,
+            HostIdentity::Fingerprint { expected, .. } => Some(expected),
+        }
+    }
+}
+
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
     /// `user@address` passed to `ssh` as the connection target.
@@ -402,15 +448,9 @@ pub struct SshTransport {
     /// Configured SSH port (passed to both `ssh -p` and `ssh-keyscan -p`).
     port: u16,
     root: PathBuf,
-    /// Dedicated known-hosts file used with `StrictHostKeyChecking=yes`.
-    known_hosts: Option<PathBuf>,
-    /// Pre-verified host-key fingerprint (e.g. `SHA256:...`) used to pin the
-    /// host key the first time we contact it.
-    host_key_fingerprint: Option<String>,
-    /// Managed known-hosts file holding the pinned key (used when only a
-    /// fingerprint was configured). Set only by [`SshTransport::prepare_identity`],
-    /// never at construction, so building the transport has no side effects.
-    pinned_known_hosts: std::sync::Mutex<Option<PathBuf>>,
+    /// The host-identity SOURCE (a known-hosts file, or a fingerprint whose pin
+    /// resolves into a managed file), classified once at construction.
+    identity: HostIdentity,
     /// The RESOLVED pin-cache directory for the managed known-hosts file
     /// (the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`, else
     /// `<temp_dir>/deploy-ssh-knownhosts`) — resolved ONCE at the
@@ -531,10 +571,17 @@ impl SshTransport {
                 "ssh deploy_dir must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
             ));
         }
-        // Defensive rejection of ambiguous or unusable identity states, even
-        // when the config validation was bypassed (e.g. a direct caller):
-        // exactly one of known_hosts / host_key_fingerprint may be set.
-        match (known_hosts, host_key_fingerprint) {
+        // THE classification of the host identity: exactly one source, decided
+        // here and never re-checked downstream. Both set is ambiguous (the ssh
+        // arguments would silently prefer the file); neither is
+        // trust-on-first-use (disabled). Defensive even when config validation
+        // was bypassed (e.g. a direct caller).
+        let identity = match (known_hosts, host_key_fingerprint) {
+            (Some(known_hosts), None) => HostIdentity::KnownHosts(known_hosts.to_path_buf()),
+            (None, Some(fingerprint)) => HostIdentity::Fingerprint {
+                expected: fingerprint.to_string(),
+                pinned: std::sync::Mutex::new(None),
+            },
             (Some(_), Some(_)) => {
                 return Err(Error::transport(
                     "ssh host identity is ambiguous: exactly one of known_hosts or \
@@ -547,8 +594,7 @@ impl SshTransport {
                      `host_key_fingerprint` must be provided (trust-on-first-use is disabled)",
                 ));
             }
-            _ => {}
-        }
+        };
         // The mux socket directory and the identity hash WIDTH it can afford
         // are resolved HERE, at the construction boundary, from the snapshot's
         // temp dir. A temp dir that leaves too little room for a
@@ -563,9 +609,7 @@ impl SshTransport {
             address: address.to_string(),
             port,
             root: deploy_dir.to_path_buf(),
-            known_hosts: known_hosts.map(|p| p.to_path_buf()),
-            host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
-            pinned_known_hosts: std::sync::Mutex::new(None),
+            identity,
             known_hosts_cache_dir: known_hosts_cache_dir.to_path_buf(),
             mux_socket_dir,
             env: env.clone(),
@@ -721,15 +765,19 @@ impl SshTransport {
     ///
     /// Identical material derives the same socket and DOES multiplex.
     fn mux_identity_material(&self, pinned: Option<&Path>) -> String {
-        let host_identity = match (&self.known_hosts, pinned) {
-            (Some(known_hosts), _) => format!("known_hosts={}", known_hosts.display()),
-            (None, Some(pinned)) => format!("pinned={}", pinned.display()),
-            // A fingerprint configured without an explicit file: the pin has
-            // not resolved yet (a dry-run status inspection calls this before
-            // `prepare_identity` has pinned). Include the fingerprint so two
-            // DIFFERENT fingerprints never derive one socket even before the
-            // pin resolves.
-            (None, None) => "known_hosts=<unresolved>".to_string(),
+        // The host-identity SOURCE is always known (the enum classifies it once),
+        // so only the pin's RESOLUTION varies: a fingerprint identity names the
+        // pinned file as soon as `prepare_identity` has written it, and the
+        // fingerprint below still separates the two identities that share the
+        // not-yet-pinned spelling.
+        let host_identity = match &self.identity {
+            HostIdentity::KnownHosts(known_hosts) => {
+                format!("known_hosts={}", known_hosts.display())
+            }
+            HostIdentity::Fingerprint { .. } => match pinned {
+                Some(pinned) => format!("pinned={}", pinned.display()),
+                None => "pinned=<unresolved>".to_string(),
+            },
         };
         let user_identity = match &self.identity_file {
             Some(path) => format!("identity={}", path.display()),
@@ -755,7 +803,7 @@ impl SshTransport {
             self.port,
             user_identity,
             host_identity,
-            self.host_key_fingerprint.as_deref().unwrap_or(""),
+            self.identity.expected_fingerprint().unwrap_or(""),
             self.ssh_options.join("\u{1f}"),
             ambient,
         )
@@ -780,14 +828,15 @@ impl SshTransport {
         Ok(full[..width].to_string())
     }
 
-    /// Build the fixed `ssh` arguments (options + target). Errors if no host
-    /// identity has been configured, so the caller cannot accidentally fall back
-    /// to trust-on-first-use.
+    /// Build the fixed `ssh` arguments (options + target). Errors when a
+    /// fingerprint identity's pin has not resolved, so the caller cannot
+    /// accidentally fall back to trust-on-first-use by never preparing the
+    /// identity ([`Remote::prepare_identity`] every request entry point runs).
     fn ssh_args(&self) -> Result<Vec<String>> {
-        // Read the pinned path through the lock; it is set only by
+        // Read the pinned path through the identity; it is set only by
         // `prepare_identity`. It is part of BOTH the mux identity (below) and
         // the host-key options (the match at the end), so it is read once.
-        let pinned = self.pinned_known_hosts.lock().ok().and_then(|g| g.clone());
+        let pinned = self.identity.pinned();
         let mut args: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
@@ -823,26 +872,26 @@ impl SshTransport {
             "-p".into(),
             self.port.to_string(),
         ];
-        match (&self.known_hosts, &pinned) {
-            (Some(kh), _) => {
-                args.push("-o".into());
-                args.push(format!("UserKnownHostsFile={}", kh.display()));
-                args.push("-o".into());
-                args.push("StrictHostKeyChecking=yes".into());
-            }
-            (None, Some(pinned)) => {
-                args.push("-o".into());
-                args.push(format!("UserKnownHostsFile={}", pinned.display()));
-                args.push("-o".into());
-                args.push("StrictHostKeyChecking=yes".into());
-            }
-            (None, None) => {
+        // The host-key policy of the ONE configured source, always verified
+        // strictly. For a fingerprint identity the pin must already have
+        // resolved: every request is self-preparing (see
+        // `prepare_for_request`), so an unresolved pin here means the caller
+        // built arguments without preparing, and there is no
+        // trust-on-first-use fallback.
+        let known_hosts: &Path = match (&self.identity, &pinned) {
+            (HostIdentity::KnownHosts(known_hosts), _) => known_hosts,
+            (HostIdentity::Fingerprint { .. }, Some(pinned)) => pinned,
+            (HostIdentity::Fingerprint { .. }, None) => {
                 return Err(Error::transport(
                     "ssh host identity is not configured: provide `known_hosts` or \
                      `host_key_fingerprint` (trust-on-first-use is disabled)",
                 ));
             }
-        }
+        };
+        args.push("-o".into());
+        args.push(format!("UserKnownHostsFile={}", known_hosts.display()));
+        args.push("-o".into());
+        args.push("StrictHostKeyChecking=yes".into());
         // The USER's authentication identity, when the caller supplied one. The
         // ambient configuration (agent, `~/.ssh`) is used when it is absent.
         // Placed AFTER the crate's own options so the first-obtained-value rule
@@ -866,13 +915,15 @@ impl SshTransport {
     /// Fails closed if the key cannot be fetched or does not match. Takes
     /// `&self`: the pinned path is stored through the interior-mutability
     /// lock; the verification/cache logic itself lives in `pin_known_hosts`.
+    ///
+    /// A known-hosts identity has a FIXED source and nothing to pin, so the call
+    /// is a no-op for it.
     pub(crate) fn pin_known_hosts(&self) -> Result<()> {
-        let fingerprint = self
-            .host_key_fingerprint
-            .clone()
-            .ok_or_else(|| Error::transport("host_key_fingerprint required for pinning"))?;
-        let pinned = pin_known_hosts(
-            &fingerprint,
+        let HostIdentity::Fingerprint { expected, pinned } = &self.identity else {
+            return Ok(());
+        };
+        let path = pin_known_hosts(
+            expected,
             &self.target,
             &self.address,
             self.port,
@@ -880,8 +931,8 @@ impl SshTransport {
             &self.env,
             &self.runner,
         )?;
-        if let Ok(mut g) = self.pinned_known_hosts.lock() {
-            *g = Some(pinned);
+        if let Ok(mut guard) = pinned.lock() {
+            *guard = Some(path);
         }
         Ok(())
     }
@@ -2485,13 +2536,13 @@ impl Remote for SshTransport {
                 self.mux_socket_dir.display()
             ))
         })?;
-        // If a fingerprint was supplied without an explicit known-hosts file,
-        // verify the host key and pin it in a managed file BEFORE any remote
-        // request — including a dry run's status inspection, which still
-        // connects over ssh and therefore needs the pinned key.
-        if self.known_hosts.is_none() && self.host_key_fingerprint.is_some() {
-            self.pin_known_hosts()?;
-        }
+        // Verify the host key against the configured source and pin it in a
+        // managed file BEFORE any remote request — including a dry run's status
+        // inspection, which still connects over ssh and therefore needs the
+        // identity ready. `pin_known_hosts` is the ONE authority on whether
+        // there is anything to pin: a known-hosts identity already has its
+        // fixed source, so this is a no-op for it.
+        self.pin_known_hosts()?;
         Ok(())
     }
 
@@ -3091,26 +3142,42 @@ impl Remote for SshTransport {
     }
 }
 
+/// The lifecycle of a far-side lock session: EXACTLY ONE of the four states
+/// holds at any time, so "released", "lost", and "unanswerable" cannot be
+/// mixed and a still-live client cannot also carry an exit status.
+///
+/// Every transition that leaves [`SessionState::Alive`] is one-way: a session
+/// never becomes alive again, which is what lets a run refuse to report a clean
+/// success for a destination it no longer owns.
+enum SessionState {
+    /// The local `ssh` client is running (as far as the last wait could tell).
+    Alive { child: std::process::Child },
+    /// [`FarSideLockSession::release`] closed the channel and reaped the client.
+    Released,
+    /// The client exit was OBSERVED, with this status.
+    Lost { status: std::process::ExitStatus },
+    /// `try_wait` failed; liveness cannot be established. Fails CLOSED.
+    Unanswerable,
+}
+
 /// The far-side lock holder process a [`SshTransport`] session owns: the local
 /// `ssh` client (the connection) plus the remote `perl` it is running. The
 /// guard IS the lock's lifetime — see [`FarSideLockSession`].
 struct SshFarSideLock {
-    /// The local `ssh` client. Its exit means the connection (and therefore the
-    /// far-side holder) is gone.
-    child: std::process::Child,
-    /// The client's stderr, kept so a lost session can report what the client
-    /// said. Taken (drained to EOF) by [`SshFarSideLock::loss_detail`].
+    /// Where the session is in its lifecycle.
+    state: SessionState,
+    /// The client's stderr, kept so a session that ended can report what the
+    /// client said. Taken (drained to EOF) by [`SshFarSideLock::loss_detail`].
+    ///
+    /// It is a DIAGNOSTIC channel, not lifecycle state: `release` does not drain
+    /// it, so a released or unanswerable session reports the client's words
+    /// exactly as an observed exit does.
     stderr: Option<std::process::ChildStderr>,
     /// The far-side record this session holds.
     record: PathBuf,
     /// The local `ssh` client's pid, for diagnostics and for a caller that must
     /// terminate exactly this connection.
     local_pid: u32,
-    /// The exit status once the client has been observed to exit.
-    status: Option<std::process::ExitStatus>,
-    /// Set by [`FarSideLockSession::release`]/`Drop` so the release is
-    /// idempotent and `is_alive` reports `false` afterwards.
-    released: bool,
 }
 
 impl SshFarSideLock {
@@ -3121,12 +3188,10 @@ impl SshFarSideLock {
         local_pid: u32,
     ) -> Self {
         SshFarSideLock {
-            child,
+            state: SessionState::Alive { child },
             stderr,
             record,
             local_pid,
-            status: None,
-            released: false,
         }
     }
 }
@@ -3137,27 +3202,37 @@ impl FarSideLockSession for SshFarSideLock {
     }
 
     fn is_alive(&mut self) -> bool {
-        if self.released {
+        // Only a live client can be waited on; every other state is already
+        // known not to be alive (released by construction, an observed exit, or
+        // a wait that could not answer), so they all fail CLOSED.
+        let SessionState::Alive { child } = &mut self.state else {
             return false;
-        }
-        match self.child.try_wait() {
+        };
+        match child.try_wait() {
+            Ok(None) => true,
             Ok(Some(status)) => {
-                self.status = Some(status);
+                self.state = SessionState::Lost { status };
                 false
             }
-            Ok(None) => true,
             // An unanswerable wait cannot establish liveness; fail CLOSED (the
             // run must not claim the destination is still owned).
-            Err(_) => false,
+            Err(_) => {
+                self.state = SessionState::Unanswerable;
+                false
+            }
         }
     }
 
     fn loss_detail(&mut self) -> String {
-        let status = self
-            .status
-            .as_ref()
-            .map(|s| format!("the local ssh client exited ({s})"))
-            .unwrap_or_else(|| "the local ssh client is no longer running".to_string());
+        // Callers ask for the detail only AFTER `is_alive` reported `false`.
+        let status = match &self.state {
+            SessionState::Lost { status } => format!("the local ssh client exited ({status})"),
+            // Released (we closed the channel), an unanswerable wait, and a
+            // still-alive client carry no observed exit.
+            SessionState::Released | SessionState::Unanswerable | SessionState::Alive { .. } => {
+                "the local ssh client is no longer running".to_string()
+            }
+        };
         let stderr = match self.stderr.take() {
             Some(mut handle) => {
                 use std::io::Read;
@@ -3180,23 +3255,25 @@ impl FarSideLockSession for SshFarSideLock {
     }
 
     fn release(&mut self) {
-        if self.released {
+        // Idempotent: a second release, and a release after an observed exit or
+        // an unanswerable wait, has no live client left to release.
+        let SessionState::Alive { child } = &mut self.state else {
             return;
-        }
-        self.released = true;
+        };
         // GRACEFUL FIRST: closing our end of the child's stdin pipe makes the
         // far-side `perl`'s `sysread` return 0, so it unlocks and exits and the
         // client then exits on its own. The record is released by the time the
         // client is reaped, because the holder process has exited.
-        self.child.stdin.take();
-        if reap_bounded(&mut self.child, FAR_SIDE_LOCK_RELEASE_GRACE).is_none() {
+        child.stdin.take();
+        if reap_bounded(child, FAR_SIDE_LOCK_RELEASE_GRACE).is_none() {
             // The child refused to exit within the grace (a hung connection):
             // kill it and reap, which drops the connection and lets the far
             // side notice EOF and release. The `reap_bounded` fallback already
             // attempted the kill; this is the belt-and-braces wait.
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
         }
+        self.state = SessionState::Released;
     }
 }
 
@@ -3597,6 +3674,68 @@ mod tests_ssh {
             msg.contains("exactly one of `known_hosts` or `host_key_fingerprint`")
                 && msg.contains("trust-on-first-use is disabled"),
             "error must refuse trust-on-first-use, got: {msg}"
+        );
+    }
+
+    // The TWO usable identity states are TYPES, classified once at
+    // construction: a known-hosts file (a FIXED source, so pinning is a no-op
+    // and the file is passed to ssh verbatim) and a fingerprint (whose pin
+    // resolves into a managed file only when the identity is prepared). The two
+    // REFUSED combinations are covered above, so this test covers what the
+    // classification accepts.
+    #[test]
+    fn host_identity_classifies_exactly_one_source() {
+        // A known-hosts file: usable immediately, nothing to pin.
+        let t = transport();
+        assert!(matches!(t.identity, HostIdentity::KnownHosts(_)));
+        assert!(
+            t.identity.pinned().is_none(),
+            "a known-hosts identity is never pinned"
+        );
+        assert_eq!(t.identity.expected_fingerprint(), None);
+        t.pin_known_hosts()
+            .expect("a known-hosts identity has nothing to pin");
+        assert!(
+            t.identity.pinned().is_none(),
+            "pinning a known-hosts identity must not invent a managed file"
+        );
+        let args = t.ssh_args().unwrap();
+        assert!(
+            args.iter().any(|a| a == "UserKnownHostsFile=/dev/null"),
+            "the configured known-hosts file must be the ssh source: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "StrictHostKeyChecking=yes"),
+            "the known-hosts source is verified strictly: {args:?}"
+        );
+
+        // A fingerprint: the source is known at construction, but the pinned
+        // file does NOT exist yet — construction has no side effects, and the
+        // pin resolves on `prepare_identity` (covered by the fake-ssh suite).
+        let fingerprint = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            Layout::empty(),
+            None,
+            Some("SHA256:abc"),
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            fingerprint.identity,
+            HostIdentity::Fingerprint { .. }
+        ));
+        assert_eq!(
+            fingerprint.identity.expected_fingerprint(),
+            Some("SHA256:abc")
+        );
+        assert!(
+            fingerprint.identity.pinned().is_none(),
+            "construction must not pin (a dry run never touches disk)"
         );
     }
 
@@ -4089,6 +4228,84 @@ mod tests_ssh {
         assert!(
             script.contains(&format!("my $header = {literal};")),
             "the holder must assign the header from the local authority: {script}"
+        );
+    }
+
+    /// The session LIFECYCLE is ONE state, not a `released` flag sitting next
+    /// to an `Option<ExitStatus>`: a released session and an observed client
+    /// exit are distinct, mutually exclusive outcomes with distinct
+    /// diagnostics. Driven through the real `Child` machinery (no ssh), so the
+    /// transition itself is what is measured.
+    // unix-only: `sh`/`cat` stand in for the local ssh client.
+    #[cfg(unix)]
+    #[test]
+    fn far_side_session_release_and_observed_exit_are_distinct_states() {
+        use std::process::{Command, Stdio};
+
+        let record = PathBuf::from("/srv/app/.storekit.lock");
+
+        // RELEASE: closing the channel ends the client, and the session reports
+        // a RELEASE (no exit status was ever observed for it).
+        let mut released = SshFarSideLock::new(
+            Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the stand-in client"),
+            None,
+            record.clone(),
+            4242,
+        );
+        released.release();
+        assert!(
+            !released.is_alive(),
+            "a released session must not report itself alive"
+        );
+        let detail = released.loss_detail();
+        assert!(
+            detail.contains("the local ssh client is no longer running"),
+            "a release must be reported as a release, got: {detail}"
+        );
+        assert!(
+            !detail.contains("exited"),
+            "a release is not an observed exit, got: {detail}"
+        );
+        // Release is idempotent: a second release cannot resurrect or re-kill.
+        released.release();
+        assert!(!released.is_alive(), "release must be idempotent");
+
+        // OBSERVED EXIT: `is_alive` waits, observes the exit, and the session
+        // names the status the client exited with.
+        let mut lost = SshFarSideLock::new(
+            Command::new("sh")
+                .arg("-c")
+                .arg("exit 7")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn the stand-in client"),
+            None,
+            record,
+            4243,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while lost.is_alive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in client must be observed to exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let detail = lost.loss_detail();
+        assert!(
+            detail.contains("the local ssh client exited"),
+            "an observed exit must be reported as an exit, got: {detail}"
+        );
+        assert!(
+            detail.contains("exit status: 7"),
+            "the observed exit status must be named, got: {detail}"
         );
     }
 
@@ -7117,7 +7334,7 @@ exec /bin/mv "$@"
             "after prepare_identity a fingerprint-only transport must serve requests"
         );
         // The pinned cache file was created on the LOCAL host.
-        let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+        let pinned = t.identity.pinned().expect("the pin must have resolved");
         assert!(pinned.exists(), "pinned file must exist");
     }
 
@@ -7144,7 +7361,7 @@ exec /bin/mv "$@"
             .count();
         assert_eq!(calls, 1, "cached pin must be reused without re-keyscan");
         // A tampered cache is not trusted: dropped and re-pinned.
-        let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+        let pinned = t.identity.pinned().expect("the pin must have resolved");
         std::fs::write(&pinned, "evil.example.com ssh-ed25519 AAAA\n").unwrap();
         t.prepare_identity().unwrap();
         let calls = std::fs::read_to_string(&fake.keyscan_log)
