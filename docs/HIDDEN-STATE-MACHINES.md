@@ -59,7 +59,7 @@ its entry corrected, in the round that lands it.
 | Remote default tree copy | TYPED |
 | Far-side lock session | TYPED |
 | Far-side script protocols | EXTERNAL — the step order lives in the shell/perl; the Rust boundary reads one status |
-| Local process runner lifecycle | OPEN — `runner-escalation`: the exec loop's `timed_out`/`sent_kill`/`sent_owned`/`kill_error` ladder is still locals; `ChildLifecycle` and `DrainState` are typed |
+| Local process runner lifecycle | TYPED — `Termination` is the timeout/escalation ladder; `ChildLifecycle` and `DrainState` are typed |
 | SSH subprocess runner | TYPED |
 | Host-identity preparation and pin cache | TYPED |
 | Receiver identity and layout provisioning | TYPED |
