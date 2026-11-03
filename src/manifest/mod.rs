@@ -1548,9 +1548,156 @@ fn build_metadata(mut entries: Vec<TreeEntry>) -> TreeMetadata {
     meta
 }
 
+/// The ONE place a manifest's entries are COLLECTED: the entry list, the
+/// `seen` set, the per-path validation and duplicate refusal, and the shared
+/// containment post-pass. Both views of a tree fill this and then
+/// [`EntryAssembler::finish`] it, so the post-pass and the duplicate rule have
+/// a single implementation instead of one copy per view.
+struct EntryAssembler {
+    /// The entries collected so far, in walk order (`build_metadata` sorts).
+    entries: Vec<TreeEntry>,
+    /// The validated spellings already collected; a repeat is refused as
+    /// [`MaterializationKind::DuplicatePath`].
+    seen: BTreeSet<String>,
+}
+
+/// How the shared containment post-pass DISPLAYS the offending link. The rule
+/// and the message are identical in both views; only the spelling of the LINK
+/// differs, because the local walk can name the path it walked
+/// (`root.join(rel)`) while the wire view holds only the manifest spelling.
+/// This enum exists for that difference alone.
+#[derive(Clone, Copy)]
+enum ShownPath<'a> {
+    /// The local walk names `root.join(rel)` in the refusal message.
+    Local(&'a Path),
+    /// The wire view names the manifest spelling.
+    Wire,
+}
+
+impl EntryAssembler {
+    fn new() -> Self {
+        EntryAssembler {
+            entries: Vec::new(),
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// Validate the path (the SAME [`validate_entry_path`] both walks run),
+    /// refuse a duplicate with the SAME typed kind and message, and append.
+    ///
+    /// The path is validated HERE even though both walks validate it first to
+    /// name the entry in their own per-entry refusals: the assembler's
+    /// invariants — every stored path passed the one validator, and no
+    /// spelling is stored twice — must not depend on a caller remembering to
+    /// establish them.
+    fn push(
+        &mut self,
+        path: String,
+        entry_type: EntryKind,
+        mode: u32,
+        content_sha256: Option<String>,
+        symlink_target: Option<String>,
+    ) -> Result<()> {
+        let entry_path = validate_entry_path(&path)?;
+        if !self.seen.insert(entry_path.clone()) {
+            return Err(Error::materialization_kind(
+                MaterializationKind::DuplicatePath,
+                format!("duplicate normalized path: {entry_path}"),
+            ));
+        }
+        self.entries.push(TreeEntry {
+            path: entry_path,
+            entry_type,
+            mode,
+            content_sha256,
+            symlink_target,
+        });
+        Ok(())
+    }
+
+    /// The post-pass over the COMPLETE entry set, then the sink's finish.
+    ///
+    /// CONSUMING: the containment verdict is the last word on the entry set,
+    /// so no caller can keep writing entries after it.
+    ///
+    /// The rule is the crate's ONE relative-target rule
+    /// ([`check_relative_symlink_target_indexed`]) over the ONE
+    /// [`SymlinkContainmentIndex`] built from THESE entries. It runs AFTER the
+    /// walk so every entry the target's spelled walk reaches is known, and it
+    /// uses the crate's platform-independent component fold, so the local walk
+    /// and the far-side assembler reach the same verdict for the same tree on
+    /// every host. See the module docs for the fold and the erring direction
+    /// it costs.
+    ///
+    /// The post-pass is SKIPPED when no RELATIVE symlink exists: only a
+    /// relative symlink target can be refused by it (an absolute target was
+    /// already classified at its own field), so the skip is
+    /// behavior-equivalent to running the loop over an empty candidate set.
+    /// The wire arm used to build the index unconditionally; it now takes the
+    /// same skip, which only avoids constructing an index nothing would read.
+    fn finish<S: UnsupportedSink>(self, mut sink: S, shown: ShownPath<'_>) -> Result<S::Output> {
+        let EntryAssembler { entries, .. } = self;
+        let needs_containment = entries.iter().any(|e| {
+            e.entry_type == EntryKind::Symlink
+                && e.symlink_target
+                    .as_deref()
+                    .is_some_and(|t| !Path::new(t).is_absolute())
+        });
+        if needs_containment {
+            let index = SymlinkContainmentIndex::from_entries(&entries);
+            for entry in &entries {
+                if entry.entry_type != EntryKind::Symlink {
+                    continue;
+                }
+                let Some(target) = entry.symlink_target.as_deref() else {
+                    continue;
+                };
+                let target_path = Path::new(target);
+                if target_path.is_absolute() {
+                    // Already classified (and tolerated or refused) at the
+                    // field, by the view that read it.
+                    continue;
+                }
+                // The link's own path is a MANIFEST spelling: convert it
+                // through the ONE authority (split on `/`) so a `\`-bearing
+                // name is never read as a host subpath on Windows.
+                let link_rel = crate::relpath::RootedRelativePath::from_manifest(&entry.path)
+                    .map_err(|e| {
+                        Error::materialization_kind(
+                            MaterializationKind::UnrepresentableName,
+                            format!(
+                                "the manifest path {} cannot be represented on this host: {e}",
+                                entry.path
+                            ),
+                        )
+                    })?;
+                if let Err(refusal) =
+                    check_relative_symlink_target_indexed(link_rel.as_path(), target_path, &index)
+                {
+                    // The link is DISPLAYED by the path the view walked: the
+                    // local walk's `root.join(rel)`, the wire view's manifest
+                    // spelling. The target is the stored link DATA either way
+                    // (the wire view's `to_string_lossy` of a UTF-8 `str` is
+                    // that same string), so the message is byte-identical to
+                    // the one each view produced before the post-pass was
+                    // shared.
+                    let link_display = match shown {
+                        ShownPath::Local(root) => {
+                            root.join(link_rel.as_path()).display().to_string()
+                        }
+                        ShownPath::Wire => entry.path.clone(),
+                    };
+                    let reason = symlink_target_refusal_message(refusal, &link_display, target);
+                    sink.tolerate(&entry.path, MaterializationKind::EscapingSymlink, reason)?;
+                }
+            }
+        }
+        Ok(sink.finish(entries))
+    }
+}
+
 fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Result<S::Output> {
-    let mut entries: Vec<TreeEntry> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut assembler = EntryAssembler::new();
 
     let root_c = root
         .canonicalize()
@@ -1586,13 +1733,10 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
         // there. The accepted spelling is stored UNCHANGED; a normalized
         // spelling would name a different file on a normalization-sensitive
         // filesystem.
+        // Validated here as well as in [`EntryAssembler::push`] because the
+        // per-entry refusals below NAME this spelling; `push` re-validates so
+        // the assembler's invariant does not depend on this call.
         let entry_path = validate_entry_path(&joined)?;
-        if !seen.insert(entry_path.clone()) {
-            return Err(Error::materialization_kind(
-                MaterializationKind::DuplicatePath,
-                format!("duplicate normalized path: {entry_path}"),
-            ));
-        }
 
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| Error::materialization(format!("stat {}: {e}", path.display())))?;
@@ -1667,70 +1811,13 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
             ));
         }
 
-        entries.push(TreeEntry {
-            path: entry_path,
-            entry_type,
-            mode,
-            content_sha256,
-            symlink_target,
-        });
+        assembler.push(entry_path, entry_type, mode, content_sha256, symlink_target)?;
     }
 
     // POST-PASS: the ONE containment rule, over the SAME view the wire
-    // assembler builds. It runs AFTER the walk so every entry the target's
-    // spelled walk reaches is known, and it uses the crate's platform
-    // -independent component fold, so the local walk and the far-side
-    // assembler reach the same verdict for the same tree on every host. See
-    // the module docs for the fold and the erring direction it costs.
-    let needs_containment = entries.iter().any(|e| {
-        e.entry_type == EntryKind::Symlink
-            && e.symlink_target
-                .as_deref()
-                .is_some_and(|t| !Path::new(t).is_absolute())
-    });
-    if needs_containment {
-        let index = SymlinkContainmentIndex::from_entries(&entries);
-        for entry in &entries {
-            if entry.entry_type != EntryKind::Symlink {
-                continue;
-            }
-            let Some(target) = entry.symlink_target.as_deref() else {
-                continue;
-            };
-            let target_path = Path::new(target);
-            if target_path.is_absolute() {
-                // Already classified (and tolerated or refused) above.
-                continue;
-            }
-            // The link's own path is a MANIFEST spelling: convert it through
-            // the ONE authority (split on `/`) so a `\`-bearing name is never
-            // read as a host subpath on Windows.
-            let link_rel =
-                crate::relpath::RootedRelativePath::from_manifest(&entry.path).map_err(|e| {
-                    Error::materialization_kind(
-                        MaterializationKind::UnrepresentableName,
-                        format!(
-                            "the manifest path {} cannot be represented on this host: {e}",
-                            entry.path
-                        ),
-                    )
-                })?;
-            if let Err(refusal) =
-                check_relative_symlink_target_indexed(link_rel.as_path(), target_path, &index)
-            {
-                // The link is DISPLAYED by the path the walk used, so the
-                // message is byte-identical to the pre-post-pass one.
-                let reason = symlink_target_refusal_message(
-                    refusal,
-                    &root.join(link_rel.as_path()).display().to_string(),
-                    target,
-                );
-                sink.tolerate(&entry.path, MaterializationKind::EscapingSymlink, reason)?;
-            }
-        }
-    }
-
-    Ok(sink.finish(entries))
+    // assembler builds, owned by the assembler so the two views cannot diverge.
+    // See [`EntryAssembler::finish`].
+    assembler.finish(sink, ShownPath::Local(root))
 }
 
 /// The remote tree-verification script: walks a tree on the remote and
@@ -1873,6 +1960,57 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
     Ok(())
 }
 
+/// Evidence that a remote listing came from a walk that enumerated the WHOLE
+/// tree.
+///
+/// The far side's exit status is the ONLY evidence of completeness, and it
+/// belongs to the `Output`/`Remote::exec` result the caller holds — never to
+/// the listing string — so this value carries it alongside the listing. There
+/// is ONE constructor, and it REFUSES a walk that did not exit zero with the
+/// typed [`MaterializationKind::IncompleteListing`] reason, so an assembler
+/// taking a `CompleteListing` cannot be handed an incomplete listing at all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompleteListing<'a> {
+    /// The listing text the far side's walk printed.
+    output: &'a str,
+    /// The root the listing describes. The wire rule is root-RELATIVE and does
+    /// NOT consult it (the far side's root cannot be canonicalized from here,
+    /// and because the walk is root-relative it does not need to be); it is
+    /// carried so the value describes what it was built from.
+    root: &'a Path,
+}
+
+impl<'a> CompleteListing<'a> {
+    /// The ONLY constructor: `exited_zero` is
+    /// [`crate::transport::ExecOutcome::success`]. `true` says the walk covered
+    /// the whole tree (an existing EMPTY directory included — its empty stdout
+    /// is the empty manifest); `false` says it did not, so a short or empty
+    /// listing must not be assembled, and the typed refusal names what the
+    /// caller must do instead.
+    pub(crate) fn new(output: &'a str, root: &'a Path, exited_zero: bool) -> Result<Self> {
+        if !exited_zero {
+            return Err(Error::materialization_kind(
+                MaterializationKind::IncompleteListing,
+                "refusing to assemble a remote listing whose walk did not exit zero: the \
+                 far side signals an absent, non-directory, or unreadable root (or any \
+                 other incomplete walk) with a non-zero exit, so a short or empty \
+                 listing here may MIS-DESCRIBE the tree; re-run the walk and refuse its \
+                 non-zero exit, or pass true only when completeness is established"
+                    .to_string(),
+            ));
+        }
+        Ok(CompleteListing { output, root })
+    }
+
+    /// The listing text and the root it describes. The wire assembler consumes
+    /// both and consults only the TEXT: the containment rule is root-relative
+    /// (see the module docs), which is exactly why the two views agree even
+    /// when the root is itself reached through a symlink.
+    fn parts(self) -> (&'a str, &'a Path) {
+        (self.output, self.root)
+    }
+}
+
 /// Assemble canonical tree metadata from the remote verification script's
 /// output ([`remote_tree_verify_script`]), applying the SAME validations the
 /// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
@@ -1902,8 +2040,8 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// refused — exactly as the local walk refuses the same component from its own
 /// entry list. (Before this the assembler compared the listing's spellings
 /// byte-exactly, so a case- or normalization-folding far side accepted a target
-/// the local walk refused.) `root` is accepted for compatibility but the
-/// symlink check does NOT consult it: the far side's root cannot be
+/// the local walk refused.) The listing's `root` is carried for provenance but
+/// the symlink check does NOT consult it: the far side's root cannot be
 /// canonicalized from here, and because the walk is root-relative it does not
 /// need to be, so the local and wire verdicts agree even when the root is
 /// itself reached through a symlink.
@@ -1915,17 +2053,17 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// existing empty directory, whose empty stdout is the empty manifest — may
 /// be assembled here.
 ///
-/// # The completeness precondition is enforced by the CHECKED constructor
+/// # The completeness precondition is enforced by the TYPE
 ///
-/// This raw assembler is `pub(crate)` because its SIGNATURE is `(&str, &Path)`:
-/// the far side's EXIT STATUS — the only evidence that the walk covered the
-/// whole tree — belongs to the `Output`/`Remote::exec` result the caller holds
-/// and is NOT carried here, so a caller holding only the string could assemble
-/// an incomplete listing. The public entry points are
+/// This raw assembler is `pub(crate)` and takes a [`CompleteListing`], whose
+/// ONLY constructor ([`CompleteListing::new`]) requires the far side's EXIT
+/// STATUS — the only evidence that the walk covered the whole tree — and
+/// refuses `false` BEFORE assembly, so no signature here can be satisfied with
+/// a bare listing string. The public entry points are
 /// [`canonicalize_remote_entries_checked`] and
 /// [`canonicalize_remote_entries_destination_checked`], which take that status
-/// (`exited_zero`) and refuse `false` BEFORE assembly; the crate's own remote
-/// path ([`crate::sync::diff::remote_manifest`] and
+/// (`exited_zero`) and build the same value; the crate's own remote path
+/// ([`crate::sync::diff::remote_manifest`] and
 /// [`crate::sync::diff::remote_destination_manifest`]) reaches this assembler
 /// ONLY through them, passing `out.success()` at the call site.
 ///
@@ -1946,8 +2084,8 @@ fn require_parent_closed(entries: &[TreeEntry]) -> Result<()> {
 /// A completeness TERMINATOR on the wire would also close this, but it CHANGES
 /// THE WIRE FORMAT (the far side would print a final sentinel line), so it is
 /// deliberately NOT done here: the exit status already carries the evidence.
-pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<TreeMetadata> {
-    canonicalize_remote_entries_with(output, root, RefuseUnsupported)
+pub(crate) fn canonicalize_remote_entries(listing: CompleteListing<'_>) -> Result<TreeMetadata> {
+    canonicalize_remote_entries_with(listing, RefuseUnsupported)
 }
 
 /// The CHECKED constructor for a remote SOURCE listing: it takes the far-side
@@ -1961,18 +2099,17 @@ pub(crate) fn canonicalize_remote_entries(output: &str, root: &Path) -> Result<T
 /// ([`MaterializationKind::IncompleteListing`]) so a caller can tell it from a
 /// wire-format refusal, whose remedy is different.
 ///
-/// This is the ONLY public assembler for the wire format: there is no public
-/// path that reaches the raw `(&str, &Path)` form, so a caller cannot assemble
-/// a listing while forgetting the completeness evidence. A caller whose listing
-/// did not come with an exit status must still establish completeness some
-/// other way and pass that decision as `exited_zero`.
+/// This is the ONLY public assembler for the wire format: the raw form takes a
+/// [`CompleteListing`], whose only constructor requires the completeness
+/// evidence, so a caller cannot assemble a listing while forgetting it. A
+/// caller whose listing did not come with an exit status must still establish
+/// completeness some other way and pass that decision as `exited_zero`.
 pub fn canonicalize_remote_entries_checked(
     output: &str,
     root: &Path,
     exited_zero: bool,
 ) -> Result<TreeMetadata> {
-    require_complete_walk(exited_zero)?;
-    canonicalize_remote_entries(output, root)
+    canonicalize_remote_entries(CompleteListing::new(output, root, exited_zero)?)
 }
 
 /// The destination-tolerant form of [`canonicalize_remote_entries`]: the same
@@ -1984,10 +2121,9 @@ pub fn canonicalize_remote_entries_checked(
 /// [`crate::atomic::PathKind::Other`]), so it cannot be carried through the
 /// manifest even though the substrate could unlink it by name.
 pub(crate) fn canonicalize_remote_entries_destination(
-    output: &str,
-    root: &Path,
+    listing: CompleteListing<'_>,
 ) -> Result<DestinationTree> {
-    canonicalize_remote_entries_with(output, root, RecordUnsupported::default())
+    canonicalize_remote_entries_with(listing, RecordUnsupported::default())
 }
 
 /// The DESTINATION-side checked constructor: [`canonicalize_remote_entries_checked`]
@@ -2000,35 +2136,15 @@ pub fn canonicalize_remote_entries_destination_checked(
     root: &Path,
     exited_zero: bool,
 ) -> Result<DestinationTree> {
-    require_complete_walk(exited_zero)?;
-    canonicalize_remote_entries_destination(output, root)
-}
-
-/// Refuse to assemble a listing whose producing walk did not exit zero. The
-/// typed reason distinguishes this completeness refusal from a wire-format
-/// refusal and names what the caller must do instead.
-fn require_complete_walk(exited_zero: bool) -> Result<()> {
-    if exited_zero {
-        return Ok(());
-    }
-    Err(Error::materialization_kind(
-        MaterializationKind::IncompleteListing,
-        "refusing to assemble a remote listing whose walk did not exit zero: the \
-         far side signals an absent, non-directory, or unreadable root (or any \
-         other incomplete walk) with a non-zero exit, so a short or empty \
-         listing here may MIS-DESCRIBE the tree; re-run the walk and refuse its \
-         non-zero exit, or pass true only when completeness is established"
-            .to_string(),
-    ))
+    canonicalize_remote_entries_destination(CompleteListing::new(output, root, exited_zero)?)
 }
 
 fn canonicalize_remote_entries_with<S: UnsupportedSink>(
-    output: &str,
-    _root: &Path,
+    listing: CompleteListing<'_>,
     mut sink: S,
 ) -> Result<S::Output> {
-    let mut entries: Vec<TreeEntry> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let (output, _root) = listing.parts();
+    let mut assembler = EntryAssembler::new();
     for line in output.split('\n') {
         // The script terminates every line with a single LF and never emits a
         // CR. `str::lines()` would fold a CR that immediately precedes the LF,
@@ -2075,27 +2191,23 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
         // absolute/empty/traversal components are refused,
         // and a name that is not already NFC is refused rather than
         // normalized, so the two verification paths accept exactly the same
-        // trees.
+        // trees. Validated here as well as in [`EntryAssembler::push`] because
+        // the per-field refusals below NAME this spelling.
         let entry_path = validate_entry_path(path)?;
-        if !seen.insert(entry_path.clone()) {
-            return Err(Error::materialization_kind(
-                MaterializationKind::DuplicatePath,
-                format!("duplicate normalized path: {entry_path}"),
-            ));
-        }
 
         let mode = u32::from_str_radix(mode_hex, 16).map_err(|_| {
             Error::materialization(format!("invalid mode {mode_hex:?} for {entry_path}"))
         })?;
 
-        let entry = match entry_type {
-            "d" => TreeEntry {
-                path: entry_path,
-                entry_type: EntryKind::Dir,
-                mode: mode_bits(mode),
-                content_sha256: None,
-                symlink_target: None,
-            },
+        // The parsed kind and its fields; [`EntryAssembler::push`] validates
+        // the spelling, refuses a duplicate and appends.
+        let (entry_type, mode, content_sha256, symlink_target): (
+            EntryKind,
+            u32,
+            Option<String>,
+            Option<String>,
+        ) = match entry_type {
+            "d" => (EntryKind::Dir, mode_bits(mode), None, None),
             "f" => {
                 let n: u64 = nlink.parse().map_err(|_| {
                     Error::materialization(format!("invalid nlink {nlink:?} for {entry_path}"))
@@ -2116,13 +2228,12 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                 // error instead of silently producing a confusing digest
                 // mismatch.
                 validate_wire_hash(content_hash, &entry_path)?;
-                TreeEntry {
-                    path: entry_path,
-                    entry_type: EntryKind::File,
-                    mode: mode_bits(mode),
-                    content_sha256: Some(content_hash.to_string()),
-                    symlink_target: None,
-                }
+                (
+                    EntryKind::File,
+                    mode_bits(mode),
+                    Some(content_hash.to_string()),
+                    None,
+                )
             }
             "l" => {
                 if symlink_target.is_empty() {
@@ -2162,13 +2273,12 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                         "symlink target hash mismatch for {entry_path}: the far side hashed its raw target bytes as {content_hash}, but the target that crossed the wire hashes to {recomputed}; refusing rather than recording a hash of a target that is not what the far side saw"
                     )));
                 }
-                TreeEntry {
-                    path: entry_path,
-                    entry_type: EntryKind::Symlink,
-                    mode: 0o777,
-                    content_sha256: Some(recomputed),
-                    symlink_target: Some(symlink_target),
-                }
+                (
+                    EntryKind::Symlink,
+                    0o777,
+                    Some(recomputed),
+                    Some(symlink_target),
+                )
             }
             other => {
                 return Err(Error::materialization_kind(
@@ -2177,57 +2287,26 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                 ));
             }
         };
-        entries.push(entry);
+        assembler.push(entry_path, entry_type, mode, content_sha256, symlink_target)?;
     }
     // The manifest must be parent-closed (see [`require_parent_closed`]); the
     // wire walk emits parents first, so a complete far-side listing already
     // satisfies this, and a hand-built or proxied line that does not is
-    // refused rather than implicitly creating an unnamed parent.
-    require_parent_closed(&entries)?;
+    // refused rather than implicitly creating an unnamed parent. This is the
+    // WIRE-ONLY gate: the local walk is parent-closed by construction
+    // (`WalkDir` yields a directory before the entries inside it), so it runs
+    // before [`EntryAssembler::finish`] here and nowhere else.
+    require_parent_closed(&assembler.entries)?;
     // The SAME relative-target rule as the local walk, over the SAME
-    // [`SymlinkContainmentIndex`] the local walk builds and with the crate's
-    // platform-independent component fold. The walk is over root-RELATIVE
-    // paths, so `root` is deliberately NOT consulted: the far side cannot be
-    // canonicalized from here, and neither side needs to, because the rule
-    // never builds an absolute base. A component resolves to a symlink exactly
-    // when the listing's EXACT entry at that spelling is one, or when the
-    // spelling fold-matches a `symlink` entry, so the two views cannot
-    // disagree about the same tree.
-    let index = SymlinkContainmentIndex::from_entries(&entries);
-    for entry in &entries {
-        if entry.entry_type != EntryKind::Symlink {
-            continue;
-        }
-        let Some(target) = entry.symlink_target.as_deref() else {
-            continue;
-        };
-        let target = Path::new(target);
-        if target.is_absolute() {
-            // Already classified (and tolerated or refused) at the field.
-            continue;
-        }
-        // The link's own path is a MANIFEST spelling: convert it through the
-        // ONE authority (split on `/`) so a `\`-bearing name is never read as
-        // a host subpath on Windows.
-        let link_rel =
-            crate::relpath::RootedRelativePath::from_manifest(&entry.path).map_err(|e| {
-                Error::materialization_kind(
-                    MaterializationKind::UnrepresentableName,
-                    format!(
-                        "the manifest path {} cannot be represented on this host: {e}",
-                        entry.path
-                    ),
-                )
-            })?;
-        if let Err(refusal) =
-            check_relative_symlink_target_indexed(link_rel.as_path(), target, &index)
-        {
-            let reason =
-                symlink_target_refusal_message(refusal, &entry.path, &target.to_string_lossy());
-            sink.tolerate(&entry.path, MaterializationKind::EscapingSymlink, reason)?;
-        }
-    }
-    Ok(sink.finish(entries))
+    // [`SymlinkContainmentIndex`] and message mapping, owned by
+    // [`EntryAssembler::finish`]. The walk is over root-RELATIVE paths, so the
+    // root is deliberately NOT consulted: the far side cannot be canonicalized
+    // from here, and neither side needs to, because the rule never builds an
+    // absolute base. A component resolves to a symlink exactly when the
+    // listing's EXACT entry at that spelling is one, or when the spelling
+    // fold-matches a `symlink` entry, so the two views cannot disagree about
+    // the same tree.
+    assembler.finish(sink, ShownPath::Wire)
 }
 
 /// Verify that a stored [`TreeMetadata`] is EXACTLY the canonical metadata of
@@ -2493,8 +2572,10 @@ mod tests {
             "script failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let remote =
-            canonicalize_remote_entries(&String::from_utf8_lossy(&out.stdout), &root).unwrap();
+        let remote = canonicalize_remote_entries(
+            CompleteListing::new(&String::from_utf8_lossy(&out.stdout), &root, true).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             remote.tree_sha256, local.tree_sha256,
             "remote-script digest must equal the local canonical digest"
@@ -2924,7 +3005,8 @@ mod tests {
         // The remote (POSIX) script spells the same name the same way, so the
         // two canonicalizers still agree byte-for-byte.
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        let remote =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap()).unwrap();
         assert_eq!(remote.entries, meta.entries);
         assert_eq!(remote.tree_sha256, meta.tree_sha256);
     }
@@ -3047,7 +3129,10 @@ mod tests {
         // A hand-built 1000-byte WIRE component is refused by the assembler.
         let wire = format!("{}\tf\t644\t1\t{}\t\n", "b".repeat(1000), "0".repeat(64));
         assert!(
-            canonicalize_remote_entries(&wire, Path::new("/srv/store")).is_err(),
+            canonicalize_remote_entries(
+                CompleteListing::new(&wire, Path::new("/srv/store"), true).unwrap()
+            )
+            .is_err(),
             "a 1000-byte wire component must be refused at assembly"
         );
 
@@ -3076,7 +3161,9 @@ mod tests {
         let hash = "0".repeat(64);
         for bad in ["../x", "/x", "a/../b", "a//b", "a/"] {
             let output = format!("{bad}\tf\t1a4\t1\t{hash}\t\n");
-            let err = canonicalize_remote_entries(&output, &root).unwrap_err();
+            let err =
+                canonicalize_remote_entries(CompleteListing::new(&output, &root, true).unwrap())
+                    .unwrap_err();
             assert!(
                 err.to_string().contains("traversal or empty")
                     || err.to_string().contains("absolute path not allowed"),
@@ -3208,8 +3295,10 @@ mod tests {
             "an empty directory must print an empty listing, got {:?}",
             String::from_utf8_lossy(&out.stdout)
         );
-        let meta =
-            canonicalize_remote_entries(&String::from_utf8_lossy(&out.stdout), &root).unwrap();
+        let meta = canonicalize_remote_entries(
+            CompleteListing::new(&String::from_utf8_lossy(&out.stdout), &root, true).unwrap(),
+        )
+        .unwrap();
         assert!(meta.entries.is_empty());
         assert_eq!(
             meta.tree_sha256.len(),
@@ -3363,7 +3452,9 @@ mod tests {
             out.lines().any(|line| line.starts_with("pipe\to\t")),
             "the far-side listing must list the FIFO as an `o` entry, got: {out:?}"
         );
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("unsupported file type"),
             "remote assembler must reject the FIFO, got: {remote_err}"
@@ -3397,7 +3488,9 @@ mod tests {
         // Remote path: the script prints nlink=2 and the assembler rejects it on
         // EVERY platform (the wire carries `nlink`).
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("hard links not allowed"),
             "remote assembler must reject the hard link, got: {remote_err}"
@@ -3506,7 +3599,8 @@ mod tests {
 
         // A duplicate normalized path.
         let dup = format!("f\tf\t81a4\t1\t{h}\t\nf\tf\t81a4\t1\t{h}\t\n");
-        let e = canonicalize_remote_entries(&dup, root).unwrap_err();
+        let e = canonicalize_remote_entries(CompleteListing::new(&dup, root, true).unwrap())
+            .unwrap_err();
         assert_eq!(
             e.materialization_reason(),
             Some(MaterializationKind::DuplicatePath),
@@ -3515,7 +3609,8 @@ mod tests {
 
         // A manifest that is not parent-closed.
         let unclosed = format!("d/x\tf\t81a4\t1\t{h}\t\n");
-        let e = canonicalize_remote_entries(&unclosed, root).unwrap_err();
+        let e = canonicalize_remote_entries(CompleteListing::new(&unclosed, root, true).unwrap())
+            .unwrap_err();
         assert_eq!(
             e.materialization_reason(),
             Some(MaterializationKind::ParentNotClosed),
@@ -3524,7 +3619,8 @@ mod tests {
 
         // A symlink target carrying a wire-unrepresentable NUL.
         let nul_target = format!("l\tl\t1ff\t1\t{h}\tx{}y", '\u{0}');
-        let e = canonicalize_remote_entries(&nul_target, root).unwrap_err();
+        let e = canonicalize_remote_entries(CompleteListing::new(&nul_target, root, true).unwrap())
+            .unwrap_err();
         assert_eq!(
             e.materialization_reason(),
             Some(MaterializationKind::UnrepresentableSymlinkTarget),
@@ -3563,6 +3659,35 @@ mod tests {
             e.materialization_reason(),
             Some(MaterializationKind::IncompleteListing),
             "{e:?}"
+        );
+    }
+
+    /// The completeness evidence is a VALUE, not a convention: the raw
+    /// assemblers take a [`CompleteListing`] and its ONLY constructor runs the
+    /// refusal, so the evidence cannot be omitted by choosing a different
+    /// entry point. This pins that refusal at the type every assembly goes
+    /// through (the public wrappers delegate to it), not only at the wrapper.
+    #[test]
+    fn complete_listing_refuses_a_nonzero_walk_exit() {
+        use crate::error::MaterializationKind;
+        let root = Path::new("/srv/store");
+
+        let e = CompleteListing::new("", root, false).unwrap_err();
+        assert_eq!(
+            e.materialization_reason(),
+            Some(MaterializationKind::IncompleteListing),
+            "the constructor must refuse a walk that did not exit zero: {e:?}"
+        );
+
+        // A zero exit with EMPTY output is the empty manifest, so the value the
+        // constructor returns is assemblable.
+        let listing = CompleteListing::new("", root, true).unwrap();
+        assert!(
+            canonicalize_remote_entries(listing)
+                .unwrap()
+                .entries
+                .is_empty(),
+            "a complete walk over an empty directory is the empty manifest"
         );
     }
 
@@ -3690,9 +3815,13 @@ mod tests {
         std::os::unix::fs::symlink("../../../etc/passwd", links.join("esc")).unwrap();
 
         let out = run_remote_script(&links);
-        assert!(canonicalize_remote_entries(&out, &links).is_err());
-        let tree = canonicalize_remote_entries_destination(&out, &links)
-            .expect("the remote destination assembler tolerates the links");
+        assert!(
+            canonicalize_remote_entries(CompleteListing::new(&out, &links, true).unwrap()).is_err()
+        );
+        let tree = canonicalize_remote_entries_destination(
+            CompleteListing::new(&out, &links, true).unwrap(),
+        )
+        .expect("the remote destination assembler tolerates the links");
         let mut paths: Vec<String> = tree.unsupported.iter().map(|u| u.path.clone()).collect();
         paths.sort();
         assert_eq!(
@@ -3711,7 +3840,10 @@ mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         let out = run_remote_script(&special);
-        let remote_err = canonicalize_remote_entries_destination(&out, &special).unwrap_err();
+        let remote_err = canonicalize_remote_entries_destination(
+            CompleteListing::new(&out, &special, true).unwrap(),
+        )
+        .unwrap_err();
         assert!(
             remote_err.to_string().contains("unsupported file type"),
             "{remote_err}"
@@ -3750,10 +3882,73 @@ mod tests {
         // Remote path: the script prints the raw target and the assembler
         // resolves it from the link's own directory and rejects the escape.
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("escaping symlink"),
             "remote assembler must reject the escaping symlink, got: {remote_err}"
+        );
+    }
+
+    /// Both views take the SAME containment post-pass (`EntryAssembler::finish`),
+    /// so the rule and the message mapping have ONE implementation. For the same
+    /// escaping link the two refusals differ ONLY in the spelling of the link —
+    /// the local walk names the path it walked (`root.join(rel)`), the wire view
+    /// names the manifest spelling — which is the single thing `ShownPath`
+    /// carries.
+    ///
+    /// The witness that DELETING the post-pass fails BOTH views is
+    /// `escaping_symlink_rejected_by_both_canonicalizers` (it asserts the local
+    /// refusal first, then the wire one). This test additionally pins that both
+    /// refusals are the SAME mapping, by comparing the two messages byte for
+    /// byte modulo that display; it asserts the WIRE refusal first, so a
+    /// post-pass deleted from the shared `finish` is witnessed from the wire
+    /// side as well.
+    // unix-only: builds symlink fixtures with symlink(2).
+    #[cfg(unix)]
+    #[test]
+    fn containment_post_pass_is_shared_by_both_views() {
+        use crate::error::MaterializationKind;
+        skip_without_perl!("containment_post_pass_is_shared_by_both_views");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(dir.path().join("outside.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink("../outside.txt", root.join("escape")).unwrap();
+
+        let out = run_remote_script(&root);
+        let wire_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
+        assert_eq!(
+            wire_err.materialization_reason(),
+            Some(MaterializationKind::EscapingSymlink),
+            "{wire_err:?}"
+        );
+
+        let local_err = canonicalize_tree(&root).unwrap_err();
+        assert_eq!(
+            local_err.materialization_reason(),
+            Some(MaterializationKind::EscapingSymlink),
+            "{local_err:?}"
+        );
+        let local_msg = local_err.to_string();
+        let local_display = root.join("escape").display().to_string();
+        assert!(
+            local_msg.contains(&local_display),
+            "the local walk must name the path it walked ({local_display}), got: {local_msg}"
+        );
+
+        let wire_msg = wire_err.to_string();
+        assert!(
+            wire_msg.contains("escaping symlink not allowed: escape"),
+            "the wire view must name the manifest spelling, got: {wire_msg}"
+        );
+        assert_eq!(
+            wire_msg,
+            local_msg.replace(&local_display, "escape"),
+            "both views must reach the ONE refusal mapping; only the link's display may differ"
         );
     }
 
@@ -3810,7 +4005,7 @@ mod tests {
         // The wire assembler applies the SAME POSIX base, so it accepts exactly
         // the same tree and stores the same bytes.
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root)
+        let remote = canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
             .expect("the wire assembler must accept the same in-root links");
         assert_eq!(remote.entries, local.entries);
         assert_eq!(remote.tree_sha256, local.tree_sha256);
@@ -3837,7 +4032,9 @@ mod tests {
             "the local canonicalizer must still refuse the escape, got: {local_err}"
         );
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("escaping symlink"),
             "the wire assembler must still refuse the escape, got: {remote_err}"
@@ -3851,7 +4048,9 @@ mod tests {
             "the local canonicalizer must still refuse an absolute target, got: {local_err}"
         );
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("absolute symlink"),
             "the wire assembler must still refuse an absolute target, got: {remote_err}"
@@ -3947,7 +4146,9 @@ mod tests {
             "the local walk must refuse the symlink component, naming it, got: {local_msg}"
         );
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         let remote_msg = remote_err.to_string();
         assert!(
             remote_msg.contains("escaping symlink") && remote_msg.contains("dir/sub"),
@@ -3987,7 +4188,9 @@ mod tests {
             "the local walk must refuse the symlink component, got: {local_err}"
         );
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("dir/sub"),
             "the wire assembler must refuse the symlink component, got: {remote_err}"
@@ -4028,7 +4231,9 @@ mod tests {
             "the local walk must refuse a target that ends at a symlink, got: {local_err}"
         );
         let out = run_remote_script(&root);
-        let remote_err = canonicalize_remote_entries(&out, &root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("other-link"),
             "the wire assembler must refuse a target that ends at a symlink, got: {remote_err}"
@@ -4063,8 +4268,9 @@ mod tests {
         let local = canonicalize_tree(&link_root)
             .expect("a target that stays in the root must be accepted locally");
         let out = run_remote_script(&link_root);
-        let remote = canonicalize_remote_entries(&out, &link_root)
-            .expect("the wire assembler must reach the SAME accept verdict");
+        let remote =
+            canonicalize_remote_entries(CompleteListing::new(&out, &link_root, true).unwrap())
+                .expect("the wire assembler must reach the SAME accept verdict");
         assert_eq!(remote.entries, local.entries);
         assert_eq!(remote.tree_sha256, local.tree_sha256);
         assert_eq!(
@@ -4093,7 +4299,9 @@ mod tests {
             "the local walk must refuse it, got: {local_err}"
         );
         let out = run_remote_script(&link_root);
-        let remote_err = canonicalize_remote_entries(&out, &link_root).unwrap_err();
+        let remote_err =
+            canonicalize_remote_entries(CompleteListing::new(&out, &link_root, true).unwrap())
+                .unwrap_err();
         assert!(
             remote_err.to_string().contains("escaping symlink"),
             "the wire assembler must reach the SAME refuse verdict, got: {remote_err}"
@@ -4204,9 +4412,10 @@ mod tests {
             "the local walk must refuse the fold-equal symlink component, naming it, got: {local_msg}"
         );
         let out = run_remote_script(&root);
-        let remote_msg = canonicalize_remote_entries(&out, &root)
-            .unwrap_err()
-            .to_string();
+        let remote_msg =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err()
+                .to_string();
         assert!(
             remote_msg.contains("escaping symlink") && remote_msg.contains("Sub"),
             "the wire assembler must refuse the SAME tree with the same fold, naming it, got: {remote_msg}"
@@ -4249,9 +4458,10 @@ mod tests {
             "the local walk must refuse the NFD-spelled component, naming it, got: {local_msg}"
         );
         let out = run_remote_script(&root);
-        let remote_msg = canonicalize_remote_entries(&out, &root)
-            .unwrap_err()
-            .to_string();
+        let remote_msg =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err()
+                .to_string();
         assert!(
             remote_msg.contains("escaping symlink") && remote_msg.contains("dir/cafe"),
             "the wire assembler must refuse the SAME tree, naming it, got: {remote_msg}"
@@ -4280,7 +4490,7 @@ mod tests {
         let local = canonicalize_tree(&root)
             .expect("a fold-equal NON-symlink component is lawful and must be accepted");
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root)
+        let remote = canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
             .expect("the wire assembler must reach the SAME accept verdict");
         assert_eq!(
             remote.entries, local.entries,
@@ -4334,7 +4544,7 @@ mod tests {
         let local = canonicalize_tree(&root)
             .expect("the exact non-symlink entry must win over the fold-equal symlink");
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root)
+        let remote = canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
             .expect("the wire assembler must reach the SAME accept verdict");
         assert_eq!(remote.entries, local.entries);
         assert_eq!(
@@ -4386,9 +4596,10 @@ mod tests {
             "the local walk must refuse the full-fold escape, naming {spelled:?}, got: {local_msg}"
         );
         let out = run_remote_script(&root);
-        let remote_msg = canonicalize_remote_entries(&out, &root)
-            .unwrap_err()
-            .to_string();
+        let remote_msg =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
+                .unwrap_err()
+                .to_string();
         assert!(
             remote_msg.contains("escaping symlink") && remote_msg.contains(&escaped),
             "the wire assembler must refuse the SAME full-fold escape, naming {spelled:?}, \
@@ -4640,7 +4851,7 @@ mod tests {
 
         let local = canonicalize_tree(&root).expect("an in-root `../other/file` target is lawful");
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root)
+        let remote = canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap())
             .expect("the wire assembler must reach the SAME accept verdict");
         assert_eq!(remote.entries, local.entries);
         assert_eq!(
@@ -4678,7 +4889,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let empty_hash = sha256_bytes(b"");
         let line = format!("l\tl\t1ff\t1\t{empty_hash}\t\n");
-        let wire_err = canonicalize_remote_entries(&line, &root).unwrap_err();
+        let wire_err =
+            canonicalize_remote_entries(CompleteListing::new(&line, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             wire_err.to_string().contains("symlink target"),
             "the wire assembler must refuse an empty target, got: {wire_err}"
@@ -4716,18 +4929,21 @@ mod tests {
         // "café" written as e + combining acute is not NFC: refused, never
         // normalized.
         let nfd = format!("cafe\u{301}.txt\tf\t1a4\t1\t{hash}\t\n");
-        let err = canonicalize_remote_entries(&nfd, &root).unwrap_err();
+        let err = canonicalize_remote_entries(CompleteListing::new(&nfd, &root, true).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("NFC/UTF-8"),
             "a non-NFC wire path must be refused, got: {err}"
         );
         // Its already-NFC partner IS accepted.
         let nfc = format!("caf\u{e9}.txt\tf\t1a4\t1\t{hash}\t\n");
-        canonicalize_remote_entries(&nfc, &root).unwrap();
+        canonicalize_remote_entries(CompleteListing::new(&nfc, &root, true).unwrap()).unwrap();
 
         // An exact duplicate line is still refused as a duplicate entry.
         let duplicate = format!("a.txt\tf\t1a4\t1\t{hash}\t\na.txt\tf\t1a4\t1\t{hash}\t\n");
-        let err = canonicalize_remote_entries(&duplicate, &root).unwrap_err();
+        let err =
+            canonicalize_remote_entries(CompleteListing::new(&duplicate, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             err.to_string().contains("duplicate normalized path"),
             "remote assembler must reject a duplicated path, got: {err}"
@@ -4758,7 +4974,8 @@ mod tests {
         );
 
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        let remote =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap()).unwrap();
         assert_eq!(
             remote.tree_sha256, local.tree_sha256,
             "remote-script digest must equal the local canonical digest"
@@ -4840,7 +5057,11 @@ mod tests {
         // silently truncating the name at the tab.
         let hash = "0".repeat(64);
         assert!(
-            canonicalize_remote_entries(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root2).is_err(),
+            canonicalize_remote_entries(
+                CompleteListing::new(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root2, true)
+                    .unwrap()
+            )
+            .is_err(),
             "the assembler must refuse a seven-field (tab-mangled) line"
         );
     }
@@ -5004,8 +5225,15 @@ mod tests {
         // downstream test that could catch the byte the transport destroyed.
         let hash = "0".repeat(64);
         assert!(
-            canonicalize_remote_entries(&format!("bad\u{fffd}name\tf\t1a4\t1\t{hash}\t\n"), &root)
-                .is_ok(),
+            canonicalize_remote_entries(
+                CompleteListing::new(
+                    &format!("bad\u{fffd}name\tf\t1a4\t1\t{hash}\t\n"),
+                    &root,
+                    true
+                )
+                .unwrap()
+            )
+            .is_ok(),
             "premise: a U+FFFD spelling is structurally acceptable, so the assembler cannot \
              detect the transport loss"
         );
@@ -5093,11 +5321,18 @@ mod tests {
         // name or target) rather than truncating the field, so it cannot be
         // fooled by a proxied line either.
         assert!(
-            canonicalize_remote_entries(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root).is_err(),
+            canonicalize_remote_entries(
+                CompleteListing::new(&format!("a\tb\tf\t1a4\t1\t{hash}\t\n"), &root, true).unwrap()
+            )
+            .is_err(),
             "assembler must refuse a tab-mangled name line"
         );
         assert!(
-            canonicalize_remote_entries(&format!("l\tl\t1ff\t1\t{hash}\ta\tb\n"), &root).is_err(),
+            canonicalize_remote_entries(
+                CompleteListing::new(&format!("l\tl\t1ff\t1\t{hash}\ta\tb\n"), &root, true)
+                    .unwrap()
+            )
+            .is_err(),
             "assembler must refuse a tab-mangled target line"
         );
     }
@@ -5141,7 +5376,8 @@ mod tests {
         );
 
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        let remote =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap()).unwrap();
         assert_eq!(
             remote.entries, local.entries,
             "both canonicalizers must store the same target bytes"
@@ -5261,7 +5497,8 @@ mod tests {
         // Pre-fix `lines()` folded the CR and accepted target `x`.
         let cr_target_hash = crate::digest::sha256_bytes(b"x\r");
         let raw = format!("L\tl\t1ff\t1\t{cr_target_hash}\tx\r\n");
-        let err = canonicalize_remote_entries(&raw, &root).unwrap_err();
+        let err = canonicalize_remote_entries(CompleteListing::new(&raw, &root, true).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("carriage return"),
             "a bare CR before the line terminator must be refused, got: {err}"
@@ -5271,7 +5508,8 @@ mod tests {
         // the CR and the dir was accepted (the target is ignored for dirs).
         let dir_line = "d\td\t1ed\t1\t\t\r\n";
         assert!(
-            canonicalize_remote_entries(dir_line, &root).is_err(),
+            canonicalize_remote_entries(CompleteListing::new(dir_line, &root, true).unwrap())
+                .is_err(),
             "a dir line whose final field is a bare CR must be refused"
         );
 
@@ -5280,7 +5518,9 @@ mod tests {
         // Pre-fix it recomputed (`sha256("x")`), stored the recomputed hash,
         // and accepted the divergent line.
         let mismatch = format!("L\tl\t1ff\t1\t{cr_target_hash}\tx\n");
-        let err = canonicalize_remote_entries(&mismatch, &root).unwrap_err();
+        let err =
+            canonicalize_remote_entries(CompleteListing::new(&mismatch, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             err.to_string().contains("symlink target hash mismatch"),
             "a script hash that disagrees with the wire target must be refused, got: {err}"
@@ -5294,7 +5534,10 @@ mod tests {
         // missing field, so a CR hiding in a line-final hash cannot be folded
         // away either.
         assert!(
-            canonicalize_remote_entries(&format!("f.txt\tf\t1a4\t1\t{hash}"), &root).is_err(),
+            canonicalize_remote_entries(
+                CompleteListing::new(&format!("f.txt\tf\t1a4\t1\t{hash}"), &root, true).unwrap()
+            )
+            .is_err(),
             "a five-field line must be refused, not defaulted"
         );
     }
@@ -5327,8 +5570,11 @@ mod tests {
         let nul_root = dir.path().join("nul");
         std::fs::create_dir_all(&nul_root).unwrap();
         assert!(
-            canonicalize_remote_entries(&format!("a\0b\tf\t1a4\t1\t{hash}\t\n"), &nul_root)
-                .is_err(),
+            canonicalize_remote_entries(
+                CompleteListing::new(&format!("a\0b\tf\t1a4\t1\t{hash}\t\n"), &nul_root, true)
+                    .unwrap()
+            )
+            .is_err(),
             "the assembler must refuse a NUL name"
         );
 
@@ -5392,7 +5638,10 @@ mod tests {
             Some("file with space.txt"),
             "a space in a target is legal link DATA and must be stored verbatim"
         );
-        let remote = canonicalize_remote_entries(&run_remote_script(&root), &root).unwrap();
+        let remote = canonicalize_remote_entries(
+            CompleteListing::new(&run_remote_script(&root), &root, true).unwrap(),
+        )
+        .unwrap();
         assert_eq!(remote.entries, local.entries);
         assert_eq!(remote.tree_sha256, local.tree_sha256);
     }
@@ -5410,7 +5659,8 @@ mod tests {
         let local = canonicalize_tree(&root).unwrap();
         assert_eq!(entry_paths(&local), vec!["caf\u{e9}.txt"]);
         let out = run_remote_script(&root);
-        let remote = canonicalize_remote_entries(&out, &root).unwrap();
+        let remote =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap()).unwrap();
         assert_eq!(remote.entries, local.entries);
         assert_eq!(remote.tree_sha256, local.tree_sha256);
     }
@@ -5436,14 +5686,15 @@ mod tests {
             // Uppercase hex.
             "file.txt\tf\t1a4\t1\tABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEF\t",
         ] {
-            let err = canonicalize_remote_entries(bad, &root).unwrap_err();
+            let err = canonicalize_remote_entries(CompleteListing::new(bad, &root, true).unwrap())
+                .unwrap_err();
             assert!(
                 err.to_string().contains("invalid content hash"),
                 "malformed hash must be rejected with a clear error, got: {err}"
             );
         }
         // The well-formed output still parses.
-        canonicalize_remote_entries(&good, &root).unwrap();
+        canonicalize_remote_entries(CompleteListing::new(&good, &root, true).unwrap()).unwrap();
     }
 
     /// A wire manifest must be PARENT-CLOSED: every entry with a `/` must have
@@ -5470,7 +5721,8 @@ mod tests {
         // (1) A child with NO parent entry: refused, naming the child and the
         // missing parent.
         let orphan = format!("d/x\tf\t1a4\t1\t{hash}\t\n");
-        let err = canonicalize_remote_entries(&orphan, &root).unwrap_err();
+        let err = canonicalize_remote_entries(CompleteListing::new(&orphan, &root, true).unwrap())
+            .unwrap_err();
         assert!(
             err.to_string().contains("not parent-closed"),
             "a child without its parent entry must be refused, got: {err}"
@@ -5488,12 +5740,14 @@ mod tests {
         // acceptable, so the gap is precisely the missing closure — not the
         // path, the type, or the hash.
         let closed = format!("d\td\t1ed\t1\t\t\nd/x\tf\t1a4\t1\t{hash}\t\n");
-        canonicalize_remote_entries(&closed, &root).unwrap();
+        canonicalize_remote_entries(CompleteListing::new(&closed, &root, true).unwrap()).unwrap();
 
         // (3) The reverse: a parent that is present but NOT a `dir` (a file
         // with children) is refused, naming both.
         let file_parent = format!("p\tf\t1a4\t1\t{hash}\t\np/x\tf\t1a4\t1\t{hash}\t\n");
-        let err = canonicalize_remote_entries(&file_parent, &root).unwrap_err();
+        let err =
+            canonicalize_remote_entries(CompleteListing::new(&file_parent, &root, true).unwrap())
+                .unwrap_err();
         assert!(
             err.to_string().contains("non-directory parent"),
             "a file entry with children must be refused, got: {err}"
@@ -5508,8 +5762,12 @@ mod tests {
         // relies on to keep its reports injective and to avoid implicitly
         // creating an unnamed parent.
         let meta = canonicalize_remote_entries(
-            &format!("a\td\t1ed\t1\t\t\na/b\td\t1ed\t1\t\t\na/b/c\tf\t1a4\t1\t{hash}\t\n"),
-            &root,
+            CompleteListing::new(
+                &format!("a\td\t1ed\t1\t\t\na/b\td\t1ed\t1\t\t\na/b/c\tf\t1a4\t1\t{hash}\t\n"),
+                &root,
+                true,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(entry_paths(&meta), vec!["a", "a/b", "a/b/c"]);

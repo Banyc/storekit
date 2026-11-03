@@ -510,9 +510,9 @@ changes and changes back is indistinguishable from a stable one.
 ### Manifest walk, wire assembly, and containment
 
 **Where.** `manifest::{canonicalize_tree_with, UnsupportedSink,
-RefuseUnsupported, RecordUnsupported}`; `canonicalize_remote_entries_with`;
-`require_complete_walk`; `SymlinkContainmentIndex`; `ComponentResolution`;
-`SpelledWalkRefusal`; `KindIndex`; `ContainmentViews`;
+RefuseUnsupported, RecordUnsupported, EntryAssembler, ShownPath,
+CompleteListing}`; `canonicalize_remote_entries_with`; `SymlinkContainmentIndex`;
+`ComponentResolution`; `SpelledWalkRefusal`; `KindIndex`; `ContainmentViews`;
 `check_relative_symlink_target_two_views`.
 
 **States.** Local walk collecting entries; per-entry path/kind/mode/content
@@ -522,18 +522,29 @@ strict refusal or tolerated recording. Containment resolution: absent,
 non-symlink, or symlink; refusal: escapes root, through symlink, or
 plan-dependent.
 
-**Carrier.** The growing entry vector, the `seen` set, the sink, and the
-containment indexes. The walk itself has no state type.
+**Carrier.** `EntryAssembler`: the growing entry vector and the `seen` set,
+finished with the `ShownPath` the refusal names the link by. `CompleteListing`
+carries the listing text and the root it describes TOGETHER with the producing
+walk's exit status. The walk itself has no state type.
 
-**Transitions.** The strict sink fails on the first tolerated condition; the
-recording sink stores the reason and keeps the entry under its live kind. The
-wire assembler runs the same validators and the same fold as the local walk.
-`require_complete_walk` refuses a listing whose producing walk did not exit
-zero.
+**Transitions.** `EntryAssembler::push` validates the spelling, refuses a
+duplicate, and appends; `EntryAssembler::finish` CONSUMES the assembler, runs
+the one containment post-pass (skipped when no relative symlink exists) and then
+`sink.finish`, so no caller can write an entry after the verdict. The wire arm
+runs `require_parent_closed` before `finish` (the local walk is parent-closed by
+construction, `WalkDir` yielding a directory before its contents). The strict
+sink fails on the first tolerated condition; the recording sink stores the
+reason and keeps the entry under its live kind. The wire assembler runs the same
+validators and the same fold as the local walk. `CompleteListing::new` is the
+only constructor of the completeness evidence and refuses a listing whose
+producing walk did not exit zero, so no assembler can be called without it.
 
 **Watch.** Containment is a property of the result, so the applier re-checks the
 source manifest against the raw destination observation, not a precomputed
-result view. The fold must not be narrower than the destination host's fold.
+result view. The fold must not be narrower than the destination host's fold. The
+post-pass and the duplicate rule exist ONCE, in `EntryAssembler`, so the two
+views cannot diverge; only the link's display differs (`ShownPath`: the local
+walk's `root.join(rel)` versus the wire's manifest spelling).
 
 ## Transport
 

@@ -4393,8 +4393,12 @@ mod tests_ssh {
             String::from_utf8_lossy(&out.stderr)
         );
         let manifest = crate::manifest::canonicalize_remote_entries(
-            &String::from_utf8_lossy(&out.stdout),
-            &tree,
+            crate::manifest::CompleteListing::new(
+                &String::from_utf8_lossy(&out.stdout),
+                &tree,
+                true,
+            )
+            .unwrap(),
         )
         .unwrap();
         assert!(
