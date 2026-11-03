@@ -14950,6 +14950,126 @@ fn a_widened_residue_path_is_not_reported_transient() {
     );
 }
 
+/// THE ORDER WITNESS for the removal verdict: a path that satisfies EVERY refusal
+/// predicate at once is refused by the FIRST check in the documented order, and
+/// dropping the winning predicate lets the next one answer. Residue below beats
+/// the conflict prohibition, which beats the alias, which beats the byte-faithful
+/// name+kind test, so no permutation of the checks can pass here.
+///
+/// The rounds also witness WHEN the parent is read: the first three refusals are
+/// decided without enumerating it (the consultation counter stays at zero), and
+/// only the name+kind test reads it, once.
+#[test]
+fn the_deletion_verdict_answers_in_the_documented_order() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    let local = LocalSide::open(root, LocalRole::Destination).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+
+    // A synthetic destination-only DIRECTORY `x` that is at once: guarded by
+    // residue below it, prohibited by a conflict on its own path, an alias of an
+    // installed spelling, and absent from its parent's listing under its manifest
+    // name (the destination is empty).
+    let path = "x";
+    let kind = EntryKind::Dir;
+    applier.dest_residue.insert("x/res".to_string());
+    applier.conflicts.insert(
+        path.to_string(),
+        Conflict {
+            path: path.to_string(),
+            kind,
+            policy: EntryPolicy::Refuse,
+            reason: ConflictReason::ParentRefused,
+            on_disk: None,
+        },
+    );
+    applier
+        .aliased_dest
+        .insert(path.to_string(), "X".to_string());
+    let entries = vec![(path.to_string(), kind)];
+    let mut listings = DeleteListings {
+        listings: BTreeMap::new(),
+        residue_guards: applier.residue_guards(&entries),
+    };
+    assert_eq!(
+        listings.residue_guards,
+        BTreeSet::from([path.to_string()]),
+        "the residue guard set really covers the path under test"
+    );
+
+    super::listing_reads::reset();
+    assert!(
+        matches!(
+            applier.delete_verdict(path, kind, &mut listings),
+            DeleteVerdict::Refused(DeleteRefusal::ResidueBelow)
+        ),
+        "residue below is the FIRST refusal"
+    );
+    assert_eq!(
+        super::listing_reads::get(),
+        0,
+        "the residue refusal is decided without listing a directory"
+    );
+
+    applier.dest_residue.clear();
+    listings.residue_guards.clear();
+    assert!(
+        matches!(
+            applier.delete_verdict(path, kind, &mut listings),
+            DeleteVerdict::Refused(DeleteRefusal::Prohibited)
+        ),
+        "the conflict prohibition beats the alias and the name+kind test"
+    );
+    assert_eq!(
+        super::listing_reads::get(),
+        0,
+        "the prohibition is decided without listing a directory"
+    );
+
+    applier.conflicts.clear();
+    match applier.delete_verdict(path, kind, &mut listings) {
+        DeleteVerdict::Refused(DeleteRefusal::Aliased { on_disk }) => {
+            assert_eq!(
+                on_disk.as_deref(),
+                Some("x"),
+                "the alias is named by its own spelling"
+            );
+        }
+        other => panic!("the alias beats the name+kind test, got {other:?}"),
+    }
+    assert_eq!(
+        super::listing_reads::get(),
+        0,
+        "the alias refusal is decided without listing a directory"
+    );
+
+    applier.aliased_dest.clear();
+    match applier.delete_verdict(path, kind, &mut listings) {
+        DeleteVerdict::Refused(DeleteRefusal::NameNotFaithful { on_disk }) => {
+            assert_eq!(
+                on_disk, None,
+                "an empty parent listing holds no spelling to name"
+            );
+        }
+        other => panic!("the name+kind test is the LAST refusal, got {other:?}"),
+    }
+    assert_eq!(
+        super::listing_reads::get(),
+        1,
+        "only the name+kind test reads the parent's listing, and it reads it once"
+    );
+}
+
 /// Build an [`Applier`] over `diff` with every field at the empty default the
 /// run constructor uses. Tests that interrogate a private guard DIRECTLY
 /// (rather than through `run`) start from here, so the guard is exercised

@@ -4674,6 +4674,94 @@ impl PassReport {
     }
 }
 
+/// One parent directory's listing for the WHOLE removal pass. `names` keeps the
+/// raw `(name, kind)` pairs so an on-disk alias that is not byte-identical to
+/// the manifest spelling can still be NAMED; `index` is the name -> kind lookup
+/// the per-entry faithful test uses. Built ONCE per parent, so k extraneous
+/// entries in one directory cost ONE listing and k log-k lookups, not k listing
+/// clones and O(k^2) scans.
+struct PassListing {
+    names: std::rc::Rc<Listing>,
+    index: BTreeMap<Vec<u8>, EntryKind>,
+}
+
+/// The pass-scoped state [`Applier::delete_verdict`] reads: one listing per
+/// parent directory, plus the residue guard set derived from the pass's entries.
+///
+/// Both halves are snapshots of the destination AS IT STOOD WHEN THE PASS BEGAN,
+/// so they belong to the pass rather than to the `Applier`; handing them in is
+/// what makes the verdict the single reader of them.
+///
+/// ONE parent listing for the whole pass is SOUND given the pass's own removals
+/// because the per-entry question is exactly "is THIS entry's own manifest name,
+/// with THIS entry's kind, present in its parent" — a SIBLING removal changes
+/// neither this entry's name nor its kind, and the pass never removes an
+/// ANCESTOR of a path it has not already folded past: entries are sorted
+/// DEEPEST-FIRST, so a child is processed before its parent, and a path whose
+/// ancestor a TRANSFER already took is caught by [`Applier::is_already_gone`]
+/// first. The snapshot is also the SAME one a per-entry fetch would see:
+/// [`Applier::listing`] caches per directory until the next `verify` pass clears
+/// it, and no verify pass runs inside the removal loop, so hoisting the fetch
+/// removes the per-entry clone/scan WITHOUT changing which listing is observed.
+struct DeleteListings {
+    listings: BTreeMap<String, PassListing>,
+    residue_guards: BTreeSet<String>,
+}
+
+impl DeleteListings {
+    /// `parent`'s listing for this pass, fetched through the applier's run-scoped
+    /// cache and indexed on FIRST use, so k entries in one directory cost one
+    /// fetch and one index.
+    fn listing(&mut self, applier: &Applier<'_, '_>, parent: &str) -> CachedListing {
+        match self.listings.entry(parent.to_string()) {
+            std::collections::btree_map::Entry::Occupied(occupied) => {
+                Ok(std::rc::Rc::clone(&occupied.get().names))
+            }
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                let names = applier.listing(parent)?;
+                let index = names.iter().cloned().collect();
+                vacant.insert(PassListing {
+                    names: std::rc::Rc::clone(&names),
+                    index,
+                });
+                Ok(names)
+            }
+        }
+    }
+}
+
+/// Why a destination-only path may NOT be destroyed. Each variant is one of the
+/// five checks in [`Applier::delete_verdict`]'s order, and the refusal names what
+/// the caller reports: a conflict for the first four, a run-level error for
+/// [`DeleteRefusal::Unenumerable`].
+#[derive(Debug)]
+enum DeleteRefusal {
+    /// A destination-only directory in the path's ancestry holds residue, so
+    /// destroying the path would strand or destroy the original it holds.
+    ResidueBelow,
+    /// The path (or an ancestor) is one a conflict forbids destroying.
+    Prohibited,
+    /// The path (or an ancestor) is a destination spelling an installed source
+    /// entry aliases; `on_disk` is that spelling's own name when readable.
+    Aliased { on_disk: Option<String> },
+    /// The parent's listing does not hold the manifest name with the manifest
+    /// kind, byte-identically; `on_disk` is the differing spelling's name when
+    /// the listing names one.
+    NameNotFaithful { on_disk: Option<String> },
+    /// The parent directory could not be enumerated, so no entry inside it can
+    /// be confirmed; the run fails with this cause.
+    Unenumerable(std::rc::Rc<Error>),
+}
+
+/// THE answer to "may this destination-only path be destroyed": the removal
+/// pass's five checks as one value, so no caller can run them out of order or
+/// skip one.
+#[derive(Debug)]
+enum DeleteVerdict {
+    Permitted,
+    Refused(DeleteRefusal),
+}
+
 impl Applier<'_, '_> {
     fn run(&mut self) -> SyncResult {
         let result = self.run_steps();
@@ -7412,16 +7500,6 @@ impl Applier<'_, '_> {
         if self.extraneous_policy == Extraneous::Keep {
             return Ok(());
         }
-        /// One parent directory's listing for the WHOLE removal pass. `names`
-        /// keeps the raw `(name, kind)` pairs so an on-disk alias that is not
-        /// byte-identical to the manifest spelling can still be NAMED; `index`
-        /// is the name -> kind lookup the per-entry faithful test uses. Built
-        /// ONCE per parent, so k extraneous entries in one directory cost ONE
-        /// listing and k log-k lookups, not k listing clones and O(k^2) scans.
-        struct PassListing {
-            names: std::rc::Rc<Listing>,
-            index: BTreeMap<Vec<u8>, EntryKind>,
-        }
         let mut entries: Vec<(String, EntryKind)> = Vec::new();
         for entry in &self.diff.dest.entries {
             if self.diff.classify(&entry.path) == Some(EntryDiff::Extraneous) {
@@ -7435,24 +7513,15 @@ impl Applier<'_, '_> {
             let db = b.0.split('/').count();
             db.cmp(&da).then_with(|| a.0.cmp(&b.0))
         });
-        // ONE parent listing for the whole pass. This is SOUND given the pass's
-        // own removals because the per-entry question below is exactly "is THIS
-        // entry's own manifest name, with THIS entry's kind, present in its
-        // parent" — a SIBLING removal changes neither this entry's name nor its
-        // kind, and the pass never removes an ANCESTOR of a path it has not
-        // already folded past: entries are sorted DEEPEST-FIRST, so a child is
-        // processed before its parent, and a path whose ancestor a TRANSFER
-        // already took is caught by [`Applier::is_already_gone`] first. The
-        // snapshot is also the SAME one the pre-fix code consumed: `self.listing`
-        // caches per directory until the next `verify` pass clears it, and no
-        // verify pass runs inside this loop, so hoisting the fetch removes the
-        // per-entry clone/scan WITHOUT changing which listing is observed.
-        let mut pass_listings: BTreeMap<String, PassListing> = BTreeMap::new();
-        // A destination-only subtree that CONTAINS residue must not be removed:
-        // destroying it would destroy the stranded original the residue holds.
-        // Refuse the topmost such directory (and everything under it) and report
-        // it as `ResidueBelow` — nothing inside is touched.
-        let residue_guards = self.residue_guards(&entries);
+        // ONE pass-scoped snapshot of the destination, shared by every entry's
+        // verdict: the per-parent listings (see [`DeleteListings`]) and the
+        // residue guard set — a destination-only directory whose subtree holds
+        // residue is refused, and everything under it with it, so nothing inside
+        // is touched.
+        let mut listings = DeleteListings {
+            listings: BTreeMap::new(),
+            residue_guards: self.residue_guards(&entries),
+        };
         for (path, kind) in entries {
             if self.is_already_gone(&path) {
                 // A transfer already took this path with an ancestor directory.
@@ -7461,83 +7530,124 @@ impl Applier<'_, '_> {
             // The parent's listing changes if this removal lands, so it is
             // verified against the run's intent in the settle pass.
             self.touched_dirs.insert(parent_manifest(&path));
-            if is_guarded(&path, &residue_guards) {
-                let policy = self.policy.for_path(&path, kind);
-                self.conflict(&path, kind, policy, ConflictReason::ResidueBelow);
-                continue;
-            }
-            // A path whose own entry (or an ancestor) a conflict left alone is
-            // off-limits to DELETION, mode-INDEPENDENTLY: a writable conflicted
-            // directory must not have its children deleted either. The
-            // prohibition is DERIVED from the conflict record, and the deletion
-            // itself carries [`Sanction::ExtraneousFlag`] as proof. The check
-            // runs BEFORE any widen, so no mode under a prohibited subtree is
-            // touched. (The transfer path keeps the narrower
-            // [`Applier::forbidden_ancestor_blocks_write`] rule.)
-            if self.is_prohibited(&path) {
-                let policy = self.policy.for_path(&path, kind);
-                self.conflict(&path, kind, policy, ConflictReason::ParentRefused);
-                continue;
-            }
-            // IDENTITY-AWARE REMOVAL. The caller's [`Extraneous::Delete`] sanctions
-            // destroying THIS destination-only path, not a spelling that aliases
-            // another file. An on-disk spelling an installed (or skipped) source
-            // entry aliases is off-limits: removing it would destroy the entry
-            // just transferred through the fold (case B).
-            if self.is_aliased_dest(&path) {
-                let on_disk = self.aliased_dest_root(&path);
-                self.name_conflict(&path, kind, on_disk);
-                continue;
-            }
-            // The entry must EXIST under the manifest spelling in its parent's
-            // listing (read byte-identically), not merely resolve through the
-            // address: a filesystem that folded an install onto a different
-            // spelling leaves the manifest spelling naming an entry that is not
-            // there, so the sanction for THIS path covers nothing again.
-            //
-            // A parent the run cannot enumerate faithfully is a HARD ERROR
-            // before any widen or remove: no entry in a directory it could not
-            // read may be destroyed, and the sanction for THIS path cannot be
-            // confirmed at all.
-            let expected = file_name_bytes(&path);
-            let parent = parent_manifest(&path);
-            if !pass_listings.contains_key(&parent) {
-                let names = match self.listing(&parent) {
-                    Ok(names) => names,
-                    Err(error) => {
-                        return Err(unenumerable_directory_error(&parent, error.as_ref()));
+            match self.delete_verdict(&path, kind, &mut listings) {
+                DeleteVerdict::Permitted => {
+                    self.widen_ancestors(&path, ParentNeed::Writable)?;
+                    let rel = rooted(&path)?;
+                    match self.remove_subtree(&path, &rel, Sanction::ExtraneousFlag)? {
+                        Removal::Removed => {}
+                        Removal::Blocked => {
+                            let policy = self.policy.for_path(&path, kind);
+                            self.conflict(&path, kind, policy, ConflictReason::ParentRefused);
+                        }
+                        Removal::ResidueLeft => {
+                            let policy = self.policy.for_path(&path, kind);
+                            self.conflict(&path, kind, policy, ConflictReason::ResidueBelow);
+                        }
                     }
-                };
-                let index = names.iter().cloned().collect();
-                pass_listings.insert(parent.clone(), PassListing { names, index });
-            }
-            let listing = &pass_listings[&parent];
-            let faithful = match &expected {
-                Some(expected) => listing.index.get(expected) == Some(&kind),
-                None => false,
-            };
-            if !faithful {
-                let on_disk = expected
-                    .as_deref()
-                    .and_then(|expected| alias_in(&listing.names, expected));
-                self.name_conflict(&path, kind, on_disk);
-                continue;
-            }
-            self.widen_ancestors(&path, ParentNeed::Writable)?;
-            let rel = rooted(&path)?;
-            match self.remove_subtree(&path, &rel, Sanction::ExtraneousFlag)? {
-                Removal::Removed => {}
-                Removal::Blocked => {
+                }
+                DeleteVerdict::Refused(DeleteRefusal::ResidueBelow) => {
+                    let policy = self.policy.for_path(&path, kind);
+                    self.conflict(&path, kind, policy, ConflictReason::ResidueBelow);
+                }
+                DeleteVerdict::Refused(DeleteRefusal::Prohibited) => {
                     let policy = self.policy.for_path(&path, kind);
                     self.conflict(&path, kind, policy, ConflictReason::ParentRefused);
                 }
-                Removal::ResidueLeft => {
-                    let policy = self.policy.for_path(&path, kind);
-                    self.conflict(&path, kind, policy, ConflictReason::ResidueBelow);
+                DeleteVerdict::Refused(DeleteRefusal::Aliased { on_disk }) => {
+                    self.name_conflict(&path, kind, on_disk);
+                }
+                DeleteVerdict::Refused(DeleteRefusal::NameNotFaithful { on_disk }) => {
+                    self.name_conflict(&path, kind, on_disk);
+                }
+                DeleteVerdict::Refused(DeleteRefusal::Unenumerable(error)) => {
+                    return Err(unenumerable_directory_error(
+                        &parent_manifest(&path),
+                        error.as_ref(),
+                    ));
                 }
             }
         }
         Ok(())
+    }
+
+    /// THE one authority for "may this destination-only path be destroyed": the
+    /// removal pass's five checks as one decision, in ONE order — residue below,
+    /// conflict prohibition, alias of an installed entry, parent listing
+    /// (unenumerable first, then name+kind fidelity). The first refusal wins, so
+    /// a path that satisfies several is reported as the first one, and no caller
+    /// holds a sequence of its own to get wrong.
+    ///
+    /// The order is the contract: residue is decided before anything widens a
+    /// parent, the prohibition before any mode is touched, and the alias before
+    /// the listing, so a refusal that needs no read never enumerates a directory.
+    ///
+    /// This DECIDES only. It does not skip a path a transfer already took
+    /// ([`Applier::is_already_gone`] is the caller's), does not record the
+    /// conflict, does not widen a parent, and removes nothing. The per-child
+    /// authority inside [`Applier::remove_subtree`] stays there: it decides about
+    /// a LIVE child, not about a manifest path.
+    fn delete_verdict(
+        &mut self,
+        path: &str,
+        kind: EntryKind,
+        listings: &mut DeleteListings,
+    ) -> DeleteVerdict {
+        // A destination-only subtree that CONTAINS residue must not be removed:
+        // destroying it would destroy the stranded original the residue holds.
+        // The topmost such directory (and everything under it) is refused, so
+        // nothing inside is touched.
+        if is_guarded(path, &listings.residue_guards) {
+            return DeleteVerdict::Refused(DeleteRefusal::ResidueBelow);
+        }
+        // A path whose own entry (or an ancestor) a conflict left alone is
+        // off-limits to DELETION, mode-INDEPENDENTLY: a writable conflicted
+        // directory must not have its children deleted either. The prohibition is
+        // DERIVED from the conflict record, and the deletion itself carries
+        // [`Sanction::ExtraneousFlag`] as proof. Running BEFORE any widen is what
+        // keeps every mode under a prohibited subtree untouched. (The transfer
+        // path keeps the narrower [`Applier::forbidden_ancestor_blocks_write`]
+        // rule.)
+        if self.is_prohibited(path) {
+            return DeleteVerdict::Refused(DeleteRefusal::Prohibited);
+        }
+        // IDENTITY-AWARE REMOVAL. The caller's [`Extraneous::Delete`] sanctions
+        // destroying THIS destination-only path, not a spelling that aliases
+        // another file. An on-disk spelling an installed (or skipped) source
+        // entry aliases is off-limits: removing it would destroy the entry just
+        // transferred through the fold (case B).
+        if self.is_aliased_dest(path) {
+            return DeleteVerdict::Refused(DeleteRefusal::Aliased {
+                on_disk: self.aliased_dest_root(path),
+            });
+        }
+        // The entry must EXIST under the manifest spelling in its parent's
+        // listing (read byte-identically), not merely resolve through the
+        // address: a filesystem that folded an install onto a different spelling
+        // leaves the manifest spelling naming an entry that is not there, so the
+        // sanction for THIS path covers nothing again.
+        //
+        // A parent the run cannot enumerate faithfully is a HARD ERROR before any
+        // widen or remove: no entry in a directory it could not read may be
+        // destroyed, and the sanction for THIS path cannot be confirmed at all.
+        let expected = file_name_bytes(path);
+        let parent = parent_manifest(path);
+        let names = match listings.listing(self, &parent) {
+            Ok(names) => names,
+            Err(error) => return DeleteVerdict::Refused(DeleteRefusal::Unenumerable(error)),
+        };
+        let listing = &listings.listings[&parent];
+        let faithful = match &expected {
+            Some(expected) => listing.index.get(expected) == Some(&kind),
+            None => false,
+        };
+        if !faithful {
+            let on_disk = expected
+                .as_deref()
+                .and_then(|expected| alias_in(&names, expected));
+            return DeleteVerdict::Refused(DeleteRefusal::NameNotFaithful { on_disk });
+        }
+        DeleteVerdict::Permitted
     }
 
     /// POST-INSTALL NAME VERIFICATION, the third leg of the one verification
