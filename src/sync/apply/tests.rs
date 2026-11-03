@@ -7911,6 +7911,93 @@ fn a_failed_drop_claim_reports_the_entry_applied_and_the_leftover_aside() {
     assert_report_lists_disjoint(err.report());
 }
 
+/// THE LINEAR CLAIM: `drop_claim` CONSUMES the claim, and when the aside
+/// survives it hands that very claim BACK with the exact cause, so the caller
+/// still holds the only description of a path it may already have partly
+/// unlinked. The caller's ONE leftover channel then names that aside — never
+/// the live real path, and never as if its content were intact.
+#[cfg(unix)]
+#[test]
+fn a_drop_claim_that_leaves_the_aside_hands_the_claim_back_and_the_caller_names_it() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    // Both trees are EMPTY for the diff: the claim's own bookkeeping (the
+    // live-kind read and the sanctioned walk) is what this test interrogates,
+    // and an aside holding a reserved child is not a canonical tree anyway.
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    // The claimed aside is a DIRECTORY holding a RESERVED child, so the removal
+    // walk stops at that child and leaves the directory in place
+    // (`Removal::ResidueLeft`) instead of rmdir-ing it.
+    write(
+        &dst.join(".sync-aside.999.0/.sync-aside.999.1/stranded"),
+        b"precious",
+    );
+    let local = LocalSide::open(&dst, true).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+    let original = rooted("p").unwrap();
+    let aside = rooted(".sync-aside.999.0").unwrap();
+    let claim = Claim {
+        original: original.clone(),
+        rel: aside.clone(),
+    };
+
+    let ClaimDisposition::LeftBehind { claim, cause } = applier.drop_claim(claim) else {
+        panic!(
+            "the aside holds a reserved child, so it is LEFT IN PLACE: {:?}",
+            applier.claim_failures
+        );
+    };
+    // The SAME claim comes back — the real path it was moved from and the aside
+    // that still holds it — with the disposition's exact cause text.
+    assert_eq!(claim.original, original, "the original path is handed back");
+    assert_eq!(claim.rel, aside, "the surviving aside is handed back");
+    assert_eq!(
+        cause.to_string(),
+        "store error: the claimed aside .sync-aside.999.0 still holds residue and was left in place"
+    );
+    // The removal stopped AT the reserved child: the caller's copy is still
+    // there and nothing has been named yet (the disposition, not the record, is
+    // what the caller sees first).
+    assert_eq!(
+        read(&dst.join(".sync-aside.999.0/.sync-aside.999.1/stranded")),
+        b"precious"
+    );
+    assert!(
+        applier.claim_failures.is_empty(),
+        "a disposition names nothing on its own: {:?}",
+        applier.claim_failures
+    );
+
+    // The caller records the aside it was handed, and THAT aside is named.
+    applier.record_leftover_aside("p", &claim, cause);
+    assert!(
+        applier.dest_residue.contains(".sync-aside.999.0"),
+        "the surviving aside is residue: {:?}",
+        applier.dest_residue
+    );
+    let failures = applier.claim_failures.join(" | ");
+    assert!(
+        failures.contains("the entry p was installed, but its claimed aside .sync-aside.999.0 could not be removed and still exists"),
+        "the caller names the aside it was handed: {failures}"
+    );
+    // A present DIRECTORY aside is confirmed only to EXIST: the walk may
+    // already have unlinked some of its children, so the message never claims
+    // its content is intact.
+    assert!(
+        failures.contains("may no longer hold every original entry"),
+        "a directory aside's content is not asserted: {failures}"
+    );
+}
+
 /// FAILURE PATH COVERAGE: a transport whose `write` PUBLISHES the entry and
 /// THEN returns `Err` — the shape of a chmod/fsync/durability check that fails
 /// after the bytes are visible, which is exactly `LocalSide::write_file`'s
@@ -14835,6 +14922,82 @@ fn an_unknown_location_names_a_path_without_an_attempt() {
     assert_eq!(
         report.transfers, 1,
         "only the begun attempt is counted: {report:?}"
+    );
+}
+
+/// ONE ACCOUNTING for a failed move whose location is UNKNOWN: the move is
+/// pushed onto the possibility channel EXACTLY ONCE and NEITHER spelling is
+/// named as confirmed residue. The witness is the record itself, so a
+/// duplicated push or a leaked residue candidate cannot hide behind a
+/// list-level assertion.
+#[test]
+fn an_unconfirmed_move_records_one_possibility_and_no_confirmed_residue() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    let local = LocalSide::open(root, true).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+    // NEITHER spelling exists, so `locate_after_failed_rename` confirms
+    // neither: the location is UNKNOWN.
+    let from = rooted("p").unwrap();
+    let aside = rooted(".sync-aside.999.0").unwrap();
+
+    applier.account_failed_move(
+        &from,
+        &aside,
+        &aside,
+        "the claim of p reported failure: injected",
+    );
+
+    // EXACTLY ONE possibility, naming the two spellings the caller must check.
+    assert_eq!(
+        applier.unconfirmed_moves.len(),
+        1,
+        "one failed move is one possibility: {:?}",
+        applier
+            .unconfirmed_moves
+            .iter()
+            .map(|moved| (&moved.from, &moved.to))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(applier.unconfirmed_moves[0].from, "p");
+    assert_eq!(applier.unconfirmed_moves[0].to, ".sync-aside.999.0");
+    // Neither spelling became a residue CANDIDATE: the aside's own read-back
+    // found nothing, so nothing is named as existing.
+    assert!(
+        applier.dest_residue.is_empty(),
+        "an unconfirmed location names no residue: {:?}",
+        applier.dest_residue
+    );
+
+    // At report time the possibility channel names BOTH spellings in a list
+    // that asserts no location, and `residue` stays empty.
+    applier.reconcile_residue();
+    let report = applier.derive_report();
+    assert!(
+        report.residue.is_empty(),
+        "neither spelling is confirmed residue: {report:?}"
+    );
+    assert!(
+        report.indeterminate.contains(&"p".to_string())
+            && report
+                .indeterminate
+                .contains(&".sync-aside.999.0".to_string()),
+        "both possible spellings are named without asserting a location: {report:?}"
+    );
+    let failures = applier.claim_failures.join(" | ");
+    assert!(
+        failures.contains("the rename of p to .sync-aside.999.0 reported an error and the entry's location could not be confirmed"),
+        "the move is surfaced as a possibility: {failures}"
     );
 }
 

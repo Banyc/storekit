@@ -3736,6 +3736,21 @@ struct Claim {
     rel: RootedRelativePath,
 }
 
+/// What became of a claim once the new entry was installed: the aside and its
+/// subtree are GONE, or the aside is still there and is handed BACK with the
+/// error that stopped its removal.
+///
+/// The claim is linear ([`Applier::drop_claim`] consumes it), so this is the
+/// only way a caller can see a claim that may already have been partly
+/// unlinked, and the only way to record a leftover aside at all.
+enum ClaimDisposition {
+    /// The aside and its whole subtree are gone.
+    Dropped,
+    /// The aside is still present (residue or blocked). It is handed back so
+    /// the caller can record it; nothing else may use it.
+    LeftBehind { claim: Claim, cause: Error },
+}
+
 /// A claim or rollback RENAME whose call reported failure and whose landed-or-
 /// not could NOT be confirmed (the follow-up probe failed, or both spellings
 /// were absent). The entry — and any reserved residue it carried — may be at
@@ -5765,33 +5780,16 @@ impl Applier<'_, '_> {
                 // side performs the move with a single atomic `rename(2)`
                 // (perl, after `mkdir -p parent`), and the connection may drop
                 // after the command executed but before its outcome is
-                // observed here. Read back where the entry actually is and
-                // reconcile the report with the disk BEFORE naming anything.
-                let location = self.locate_after_failed_rename(rel, &aside);
-                if location == RenamedEntryLocation::Destination {
-                    // The subtree may have held residue; keep the reported
-                    // paths naming its CURRENT (aside) location.
-                    self.re_root_residue(rel, &aside);
-                }
-                // ONE decision point: `record_stranded_entry` names the aside
-                // as residue ONLY when the entry is CONFIRMED to still be there.
-                // A move that did not land (Source) and a move whose location
-                // could not be confirmed (Unknown) both reach its false branch
-                // and record nothing.
-                self.record_stranded_entry(
+                // observed here. The ONE failed-move accounting reads back
+                // where the entry actually is and reconciles the report with
+                // the disk BEFORE naming anything; the aside is the move's
+                // DESTINATION here.
+                self.account_failed_move(
+                    rel,
+                    &aside,
                     &aside,
                     &format!("the claim of {path} reported failure: {error}"),
                 );
-                if location == RenamedEntryLocation::Unknown {
-                    // The location could not be confirmed: assert NOTHING. The
-                    // final reconciliation drops every unconfirmable residue
-                    // candidate and names BOTH possible spellings of each in
-                    // `restore_failures`.
-                    self.unconfirmed_moves.push(UnconfirmedMove {
-                        from: manifest_spelling(rel),
-                        to: manifest_spelling(&aside),
-                    });
-                }
                 return Err(error);
             }
         }
@@ -5802,6 +5800,61 @@ impl Applier<'_, '_> {
             original: rel.clone(),
             rel: aside,
         })
+    }
+
+    /// THE ONE failed-move accounting for a claim or rollback RENAME whose call
+    /// reported an error: reconcile the report with where the entry actually is
+    /// and account for the aside the caller's only copy may be stranded at.
+    ///
+    /// The move is described in the direction it was ATTEMPTED (`from` → `to`),
+    /// so neither caller re-derives the residue accounting from the location:
+    ///
+    /// * [`RenamedEntryLocation::Destination`] — the move LANDED, so any residue
+    ///   the entry carried is named at `to` now (`re_root_residue`);
+    /// * [`RenamedEntryLocation::Source`] — the move did NOT land, so the residue
+    ///   is still named where it was;
+    /// * [`RenamedEntryLocation::Unknown`] — the location could not be
+    ///   confirmed, so the move is pushed onto the POSSIBILITY channel and the
+    ///   report-time reconciliation ([`Applier::reconcile_residue`]) names BOTH
+    ///   possible spellings of every affected path and asserts neither.
+    ///
+    /// `aside` is the claim's aside — the path the ORIGINAL is stranded at when
+    /// the entry is not back at the real path. It is `to` for a claim and `from`
+    /// for a rollback, which is why the caller states it instead of the two
+    /// being interchangeable: the ONE presence-gated read-back
+    /// ([`Applier::record_stranded_entry`]) must name the ASIDE, never the live
+    /// real path. That read-back is a no-op when the entry is confirmed to be at
+    /// the other spelling, so the same accounting is honest in every branch.
+    fn account_failed_move(
+        &mut self,
+        from: &RootedRelativePath,
+        to: &RootedRelativePath,
+        aside: &RootedRelativePath,
+        cause: &str,
+    ) {
+        match self.locate_after_failed_rename(from, to) {
+            // The move LANDED: the entry (and any residue it carried) is at the
+            // destination now, so the reported paths must name THAT spelling.
+            RenamedEntryLocation::Destination => self.re_root_residue(from, to),
+            // The move did NOT land: the entry is still at the source, so the
+            // residue has not moved.
+            RenamedEntryLocation::Source => {}
+            // The location could not be confirmed: assert NOTHING about it. The
+            // final reconciliation drops every unconfirmable residue candidate
+            // and names BOTH possible spellings of each in `restore_failures`.
+            RenamedEntryLocation::Unknown => {
+                self.unconfirmed_moves.push(UnconfirmedMove {
+                    from: manifest_spelling(from),
+                    to: manifest_spelling(to),
+                });
+            }
+        }
+        // ONE decision point for the ASIDE itself, in every branch: it is named
+        // as residue ONLY when the read-back CONFIRMS it is still holding the
+        // entry. A confirmed-absent aside names nothing (the entry is at the
+        // other spelling), and a probe that itself fails records the candidate
+        // for the report-time reconciliation instead of asserting existence.
+        self.record_stranded_entry(aside, cause);
     }
 
     /// Where a rename whose call reported an error actually left the entry.
@@ -5875,37 +5928,57 @@ impl Applier<'_, '_> {
     }
 
     /// Delete the aside after a SUCCESSFUL install, deepest-first with widening
-    /// (the ONE removal implementation). A reserved child of the aside is never
-    /// removed: the directory holding it is LEFT IN PLACE and this returns an
-    /// error the caller turns into machine-readable residue. Deletion is
+    /// (the ONE removal implementation), and report the claim's DISPOSITION. A
+    /// reserved child of the aside is never removed: the directory holding it is
+    /// LEFT IN PLACE and handed back (with the error that stopped the deletion)
+    /// so the caller turns it into machine-readable residue. Deletion is
     /// sanctioned by the [`Claim`] itself ([`Sanction::OwnClaim`]): the path was
     /// renamed aside by THIS sync, so it is not caller data, and the sync's own
     /// cleanup cannot strand residue under a conflicted writable ancestor. The
     /// claim is NOT a licence to destroy a child that appeared after it was
     /// taken: `remove_subtree` re-establishes the sanction against the LIVE
     /// listing and leaves an unaddressed child as residue.
-    fn drop_claim(&mut self, claim: &Claim) -> Result<()> {
+    ///
+    /// The claim is CONSUMED: [`ClaimDisposition`] is the only way to see it
+    /// again, so no caller can keep using (or re-delete) a claim whose subtree
+    /// may already have been partly unlinked.
+    fn drop_claim(&mut self, claim: Claim) -> ClaimDisposition {
         // Whether the claimed subtree took a directory off the real path is
         // decided from the LIVE kind of the aside, never a stored one: a stale
         // kind here would mark (or fail to mark) the real path's descendants as
         // gone incorrectly.
-        if self.dest.kind_opt(&claim.rel)? == Some(EntryKind::Dir) {
-            // The claimed subtree no longer exists at the real path, so a later
-            // extraneous removal must not re-attempt one of its descendants.
-            self.removed.insert(manifest_spelling(&claim.original));
+        match self.dest.kind_opt(&claim.rel) {
+            Ok(Some(EntryKind::Dir)) => {
+                // The claimed subtree no longer exists at the real path, so a
+                // later extraneous removal must not re-attempt one of its
+                // descendants.
+                self.removed.insert(manifest_spelling(&claim.original));
+            }
+            Ok(_) => {}
+            // The kind could not be read, so nothing may be removed. The aside
+            // is handed back with the probe's error and the caller records it
+            // through the same read-back channel as every other leftover.
+            Err(error) => {
+                return ClaimDisposition::LeftBehind {
+                    claim,
+                    cause: error,
+                };
+            }
         }
         let path = manifest_spelling(&claim.rel);
         // No kind parameter: `remove_subtree` reads the LIVE kind and, for a
         // live directory, walks it under the per-child authority.
-        match self.remove_subtree(&path, &claim.rel, Sanction::OwnClaim(claim))? {
-            Removal::Removed => Ok(()),
-            Removal::ResidueLeft => Err(Error::store(format!(
+        let cause = match self.remove_subtree(&path, &claim.rel, Sanction::OwnClaim(&claim)) {
+            Ok(Removal::Removed) => return ClaimDisposition::Dropped,
+            Ok(Removal::ResidueLeft) => Error::store(format!(
                 "the claimed aside {path} still holds residue and was left in place"
-            ))),
-            Removal::Blocked => Err(Error::store(format!(
+            )),
+            Ok(Removal::Blocked) => Error::store(format!(
                 "the claimed aside {path} is under a path a conflict blocked and was left in place"
-            ))),
-        }
+            )),
+            Err(error) => error,
+        };
+        ClaimDisposition::LeftBehind { claim, cause }
     }
 
     /// Record a claim whose deletion failed AFTER the new entry was installed:
@@ -6006,30 +6079,20 @@ impl Applier<'_, '_> {
             }
         }
         if let Err(error) = self.rename_back(&claim.rel, rel) {
-            match self.locate_after_failed_rename(&claim.rel, rel) {
-                // The rollback did NOT land: the original really is stranded
-                // at the aside (which is confirmed to exist).
-                RenamedEntryLocation::Source => self.record_stranded_entry(
-                    &claim.rel,
-                    &format!(
-                        "the replaced entry {rel_path} could not be restored after a failed install: {error}"
-                    ),
+            // The ONE failed-move accounting: a rollback that did NOT land
+            // leaves the original stranded at the aside (which is confirmed to
+            // exist), and one that LANDED despite reporting its failure has it
+            // back at `rel` with the aside gone, so NOTHING is stranded (and
+            // asserting "remains stranded at the aside" would name a path that
+            // is gone). The aside is the move's SOURCE here.
+            self.account_failed_move(
+                &claim.rel,
+                rel,
+                &claim.rel,
+                &format!(
+                    "the replaced entry {rel_path} could not be restored after a failed install: {error}"
                 ),
-                // The rollback LANDED despite reporting its failure: the entry
-                // is back at `rel` and the aside no longer exists, so NOTHING
-                // is stranded (and asserting "remains stranded at the aside"
-                // would name a path that is gone).
-                RenamedEntryLocation::Destination => self.re_root_residue(&claim.rel, rel),
-                RenamedEntryLocation::Unknown => {
-                    // The rollback may or may not have landed: assert NOTHING
-                    // about location. The reconciliation names both possible
-                    // spellings for every affected residue path.
-                    self.unconfirmed_moves.push(UnconfirmedMove {
-                        from: manifest_spelling(&claim.rel),
-                        to: rel_path.clone(),
-                    });
-                }
-            }
+            );
         } else {
             // The original is back at `rel`; re-root any residue it holds.
             self.re_root_residue(&claim.rel, rel);
@@ -6395,8 +6458,11 @@ impl Applier<'_, '_> {
                 match self.dest.create_dir_all(rel) {
                     Ok(()) => {
                         self.commit_mutation(attempt);
-                        if let Err(error) = self.drop_claim(&claim) {
-                            self.record_leftover_aside(&entry.path, &claim, error);
+                        match self.drop_claim(claim) {
+                            ClaimDisposition::Dropped => {}
+                            ClaimDisposition::LeftBehind { claim, cause } => {
+                                self.record_leftover_aside(&entry.path, &claim, cause);
+                            }
                         }
                     }
                     Err(error) => {
@@ -6544,11 +6610,12 @@ impl Applier<'_, '_> {
                     // as machine-readable residue and a reported failure (loud),
                     // never swallowed — and the entry is still verified and
                     // reported `applied`, because it WAS installed.
-                    (Ok(()), Some(claim)) => {
-                        if let Err(error) = self.drop_claim(&claim) {
-                            self.record_leftover_aside(&entry.path, &claim, error);
+                    (Ok(()), Some(claim)) => match self.drop_claim(claim) {
+                        ClaimDisposition::Dropped => {}
+                        ClaimDisposition::LeftBehind { claim, cause } => {
+                            self.record_leftover_aside(&entry.path, &claim, cause);
                         }
-                    }
+                    },
                     (Err(error), None) => return Err(error),
                     (Err(error), Some(claim)) => {
                         self.rollback_claim(rel, claim);
@@ -6960,8 +7027,11 @@ impl Applier<'_, '_> {
             }
             (Ok(()), Some(claim)) => {
                 self.commit_mutation(attempt);
-                if let Err(error) = self.drop_claim(&claim) {
-                    self.record_leftover_aside(&entry.path, &claim, error);
+                match self.drop_claim(claim) {
+                    ClaimDisposition::Dropped => {}
+                    ClaimDisposition::LeftBehind { claim, cause } => {
+                        self.record_leftover_aside(&entry.path, &claim, cause);
+                    }
                 }
             }
             (Err(error), None) => return Err(error),
