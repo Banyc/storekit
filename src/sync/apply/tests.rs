@@ -14659,6 +14659,7 @@ fn applier_over<'a, 'b>(
         verified: BTreeSet::new(),
         verify_failures: BTreeSet::new(),
         indeterminate: BTreeMap::new(),
+        location_unknown: BTreeSet::new(),
         journal: ModeJournal::default(),
         removed: BTreeSet::new(),
         claim_failures: Vec::new(),
@@ -14686,6 +14687,118 @@ fn applier_with_ancestry_memo<'a, 'b>(
     diff: &'b TreeDiff,
 ) -> Applier<'a, 'b> {
     applier_over(source, dest, policy, diff)
+}
+
+/// THE ACCOUNTING UNIT: an attempt is a TOKEN, and only a commit of the token's
+/// own kind resolves it. A dropped token leaves the attempt pending — the TYPE
+/// is the device (`MutationAttempt` is `#[must_use]`, so dropping one is
+/// deliberate, not the silent over-commit the old absent-entry guard absorbed) —
+/// and a LATER success of the same kind resolves only ITS OWN attempt, so a
+/// prior failed attempt keeps the path indeterminate.
+#[test]
+fn a_commit_resolves_only_its_own_attempt() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    let local = LocalSide::open(root, true).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+
+    // A begun-and-committed attempt is resolved.
+    let committed = applier.begin_mutation("resolved", MutationKind::Content);
+    applier.commit_mutation(committed);
+    assert!(
+        !applier.indeterminate.contains_key("resolved"),
+        "a committed attempt leaves no pending record"
+    );
+
+    // A dropped token leaves the attempt pending (there is no other way to
+    // abandon an attempt, and no way to commit without one).
+    let failed = applier.begin_mutation("p", MutationKind::Content);
+    drop(failed);
+
+    // A LATER successful call of the same kind resolves only ITS OWN attempt:
+    // the prior failure keeps the path indeterminate.
+    let later = applier.begin_mutation("p", MutationKind::Content);
+    applier.commit_mutation(later);
+    assert_eq!(
+        applier.indeterminate["p"].content, 1,
+        "only the later attempt was resolved"
+    );
+    assert_eq!(
+        applier.indeterminate["p"].mode, 0,
+        "no mode attempt was begun"
+    );
+
+    // A commit of a DIFFERENT kind clears nothing.
+    let mode = applier.begin_mutation("p", MutationKind::Mode);
+    applier.commit_mutation(mode);
+    assert_eq!(
+        applier.indeterminate["p"].content, 1,
+        "a mode commit cannot resolve a content attempt"
+    );
+
+    let report = applier.derive_report();
+    assert_eq!(report.indeterminate, vec!["p".to_string()], "{report:?}");
+    assert_eq!(
+        report.transfers, 4,
+        "every begin is one counted attempt: {report:?}"
+    );
+}
+
+/// An UNKNOWN LOCATION is its own channel: `note_indeterminate` names a path in
+/// [`SyncReport::indeterminate`] WITHOUT an attempt, so it counts no transfer
+/// and adds no `PendingMutations` entry. `derive_report` unions the two
+/// channels, and a path both channels know is still named ONCE.
+#[test]
+fn an_unknown_location_names_a_path_without_an_attempt() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    let local = LocalSide::open(root, true).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+
+    applier.note_indeterminate("lost");
+    assert_eq!(applier.transfers, 0, "a location note is not an attempt");
+    assert!(
+        !applier.indeterminate.contains_key("lost"),
+        "a location note is not a pending mutation"
+    );
+    assert!(applier.location_unknown.contains("lost"));
+
+    // Both channels naming the same path produce ONE report path.
+    applier.note_indeterminate("both");
+    let attempt = applier.begin_mutation("both", MutationKind::Content);
+    applier.commit_mutation(attempt);
+    applier.note_indeterminate("both");
+
+    let report = applier.derive_report();
+    assert_eq!(
+        report.indeterminate,
+        vec!["both".to_string(), "lost".to_string()],
+        "{report:?}"
+    );
+    assert_eq!(
+        report.transfers, 1,
+        "only the begun attempt is counted: {report:?}"
+    );
 }
 
 /// The confinement predicate is a CONJUNCTION: the side kind ([`Side::Local`])

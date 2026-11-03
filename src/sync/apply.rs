@@ -3660,6 +3660,25 @@ enum MutationKind {
     Content,
 }
 
+/// A begun-but-uncommitted mutation attempt: the proof that
+/// [`Applier::begin_mutation`] counted this call and incremented the counter for
+/// its kind. [`Applier::begin_mutation`] is the ONLY constructor, so
+/// [`Applier::commit_mutation`] can never decrement a counter no attempt
+/// incremented. Dropping the token without committing it leaves the attempt
+/// pending, which is exactly what the report needs: the path stays in
+/// [`SyncReport::indeterminate`].
+///
+/// The TYPE is the device: `#[must_use]` makes a dropped token a warning, and
+/// the borrow of the attempt's path keeps that spelling alive until the attempt
+/// is either committed or abandoned.
+#[must_use = "a begun mutation must be committed or left pending"]
+struct MutationAttempt<'p> {
+    /// The manifest spelling the attempt was recorded against.
+    path: &'p str,
+    /// The kind of mutation attempted; only a commit of THIS kind resolves it.
+    kind: MutationKind,
+}
+
 /// The begun-but-uncommitted mutation attempts at ONE path, counted PER KIND.
 /// [`Applier::begin_mutation`] increments the counter for the attempt it is
 /// about to make; [`Applier::commit_mutation`] decrements it only when a call
@@ -4195,6 +4214,7 @@ fn run(
         verified: BTreeSet::new(),
         verify_failures: BTreeSet::new(),
         indeterminate: BTreeMap::new(),
+        location_unknown: BTreeSet::new(),
         journal: ModeJournal::default(),
         removed: BTreeSet::new(),
         claim_failures: Vec::new(),
@@ -4330,10 +4350,18 @@ struct Applier<'a, 'b> {
     /// Counts are PER KIND and only a successful call of that kind decrements
     /// them, so a later successful mutation at the same path cannot erase an
     /// earlier failed attempt.
-    /// [`Applier::reconcile_residue`] also inserts a residue candidate whose
-    /// presence could not be confirmed: its location is unknown, and an unknown
-    /// location is exactly what this map records.
+    /// [`Applier::reconcile_residue`] does NOT insert here: a residue candidate
+    /// whose presence could not be confirmed has an unknown LOCATION, which is a
+    /// different fact recorded in `location_unknown` (the report unions the two
+    /// channels).
     indeterminate: BTreeMap<String, PendingMutations>,
+    /// Paths whose LOCATION could not be confirmed (a residue candidate a
+    /// report-time probe could not find, or a rename whose landed-or-not was
+    /// unreadable). This asserts no location and is a DIFFERENT fact from an
+    /// uncommitted attempt: it has no counter, it is never incremented by a
+    /// mutation, and nothing commits it away.
+    /// [`Applier::derive_report`] unions it with `indeterminate`'s keys.
+    location_unknown: BTreeSet<String>,
     /// THE mode record. It owns the intended final mode every directory has
     /// pending as well as every mode this sync changed (see [`ModeRecord`]).
     journal: ModeJournal,
@@ -4641,8 +4669,19 @@ impl Applier<'_, '_> {
     /// from `indeterminate`, `conflicts`, `residue`, `skipped`, and
     /// `extraneous`.
     fn derive_report(&self) -> SyncReport {
-        // The raw candidate claims, before the ONE rank fold.
-        let indeterminate: BTreeSet<String> = self.indeterminate.keys().cloned().collect();
+        // The raw candidate claims, before the ONE rank fold. TWO channels feed
+        // the indeterminate claim: an attempt that was BEGUN and never committed
+        // (a mutation that may have landed), and a path whose LOCATION could not
+        // be confirmed (which asserts no location at all). They are unioned here
+        // and never merged in the record: the counters keep "a later success
+        // cannot erase an earlier failure", and a location note has no counter to
+        // decrement.
+        let indeterminate: BTreeSet<String> = self
+            .indeterminate
+            .keys()
+            .chain(self.location_unknown.iter())
+            .cloned()
+            .collect();
         let mut applied: BTreeSet<String> = BTreeSet::new();
         let mut skipped: BTreeSet<String> = BTreeSet::new();
         // A `Transferred` path that did not reach a verified final state is NOT
@@ -4777,7 +4816,10 @@ impl Applier<'_, '_> {
     /// have changed, a later mode attempt on the same path must not overwrite
     /// that record, or [`Applier::restore`]'s confirming chmod could silently
     /// resolve a failed write.
-    fn begin_mutation(&mut self, path: &str, kind: MutationKind) {
+    ///
+    /// The returned token is the ONLY handle [`Applier::commit_mutation`]
+    /// accepts, so the attempt it resolves is provably one that was begun.
+    fn begin_mutation<'p>(&mut self, path: &'p str, kind: MutationKind) -> MutationAttempt<'p> {
         // A CONTENT mutation can change the KIND of `path`: a create, a write, a
         // rename (claim/rollback), or a removal. Any memoized "this path is a
         // real directory" fact is therefore no longer trustworthy AT this
@@ -4795,22 +4837,30 @@ impl Applier<'_, '_> {
             MutationKind::Content => pending.content += 1,
             MutationKind::Mode => pending.mode += 1,
         }
+        MutationAttempt { path, kind }
     }
 
-    /// The `kind` mutating call on `path` returned `Ok`: THAT attempt landed, so
-    /// it is resolved. A count is decremented only for the SAME kind — a
-    /// successful restore of a path's mode says nothing about whether a failed
-    /// CONTENT mutation landed — and only by one, so a PRIOR failed attempt of
-    /// the same kind keeps the path indeterminate.
-    fn commit_mutation(&mut self, path: &str, kind: MutationKind) {
-        let Some(pending) = self.indeterminate.get_mut(path) else {
-            return;
-        };
+    /// The `kind` mutating call on the attempt's path returned `Ok`: THAT attempt
+    /// landed, so it is resolved. The token is the proof that a begin happened,
+    /// so the counter is decremented unconditionally — there is no absent entry
+    /// to guard and no over-commit to clamp. A count is decremented only for the
+    /// SAME kind — a successful restore of a path's mode says nothing about
+    /// whether a failed CONTENT mutation landed — and only by one, so a PRIOR
+    /// failed attempt of the same kind keeps the path indeterminate.
+    fn commit_mutation(&mut self, attempt: MutationAttempt<'_>) {
+        let MutationAttempt { path, kind } = attempt;
+        // `begin_mutation` incremented this path's counter for `kind`, and an
+        // entry is removed only at zero, so a token outstanding for THIS kind
+        // keeps both the entry and its count present here.
+        let pending = self
+            .indeterminate
+            .get_mut(path)
+            .expect("a mutation token is only produced by begin_mutation");
         let slot = match kind {
             MutationKind::Content => &mut pending.content,
             MutationKind::Mode => &mut pending.mode,
         };
-        *slot = slot.saturating_sub(1);
+        *slot -= 1;
         if pending.is_empty() {
             self.indeterminate.remove(path);
         }
@@ -5302,11 +5352,11 @@ impl Applier<'_, '_> {
         if target == current {
             return Ok(());
         }
-        self.begin_mutation(path, MutationKind::Mode);
+        let attempt = self.begin_mutation(path, MutationKind::Mode);
         match self.dest.set_mode(rel, target, EntryKind::Dir) {
             Ok(()) => {
                 self.journal.mark_widened(path, EntryKind::Dir, current);
-                self.commit_mutation(path, MutationKind::Mode);
+                self.commit_mutation(attempt);
                 Ok(())
             }
             Err(error) => {
@@ -5442,7 +5492,7 @@ impl Applier<'_, '_> {
                             // (never `AT_REMOVEDIR`), so the leaf has no
                             // descendants the sync walks and needs no per-child
                             // authority.
-                            self.begin_mutation(&entry_path, MutationKind::Content);
+                            let attempt = self.begin_mutation(&entry_path, MutationKind::Content);
                             // Under `OwnClaim` the WHOLE walk is inside the sync's
                             // own claim-aside, so every path includes the residue
                             // root and must use the sanctioned primitive; a nested
@@ -5455,7 +5505,7 @@ impl Applier<'_, '_> {
                             };
                             match removal {
                                 Ok(()) => {
-                                    self.commit_mutation(&entry_path, MutationKind::Content);
+                                    self.commit_mutation(attempt);
                                     completed = Some(Removal::Removed);
                                 }
                                 Err(error) => return Err(error),
@@ -5550,7 +5600,7 @@ impl Applier<'_, '_> {
                     completed = Some(Removal::ResidueLeft);
                     break 'advance;
                 }
-                self.begin_mutation(&frame.path, MutationKind::Content);
+                let attempt = self.begin_mutation(&frame.path, MutationKind::Content);
                 // THE FINAL DIRECTORY REMOVAL IS NON-RECURSIVE: `Side::remove_dir`
                 // maps to rmdir semantics, which fails with
                 // ENOTEMPTY/EEXIST when the directory is not empty. That makes
@@ -5568,7 +5618,7 @@ impl Applier<'_, '_> {
                 };
                 match removal {
                     Ok(()) => {
-                        self.commit_mutation(&frame.path, MutationKind::Content);
+                        self.commit_mutation(attempt);
                         self.journal.mark_removed(&frame.path);
                         self.removed.insert(frame.path.clone());
                         completed = Some(Removal::Removed);
@@ -5644,10 +5694,10 @@ impl Applier<'_, '_> {
     fn install_file(&mut self, path: &str, rel: &RootedRelativePath, mode: Mode) -> Result<()> {
         let bytes = self.source.read(rel)?;
         self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-        self.begin_mutation(path, MutationKind::Content);
+        let attempt = self.begin_mutation(path, MutationKind::Content);
         match self.dest.write_file(rel, &bytes, mode) {
             Ok(()) => {
-                self.commit_mutation(path, MutationKind::Content);
+                self.commit_mutation(attempt);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -5676,9 +5726,9 @@ impl Applier<'_, '_> {
         // location is the aside); record the attempt against `rel`.
         let path = manifest_spelling(rel);
         self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::Unresolved)?;
-        self.begin_mutation(&path, MutationKind::Content);
+        let attempt = self.begin_mutation(&path, MutationKind::Content);
         match self.dest.rename_aside(rel, &aside) {
-            Ok(()) => self.commit_mutation(&path, MutationKind::Content),
+            Ok(()) => self.commit_mutation(attempt),
             Err(error) => {
                 // A rename that REPORTS an error may still have LANDED: the far
                 // side performs the move with a single atomic `rename(2)`
@@ -5990,10 +6040,10 @@ impl Applier<'_, '_> {
                 "the rollback of {path} found a live {kind:?} entry there that this run did not create; refusing to displace it"
             )));
         }
-        self.begin_mutation(&path, MutationKind::Content);
+        let attempt = self.begin_mutation(&path, MutationKind::Content);
         match self.dest.rename_aside(from, to) {
             Ok(()) => {
-                self.commit_mutation(&path, MutationKind::Content);
+                self.commit_mutation(attempt);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -6110,16 +6160,15 @@ impl Applier<'_, '_> {
         }
     }
 
-    /// Record `path` in [`SyncReport::indeterminate`] WITHOUT an in-flight
-    /// attempt: the residue reconciliation uses it for a location that could not
-    /// be confirmed. A list that asserts NO location is exactly what
-    /// `indeterminate` means, and the count is permanent (nothing commits it),
-    /// so a later probe cannot silently drop it.
+    /// Record that `path`'s LOCATION could not be confirmed: the residue
+    /// reconciliation uses it for a candidate a report-time probe could not find
+    /// and for a rename pair whose landed-or-not was unreadable. This asserts NO
+    /// location and is a DIFFERENT fact from an uncommitted attempt, so it is
+    /// kept in its own channel: it increments no counter and no transfer, and no
+    /// commit can erase it. [`Applier::derive_report`] unions this set with the
+    /// paths that have a pending attempt.
     fn note_indeterminate(&mut self, path: &str) {
-        self.indeterminate
-            .entry(path.to_string())
-            .or_default()
-            .content += 1;
+        self.location_unknown.insert(path.to_string());
     }
 
     /// Whether `path` or an ancestor was already removed this run. Ancestry is
@@ -6311,10 +6360,10 @@ impl Applier<'_, '_> {
                 self.widen_ancestors(&entry.path, ParentNeed::Writable)?;
                 let claim = self.claim_aside(rel)?;
                 self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-                self.begin_mutation(&entry.path, MutationKind::Content);
+                let attempt = self.begin_mutation(&entry.path, MutationKind::Content);
                 match self.dest.create_dir_all(rel) {
                     Ok(()) => {
-                        self.commit_mutation(&entry.path, MutationKind::Content);
+                        self.commit_mutation(attempt);
                         if let Err(error) = self.drop_claim(&claim) {
                             self.record_leftover_aside(&entry.path, &claim, error);
                         }
@@ -6330,9 +6379,9 @@ impl Applier<'_, '_> {
             None => {
                 self.widen_ancestors(&entry.path, ParentNeed::Writable)?;
                 self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-                self.begin_mutation(&entry.path, MutationKind::Content);
+                let attempt = self.begin_mutation(&entry.path, MutationKind::Content);
                 match self.dest.create_dir_all(rel) {
-                    Ok(()) => self.commit_mutation(&entry.path, MutationKind::Content),
+                    Ok(()) => self.commit_mutation(attempt),
                     // The directory may have been CREATED before the failure
                     // (the local create chmods and the transport may sync); do
                     // not roll back our OWN root-relative creation, and leave
@@ -6399,10 +6448,10 @@ impl Applier<'_, '_> {
                         AncestorPolicy::MustExist,
                         FinalPolicy::NotSymlink,
                     )?;
-                    self.begin_mutation(&entry.path, MutationKind::Mode);
+                    let attempt = self.begin_mutation(&entry.path, MutationKind::Mode);
                     match self.dest.set_mode(rel, mode, EntryKind::File) {
                         Ok(()) => {
-                            self.commit_mutation(&entry.path, MutationKind::Mode);
+                            self.commit_mutation(attempt);
                             // Record the outcome BEFORE the fallible mode READ
                             // (`note_final`): if that read fails, the chmod
                             // already landed and the path must be named, not
@@ -6526,14 +6575,14 @@ impl Applier<'_, '_> {
         self.journal
             .note_first_touch(path, EntryKind::File, Some(current));
         self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::NotSymlink)?;
-        self.begin_mutation(path, MutationKind::Mode);
+        let attempt = self.begin_mutation(path, MutationKind::Mode);
         match self
             .dest
             .set_mode(rel, current | OWNER_WRITE, EntryKind::File)
         {
             Ok(()) => {
                 self.journal.mark_widened(path, EntryKind::File, current);
-                self.commit_mutation(path, MutationKind::Mode);
+                self.commit_mutation(attempt);
                 Ok(())
             }
             Err(error) => {
@@ -6740,10 +6789,10 @@ impl Applier<'_, '_> {
         self.journal
             .note_first_touch(&entry.path, EntryKind::File, Some(current));
         self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::NotSymlink)?;
-        self.begin_mutation(&entry.path, MutationKind::Mode);
+        let attempt = self.begin_mutation(&entry.path, MutationKind::Mode);
         match self.dest.set_mode(rel, mode, EntryKind::File) {
             Ok(()) => {
-                self.commit_mutation(&entry.path, MutationKind::Mode);
+                self.commit_mutation(attempt);
                 self.outcomes
                     .insert(entry.path.clone(), Outcome::Transferred);
                 self.note_final(&entry.path, mode, EntryKind::File)?;
@@ -6793,7 +6842,7 @@ impl Applier<'_, '_> {
             .note_first_touch(&entry.path, EntryKind::File, original);
         self.make_overwritable(&entry.path, rel)?;
         self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-        self.begin_mutation(&entry.path, MutationKind::Content);
+        let attempt = self.begin_mutation(&entry.path, MutationKind::Content);
         // THE CHECKED WRITE: install `source_bytes` only if the live destination
         // still holds `expected_bytes` (or is still absent when that is `None`).
         // A mismatch means a concurrent writer changed the destination after we
@@ -6804,7 +6853,7 @@ impl Applier<'_, '_> {
             .write_file_if_match(rel, expected_bytes, source_bytes, mode)
         {
             Ok(CheckedWrite::Written) => {
-                self.commit_mutation(&entry.path, MutationKind::Content);
+                self.commit_mutation(attempt);
                 // Record the outcome BEFORE the fallible mode READ, so a read
                 // failure names the path.
                 self.outcomes
@@ -6821,7 +6870,7 @@ impl Applier<'_, '_> {
                 // The primitive returned a DEFINITE "nothing written" verdict,
                 // so the path's state is known and the in-flight attempt is
                 // resolved; the mutation COUNT stays (a call was attempted).
-                self.commit_mutation(&entry.path, MutationKind::Content);
+                self.commit_mutation(attempt);
                 Ok(AppendAttempt::Changed)
             }
             Err(error) => Err(error),
@@ -6863,7 +6912,7 @@ impl Applier<'_, '_> {
             None => None,
         };
         self.guard_destination(rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-        self.begin_mutation(&entry.path, MutationKind::Content);
+        let attempt = self.begin_mutation(&entry.path, MutationKind::Content);
         // `Path::new` over the manifest's target string is a BYTE-FAITHFUL
         // constructor: it splits on the platform separator but never resolves
         // `.`/`..`, never normalizes, and never consults the filesystem, so
@@ -6876,10 +6925,10 @@ impl Applier<'_, '_> {
         let install = self.dest.symlink(Path::new(target), rel);
         match (install, claim) {
             (Ok(()), None) => {
-                self.commit_mutation(&entry.path, MutationKind::Content);
+                self.commit_mutation(attempt);
             }
             (Ok(()), Some(claim)) => {
-                self.commit_mutation(&entry.path, MutationKind::Content);
+                self.commit_mutation(attempt);
                 if let Err(error) = self.drop_claim(&claim) {
                     self.record_leftover_aside(&entry.path, &claim, error);
                 }
@@ -6936,10 +6985,10 @@ impl Applier<'_, '_> {
                 continue;
             }
             self.guard_destination(&rel, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
-            self.begin_mutation(&path, MutationKind::Mode);
+            let attempt = self.begin_mutation(&path, MutationKind::Mode);
             match self.dest.set_mode(&rel, mode, EntryKind::Dir) {
                 Ok(()) => {
-                    self.commit_mutation(&path, MutationKind::Mode);
+                    self.commit_mutation(attempt);
                     self.note_final(&path, mode, EntryKind::Dir)?;
                 }
                 Err(error) => return Err(error),
@@ -6997,10 +7046,12 @@ impl Applier<'_, '_> {
                 }
             };
             if current == target {
-                // The live mode already matches the target, so the path's mode
-                // is KNOWN; clear a pending MODE attempt (never a CONTENT one —
-                // a failed write/removal is not resolved by a mode restore).
-                self.commit_mutation(&path, MutationKind::Mode);
+                // The live mode already matches the target, so NO call is made:
+                // there is no attempt to begin, and therefore no token to
+                // commit. A MODE attempt left pending by a chmod that reported
+                // an error stays pending — a READ cannot resolve an attempt, only
+                // a successful call of the same kind can (and it would not
+                // resolve a CONTENT attempt either).
                 continue;
             }
             if let Err(error) = self.guard_destination(
@@ -7015,12 +7066,12 @@ impl Applier<'_, '_> {
                 failures.push(format!("restore mode {target:04o} of {path}: {error}"));
                 continue;
             }
-            self.begin_mutation(&path, MutationKind::Mode);
+            let attempt = self.begin_mutation(&path, MutationKind::Mode);
             if let Err(error) = self.dest.set_mode(&rel, target, live) {
                 failures.push(format!("restore mode {target:04o} of {path}: {error}"));
                 continue;
             }
-            self.commit_mutation(&path, MutationKind::Mode);
+            self.commit_mutation(attempt);
             // A dropped restore is never a silent success.
             match self.dest.mode_opt(&rel, live) {
                 Ok(Some(mode)) if mode == target => {}
@@ -8185,9 +8236,9 @@ impl Applier<'_, '_> {
         let rel = RootedRelativePath::parse(Path::new(&name))?;
         let flipped_rel = RootedRelativePath::parse(Path::new(&flipped))?;
         self.guard_destination(&rel, AncestorPolicy::MayCreate, FinalPolicy::NotSymlink)?;
-        self.begin_mutation(&name, MutationKind::Content);
+        let attempt = self.begin_mutation(&name, MutationKind::Content);
         match self.dest.create_dir_all(&rel) {
-            Ok(()) => self.commit_mutation(&name, MutationKind::Content),
+            Ok(()) => self.commit_mutation(attempt),
             Err(error) => return Err(error),
         }
         let insensitive = match self.dest.exists(&flipped_rel) {
@@ -8208,10 +8259,10 @@ impl Applier<'_, '_> {
     fn remove_probe(&mut self, rel: &RootedRelativePath) -> Result<()> {
         let path = manifest_spelling(rel);
         self.guard_destination(rel, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
-        self.begin_mutation(&path, MutationKind::Content);
+        let attempt = self.begin_mutation(&path, MutationKind::Content);
         match self.dest.remove_residue_dir(rel) {
             Ok(()) => {
-                self.commit_mutation(&path, MutationKind::Content);
+                self.commit_mutation(attempt);
                 Ok(())
             }
             Err(error) => {
