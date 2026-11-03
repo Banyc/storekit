@@ -3193,6 +3193,43 @@ fn append_tail_no_op_applies_a_changed_mode_without_writing_bytes() {
     assert_eq!(mode_of(&dst.join("f")), 0o644);
 }
 
+/// `Removal::join` is the removal walk's fold, so its table is the walk's
+/// precedence rule: `ResidueLeft` absorbs (a directory holding residue must stay
+/// whatever its siblings did), `Blocked` upgrades only a `Removed` accumulator,
+/// and `Removed` is the unit. The 3x3 table is checked cell by cell, and the
+/// rule is associative, so folding children in any DFS order gives the same
+/// outcome.
+#[test]
+fn removal_join_is_the_walks_fold_table() {
+    use Removal::{Blocked, Removed, ResidueLeft};
+    let all = [Removed, Blocked, ResidueLeft];
+    let expected = |acc: Removal, child: Removal| match (acc, child) {
+        (ResidueLeft, _) | (_, ResidueLeft) => ResidueLeft,
+        (Blocked, _) | (_, Blocked) => Blocked,
+        (Removed, Removed) => Removed,
+    };
+    for acc in all {
+        for child in all {
+            assert_eq!(
+                acc.join(child),
+                expected(acc, child),
+                "{acc:?}.join({child:?})"
+            );
+        }
+    }
+    for a in all {
+        for b in all {
+            for c in all {
+                assert_eq!(
+                    a.join(b).join(c),
+                    a.join(b.join(c)),
+                    "join is associative at ({a:?}, {b:?}, {c:?})"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn extraneous_is_reported_and_survives_then_is_removed_with_the_flag() {
     let dir = fixture_tmpdir(&env()).unwrap();

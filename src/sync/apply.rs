@@ -3915,6 +3915,25 @@ enum Removal {
     Blocked,
 }
 
+impl Removal {
+    /// The walk's fold: combine the accumulator (the outcome of the children
+    /// folded back before it) with the outcome of the entry/subtree just
+    /// finished. `ResidueLeft` absorbs — a directory that still holds residue
+    /// must stay, whatever its siblings did; `Blocked` upgrades only a
+    /// `Removed` accumulator (it never clears a `ResidueLeft`); `Removed` is
+    /// the unit.
+    fn join(self, child: Removal) -> Removal {
+        match self {
+            Removal::ResidueLeft => Removal::ResidueLeft,
+            Removal::Blocked => match child {
+                Removal::ResidueLeft => Removal::ResidueLeft,
+                Removal::Removed | Removal::Blocked => Removal::Blocked,
+            },
+            Removal::Removed => child,
+        }
+    }
+}
+
 /// Where a rename whose call reported an error actually left the entry. A
 /// failed rename is not assumed to have done nothing: the far side performs the
 /// move with a single atomic `rename(2)` (perl, after `mkdir -p parent`), so a
@@ -5438,24 +5457,45 @@ impl Applier<'_, '_> {
             outcome: Removal,
         }
 
-        // `pending` is the single entry whose own removal is next to attempt;
-        // `completed` is the outcome of the entry/subtree just finished, waiting
-        // to be folded into the frame it belongs to; `stack` holds the directory
-        // frames still being walked. `pending` and `completed` are never both
-        // set. The ENTRY phase below is the recursive body verbatim; the only
-        // changes are the push instead of the recursive call and the fold of the
-        // return value into the top frame.
+        /// One unit of the walk's work: attempt one entry's removal, or fold a
+        /// finished entry/subtree into the frame it belongs to. The two phases
+        /// are exclusive: the walk is in exactly one of them at a time.
+        enum Work {
+            /// Attempt the removal of one entry.
+            Enter {
+                path: String,
+                rel: RootedRelativePath,
+            },
+            /// Fold one finished entry/subtree into its parent frame.
+            Fold(Removal),
+        }
+
+        // `work` is the phase the walk is in; `stack` holds the directory frames
+        // still being walked. The ENTRY phase below is the recursive body
+        // verbatim; the only changes are the push instead of the recursive call
+        // and the fold of the return value into the top frame.
         let mut stack: Vec<DirFrame> = Vec::new();
-        let mut pending: Option<(String, RootedRelativePath)> =
-            Some((path.to_string(), rel.clone()));
-        let mut completed: Option<Removal> = None;
+        let mut work = Work::Enter {
+            path: path.to_string(),
+            rel: rel.clone(),
+        };
 
         loop {
-            if let Some((entry_path, entry_rel)) = pending.take() {
-                // ---- ENTRY: attempt the removal of one entry. ----
-                if !self.may_delete(&entry_path, sanction) {
-                    completed = Some(Removal::Blocked);
-                } else if let Some(kind) = self.dest.kind_opt(&entry_rel)? {
+            match work {
+                Work::Enter {
+                    path: entry_path,
+                    rel: entry_rel,
+                } => {
+                    // ---- ENTRY: attempt the removal of one entry. ----
+                    if !self.may_delete(&entry_path, sanction) {
+                        work = Work::Fold(Removal::Blocked);
+                        continue;
+                    }
+                    let Some(kind) = self.dest.kind_opt(&entry_rel)? else {
+                        // An entry that is absent has nothing to remove.
+                        work = Work::Fold(Removal::Removed);
+                        continue;
+                    };
                     // The LIVE kind, not a snapshot/claim/journal kind.
                     self.guard_destination(
                         &entry_rel,
@@ -5506,34 +5546,22 @@ impl Applier<'_, '_> {
                             match removal {
                                 Ok(()) => {
                                     self.commit_mutation(attempt);
-                                    completed = Some(Removal::Removed);
+                                    work = Work::Fold(Removal::Removed);
+                                    continue;
                                 }
                                 Err(error) => return Err(error),
                             }
                         }
                     }
-                } else {
-                    // An entry that is absent has nothing to remove.
-                    completed = Some(Removal::Removed);
                 }
-                continue;
-            }
-
-            if let Some(outcome) = completed.take() {
-                // ---- FOLD: hand a finished entry/subtree to its parent. ----
-                match stack.last_mut() {
-                    // No enclosing frame: this was the entry the call started
-                    // with, so the whole removal is done.
-                    None => return Ok(outcome),
-                    Some(frame) => match outcome {
-                        Removal::Removed => {}
-                        Removal::Blocked => {
-                            if frame.outcome == Removal::Removed {
-                                frame.outcome = Removal::Blocked;
-                            }
-                        }
-                        Removal::ResidueLeft => frame.outcome = Removal::ResidueLeft,
-                    },
+                Work::Fold(outcome) => {
+                    // ---- FOLD: hand a finished entry/subtree to its parent. ----
+                    match stack.last_mut() {
+                        // No enclosing frame: this was the entry the call started
+                        // with, so the whole removal is done.
+                        None => return Ok(outcome),
+                        Some(frame) => frame.outcome = frame.outcome.join(outcome),
+                    }
                 }
             }
 
@@ -5573,7 +5601,10 @@ impl Applier<'_, '_> {
                         continue 'advance;
                     }
                     let child_rel = stack[last].rel.join(&name)?;
-                    pending = Some((child_path, child_rel));
+                    work = Work::Enter {
+                        path: child_path,
+                        rel: child_rel,
+                    };
                     break 'advance;
                 }
 
@@ -5583,7 +5614,7 @@ impl Applier<'_, '_> {
                     // The directory is non-empty by construction: do NOT rmdir
                     // it (and never a RECURSIVE remove, which would delete the
                     // residue we just skipped).
-                    completed = Some(frame.outcome);
+                    work = Work::Fold(frame.outcome);
                     break 'advance;
                 }
                 // Re-establish EMPTINESS against the LIVE listing before the
@@ -5597,7 +5628,7 @@ impl Applier<'_, '_> {
                     for (name, _) in live {
                         self.note_residue(&join_manifest_path(&frame.path, &name));
                     }
-                    completed = Some(Removal::ResidueLeft);
+                    work = Work::Fold(Removal::ResidueLeft);
                     break 'advance;
                 }
                 let attempt = self.begin_mutation(&frame.path, MutationKind::Content);
@@ -5621,7 +5652,7 @@ impl Applier<'_, '_> {
                         self.commit_mutation(attempt);
                         self.journal.mark_removed(&frame.path);
                         self.removed.insert(frame.path.clone());
-                        completed = Some(Removal::Removed);
+                        work = Work::Fold(Removal::Removed);
                     }
                     Err(error) => {
                         // The directory was not empty at removal time (or the
