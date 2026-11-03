@@ -50,7 +50,7 @@ its entry corrected, in the round that lands it.
 | Lazy local root | TYPED |
 | Run-scoped caches | TYPED |
 | Source-quiescence two-sample check | TYPED |
-| Manifest walk, wire assembly, and containment | OPEN — `walk-classify` |
+| Manifest walk, wire assembly, and containment | TYPED — `Classified` is the per-entry carrier; the walk holds no cross-entry state type |
 | Create-new seven-stage install | TYPED |
 | Create-new verification ladder | TYPED |
 | Sidecar mutex critical section | TYPED |
