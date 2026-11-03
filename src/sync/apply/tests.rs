@@ -7579,7 +7579,7 @@ fn a_sanctioned_replacement_leaves_a_nested_aside_in_place() {
 /// The report lists PARTITION under the documented precedence. A residue path
 /// whose widen-RESTORE silently fails (the chmod reports `Ok` but the mode does
 /// not change) sits in BOTH `residue` and `verify_failures` before the
-/// precedence filter — this fixture VIOLATED `assert_report_lists_disjoint`
+/// rank fold — this fixture VIOLATED `assert_report_lists_disjoint`
 /// under the old, unfiltered derivation. `residue` outranks `verify_failures`,
 /// so the path is reported in exactly one list and the split is not silently
 /// duplicated.
@@ -7748,7 +7748,7 @@ fn a_failed_drop_claim_reports_the_entry_applied_and_the_leftover_aside() {
         "an indeterminate path is not also residue (the lists partition): {:?}",
         err.report()
     );
-    // The side of the precedence filter THIS test pins: the aside IS a residue
+    // The side of the rank fold THIS test pins: the aside IS a residue
     // candidate (its removal was attempted and failed), but because that same
     // removal makes it `indeterminate`, the partition drops it from `residue`
     // entirely — so `residue` is EMPTY, not merely free of this one path. (The
@@ -8089,7 +8089,7 @@ fn a_source_entry_in_the_reserved_namespace_is_a_conflict() {
     // residue is the LEFT-IN-PLACE DESTINATION state (a path this sync left in
     // place), and the caller has nothing to recover here. The destination ALSO
     // strands a `.sync-aside.foo`, so both lists carry the path before the
-    // precedence filter; `conflicts` outranks `residue`, so residue is empty
+    // rank fold; `conflicts` outranks `residue`, so residue is empty
     // and the report still partitions. Keeping the source collision out of
     // `residue` is what lets residue stay disjoint from `conflicts`.
     assert!(
@@ -8491,7 +8491,7 @@ fn assert_dir_on_disk(root: &Path, rel: &str, mode: u32) {
 /// `run_steps` and `settle` runs `verify(true)` AFTER the restore; a path that
 /// passed the first pass and FAILS the second used to stay in the cumulative
 /// `verified` set, so `derive_report`'s `applied` gate admitted it and the
-/// `applied` > `verify_failures` precedence DELETED the genuine failure. The
+/// report advertised a genuine verification failure as an applied path. The
 /// dropped settle RESTORE of `d` is exactly that shape.
 #[cfg(unix)]
 #[test]
@@ -9191,52 +9191,73 @@ fn append_tail_file_over_a_read_only_directory_on_a_pull_destroys_nothing() {
     assert_report_lists_disjoint(&report);
 }
 
-/// LOW: the documented precedence applies to `conflicts` too. A
-/// conflict records the caller's decision surface and `indeterminate` the
-/// least-certain claim, so a path in BOTH must be reported only in
-/// `indeterminate`. This is unreachable through the public API today (a
-/// conflict leaves its path alone while `indeterminate` means a mutation on it
-/// was attempted and failed), so the partition is a pure function and is pinned
-/// directly: removing the `conflicts.retain` line in `apply_precedence` fails
-/// this test.
+/// The report's partition is ONE rank fold: every candidate path lands in
+/// exactly ONE list, chosen by [`ReportClass`]'s rank — the documented composed
+/// precedence
+///
+/// > indeterminate > conflicts > residue > verify_failures > applied > skipped
+/// > > extraneous
+///
+/// `all` is a synthetic path present in ALL SEVEN candidate sets, so it pins the
+/// top of the order; `i_c`, `c_r`, `r_v`, `v_a`, `a_s`, and `s_e` are each
+/// present in exactly TWO NEIGHBOURING sets, so flipping any single rank fails
+/// here. This overlap is unreachable through the public API today (a conflict
+/// leaves a path alone while `indeterminate` means a mutation on it was
+/// attempted and failed), so the fold is pinned directly as a pure function.
 #[test]
-fn the_precedence_partition_drops_a_conflict_named_indeterminate() {
-    let indeterminate: BTreeSet<String> = ["p".to_string()].into_iter().collect();
-    let mut conflicts = vec![Conflict {
-        path: "p".to_string(),
-        kind: EntryKind::File,
-        policy: EntryPolicy::Replace,
-        reason: ConflictReason::Refused,
-        on_disk: None,
-    }];
-    let mut residue: BTreeSet<String> = ["p".to_string()].into_iter().collect();
-    let mut applied: BTreeSet<String> = ["p".to_string()].into_iter().collect();
-    let mut skipped: BTreeSet<String> = ["p".to_string()].into_iter().collect();
-    let mut extraneous: BTreeSet<String> = ["p".to_string()].into_iter().collect();
-    let mut verify_failures: BTreeSet<String> = ["p".to_string()].into_iter().collect();
-
-    apply_precedence(
-        &indeterminate,
-        &mut conflicts,
-        &mut residue,
-        &mut applied,
-        &mut skipped,
-        &mut extraneous,
-        &mut verify_failures,
+fn the_report_partition_is_one_rank_fold() {
+    let claims = ReportClaims {
+        indeterminate: ["all", "i_c"].into_iter().collect(),
+        conflicts: ["all", "i_c", "c_r"].into_iter().collect(),
+        residue: ["all", "c_r", "r_v"].into_iter().collect(),
+        verify_failures: ["all", "r_v", "v_a"].into_iter().collect(),
+        applied: ["all", "v_a", "a_s"].into_iter().collect(),
+        skipped: ["all", "a_s", "s_e"].into_iter().collect(),
+        extraneous: ["all", "s_e", "e_only"].into_iter().collect(),
+    };
+    let partition = claims.partition();
+    assert_eq!(partition.indeterminate, ["all", "i_c"]);
+    assert_eq!(partition.conflicts, ["c_r"]);
+    assert_eq!(partition.residue, ["r_v"]);
+    assert_eq!(partition.verify_failures, ["v_a"]);
+    assert_eq!(partition.applied, ["a_s"]);
+    assert_eq!(partition.skipped, ["s_e"]);
+    assert_eq!(partition.extraneous, ["e_only"]);
+    // ... and the fold is TOTAL: each candidate path is named exactly once, so
+    // no path can be dropped by the rank fold.
+    let mut named: Vec<&str> = partition
+        .indeterminate
+        .iter()
+        .chain(partition.conflicts.iter())
+        .chain(partition.residue.iter())
+        .chain(partition.verify_failures.iter())
+        .chain(partition.applied.iter())
+        .chain(partition.skipped.iter())
+        .chain(partition.extraneous.iter())
+        .map(String::as_str)
+        .collect();
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        ["a_s", "all", "c_r", "e_only", "i_c", "r_v", "s_e", "v_a"],
+        "every candidate path is named exactly once"
     );
-
-    // `indeterminate` wins: the conflict is dropped and every lower list is
-    // emptied, so the path is named exactly once.
+    // The enum's DECLARATION is the rank the fold uses (`Ord`), so a reordered
+    // declaration fails here even if the fold's visiting order changes.
+    let rank = [
+        ReportClass::Indeterminate,
+        ReportClass::Conflict,
+        ReportClass::Residue,
+        ReportClass::VerifyFailure,
+        ReportClass::Applied,
+        ReportClass::Skipped,
+        ReportClass::Extraneous,
+    ];
     assert!(
-        conflicts.is_empty(),
-        "a conflict named `indeterminate` is dropped: {conflicts:?}"
+        rank.windows(2).all(|pair| pair[0] < pair[1]),
+        "ReportClass declares the report precedence in rank order: {:?}",
+        rank.map(|class| class as u8)
     );
-    assert!(residue.is_empty(), "{residue:?}");
-    assert!(applied.is_empty(), "{applied:?}");
-    assert!(skipped.is_empty(), "{skipped:?}");
-    assert!(extraneous.is_empty(), "{extraneous:?}");
-    assert!(verify_failures.is_empty(), "{verify_failures:?}");
-    assert_eq!(indeterminate.len(), 1);
 }
 
 /// HIGH: the ROLLBACK variant of the unconfirmed location. The claim
@@ -11652,8 +11673,8 @@ fn a_path_based_destination_refuses_a_directory_swapped_for_a_symlink_after_a_tr
 /// The chmod variant: a `Skipped` path whose final
 /// verification COULD NOT RUN because its parent directory became unreadable
 /// must be a verification failure, never advertised `skipped`. The failure was
-/// recorded in the listing-failure branch, but `derive_report` ranked the
-/// `Skipped` outcome above it.
+/// recorded in the listing-failure branch, and the recorded FAILURE decides the
+/// path's rank — `verify_failures` outranks `skipped`.
 #[cfg(unix)]
 #[test]
 fn a_skipped_path_whose_verification_could_not_run_is_not_reported_skipped() {

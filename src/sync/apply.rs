@@ -184,22 +184,22 @@
 //! establish. A failed content mutation therefore STAYS in `indeterminate` even
 //! after its mode has been restored.
 //!
-//! The report lists PARTITION under ONE explicit precedence, applied in
-//! `Applier::derive_report`:
+//! The report lists PARTITION under ONE rank fold in `Applier::derive_report`
+//! ([`ReportClass`]), whose rank IS the precedence:
 //!
-//! > `indeterminate` > `conflicts` > `residue` > `applied` > `skipped` >
-//! > `extraneous` > `verify_failures`
+//! > `indeterminate` > `conflicts` > `residue` > `verify_failures` >
+//! > `applied` > `skipped` > `extraneous`
 //!
-//! A path named by a higher list is omitted from every lower one.
+//! A path ranked by a higher class is omitted from every lower one.
 //! `indeterminate` is the least certain claim (a failed mutation may or may not
 //! have landed), so it subsumes every other; `conflicts` is the caller's
 //! decision surface and is never hidden; `residue` still EXISTS and must be
 //! recovered by hand, so it wins over the verification bookkeeping in
 //! `verify_failures` (whose failure is also carried in
-//! `SyncError::restore_failures`); `applied`/`skipped`/`extraneous` describe a
-//! known outcome; `verify_failures` is the catch-all for a mutation that did
-//! not reach a passed final state. `transient_dirs` is deliberately OUTSIDE the
-//! partition: it may share a path with `applied` or `verify_failures` (a
+//! `SyncError::restore_failures`); `verify_failures` is the catch-all for a
+//! mutation that did not reach a passed final state, so it wins over the
+//! "known outcome" lists `applied`/`skipped`/`extraneous`. `transient_dirs` is
+//! deliberately OUTSIDE the partition: it may share a path with `applied` or `verify_failures` (a
 //! widened directory that was also applied, or whose verification failed), but
 //! never with `indeterminate`, `conflicts`, `residue`, `skipped`, or
 //! `extraneous`.
@@ -4543,21 +4543,23 @@ impl Applier<'_, '_> {
     /// Derive the report from the outcome record and the mode journal. Nothing
     /// is pushed ad hoc during the transfer.
     ///
-    /// The lists PARTITION under ONE explicit precedence, documented here and
-    /// asserted by the tests:
+    /// Every path the report can name is a CANDIDATE claimed by one or more of
+    /// the seven outcome lists, and ONE rank fold files it under exactly ONE
+    /// [`ReportClass`]. The rank IS the precedence, documented here and asserted
+    /// by the tests:
     ///
-    /// > indeterminate > conflicts > residue > applied > skipped > extraneous >
-    /// > verify_failures
+    /// > indeterminate > conflicts > residue > verify_failures > applied >
+    /// > skipped > extraneous
     ///
-    /// A path claimed by a higher list is omitted from every lower one. On the
+    /// A path ranked by a higher class is omitted from every lower one. On the
     /// merits: `indeterminate` is the LEAST certain claim (a failed mutation may
     /// have landed or not), so it subsumes the rest; `conflicts` is the caller's
     /// decision surface and must never be hidden; `residue` still EXISTS and must
     /// be recovered by hand, so it wins over the verification bookkeeping in
     /// `verify_failures` (whose failure is also carried in
-    /// [`SyncError::restore_failures`]); `applied`/`skipped`/`extraneous` are the
-    /// outcome of a known mutation; `verify_failures` is the catch-all for a
-    /// mutation that did not reach a passed final state.
+    /// [`SyncError::restore_failures`]); `verify_failures` is the catch-all for a
+    /// mutation that did not reach a passed final state, so it wins over the
+    /// "known outcome" lists `applied`/`skipped`/`extraneous`.
     ///
     /// `transient_dirs` is deliberately NOT in that partition: it MAY share a
     /// path with `applied` and `verify_failures` (a widened `Changed` directory
@@ -4565,7 +4567,7 @@ impl Applier<'_, '_> {
     /// from `indeterminate`, `conflicts`, `residue`, `skipped`, and
     /// `extraneous`.
     fn derive_report(&self) -> SyncReport {
-        // The raw candidate claims, before the precedence filter.
+        // The raw candidate claims, before the ONE rank fold.
         let indeterminate: BTreeSet<String> = self.indeterminate.keys().cloned().collect();
         let mut applied: BTreeSet<String> = BTreeSet::new();
         let mut skipped: BTreeSet<String> = BTreeSet::new();
@@ -4597,40 +4599,43 @@ impl Applier<'_, '_> {
                 }
             }
         }
-        let mut conflicts: Vec<Conflict> = self.conflicts.values().cloned().collect();
-        let mut residue: BTreeSet<String> =
-            reserved_roots(&self.dest_residue).into_iter().collect();
-        let mut extraneous: BTreeSet<String> = self.extraneous.iter().cloned().collect();
+        let residue: BTreeSet<String> = reserved_roots(&self.dest_residue).into_iter().collect();
+        let extraneous: BTreeSet<String> = self.extraneous.iter().cloned().collect();
 
-        // ONE authority for "a path whose FINAL verification could not complete
-        // is never reported as a verified outcome". `verify_failures` here is
-        // the derived failure set (every recorded verification failure PLUS
-        // every `Transferred` path that did not reach a verified final state),
-        // and a path in it is excluded from EVERY verified-outcome list
-        // REGARDLESS of which pass recorded the failure or what the per-path
-        // outcome is. This is what stops a `Skipped` path whose verification
-        // COULD NOT RUN (an unenumerable directory, a kind swap) from being
-        // advertised as `skipped` just because the failure happened to be
-        // recorded in a set that `apply_precedence` ranks below `skipped`: the
+        // ONE rank fold, and ONE authority for "a path whose FINAL verification
+        // could not complete is never reported as a verified outcome": every
+        // candidate path is filed under its single highest-ranked class, and
+        // `verify_failures` outranks `applied`/`skipped`/`extraneous`. So a
+        // `Skipped` path whose verification COULD NOT RUN (an unenumerable
+        // directory, a kind swap), or a `Transferred` path that did not reach a
+        // verified final state, is named in `verify_failures` REGARDLESS of
+        // which pass recorded the failure or what the per-path outcome is: the
         // recorded FAILURE decides membership, not the outcome.
-        for path in &verify_failures {
-            applied.remove(path);
-            skipped.remove(path);
-            extraneous.remove(path);
+        let ReportPartition {
+            indeterminate,
+            conflicts,
+            residue,
+            verify_failures,
+            applied,
+            skipped,
+            extraneous,
+        } = ReportClaims {
+            indeterminate: indeterminate.iter().map(String::as_str).collect(),
+            conflicts: self.conflicts.keys().map(String::as_str).collect(),
+            residue: residue.iter().map(String::as_str).collect(),
+            verify_failures: verify_failures.iter().map(String::as_str).collect(),
+            applied: applied.iter().map(String::as_str).collect(),
+            skipped: skipped.iter().map(String::as_str).collect(),
+            extraneous: extraneous.iter().map(String::as_str).collect(),
         }
-
-        // ONE explicit precedence so the lists partition. The filter is a pure
-        // function (see `apply_precedence`) so the partition is unit-testable
-        // with an arbitrary overlap.
-        apply_precedence(
-            &indeterminate,
-            &mut conflicts,
-            &mut residue,
-            &mut applied,
-            &mut skipped,
-            &mut extraneous,
-            &mut verify_failures,
-        );
+        .partition();
+        // The fold deals only in paths; the recorded `Conflict` for a path it
+        // ranked `Conflict` is attached here (it is a key of `self.conflicts` by
+        // construction).
+        let conflicts: Vec<Conflict> = conflicts
+            .iter()
+            .map(|path| self.conflicts[path.as_str()].clone())
+            .collect();
 
         // Outside the partition (may share with `applied`/`verify_failures`),
         // but still disjoint from the lists above.
@@ -4669,18 +4674,18 @@ impl Applier<'_, '_> {
             .cloned()
             .collect();
         SyncReport {
-            applied: applied.into_iter().collect(),
-            skipped: skipped.into_iter().collect(),
+            applied,
+            skipped,
             conflicts,
             // A destination-only path whose sanctioned removal a conflict
             // blocked is reported in `conflicts` (reason `ParentRefused`)
             // instead of being duplicated here: the lists are mutually
-            // exclusive under the precedence above.
-            extraneous: extraneous.into_iter().collect(),
+            // exclusive under the rank above.
+            extraneous,
             transient_dirs,
-            residue: residue.into_iter().collect(),
-            verify_failures: verify_failures.into_iter().collect(),
-            indeterminate: indeterminate.into_iter().collect(),
+            residue,
+            verify_failures,
+            indeterminate,
             transfers: self.transfers,
             unsupported_destination,
         }
@@ -7080,9 +7085,10 @@ impl Applier<'_, '_> {
         // ... and remove it from the CUMULATIVE `verified` set. The set must mean
         // "passed the LATEST verification pass", or a path that passed the
         // pre-settle pass and then FAILED the post-settle one (a dropped restore)
-        // would still satisfy `derive_report`'s `applied` gate, and the
-        // `applied > verify_failures` precedence would delete the genuine
-        // failure. `applied` must require the FINAL post-settle verification.
+        // would still satisfy `derive_report`'s `applied` gate. The rank fold
+        // would name it in `verify_failures` (which outranks `applied`) either
+        // way, but `verified` itself must not claim a path passed: `applied`
+        // requires the FINAL post-settle verification.
         self.verified.retain(|path| !failed.contains(path));
         self.verified.extend(verified_now);
         match first_error {
@@ -8455,41 +8461,96 @@ fn reserved_paths(meta: &TreeMetadata) -> BTreeSet<String> {
         .collect()
 }
 
-/// Apply the report's ONE documented precedence to the raw candidate claims:
+/// The rank a report path is filed under: the report's ONE precedence, and the
+/// ONLY authority for it. The declaration order IS the rank order (the explicit
+/// discriminants make that visible), so the `min` over a path's candidate
+/// claims cannot drift from the documented sentence:
 ///
-/// > `indeterminate` > `conflicts` > `residue` > `applied` > `skipped` >
-/// > `extraneous` > `verify_failures`
-///
-/// A path named by a higher-precedence list is removed from EVERY lower one, so
-/// the lists partition. `indeterminate` is the least-certain claim (an attempted
-/// mutation may or may not have landed), so it subsumes the rest — including a
-/// path that is ALSO a conflict. Pure, so the partition (the
-/// `indeterminate` > `conflicts` edge in particular) is unit-testable with an
-/// arbitrary overlap even though the two lists are unreachable together through
-/// the public API today: a conflict leaves a path alone while `indeterminate`
-/// means a mutation on it was attempted and failed.
-fn apply_precedence(
-    indeterminate: &BTreeSet<String>,
-    conflicts: &mut Vec<Conflict>,
-    residue: &mut BTreeSet<String>,
-    applied: &mut BTreeSet<String>,
-    skipped: &mut BTreeSet<String>,
-    extraneous: &mut BTreeSet<String>,
-    verify_failures: &mut BTreeSet<String>,
-) {
-    let mut claimed: BTreeSet<String> = indeterminate.clone();
-    // `indeterminate` wins over `conflicts`.
-    conflicts.retain(|conflict| !claimed.contains(&conflict.path));
-    claimed.extend(conflicts.iter().map(|conflict| conflict.path.clone()));
-    residue.retain(|path| !claimed.contains(path));
-    claimed.extend(residue.iter().cloned());
-    applied.retain(|path| !claimed.contains(path));
-    claimed.extend(applied.iter().cloned());
-    skipped.retain(|path| !claimed.contains(path));
-    claimed.extend(skipped.iter().cloned());
-    extraneous.retain(|path| !claimed.contains(path));
-    claimed.extend(extraneous.iter().cloned());
-    verify_failures.retain(|path| !claimed.contains(path));
+/// > `indeterminate` > `conflicts` > `residue` > `verify_failures` >
+/// > `applied` > `skipped` > `extraneous`
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReportClass {
+    Indeterminate = 0,
+    Conflict = 1,
+    Residue = 2,
+    VerifyFailure = 3,
+    Applied = 4,
+    Skipped = 5,
+    Extraneous = 6,
+}
+
+/// The report's raw candidate claims, one path set per class. The union of
+/// these sets is EXACTLY the set of paths the report may name, and the rank
+/// fold files each of them into exactly one list. `transient_dirs` is not here:
+/// it sits outside the partition.
+struct ReportClaims<'a> {
+    indeterminate: BTreeSet<&'a str>,
+    conflicts: BTreeSet<&'a str>,
+    residue: BTreeSet<&'a str>,
+    verify_failures: BTreeSet<&'a str>,
+    applied: BTreeSet<&'a str>,
+    skipped: BTreeSet<&'a str>,
+    extraneous: BTreeSet<&'a str>,
+}
+
+/// The seven partition lists, already filed by [`ReportClaims::partition`], in
+/// path order.
+#[derive(Default)]
+struct ReportPartition {
+    indeterminate: Vec<String>,
+    conflicts: Vec<String>,
+    residue: Vec<String>,
+    verify_failures: Vec<String>,
+    applied: Vec<String>,
+    skipped: Vec<String>,
+    extraneous: Vec<String>,
+}
+
+impl<'a> ReportClaims<'a> {
+    /// The claims in RANK order, each paired with the class it wins at.
+    fn ranked(&self) -> [(ReportClass, &BTreeSet<&'a str>); 7] {
+        [
+            (ReportClass::Indeterminate, &self.indeterminate),
+            (ReportClass::Conflict, &self.conflicts),
+            (ReportClass::Residue, &self.residue),
+            (ReportClass::VerifyFailure, &self.verify_failures),
+            (ReportClass::Applied, &self.applied),
+            (ReportClass::Skipped, &self.skipped),
+            (ReportClass::Extraneous, &self.extraneous),
+        ]
+    }
+
+    /// ONE class per candidate path: the highest-ranked claim about it. The
+    /// `min` is over [`ReportClass`]'s `Ord`, not over the visiting order, so
+    /// the enum declaration is the single authority for the precedence.
+    fn classes(&self) -> BTreeMap<&'a str, ReportClass> {
+        let mut classes: BTreeMap<&'a str, ReportClass> = BTreeMap::new();
+        for (class, paths) in self.ranked() {
+            for path in paths {
+                let seen = classes.entry(*path).or_insert(class);
+                *seen = (*seen).min(class);
+            }
+        }
+        classes
+    }
+
+    /// File every candidate path into exactly ONE list (path order).
+    fn partition(&self) -> ReportPartition {
+        let mut partition = ReportPartition::default();
+        for (path, class) in self.classes() {
+            let list = match class {
+                ReportClass::Indeterminate => &mut partition.indeterminate,
+                ReportClass::Conflict => &mut partition.conflicts,
+                ReportClass::Residue => &mut partition.residue,
+                ReportClass::VerifyFailure => &mut partition.verify_failures,
+                ReportClass::Applied => &mut partition.applied,
+                ReportClass::Skipped => &mut partition.skipped,
+                ReportClass::Extraneous => &mut partition.extraneous,
+            };
+            list.push(path.to_owned());
+        }
+        partition
+    }
 }
 
 /// Re-root a manifest-spelled `path` from the `from` domain onto the `to`
