@@ -32,6 +32,27 @@ impl KillSeam for RealKill {
     }
 }
 
+/// The Windows termination ladder's ONE transition. Windows has no process
+/// groups, so the ladder has no graceful and no group rung: `Armed` →
+/// `ChildKilled` in a single transition, the owned handle being the whole
+/// termination path. It matches its required predecessor (`Armed`) and returns
+/// the ladder UNCHANGED from any other rung, dispatching nothing, so it is the
+/// rung's one order authority — a rule its own `match` enforces at runtime, not
+/// a typing fact. `at` is the DEADLINE the rung crossed, not the instant the
+/// kill landed, because this port measures its reap bound from the deadline
+/// (`now - deadline`) — the anchor it used before the ladder existed.
+impl Termination {
+    fn child_killed(self, at: Instant, dispatch: impl FnOnce() -> Option<KillFailure>) -> Self {
+        match self {
+            Termination::Armed { .. } => Termination::ChildKilled(Escalating {
+                escalation_start: at,
+                failure: dispatch(),
+            }),
+            other => other,
+        }
+    }
+}
+
 /// Execute `argv` (no shell) bounded by `timeout` — the Windows lifecycle:
 /// spawn plain, drain stdout/stderr via reader THREADS, poll `try_wait`
 /// with the timeout, terminate the OWNED child on timeout, collect the
@@ -75,12 +96,10 @@ pub(crate) fn exec(
     let stdout_rx = spawn_reader(child.stdout_mut().take());
     let stderr_rx = spawn_reader(child.stderr_mut().take());
 
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let mut kill_error: Option<String> = None;
+    let mut termination = Termination::armed(Instant::now() + timeout);
     // Wait loop: poll `try_wait` (no `waitid` WNOWAIT peek on Windows — the
     // child is reaped by the final `wait`). On timeout, terminate the OWNED
-    // child (TerminateProcess); every kill failure is recorded.
+    // child (TerminateProcess); the ladder records the signal and its failure.
     loop {
         // `try_wait` records the status it consumes: from the reap on the
         // lifecycle is `Reaped`, so nothing can reach the handle to signal it.
@@ -90,18 +109,29 @@ pub(crate) fn exec(
             Err(e) => return Err(RunError::Wait(format!("wait {argv:?}: {e}"))),
         }
         let now = Instant::now();
-        if !timed_out && now >= deadline {
-            timed_out = true;
+        // The single rung: `Armed` → `ChildKilled`, the transition that has the
+        // order authority and the ONLY writer of the kill failure, so a
+        // failure cannot exist without the timeout. `deadline()` is the DUE
+        // test; the transition refuses the rung from any other state, so it
+        // cannot repeat.
+        if let Some(deadline) = termination.deadline()
+            && now >= deadline
+        {
             // Terminate the OWNED child. No process group: a background
             // descendant survives. The handle is reachable only while the
             // child is LIVE (a reaped child's pid may already be recycled).
-            if let Some(live) = child.live_child()
-                && let Err(e) = config.kill.kill_owned(live)
-            {
-                kill_error = Some(format!("kill child {pid}: {e}"));
-            }
+            termination = termination.child_killed(deadline, || match child.live_child() {
+                Some(live) => config
+                    .kill
+                    .kill_owned(live)
+                    .err()
+                    .map(|e| KillFailure::new(format!("kill child {pid}: {e}"))),
+                None => None,
+            });
         }
-        if timed_out && now.duration_since(deadline) >= config.reap_bound {
+        if let Some(escalation_start) = termination.escalation_start()
+            && now.duration_since(escalation_start) >= config.reap_bound
+        {
             // The child is STILL alive after the termination attempt: the
             // kill did not take effect. This is a reap failure — NEVER a
             // successful timeout outcome.
@@ -139,11 +169,14 @@ pub(crate) fn exec(
         ))
     })?;
 
-    if timed_out {
+    if termination.timed_out() {
         // A timeout outcome is legitimate ONLY when the termination was
         // effective: a kill failure is an ERROR, never a fake timeout.
-        if let Some(e) = kill_error {
-            return Err(RunError::Kill(format!("timeout termination failed: {e}")));
+        if let Some(failure) = termination.failure() {
+            return Err(RunError::Kill(format!(
+                "timeout termination failed: {}",
+                failure.message()
+            )));
         }
         return Ok(RunOutcome::TimedOut {
             stderr: format!("timed out after {timeout:?}"),

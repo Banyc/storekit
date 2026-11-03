@@ -239,6 +239,63 @@ impl KillSeam for RealKill {
     }
 }
 
+/// The Unix termination ladder's transitions: the platform's three rungs, in
+/// ASCENDING order, and the ONE authority for that order. Each transition
+/// matches its required PREDECESSOR into the next rung and hands that rung's
+/// failure through the caller's `dispatch` closure — which it calls ONLY in that
+/// arm, so a transition from any other rung signals nothing and returns the
+/// ladder unchanged — and it carries the previous rung's [`KillFailure`]
+/// forward unless this rung failed too (the LAST failure is the reported one),
+/// so the accumulation has no writer outside this state.
+impl Termination {
+    /// The GRACEFUL rung: `Armed` → `Termed`, anchored at `now` (the instant
+    /// the timeout fired). `dispatch` is the group SIGTERM, called only when the
+    /// ladder is still `Armed`, so a kill failure is only ever recorded by the
+    /// transition that dispatched the signal it names.
+    fn termed(self, now: Instant, dispatch: impl FnOnce() -> Option<KillFailure>) -> Self {
+        match self {
+            Termination::Armed { .. } => Termination::Termed(Escalating {
+                escalation_start: now,
+                failure: dispatch(),
+            }),
+            other => other,
+        }
+    }
+
+    /// The escalated rung: `Termed` → `GroupKilled`, at the SAME start, so
+    /// every rung of one timeout is measured from the instant it fired.
+    /// `dispatch` is the group SIGKILL, called only in the `Termed` arm.
+    fn group_killed(
+        self,
+        escalation_start: Instant,
+        dispatch: impl FnOnce() -> Option<KillFailure>,
+    ) -> Self {
+        match self {
+            Termination::Termed(previous) => Termination::GroupKilled(Escalating {
+                escalation_start,
+                failure: dispatch().or(previous.failure),
+            }),
+            other => other,
+        }
+    }
+
+    /// The last-resort rung: `GroupKilled` → `ChildKilled`. `dispatch` is the
+    /// kill on the OWNED handle, called only in the `GroupKilled` arm.
+    fn child_killed(
+        self,
+        escalation_start: Instant,
+        dispatch: impl FnOnce() -> Option<KillFailure>,
+    ) -> Self {
+        match self {
+            Termination::GroupKilled(previous) => Termination::ChildKilled(Escalating {
+                escalation_start,
+                failure: dispatch().or(previous.failure),
+            }),
+            other => other,
+        }
+    }
+}
+
 /// THE shared bounded child-runner for local command execution: spawn the
 /// child into its OWN process group with piped stdout/stderr, wait with the
 /// caller's timeout, on timeout terminate the GROUP (TERM, grace, KILL) and
@@ -292,20 +349,17 @@ pub(crate) fn exec(
     set_nonblocking(owned.stdout_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
     set_nonblocking(owned.stderr_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
 
-    let deadline = Instant::now() + timeout;
+    let mut termination = Termination::armed(Instant::now() + timeout);
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    let mut timed_out = false;
-    let mut term_started = Instant::now();
-    let mut sent_kill = false;
-    let mut sent_owned = false;
-    let mut kill_error: Option<String> = None;
 
     // Wait loop: detect the child's exit WITHOUT reaping it (`waitid`
     // WNOWAIT peek — the child becomes a ZOMBIE and stays waitable,
     // holding its pid/pgid allocated for the foreground-only check
-    // that follows the loop). On timeout, terminate the group and
-    // escalate exactly as before; every kill failure is recorded.
+    // that follows the loop). On timeout, walk the termination ladder:
+    // TERM the group, escalate to KILL, then the owned handle — each rung
+    // dispatched once, in that order, by the transition that names it (the
+    // ladder's ONE order authority).
     loop {
         // Bytes drained THIS pass: a pass that moved data must not sleep
         // before the next one, or the drain would be capped at
@@ -320,51 +374,66 @@ pub(crate) fn exec(
             break;
         }
         let now = Instant::now();
-        if !timed_out && now >= deadline {
-            timed_out = true;
-            term_started = now;
+        // The timeout rung: `Armed` → `Termed`, recording the graceful
+        // signal's failure. `deadline()` is the DUE test (the ladder is still
+        // `Armed` and its deadline passed); the transition is the ORDER
+        // authority and the ONLY writer of that failure, so a kill failure
+        // cannot exist without the timeout.
+        if let Some(deadline) = termination.deadline()
+            && now >= deadline
+        {
             // Graceful TERM of the WHOLE process group.
-            if let Err(e) = config.kill.kill_group(pgid, libc::SIGTERM) {
-                // ESRCH is benign only when the child itself is already
-                // gone (it exited as the deadline fired — the peek
-                // reports it next); a live child behind an unreachable
-                // group is a real termination failure. The liveness
-                // check must NOT reap: the child stays a zombie until
-                // the post-loop foreground check.
-                let alive = child_exited_unreaped(pid)
-                    .map(|exited| !exited)
-                    .unwrap_or(false);
-                if alive {
-                    kill_error = Some(format!("TERM group {pgid}: {e}"));
-                }
-            }
-        }
-        if timed_out {
-            let since = now.duration_since(term_started);
-            if since >= config.term_to_kill_grace && !sent_kill {
-                sent_kill = true;
-                // Escalate to KILL on the whole group: a child that
-                // ignores TERM must still die.
-                if let Err(e) = config.kill.kill_group(pgid, libc::SIGKILL) {
-                    let alive = child_exited_unreaped(pid)
-                        .map(|exited| !exited)
-                        .unwrap_or(false);
-                    if alive {
-                        kill_error = Some(format!("KILL group {pgid}: {e}"));
+            termination =
+                termination.termed(now, || match config.kill.kill_group(pgid, libc::SIGTERM) {
+                    Ok(()) => None,
+                    // ESRCH is benign only when the child itself is already
+                    // gone (it exited as the deadline fired — the peek
+                    // reports it next); a live child behind an unreachable
+                    // group is a real termination failure. The liveness
+                    // check must NOT reap: the child stays a zombie until
+                    // the post-loop foreground check.
+                    Err(e) => {
+                        let alive = child_exited_unreaped(pid)
+                            .map(|exited| !exited)
+                            .unwrap_or(false);
+                        alive.then(|| KillFailure::new(format!("TERM group {pgid}: {e}")))
                     }
-                }
+                });
+        }
+        if let Some(escalation_start) = termination.escalation_start() {
+            let since = now.duration_since(escalation_start);
+            // The escalated rung: `Termed` → `GroupKilled`. A child that
+            // ignores TERM must still die. The grace is the DUE test; the
+            // transition refuses the rung from any other state, so the KILL
+            // cannot precede the TERM or repeat.
+            if since >= config.term_to_kill_grace {
+                termination = termination.group_killed(escalation_start, || {
+                    match config.kill.kill_group(pgid, libc::SIGKILL) {
+                        Ok(()) => None,
+                        Err(e) => {
+                            let alive = child_exited_unreaped(pid)
+                                .map(|exited| !exited)
+                                .unwrap_or(false);
+                            alive.then(|| KillFailure::new(format!("KILL group {pgid}: {e}")))
+                        }
+                    }
+                });
             }
-            if since >= config.term_to_kill_grace * 2 && !sent_owned {
-                sent_owned = true;
-                // Last-resort direct kill on the OWNED handle: catches a
-                // child that escaped its group (e.g. setsid). The handle is
-                // reachable only while the child is LIVE, so a reaped child
-                // (whose pid the OS may have recycled) is never signalled.
-                if let Some(child) = owned.live_child()
-                    && let Err(e) = config.kill.kill_owned(child)
-                {
-                    kill_error = Some(format!("kill child {pid}: {e}"));
-                }
+            // The last-resort rung: `GroupKilled` → `ChildKilled`, a direct
+            // kill on the OWNED handle that catches a child which escaped its
+            // group (e.g. setsid). The handle is reachable only while the
+            // child is LIVE, so a reaped child (whose pid the OS may have
+            // recycled) is never signalled.
+            if since >= config.term_to_kill_grace * 2 {
+                termination =
+                    termination.child_killed(escalation_start, || match owned.live_child() {
+                        Some(child) => config
+                            .kill
+                            .kill_owned(child)
+                            .err()
+                            .map(|e| KillFailure::new(format!("kill child {pid}: {e}"))),
+                        None => None,
+                    });
             }
             if since >= config.reap_bound {
                 // The child is STILL alive after every termination
@@ -484,11 +553,14 @@ pub(crate) fn exec(
         )));
     }
 
-    if timed_out {
+    if termination.timed_out() {
         // A timeout outcome is legitimate ONLY when the termination was
         // effective: a kill failure is an ERROR, never a fake timeout.
-        if let Some(e) = kill_error {
-            return Err(RunError::Kill(format!("timeout termination failed: {e}")));
+        if let Some(failure) = termination.failure() {
+            return Err(RunError::Kill(format!(
+                "timeout termination failed: {}",
+                failure.message()
+            )));
         }
         return Ok(RunOutcome::TimedOut {
             stderr: format!("timed out after {timeout:?}"),
@@ -904,5 +976,142 @@ mod drain_tests {
             buf.len() < MAX_DRAIN_BYTES,
             "the size cap was not the stopper"
         );
+    }
+}
+
+/// The Unix termination ladder as a VALUE: every rung past `Armed` carries the
+/// instant the timeout fired, and the kill-failure accumulator keeps the LAST
+/// FAILED signal — a later successful rung does not erase an earlier failure,
+/// and a later failure replaces it (exactly the rule the ladder replaced).
+#[cfg(all(test, unix))]
+mod termination_tests {
+    use super::{KillFailure, Termination};
+    use std::time::{Duration, Instant};
+
+    /// A regression that re-anchored an escalation rung (so the grace and reap
+    /// bounds were measured from the wrong instant) or that dropped the earlier
+    /// failure on a successful later signal fails here: neither property is
+    /// reachable from an end-to-end test without an injected kill fault, and
+    /// the ladder's own transitions are where both are decided.
+    #[test]
+    fn the_ladder_carries_its_start_and_keeps_the_last_failed_signal() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let fired = Instant::now();
+
+        let armed = Termination::armed(deadline);
+        assert_eq!(armed.deadline(), Some(deadline), "the armed deadline");
+        assert!(!armed.timed_out(), "an armed ladder has not timed out");
+        assert!(
+            armed.escalation_start().is_none(),
+            "no bound runs before the timeout fires"
+        );
+        assert!(armed.failure().is_none(), "nothing was signalled yet");
+
+        // The graceful signal failed.
+        let termed = armed.termed(fired, || {
+            Some(KillFailure::new("TERM group 7: denied".into()))
+        });
+        assert!(termed.timed_out());
+        assert!(
+            termed.deadline().is_none(),
+            "the deadline is consumed by the timeout that fired"
+        );
+        assert_eq!(termed.escalation_start(), Some(fired));
+        assert_eq!(
+            termed.failure().map(KillFailure::message),
+            Some("TERM group 7: denied")
+        );
+
+        // The escalated signal landed: the earlier failure SURVIVES it.
+        let group_killed = termed.group_killed(fired, || None);
+        assert_eq!(
+            group_killed.escalation_start(),
+            Some(fired),
+            "every rung of one timeout measures from the instant it fired"
+        );
+        assert_eq!(
+            group_killed.failure().map(KillFailure::message),
+            Some("TERM group 7: denied"),
+            "a successful later signal must not erase an earlier failure"
+        );
+
+        // A later failure REPLACES it: the LAST failure is the reported one.
+        let child_killed = group_killed.child_killed(fired, || {
+            Some(KillFailure::new("kill child 7: denied".into()))
+        });
+        assert_eq!(child_killed.escalation_start(), Some(fired));
+        assert_eq!(
+            child_killed.failure().map(KillFailure::message),
+            Some("kill child 7: denied")
+        );
+    }
+
+    /// WITNESS that each transition is the ORDER AUTHORITY for its own rung:
+    /// attempted from any rung but its predecessor it dispatches NOTHING (the
+    /// closure is never called) and returns the ladder UNCHANGED, so KILL
+    /// cannot precede TERM, a rung cannot repeat, and no failure is recorded
+    /// for a signal that was not sent. The chain asserted here is the one the
+    /// deleted `matches!` guards at the `exec` call sites used to enforce, and
+    /// `exec` now relies on the transitions alone for it.
+    #[test]
+    fn a_transition_from_the_wrong_rung_dispatches_nothing_and_returns_the_ladder() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let fired = Instant::now();
+        let mut dispatched = 0usize;
+
+        // `group_killed` and `child_killed` from `Armed` are no-ops.
+        let armed = Termination::armed(deadline);
+        let still_armed = armed.group_killed(fired, || {
+            dispatched += 1;
+            None
+        });
+        let still_armed = still_armed.child_killed(fired, || {
+            dispatched += 1;
+            None
+        });
+        assert_eq!(
+            still_armed.deadline(),
+            Some(deadline),
+            "a rung attempted before its predecessor must leave the ladder armed"
+        );
+        assert!(!still_armed.timed_out());
+        assert_eq!(dispatched, 0, "a refused rung must dispatch no signal");
+
+        // `termed` twice: the second attempt is a no-op, not a re-dispatch.
+        let termed = still_armed.termed(fired, || None);
+        let termed_again = termed.termed(fired + Duration::from_millis(1), || {
+            dispatched += 1;
+            None
+        });
+        assert_eq!(
+            termed_again.escalation_start(),
+            Some(fired),
+            "a repeated rung must not re-anchor the ladder"
+        );
+        assert_eq!(dispatched, 0, "a repeated rung must dispatch no signal");
+
+        // `child_killed` from `Termed` is a no-op; only `group_killed` advances.
+        let termed_still = termed_again.child_killed(fired, || {
+            dispatched += 1;
+            None
+        });
+        assert_eq!(
+            termed_still.failure().map(KillFailure::message),
+            None,
+            "a refused rung must record no failure"
+        );
+        assert_eq!(dispatched, 0, "a skipped rung must dispatch no signal");
+
+        // The ascending order still advances one rung at a time.
+        let group_killed = termed_still.group_killed(fired, || {
+            dispatched += 1;
+            None
+        });
+        let child_killed = group_killed.child_killed(fired, || {
+            dispatched += 1;
+            None
+        });
+        assert!(child_killed.timed_out());
+        assert_eq!(dispatched, 2, "each due rung dispatches exactly once");
     }
 }

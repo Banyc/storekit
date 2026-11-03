@@ -231,6 +231,131 @@ pub(crate) enum ChildLifecycle {
     Reaped(ExitStatus),
 }
 
+/// The LAST termination signal the runner failed to deliver, in the message
+/// form [`RunError::Kill`] reports. A newtype rather than a bare `String` so an
+/// escalation's failure cannot be confused with any other message, and so the
+/// only writer is the [`Termination`] transition that DISPATCHED the signal it
+/// names: a transition attempted from any rung but its predecessor dispatches
+/// nothing and records nothing (see [`Escalating`]).
+#[derive(Debug)]
+pub(crate) struct KillFailure(String);
+
+impl KillFailure {
+    pub(crate) fn new(message: String) -> Self {
+        KillFailure(message)
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What every termination rung past `Armed` carries: the instant its bounds
+/// are measured from, and the failure accumulator. One value, so a rung cannot
+/// carry a bound without carrying its failure. Only a [`Termination`] transition
+/// constructs it, and only the arm that advances supplies the failure, so the
+/// accumulator's only writer is a transition that dispatched a signal.
+#[derive(Debug)]
+pub(crate) struct Escalating {
+    /// The instant this rung's bounds are measured from: on Unix the instant
+    /// the timeout fired (every rung of the ladder measures from the same
+    /// anchor), on Windows the deadline the single rung crossed, because that
+    /// port measures its reap bound from the deadline.
+    escalation_start: Instant,
+    /// The LAST failed termination signal (`None` while every signal so far
+    /// was delivered). A later successful signal does NOT erase an earlier
+    /// failure, and a later failure replaces it.
+    failure: Option<KillFailure>,
+}
+
+/// The termination ladder as ONE ascending value: the timeout rung and every
+/// escalation after it, replacing the exec loop's independent
+/// timeout/kill/owned-kill booleans and the parallel `Instant` they were
+/// measured against.
+///
+/// The ladder ASCENDS — `Armed` → `Termed` → `GroupKilled` → `ChildKilled` on
+/// Unix; `Armed` → `ChildKilled` on Windows, which has no process groups and
+/// therefore no graceful or group rung. The ORDER of that ascent has ONE
+/// authority, the transition methods: each is the authority for its own rung,
+/// matching its required PREDECESSOR into the next rung, and called from any
+/// other rung it dispatches nothing and returns the ladder UNCHANGED. That is a
+/// rule the transition's own `match` enforces at runtime, not a typing fact —
+/// `self` is accepted in every state — so a call site needs no state guard of
+/// its own: the same rung cannot be dispatched twice and KILL cannot precede
+/// TERM, because `group_killed` matches only `Termed`. The caller supplies the
+/// DUE test (the bound that decides whether the rung is attempted now) and the
+/// dispatch; the transition supplies the order. The escalation's instant and its
+/// [`KillFailure`] accumulator are carried BY the value rather than kept beside
+/// it, so a kill failure can only be recorded on a ladder whose timeout fired.
+///
+/// This type records WHICH SIGNAL WAS DISPATCHED, never whether it took effect.
+/// "Is this process alive?" is not asked here and must not be: the liveness
+/// decision is single-sourced PER PLATFORM (see the module docs), so no
+/// cross-platform "is live" predicate can grow on this type, and each
+/// platform's arm keeps its own ESRCH-benign rule.
+#[derive(Debug)]
+pub(crate) enum Termination {
+    /// Nothing was signalled yet: the child runs against `deadline`.
+    Armed { deadline: Instant },
+    /// The GRACEFUL rung: the timeout fired and the platform's graceful
+    /// signal was dispatched (Unix: SIGTERM to the whole process group).
+    #[cfg(unix)]
+    Termed(Escalating),
+    /// The escalated rung: the platform's group KILL was dispatched (Unix
+    /// only — Windows has no process group to escalate to).
+    #[cfg(unix)]
+    GroupKilled(Escalating),
+    /// The last rung: the OWNED-handle kill was dispatched, on either
+    /// platform. On Unix it catches a child that escaped its group.
+    ChildKilled(Escalating),
+}
+
+impl Termination {
+    /// A ladder armed against `deadline`, with nothing signalled yet.
+    pub(crate) fn armed(deadline: Instant) -> Self {
+        Termination::Armed { deadline }
+    }
+
+    /// The deadline an ARMED ladder fires against, `None` once the timeout
+    /// fired (the ladder left `Armed`).
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        match self {
+            Termination::Armed { deadline } => Some(*deadline),
+            #[cfg(unix)]
+            Termination::Termed(_) | Termination::GroupKilled(_) => None,
+            Termination::ChildKilled(_) => None,
+        }
+    }
+
+    /// The instant this ladder's bounds are measured from, `None` while
+    /// `Armed` (no signal was dispatched, so no bound is running).
+    pub(crate) fn escalation_start(&self) -> Option<Instant> {
+        self.escalating().map(|rung| rung.escalation_start)
+    }
+
+    /// Whether the timeout fired — the ladder left `Armed`. Says nothing about
+    /// the child: which rung is due, and whether the child is alive, are each
+    /// platform's own answer.
+    pub(crate) fn timed_out(&self) -> bool {
+        self.escalating().is_some()
+    }
+
+    /// The LAST termination signal this ladder failed to deliver.
+    pub(crate) fn failure(&self) -> Option<&KillFailure> {
+        self.escalating().and_then(|rung| rung.failure.as_ref())
+    }
+
+    /// The rung payload, `None` while `Armed`.
+    fn escalating(&self) -> Option<&Escalating> {
+        match self {
+            Termination::Armed { .. } => None,
+            #[cfg(unix)]
+            Termination::Termed(rung) | Termination::GroupKilled(rung) => Some(rung),
+            Termination::ChildKilled(rung) => Some(rung),
+        }
+    }
+}
+
 /// An owned child with a drop backstop, shared by BOTH real runners AND both
 /// platforms so the "every error path leaves no uncollected child" contract
 /// has ONE implementation. The local runner owns one directly; the SSH

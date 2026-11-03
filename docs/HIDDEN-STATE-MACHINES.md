@@ -940,8 +940,9 @@ publish; a confirmed conflict must not replace the winner.
 ### Local process runner lifecycle
 
 **Where.** `transport::runner::{OwnedChild, ChildLifecycle, RunnerConfig,
-ChildRunner::exec}`; `transport::runner::unix::exec`; `ProcessState`;
-`RunOutcome`; `RunError`; `DrainState`.
+ChildRunner::exec, Termination, Escalating, KillFailure}`;
+`transport::runner::unix::exec`; `ProcessState`; `RunOutcome`; `RunError`;
+`DrainState`.
 
 **States.** Spawned; running; exited but unreaped (zombie); timeout TERM;
 escalated KILL; owned-handle kill; foreground-only group check; reaped; drained.
@@ -951,9 +952,23 @@ Error states: spawn, wait, background leftover, kill, reap.
 `ChildLifecycle::{Live, Reaped(ExitStatus)}` is the reap state as a VALUE: the
 handle is reachable only through `live_child()`, `None` once reaped, so a signal
 after the reap is unrepresentable and the status is carried instead of
-discarded. The exec loop's `timed_out`, `sent_kill`, `sent_owned`, and
-`kill_error` remain locals of the one loop; the process group and the zombie's
-allocated pid are kernel state.
+discarded. The timeout and its escalation are `Termination::Armed { deadline }`
+→ `Termed` → `GroupKilled` → `ChildKilled` on Unix (`Armed` → `ChildKilled` on
+Windows, which has no process groups): ONE ascending value whose transitions are
+the SOLE authority for that order. Each transition method (`termed`,
+`group_killed`, `child_killed`) matches its required PREDECESSOR into the next
+rung and dispatches the rung's signal only in that arm, so a rung advances only
+from its predecessor and a transition attempted from any OTHER rung is a no-op
+that signals nothing and returns the ladder unchanged. That order is a runtime
+rule each transition's own `match` enforces — not a typing fact, and not a guard
+repeated at the call sites — so the callers in `unix::exec` and `windows::exec`
+supply only the DUE test (the bound that decides whether a rung is attempted) and
+the dispatch, and the same rung cannot repeat and KILL cannot precede TERM. Each
+rung past `Armed` carries `Escalating { escalation_start, failure }`, so the
+instant the bounds are measured from is a field rather than a parallel local,
+and the `KillFailure` accumulator's only writer is the transition that
+dispatched the signal (the LAST failure is the reported one). The process group
+and the zombie's allocated pid are kernel state.
 
 **Transitions.** The wait loop peeks with `waitid(WNOWAIT)` so the direct child
 stays a zombie and holds its pgid. On timeout it TERMs and escalates to KILL;
@@ -966,7 +981,12 @@ final backstop and returns early once reaped.
 daemonized descendant is outside the contract. On Windows the group check and
 group kill do not exist. The process group's membership, the zombie's pid, and
 whether a descendant still lives are the KERNEL's state; `ChildLifecycle` and
-`DrainState` are the only typed observations of them.
+`DrainState` are the only typed observations of them. `Termination`'s rungs
+record that a signal was DISPATCHED, never that it landed: non-delivery is the
+`KillFailure` the rung carries, and effectiveness is decided by the reap bound
+and, on Unix, the liveness enumeration — `GroupKilled` must not be read as "the
+group is dead". A rung refused by the ladder says nothing about the child: the
+refusal is the ladder's order rule, not a kernel answer.
 
 ### SSH subprocess runner
 
