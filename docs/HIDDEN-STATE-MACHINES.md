@@ -18,6 +18,57 @@ point a reviewer must check. Symbols are cited by name; line numbers are
 deliberately absent because they rot. Every statement is derived by reading the
 named symbols; none is a test result. Test-only machines are listed last.
 
+## Inventory status
+
+One row per entry. `TYPED` is a carrier that is a type or a linear value;
+`EXTERNAL` is state the kernel, the filesystem, or a far-side process holds, with
+no in-crate carrier left to build — its reach is the entry's Watch; `OPEN` is an
+entry whose carrier is still implicit and is an item of this inventory;
+`TEST-ONLY` is test scaffolding. An OPEN row is marked TYPED, with the prose of
+its entry corrected, in the round that lands it.
+
+| Entry | Status |
+|---|---|
+| Lock-record lifecycle | EXTERNAL — the kernel's advisory `flock` bit; the typed observations are `LockAttempt` and `RetireOutcome::Held` |
+| Atomic-replace commit machine | TYPED |
+| Compare-and-swap replace | EXTERNAL — the compare-to-`renameat` window; races are out of scope by `CONSISTENCY.md` |
+| Copy mode journal and two-phase copy | TYPED |
+| Iterative removal walk | TYPED |
+| Durable directory-chain creation | TYPED |
+| Owned-root registry | TYPED |
+| Residue handle lifecycle | TYPED |
+| Destination-ownership token and preflight binding | TYPED |
+| Run phase pipeline | OPEN — `run-phases` |
+| Mode journal | TYPED |
+| Pending-mutation accounting | TYPED |
+| Claim, rollback, and residue reconciliation | TYPED |
+| Deletion-sanction state | TYPED |
+| AppendTail compare-and-append loop | TYPED — the attempt's verdict is `AppendAttempt::{Done, Changed}`; the retry bound is policy and the live destination is the filesystem's |
+| Case-sensitivity probe and fold gate | OPEN — `case-sensitivity` |
+| Verification passes | TYPED |
+| Report partition | TYPED |
+| Lazy local root | TYPED |
+| Run-scoped caches | TYPED |
+| Source-quiescence two-sample check | TYPED |
+| Manifest walk, wire assembly, and containment | OPEN — `walk-classify` |
+| Create-new seven-stage install | TYPED |
+| Create-new verification ladder | TYPED |
+| Sidecar mutex critical section | TYPED |
+| Local compare-and-delete claim/restore | TYPED |
+| Remote default compare-and-delete | EXTERNAL — the documented non-atomic fallback; the live entry is the filesystem's and the claim step is deliberately absent |
+| Remote default tree copy | TYPED |
+| Far-side lock session | TYPED |
+| Far-side script protocols | EXTERNAL — the step order lives in the shell/perl; the Rust boundary reads one status |
+| Local process runner lifecycle | OPEN — `runner-escalation`: the exec loop's `timed_out`/`sent_kill`/`sent_owned`/`kill_error` ladder is still locals; `ChildLifecycle` and `DrainState` are typed |
+| SSH subprocess runner | TYPED |
+| Host-identity preparation and pin cache | TYPED |
+| Receiver identity and layout provisioning | TYPED |
+| Fault and swap latches | TEST-ONLY |
+| Scripted transports | TEST-ONLY |
+| `IdentityProbe` | TEST-ONLY |
+| Source audit traversal | TEST-ONLY |
+| Child-process orchestration | TEST-ONLY |
+
 ## Store substrate
 
 ### Lock-record lifecycle
