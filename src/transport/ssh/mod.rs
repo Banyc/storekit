@@ -153,6 +153,49 @@ pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
 /// [`SSH_TWRITE_CONFLICT_EXIT`].
 pub const SSH_UPLOAD_POST_RENAME_EXIT: i32 = 74;
 
+/// The remote `try_write_new` script's exit status, classified ONCE.
+///
+/// The exit status is the ONLY evidence the transport uses for "did the
+/// no-clobber publish reach its decision point", and the three outcomes are
+/// mutually exclusive: a durable install, a destination that already existed,
+/// or a failure BEFORE the publish. The script never reports the middle state
+/// any other way, so [`RemotePublish::of`] is the whole classification and
+/// [`SshTransport::try_write_new_with`] branches on it instead of re-testing
+/// `success()` and `code()` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePublish {
+    /// Exit 0: the script ran its pre-install steps, published the temp with the
+    /// no-clobber `link(2)`, and synced the parent directory — a fresh, durable
+    /// install.
+    InstalledDurably,
+    /// [`SSH_TWRITE_CONFLICT_EXIT`]: the publish found the destination ALREADY
+    /// PRESENT and did not touch it. The destination's CONTENT is still unknown
+    /// here, so the caller verifies the existing entry; the verdict (converged
+    /// `AlreadyPresent` or a typed `Conflict`) comes from that verification,
+    /// never from this code.
+    Existed,
+    /// Every other status: a PRE-INSTALL failure (the parent `mkdir`, the temp
+    /// allocation, the payload write, the final chmod, the file fsync, or a
+    /// non-EEXIST `link(2)` failure) — and equally a status with NO exit code at
+    /// all (the client or the remote command died on a signal, or `ssh` itself
+    /// failed). The operation never reached the publish decision point, so this
+    /// is a propagated error, NEVER a verdict: the transport does not guess the
+    /// destination's state.
+    PreInstall,
+}
+
+impl RemotePublish {
+    fn of(status: &std::process::ExitStatus) -> Self {
+        if status.success() {
+            return RemotePublish::InstalledDurably;
+        }
+        if status.code() == Some(SSH_TWRITE_CONFLICT_EXIT) {
+            return RemotePublish::Existed;
+        }
+        RemotePublish::PreInstall
+    }
+}
+
 /// How long the SSH sidecar flock waits before giving up — mirrors
 /// `crate::transport::SIDECAR_WAIT_TIMEOUT` (2s) with a 5ms retry interval
 /// (`crate::transport::SIDECAR_RETRY_INTERVAL`). The Perl sidecars use a
@@ -210,6 +253,56 @@ const PERL_FSYNC_DIR: &str = "use Fcntl qw(O_RDONLY O_NONBLOCK); use IO::Handle;
 /// file and is portable across GNU and BSD userlands; perl is already required
 /// on the far side for the fsync helpers.
 const PERL_VERIFY_LEN: &str = "my $n = -s $ARGV[0]; if (!defined $n || $n != $ARGV[1]) { print STDERR \"storekit: remote payload truncated: \", $ARGV[0], \" holds \", (defined $n ? $n : \"?\"), \" bytes, expected $ARGV[1]; refusing to publish\\n\"; exit 1; } exit 0; # STOREKIT_TEST_VERIFY_LEN";
+
+/// The far-side lock protocol's ONE spelling: the reserved exit codes and the
+/// anchored markers [`far_side_lock_refusal`] classifies a holder's failure by,
+/// and which [`SshTransport::spawn_far_side_lock`] matches for readiness —
+/// matched by value here instead of re-spelled as a literal at each site.
+///
+/// The PROGRAM is not generated from these constants (it is
+/// [`PERL_HOLD_LOCK_TEMPLATE`], a `const concat!` whose Perl has to stay
+/// readable), so `tests_ssh::the_far_side_holder_emits_the_shared_protocol_values`
+/// pins the template to them in BOTH directions: it extracts every `exit <n>`
+/// from the rendered script and compares the set with the codes below, and it
+/// requires each diagnostic to carry the marker and the code paired here. A
+/// change on either side fails that test, so there is still exactly one
+/// authority.
+mod holder {
+    /// A live holder owns the record: the single non-blocking
+    /// `flock(LOCK_EX | LOCK_NB)` reported `EWOULDBLOCK`/`EAGAIN`. Never waited
+    /// on — contention is a refusal, not a queue.
+    pub(super) const CONTENDED: i32 = 3;
+    /// The record could not be MADE usable: the parent `make_path`, the
+    /// `O_NOFOLLOW` open, or the `chmod 0600` tightening failed.
+    pub(super) const RECORD_UNUSABLE: i32 = 4;
+    /// `flock` failed for a reason OTHER than contention.
+    pub(super) const FLOCK_FAILED: i32 = 5;
+    /// The entry is NON-EMPTY and does not begin with
+    /// [`crate::lock::RECORD_HEADER`] — not a record this crate wrote, so the
+    /// holder REFUSES and leaves the entry untouched.
+    pub(super) const RECORD_NOT_RECOGNIZED: i32 = 6;
+    /// The far-side shell found `perl` but could not EXECUTE it. Not a holder
+    /// exit code (the holder never runs, so no [`PERL_HOLD_LOCK_TEMPLATE`] exit
+    /// is this value); it is interpreter-missing evidence, exactly like
+    /// [`INTERPRETER_MISSING`].
+    pub(super) const INTERPRETER_NOT_EXECUTABLE: i32 = 126;
+    /// `perl` is absent on the far side (the shell's own code). Also not a
+    /// holder exit code, and matched for the same reason.
+    pub(super) const INTERPRETER_MISSING: i32 = 127;
+
+    /// The readiness line's leading token, followed by the holder's pid — the
+    /// ONLY thing [`SshTransport::spawn_far_side_lock`] accepts as "the flock is
+    /// held and the record is written".
+    pub(super) const READY: &str = "LOCKOK";
+    /// Leading token of the contention diagnostic (exit [`CONTENDED`]).
+    pub(super) const MARK_CONTENDED: &str = "LOCKCONTENDED";
+    /// Leading token of an unusable-record / failed-flock diagnostic (exit
+    /// [`RECORD_UNUSABLE`] or [`FLOCK_FAILED`]).
+    pub(super) const MARK_ERR: &str = "LOCKERR";
+    /// Leading token of the "not a record this crate wrote" refusal (exit
+    /// [`RECORD_NOT_RECOGNIZED`]).
+    pub(super) const MARK_NOT_RECOGNIZED: &str = "LOCKRECORDNOTRECOGNIZED";
+}
 
 /// The PORTABLE far-side operation-lock HOLDER: the long-lived `perl` program
 /// an [`SshTransport::lock_far_side`] session runs on the remote, which takes
@@ -271,6 +364,13 @@ fn perl_hold_lock() -> String {
 /// for the record header so the text has ONE authority
 /// ([`crate::lock::RECORD_HEADER`]); [`perl_hold_lock`] splices it in as a Perl
 /// double-quoted literal.
+///
+/// The reserved exit codes and the markers below are LITERALS because this is a
+/// `const concat!` and a compile-time string cannot interpolate the [`holder`]
+/// constants; the rendering test
+/// `tests_ssh::the_far_side_holder_emits_the_shared_protocol_values` pins them
+/// to [`holder`] (exact code set, and each marker with the code it is paired
+/// with), so editing either side alone fails the suite.
 const PERL_HOLD_LOCK_TEMPLATE: &str = concat!(
     "use strict; use warnings; ",
     "use Fcntl qw(:flock O_RDWR O_CREAT O_NOFOLLOW); ",
@@ -3023,23 +3123,27 @@ impl Remote for SshTransport {
                     leftover_pipe_note(&leftover_pipes)
                 )),
             })?;
-        if out.status.success() {
-            // All seven steps completed: the record is installed with the
-            // final mode and a parent-directory-sync'd durable entry.
-            return Ok(CreateNewVerdict::Created);
-        }
-        // A pre-install failure (the temp allocation, the payload write, the
-        // final chmod, or the file fsync) or the final parent-dir sync failure
-        // exits with a code other than the reserved conflict code: the
-        // operation never reached (or never finished) the publish decision
-        // point, so this is a propagated ERROR — never a verdict. The
-        // transport never guesses the destination's state from a failed
-        // pre-install.
-        if out.status.code() != Some(SSH_TWRITE_CONFLICT_EXIT) {
-            return Err(Error::transport(format!(
-                "ssh try_write_new failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
+        match RemotePublish::of(&out.status) {
+            // The script ran every step, published, and synced the parent
+            // directory: the record is installed with the final mode and a
+            // durable entry.
+            RemotePublish::InstalledDurably => return Ok(CreateNewVerdict::Created),
+            // A pre-install failure (the temp allocation, the payload write, the
+            // final chmod, or the file fsync) or the final parent-dir sync
+            // failure — and equally a status carrying NO exit code — exits with
+            // a code other than the reserved conflict code: the operation never
+            // reached (or never finished) the publish decision point, so this is
+            // a propagated ERROR, never a verdict. The transport never guesses
+            // the destination's state from a failed pre-install.
+            RemotePublish::PreInstall => {
+                return Err(Error::transport(format!(
+                    "ssh try_write_new failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )));
+            }
+            // The destination was already present: not a verdict yet, and not
+            // an error — the existing entry is verified below.
+            RemotePublish::Existed => {}
         }
         // CONFIRMED EEXIST: the no-clobber publish (perl `link(2)`) found
         // the destination already present — the verdict decision point. The
@@ -3384,7 +3488,7 @@ impl SshTransport {
                 )
             })?;
         match rx.recv_timeout(FAR_SIDE_LOCK_ACQUIRE_GRACE) {
-            Ok((Ok(_), line)) if line.starts_with("LOCKOK") => {
+            Ok((Ok(_), line)) if line.starts_with(holder::READY) => {
                 let _ = reader.join();
                 Ok(SshFarSideLock::new(
                     child,
@@ -3461,14 +3565,14 @@ fn far_side_lock_refusal(
         stderr
     };
     let line_starts = |marker: &str| stderr.split('\n').any(|line| line.starts_with(marker));
-    if code == Some(3) || line_starts("LOCKCONTENDED") {
+    if code == Some(holder::CONTENDED) || line_starts(holder::MARK_CONTENDED) {
         return Error::lock_contended(format!(
             "far-side lock {} held by another run (the far-side `flock` is NON-BLOCKING, so this is \
              a refusal to WAIT, not a wait): {stderr_disp}",
             record.display()
         ));
     }
-    if code == Some(6) || line_starts("LOCKRECORDNOTRECOGNIZED") {
+    if code == Some(holder::RECORD_NOT_RECOGNIZED) || line_starts(holder::MARK_NOT_RECOGNIZED) {
         return Error::preflight_kind(
             PreflightKind::LockRecordNotRecognized,
             format!(
@@ -3483,8 +3587,8 @@ fn far_side_lock_refusal(
             ),
         );
     }
-    if code == Some(126)
-        || code == Some(127)
+    if code == Some(holder::INTERPRETER_NOT_EXECUTABLE)
+        || code == Some(holder::INTERPRETER_MISSING)
         || line_starts("perl: command not found")
         || line_starts("perl: not found")
     {
@@ -3501,7 +3605,11 @@ fn far_side_lock_refusal(
             ),
         );
     }
-    if code == Some(4) || code == Some(5) || line_starts("LOCKERR") || read_error.is_some() {
+    if code == Some(holder::RECORD_UNUSABLE)
+        || code == Some(holder::FLOCK_FAILED)
+        || line_starts(holder::MARK_ERR)
+        || read_error.is_some()
+    {
         return Error::transport_kind(
             TransportKind::FarSideScript,
             format!(
@@ -4229,6 +4337,82 @@ mod tests_ssh {
             script.contains(&format!("my $header = {literal};")),
             "the holder must assign the header from the local authority: {script}"
         );
+    }
+
+    /// The holder's exit codes and markers have ONE spelling and it is
+    /// [`holder`]'s: the rendered program emits exactly those codes (the SET is
+    /// compared, so a MISSING code and a STRAY one both fail), the readiness
+    /// line carries the marker `spawn_far_side_lock` waits for, and every
+    /// diagnostic carries its marker PAIRED with the code
+    /// `far_side_lock_refusal` maps that marker to. Editing the template's
+    /// literals or a [`holder`] constant alone therefore fails here instead of
+    /// silently changing which message an operator sees.
+    #[test]
+    fn the_far_side_holder_emits_the_shared_protocol_values() {
+        let script = perl_hold_lock();
+        let emitted: std::collections::BTreeSet<i32> = script
+            .split("exit ")
+            .skip(1)
+            .map(|rest| {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<i32>().unwrap_or_else(|_| {
+                    panic!("every `exit ` in the holder must carry a numeric code: {script}")
+                })
+            })
+            .collect();
+        assert_eq!(
+            emitted,
+            std::collections::BTreeSet::from([
+                holder::CONTENDED,
+                holder::RECORD_UNUSABLE,
+                holder::FLOCK_FAILED,
+                holder::RECORD_NOT_RECOGNIZED,
+            ]),
+            "the holder must emit exactly the shared exit codes: {script}"
+        );
+        assert!(
+            script.contains(&format!("print \"{} $$\\n\";", holder::READY)),
+            "the readiness line must carry `holder::READY` followed by the pid: {script}"
+        );
+        // Marker AND code, on the SAME statement: a marker is evidence only in
+        // the pairing the classifier reads it in.
+        let diagnostics = [
+            (
+                format!("{} $path: $!", holder::MARK_CONTENDED),
+                holder::CONTENDED,
+            ),
+            (
+                format!("{} mkdir $dir: $!", holder::MARK_ERR),
+                holder::RECORD_UNUSABLE,
+            ),
+            (
+                format!("{} open $path: $!", holder::MARK_ERR),
+                holder::RECORD_UNUSABLE,
+            ),
+            (
+                format!("{} flock $path: $!", holder::MARK_ERR),
+                holder::FLOCK_FAILED,
+            ),
+            (
+                format!("{} chmod $path: $!", holder::MARK_ERR),
+                holder::RECORD_UNUSABLE,
+            ),
+            (
+                format!(
+                    "{} $path: the entry is not a lock record this crate wrote; refusing to \
+                     truncate it",
+                    holder::MARK_NOT_RECOGNIZED
+                ),
+                holder::RECORD_NOT_RECOGNIZED,
+            ),
+        ];
+        for (line, code) in diagnostics {
+            let needle = format!("{line}\\n\"; exit {code};");
+            assert!(
+                script.contains(&needle),
+                "the holder must print `{needle}`: {script}"
+            );
+        }
     }
 
     /// The session LIFECYCLE is ONE state, not a `released` flag sitting next
@@ -6278,6 +6462,56 @@ mod tests_ssh {
             vec![stale.file_name().unwrap().to_string_lossy().into_owned()],
             "only the stale temp may remain; the fresh invocation's own temp must be removed"
         );
+    }
+
+    /// The publish decision point is classified from the exit status ALONE:
+    /// exit 0 is a durable install, the reserved conflict code is the
+    /// "destination existed, verify it" outcome, and EVERYTHING else — including
+    /// a status that carries no exit code at all — is a pre-install failure,
+    /// never a verdict.
+    #[test]
+    fn remote_publish_classifies_the_scripts_reserved_statuses() {
+        // `from_raw` takes a `wait(2)` status on unix, so the exit code sits in
+        // bits 8..=15; on Windows it takes the exit code itself.
+        #[cfg(unix)]
+        fn status_of(code: u32) -> std::process::ExitStatus {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw((code << 8) as i32)
+        }
+        #[cfg(windows)]
+        fn status_of(code: u32) -> std::process::ExitStatus {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        }
+
+        assert_eq!(
+            RemotePublish::of(&status_of(0)),
+            RemotePublish::InstalledDurably
+        );
+        assert_eq!(
+            RemotePublish::of(&status_of(SSH_TWRITE_CONFLICT_EXIT as u32)),
+            RemotePublish::Existed,
+            "the reserved conflict code is the ONE status that means `existed`"
+        );
+        assert_eq!(
+            RemotePublish::of(&status_of(SSH_TWRITE_PREINSTALL_EXIT as u32)),
+            RemotePublish::PreInstall
+        );
+        assert_eq!(
+            RemotePublish::of(&status_of(SSH_UPLOAD_POST_RENAME_EXIT as u32)),
+            RemotePublish::PreInstall,
+            "the post-rename durability code is not a create-new verdict either"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // A signal leaves NO exit code: the child never produced a status
+            // this protocol defines, so it can never be read as "the
+            // destination existed".
+            let killed = std::process::ExitStatus::from_raw(9);
+            assert_eq!(killed.code(), None, "SIGKILL carries no exit code");
+            assert_eq!(RemotePublish::of(&killed), RemotePublish::PreInstall);
+        }
     }
 
     /// The remote script implements the canonical seven-step
