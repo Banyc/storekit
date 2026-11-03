@@ -279,25 +279,38 @@ it mutated.
 
 ### Mode journal
 
-**Where.** `sync::apply::{ModeEntry, ModeJournal}`; `widen_ancestors`;
-`widen_dir_verified`; `finalize`; `restore`; `note_residue`.
+**Where.** `sync::apply::{ModeRecord, ModeJournal, OriginalMode}`;
+`widen_ancestors`; `widen_dir_verified`; `finalize`; `restore`; `note_residue`.
 
-**States.** Per live path identity: untracked; first touch with original mode
-(recorded once); widened; final mode recorded; final mode applied; removed;
-abandoned.
+**States.** Per live path identity, exactly ONE `ModeRecord` variant: `Seen`
+(first touch), `FirstTouchPending` (a final mode is intended and nothing has read
+this path's mode yet), `FinalPending`, `Widened`, `WidenedFinalPending`,
+`WidenedFinal`, `Final`, `FinalUnlanded` (the intended mode did not land),
+`Removed`. `OriginalMode` is `Created` (this sync created the path, so it has no
+mode of its own to restore) or `Observed(mode)`, recorded at the first touch.
 
-**Carrier.** `kind`, `original: Option<Mode>`, `final_mode: Option<Mode>`,
-and four independent flags: `widened`, `final_applied`, `removed`, `abandoned`.
+**Carrier.** `ModeJournal { entries: BTreeMap<String, ModeRecord> }`. The final
+mode a directory still owes `finalize` lives in that directory's OWN record, so
+there is no second map; the old `final_mode`, `widened`, `final_applied`,
+`removed`, and `abandoned` fields are gone.
 
-**Transitions.** `note_first_touch` records the original only once; a path
-removed by this sync starts a fresh identity if recreated. `mark_widened`,
-`mark_final_mode`, `mark_removed`, and `mark_abandoned` move the flags.
-`restore_plan` is deepest-first; `mode_targets` derives verification targets;
-`widened_paths` excludes removed and abandoned paths.
+**Transitions.** `note_first_touch` records the original only once, and a pending
+final whose mode nothing had read takes that read as its identity's first touch;
+a path removed by this sync starts a fresh identity if recreated. `mark_widened`
+records the pre-widen mode as the first touch when nothing did (so a widen can
+never run ahead of the mode it restores to), `note_final_pending` records the
+intent, `take_pending_finals` drains it exactly once (so a second `finalize` is a
+no-op), `mark_final_mode` decides `Final`/`WidenedFinal`/`FinalUnlanded`, and
+`mark_removed` ends the identity. `restore_plan` is deepest-first; `mode_targets`
+derives verification targets; `widened_paths` excludes only removed paths.
 
-**Watch.** The flags can represent contradictory combinations (`removed` plus
-`abandoned`, or `final_applied` plus `removed`). The derived functions filter
-them, but the invariant is conventional rather than type-enforced.
+**Watch.** `ModeRecord::Removed` is NOT `Applier.removed`: `discard_partial`
+takes a path back OUT of the removal ledger when the original is renamed over the
+partial this sync made, while the journal keeps `Removed`, so a later creation
+starts a fresh mode identity. A path LEFT IN PLACE as residue has no journal
+state of its own (there is no `abandoned` flag): it keeps its widen, and the
+report keeps it out of `transient_dirs` because `note_residue` names it in
+`dest_residue` (or, once `reconcile_residue` moves it, in `indeterminate`).
 
 ### Pending-mutation accounting
 

@@ -2981,7 +2981,8 @@ fn refuse_on_a_read_only_existing_directory_blocks_its_children_without_mutating
 }
 
 /// MED: a DIRECTORY over an EXISTING directory is a MODE-only change
-/// — `transfer_dir` queues `pending_final` and `finalize` chmods the CHILD, so
+/// — `transfer_dir` records the intended final mode as pending on the
+/// directory's own mode record and `finalize` chmods the CHILD, so
 /// nothing is written into the parent. Such a transfer needs TRAVERSE on a
 /// refused ancestor, never write, so a refused READ-ONLY (traversable)
 /// directory admits it; a refused directory WITHOUT traverse still blocks it.
@@ -6577,6 +6578,46 @@ fn a_kind_changing_replacement_removes_a_read_only_subtree() {
     assert_no_aside(&local);
 }
 
+/// A READ-ONLY destination DIRECTORY replaced by a source file: the claim moves
+/// the directory aside, and removing that aside widens it (it is read-only)
+/// before the unlink. The removal ENDS the aside's mode identity, so the
+/// journal's record is `Removed` — a path that has no mode left and no
+/// directory left. It must therefore never be reported in `transient_dirs`,
+/// which names the directories this run widened and LEFT IN PLACE.
+#[cfg(unix)]
+#[test]
+fn a_removed_read_only_claim_aside_is_never_reported_as_a_transient_dir() {
+    if !the_filesystem_honours_modes() {
+        return;
+    }
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("p"), b"file");
+    fs::create_dir_all(dst.join("p")).unwrap();
+    set_mode(&dst.join("p"), 0o555);
+
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Keep).unwrap();
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+    assert!(dst.join("p").is_file(), "the file replaced the directory");
+    assert_eq!(read(&dst.join("p")), b"file");
+    assert!(report.applied.contains(&"p".to_string()), "{report:?}");
+    assert!(
+        report.transient_dirs.is_empty(),
+        "the claim aside was REMOVED (no directory and no mode is left): {:?}",
+        report.transient_dirs
+    );
+    assert!(
+        report
+            .transient_dirs
+            .iter()
+            .all(|path| !path.contains(ASIDE_PREFIX)),
+        "no removed claim-aside spelling is reported: {:?}",
+        report.transient_dirs
+    );
+    assert_no_aside(&dst);
+}
+
 /// A FAILED install in the read-only-subtree shape leaves the
 /// destination byte-identical with NO aside.
 #[cfg(unix)]
@@ -7463,10 +7504,10 @@ fn a_directory_holding_residue_is_never_treated_as_childless() {
 /// left in place and reported. Push and pull, `delete_extraneous` false and
 /// true.
 ///
-/// It also covers the ABANDONED-vs-REMOVED distinction: the claimed directory is
-/// READ-ONLY, so the removal widens it before discovering the reserved child.
-/// Because the directory is left in place (abandoned, not removed), that widen
-/// is RESTORED — the residue ends at its ORIGINAL mode.
+/// It also covers the LEFT-IN-PLACE-vs-REMOVED distinction: the claimed
+/// directory is READ-ONLY, so the removal widens it before discovering the
+/// reserved child. Because the directory is left in place (residue, not
+/// removed), that widen is RESTORED — the residue ends at its ORIGINAL mode.
 #[cfg(unix)]
 #[test]
 fn a_sanctioned_replacement_leaves_a_nested_aside_in_place() {
@@ -8045,7 +8086,7 @@ fn a_source_entry_in_the_reserved_namespace_is_a_conflict() {
         "a source reserved name is never destroyed either"
     );
     // A SOURCE collision is a `ReservedName` CONFLICT, not destination residue:
-    // residue is the abandoned DESTINATION state (a path this sync left in
+    // residue is the LEFT-IN-PLACE DESTINATION state (a path this sync left in
     // place), and the caller has nothing to recover here. The destination ALSO
     // strands a `.sync-aside.foo`, so both lists carry the path before the
     // precedence filter; `conflicts` outranks `residue`, so residue is empty
@@ -14104,6 +14145,384 @@ fn removing_an_all_extraneous_nested_chain_does_not_fail_the_removal_verify() {
     );
 }
 
+/// THE JOURNAL'S ANSWER TABLE. [`ModeRecord`] is a sum type, so every answer the
+/// journal gives — `is_widened`, `final_applied`, `settled_mode`, the restore
+/// target — is decided by ONE record variant. This test pins the WHOLE table,
+/// one row per legal variant, so a variant cannot be added without stating what
+/// it means for verification and for the restore.
+#[test]
+fn the_mode_record_variant_table_decides_verification_and_restore() {
+    const OBS: OriginalMode = OriginalMode::Observed(0o444);
+    const CREATED: OriginalMode = OriginalMode::Created;
+    /// One row: the record, then `is_widened`, `final_applied`, `settled_mode`
+    /// before the restore, `settled_mode` after it, and the restore target.
+    type Row = (
+        ModeRecord,
+        bool,
+        bool,
+        Option<Mode>,
+        Option<Mode>,
+        Option<Mode>,
+    );
+    let table: &[Row] = &[
+        (
+            ModeRecord::Seen {
+                kind: EntryKind::Dir,
+                original: OBS,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::Seen {
+                kind: EntryKind::Dir,
+                original: CREATED,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::Seen {
+                kind: EntryKind::Symlink,
+                original: CREATED,
+            },
+            false,
+            true,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::FirstTouchPending {
+                kind: EntryKind::Dir,
+                intended: 0o755,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::FinalPending {
+                kind: EntryKind::Dir,
+                original: OBS,
+                intended: 0o755,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::FinalPending {
+                kind: EntryKind::Dir,
+                original: CREATED,
+                intended: 0o755,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::Widened {
+                kind: EntryKind::File,
+                original: OBS,
+            },
+            true,
+            false,
+            None,
+            Some(0o444),
+            Some(0o444),
+        ),
+        (
+            ModeRecord::Widened {
+                kind: EntryKind::Dir,
+                original: CREATED,
+            },
+            true,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::WidenedFinalPending {
+                kind: EntryKind::Dir,
+                original: OBS,
+                intended: 0o755,
+            },
+            true,
+            false,
+            None,
+            Some(0o444),
+            Some(0o444),
+        ),
+        (
+            ModeRecord::WidenedFinal {
+                kind: EntryKind::File,
+                original: OBS,
+                final_mode: 0o644,
+            },
+            true,
+            true,
+            Some(0o644),
+            Some(0o644),
+            Some(0o644),
+        ),
+        (
+            ModeRecord::Final {
+                kind: EntryKind::File,
+                original: OBS,
+                final_mode: 0o644,
+            },
+            false,
+            true,
+            Some(0o644),
+            Some(0o644),
+            None,
+        ),
+        (
+            ModeRecord::FinalUnlanded {
+                kind: EntryKind::File,
+                original: OBS,
+                widened: false,
+                intended: 0o600,
+            },
+            false,
+            false,
+            Some(0o600),
+            Some(0o600),
+            None,
+        ),
+        (
+            ModeRecord::FinalUnlanded {
+                kind: EntryKind::File,
+                original: OBS,
+                widened: true,
+                intended: 0o600,
+            },
+            true,
+            false,
+            Some(0o600),
+            Some(0o600),
+            Some(0o444),
+        ),
+        (
+            ModeRecord::FinalUnlanded {
+                kind: EntryKind::Dir,
+                original: CREATED,
+                widened: true,
+                intended: 0o700,
+            },
+            true,
+            false,
+            Some(0o700),
+            Some(0o700),
+            None,
+        ),
+        (
+            ModeRecord::Removed {
+                kind: EntryKind::Dir,
+                widened: false,
+            },
+            false,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::Removed {
+                kind: EntryKind::Dir,
+                widened: true,
+            },
+            true,
+            false,
+            None,
+            None,
+            None,
+        ),
+        (
+            ModeRecord::Removed {
+                kind: EntryKind::Symlink,
+                widened: false,
+            },
+            false,
+            true,
+            None,
+            None,
+            None,
+        ),
+    ];
+    for (record, widened, final_applied, before, after, restore) in table {
+        assert_eq!(record.is_widened(), *widened, "is_widened for {record:?}");
+        assert_eq!(
+            record.final_applied(),
+            *final_applied,
+            "final_applied for {record:?}"
+        );
+        assert_eq!(
+            record.settled_mode(false),
+            *before,
+            "settled_mode before the restore for {record:?}"
+        );
+        assert_eq!(
+            record.settled_mode(true),
+            *after,
+            "settled_mode after the restore for {record:?}"
+        );
+        assert_eq!(
+            record.restore_target(),
+            *restore,
+            "restore target for {record:?}"
+        );
+    }
+
+    // The journal's plan and targets derive from that table: deepest-first over
+    // the MANIFEST's `/`-separated segments, and only a widened identity is
+    // planned.
+    let mut journal = ModeJournal::default();
+    journal.note_first_touch("d", EntryKind::Dir, Some(0o555));
+    journal.mark_widened("d", EntryKind::Dir, 0o555);
+    journal.note_first_touch("d/f", EntryKind::File, Some(0o444));
+    journal.mark_widened("d/f", EntryKind::File, 0o444);
+    // A directory the transfer never mode-touched: `finalize`'s own read is its
+    // first touch.
+    journal.note_final_pending("e", 0o700);
+    assert_eq!(
+        journal.restore_plan(),
+        vec![
+            ("d/f".to_string(), EntryKind::File, 0o444),
+            ("d".to_string(), EntryKind::Dir, 0o555),
+        ]
+    );
+
+    // `finalize`'s read fills the first touch the pending record did not have.
+    journal.note_first_touch("e", EntryKind::Dir, Some(0o750));
+    assert_eq!(
+        journal.entries.get("e"),
+        Some(&ModeRecord::FinalPending {
+            kind: EntryKind::Dir,
+            original: OriginalMode::Observed(0o750),
+            intended: 0o700,
+        })
+    );
+
+    // A widen of a directory whose final mode is still pending records the
+    // PRE-WIDEN mode as its original, so the widen stays restorable: this is the
+    // shape a child entry produces (`widen_ancestors`) before `finalize` runs,
+    // and losing it would leave the directory at its widened mode.
+    let mut pending_widen = ModeJournal::default();
+    pending_widen.note_final_pending("w", 0o700);
+    pending_widen.mark_widened("w", EntryKind::Dir, 0o555);
+    assert_eq!(
+        pending_widen.entries.get("w"),
+        Some(&ModeRecord::WidenedFinalPending {
+            kind: EntryKind::Dir,
+            original: OriginalMode::Observed(0o555),
+            intended: 0o700,
+        })
+    );
+    assert_eq!(
+        pending_widen.restore_plan(),
+        vec![("w".to_string(), EntryKind::Dir, 0o555)],
+        "a widened directory with a pending final is restored to its pre-widen mode"
+    );
+
+    // The pending intent is DRAINED once, so a second `finalize` is a no-op: a
+    // first-touched record goes back to being merely touched (its widen is still
+    // restored), and a record whose mode nothing read leaves no trace.
+    assert_eq!(
+        journal.take_pending_finals(),
+        vec![("e".to_string(), 0o700)]
+    );
+    assert_eq!(
+        journal.entries.get("e"),
+        Some(&ModeRecord::Seen {
+            kind: EntryKind::Dir,
+            original: OriginalMode::Observed(0o750),
+        })
+    );
+    journal.note_first_touch("g", EntryKind::Dir, Some(0o555));
+    journal.mark_widened("g", EntryKind::Dir, 0o555);
+    journal.note_final_pending("g", 0o700);
+    journal.note_final_pending("h", 0o700);
+    assert_eq!(
+        journal.take_pending_finals(),
+        vec![("g".to_string(), 0o700), ("h".to_string(), 0o700)]
+    );
+    assert_eq!(
+        journal.entries.get("g"),
+        Some(&ModeRecord::Widened {
+            kind: EntryKind::Dir,
+            original: OriginalMode::Observed(0o555),
+        })
+    );
+    assert!(
+        !journal.entries.contains_key("h"),
+        "a pending final whose mode was never read leaves no record behind"
+    );
+    assert_eq!(
+        journal.take_pending_finals(),
+        Vec::new(),
+        "the intended final mode is consumed once"
+    );
+}
+
+/// The residue exclusion is still honored WITHOUT a journal flag. `note_residue`
+/// no longer marks the mode journal (there is no `abandoned` state to mark): the
+/// journal KEEPS the widen, so the widen of a path left in place is still
+/// restored, and `derive_report` excludes the path from `transient_dirs` because
+/// `note_residue` names it in [`Applier::dest_residue`] (`indeterminate` covers
+/// the one path that leaves that set). The end-to-end witness that this is what
+/// keeps `residue` and `transient_dirs` disjoint is
+/// `a_leftover_aside_is_not_also_reported_transient`, where the claim aside IS
+/// widened and then left as residue; this test pins the filter itself.
+#[test]
+fn a_widened_residue_path_is_not_reported_transient() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    let diff = crate::sync::diff::diff_trees(
+        &canonicalize_tree(&src).unwrap(),
+        &canonicalize_tree(&dst).unwrap(),
+    );
+    let local = LocalSide::open(root, true).unwrap();
+    let side = Side::Local(&local);
+    let policy = ReplaceAll;
+    let mut applier = applier_over(&side, &side, &policy, &diff);
+
+    // The shape the removal walk produces: it widened the directory on the way
+    // in and then left it in place.
+    applier.journal.mark_widened("x", EntryKind::Dir, 0o555);
+    applier.note_residue("x");
+    assert_eq!(
+        applier.journal.widened_paths(),
+        vec!["x".to_string()],
+        "the journal keeps the widen, so the widen is restored"
+    );
+
+    let report = applier.derive_report();
+    assert_eq!(report.residue, vec!["x".to_string()], "{report:?}");
+    assert!(
+        !report.transient_dirs.contains(&"x".to_string()),
+        "a residue path is never also transient: {report:?}"
+    );
+}
+
 /// Build an [`Applier`] over `diff` with every field at the empty default the
 /// run constructor uses. Tests that interrogate a private guard DIRECTLY
 /// (rather than through `run`) start from here, so the guard is exercised
@@ -14127,7 +14546,6 @@ fn applier_over<'a, 'b>(
         verified: BTreeSet::new(),
         verify_failures: BTreeSet::new(),
         indeterminate: BTreeMap::new(),
-        pending_final: BTreeMap::new(),
         journal: ModeJournal::default(),
         removed: BTreeSet::new(),
         claim_failures: Vec::new(),

@@ -96,13 +96,14 @@
 //!   explicit heap stack, one frame per directory), and every child is
 //!   re-checked against the live authority on the way in, so a deep tree is
 //!   bounded by memory rather than by the thread stack.
-//! * **"Left in place" is a state, not `removed`.** A path that becomes residue
-//!   is recorded `abandoned` in the mode journal: it is NOT deleted, NOT
-//!   transferred, REPORTED in [`SyncReport::residue`], and — because it still
-//!   exists — its transient widen is STILL restored. A path this sync removed is
-//!   `removed`: there is no mode left to restore and it is never residue.
-//!   Conflating the two silently left a widened residue directory at its
-//!   widened mode.
+//! * **"Left in place" is a state, not `removed`.** A path that becomes
+//!   residue is NEVER recorded as removed: it is NOT deleted, NOT transferred,
+//!   REPORTED in [`SyncReport::residue`], and — because it still exists — its
+//!   transient widen is STILL restored. A path this sync removed ends its mode
+//!   identity (`ModeRecord::Removed`): there is no mode left to restore and it
+//!   is never residue. Conflating the two silently left a widened residue
+//!   directory at its widened mode; `ModeRecord` is a sum type precisely so the
+//!   two cannot be conflated by a flag combination.
 //!
 //! # The mode-record invariant
 //!
@@ -120,8 +121,11 @@
 //!
 //! Each clause is realized structurally, not by convention:
 //!
-//! * **One entry per live path.** `ModeJournal` is a `BTreeMap<path,
-//!   ModeEntry>`. `original` is recorded on the FIRST touch only and never
+//! * **One record per live path.** `ModeJournal` is a `BTreeMap<path,
+//!   ModeRecord>`, and a `ModeRecord` is a sum type with one variant per LEGAL
+//!   state, so a contradictory combination (`removed` plus `abandoned`,
+//!   `final_applied` plus `removed`) is not representable. `original` is
+//!   recorded on the FIRST touch only and never
 //!   overwritten, so the value a restore must return to cannot be lost by a
 //!   later widen, and a second touch cannot create a second bookkeeping record
 //!   to get out of sync. A path this sync REMOVED ends its identity; if the same
@@ -254,7 +258,8 @@
 //! named in `residue` still EXISTS afterward: a claim that moves a
 //! residue-holding subtree re-roots the reported paths to their current location,
 //! and because the path still exists a transient widen of it is RESTORED (the
-//! journal records it abandoned, not removed). This is made true BY CONSTRUCTION
+//! journal keeps the widen: only a `Removed` record has no mode left to restore).
+//! This is made true BY CONSTRUCTION
 //! by the final reconciliation (`Applier::reconcile_residue`), which confirms
 //! every residue candidate present at report time: a candidate that is gone, or
 //! whose presence cannot be confirmed because the probe itself fails, is NOT
@@ -961,6 +966,7 @@ use crate::sync::diff::{
 };
 use crate::transport::{FarSideLockSession, Layout, Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -1374,7 +1380,7 @@ pub struct SyncReport {
     /// the FAILURE path alike. Excluded: a path
     /// the sync removed (its widening left no residue; its terminal state is
     /// absence, reported in [`SyncReport::extraneous`]), a path that became
-    /// abandoned residue (it still exists and its widen is RESTORED, but it is
+    /// residue (it still exists and its widen is RESTORED, but it is
     /// reported in [`SyncReport::residue`] instead), and a path that is
     /// destination-only or conflicted (it was merely PASSED THROUGH on the way
     /// to a failed removal and is reported there instead).
@@ -3065,44 +3071,230 @@ fn prepare(
     })
 }
 
-/// A mode kind this sync knows how to widen and restore.
+/// What this sync knows about a path's mode at the FIRST touch of its current
+/// identity. Recorded once; a later touch never overwrites it, so the mode a
+/// restore must return to cannot be lost by a later widen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ModeEntry {
-    /// The kind, so a restore chmod resolves the path with the right flags
-    /// (`O_DIRECTORY` for a directory).
-    kind: EntryKind,
-    /// The mode observed the FIRST time this sync touched the path, or `None`
-    /// when the path did not exist then (a path this sync created). Recorded on
-    /// the first touch only; a later touch never overwrites it.
-    original: Option<Mode>,
-    /// The intended final mode, when this sync has one for the path.
-    final_mode: Option<Mode>,
-    /// This sync transiently changed the path's mode to admit a child.
-    widened: bool,
-    /// The intended final mode was successfully applied (a chmod ran, or the
-    /// mode already matched).
-    final_applied: bool,
-    /// The path was removed by this sync, so there is no mode left to restore.
-    removed: bool,
-    /// The path was deliberately LEFT IN PLACE as abandoned residue. It still
-    /// EXISTS (so a transient widen must still be restored) but it is not a live
-    /// subject of the transfer (so it is never reported `transient_dirs`, never
-    /// transferred, and never deleted). Distinct from [`ModeEntry::removed`] by
-    /// construction: this is exactly the distinction whose conflation silently
-    /// left a widened residue directory at its widened mode.
-    abandoned: bool,
+enum OriginalMode {
+    /// The path did not exist at first touch: this sync created it, so it has no
+    /// mode of its own to restore.
+    Created,
+    /// The mode observed at first touch.
+    Observed(Mode),
 }
 
-/// The single record of every mode this sync changes: at most one entry per
-/// LIVE path identity, `original` fixed at that identity's first touch.
-/// Nothing here is drained or overwritten; the report derives from it and a
-/// restore reads it idempotently. A path this sync REMOVED ends its identity:
-/// if the same path is created again in the same run (a source file replacing
-/// a destination directory), `note_first_touch` starts a fresh record, because
-/// the old identity no longer exists to restore.
+impl OriginalMode {
+    /// The mode a restore returns to, when this identity has one.
+    fn mode(self) -> Option<Mode> {
+        match self {
+            OriginalMode::Created => None,
+            OriginalMode::Observed(mode) => Some(mode),
+        }
+    }
+}
+
+/// ONE legal state of a journaled path identity, carrying the data that state
+/// needs. The state a record is in is the ONLY thing that decides the journal's
+/// answers, so the combinations the old flat flag set could represent but this
+/// machinery cannot reach (`removed` AND `abandoned`, `final_applied` AND
+/// `removed`, …) are not representable at all.
+///
+/// `kind` is the kind of the identity the sync touched, so a restore chmod
+/// resolves the path with the right flags (`O_DIRECTORY` for a directory). It is
+/// used ONLY to detect that a live kind changed, never to dispatch a mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModeRecord {
+    /// First touch; nothing mode-relevant has happened yet.
+    Seen {
+        kind: EntryKind,
+        original: OriginalMode,
+    },
+    /// A directory with an intended final mode `finalize` has not applied, whose
+    /// mode NOTHING has read yet: the destination already held the directory, so
+    /// the transfer did not mode-touch it and `finalize`'s own read is this
+    /// identity's first touch.
+    FirstTouchPending { kind: EntryKind, intended: Mode },
+    /// A final mode is intended and the identity is first-touched, but neither a
+    /// widen nor the final chmod has happened yet.
+    FinalPending {
+        kind: EntryKind,
+        original: OriginalMode,
+        intended: Mode,
+    },
+    /// A transient widen landed; no final mode is intended.
+    Widened {
+        kind: EntryKind,
+        original: OriginalMode,
+    },
+    /// A transient widen landed and the intended final mode has not (yet).
+    WidenedFinalPending {
+        kind: EntryKind,
+        original: OriginalMode,
+        intended: Mode,
+    },
+    /// A widen landed and the intended final mode landed after it.
+    WidenedFinal {
+        kind: EntryKind,
+        original: OriginalMode,
+        final_mode: Mode,
+    },
+    /// The final mode landed with no prior widen.
+    Final {
+        kind: EntryKind,
+        original: OriginalMode,
+        final_mode: Mode,
+    },
+    /// A final chmod ran but the live mode did not equal the intended one. The
+    /// intended mode stays the verification target (a dropped chmod is loud,
+    /// never repaired-and-forgotten) and a prior widen is still undone.
+    FinalUnlanded {
+        kind: EntryKind,
+        original: OriginalMode,
+        widened: bool,
+        intended: Mode,
+    },
+    /// This sync removed the path: there is no mode left to restore. `widened`
+    /// keeps [`ModeRecord::is_widened`]'s answer and `kind` keeps
+    /// [`ModeRecord::final_applied`]'s (a SYMLINK has no mode step).
+    ///
+    /// A record that carried a final mode when it was removed drops it, which
+    /// cannot hide a pending step: [`Applier::finalize`] runs before every
+    /// removal, and the removal passes act only on destination-only paths, which
+    /// `finalize` never queues.
+    Removed { kind: EntryKind, widened: bool },
+}
+
+impl ModeRecord {
+    /// The kind of the identity this sync touched.
+    fn kind(self) -> EntryKind {
+        match self {
+            ModeRecord::Seen { kind, .. }
+            | ModeRecord::FirstTouchPending { kind, .. }
+            | ModeRecord::FinalPending { kind, .. }
+            | ModeRecord::Widened { kind, .. }
+            | ModeRecord::WidenedFinalPending { kind, .. }
+            | ModeRecord::WidenedFinal { kind, .. }
+            | ModeRecord::Final { kind, .. }
+            | ModeRecord::FinalUnlanded { kind, .. }
+            | ModeRecord::Removed { kind, .. } => kind,
+        }
+    }
+
+    /// Whether the journal recorded a widen for this identity. This is NOT a
+    /// "currently widened" test: the live mode is always read before deciding a
+    /// chmod, so a directory whose read-only final mode was reinstated by
+    /// `finalize` can be widened again. A [`ModeRecord::Removed`] identity keeps
+    /// the widen it carried when it was removed (the path still existed then),
+    /// which is why [`ModeJournal::widened_paths`] excludes removed identities
+    /// instead of relying on this answer alone.
+    fn is_widened(self) -> bool {
+        match self {
+            ModeRecord::Widened { .. }
+            | ModeRecord::WidenedFinalPending { .. }
+            | ModeRecord::WidenedFinal { .. } => true,
+            ModeRecord::FinalUnlanded { widened, .. } | ModeRecord::Removed { widened, .. } => {
+                widened
+            }
+            ModeRecord::Seen { .. }
+            | ModeRecord::FirstTouchPending { .. }
+            | ModeRecord::FinalPending { .. }
+            | ModeRecord::Final { .. } => false,
+        }
+    }
+
+    /// Whether this identity has no mode step left to wait for: its intended
+    /// final mode landed, or it has none and it is a SYMLINK (its manifest mode
+    /// is the fixed `0777` and is never chmodded).
+    fn final_applied(self) -> bool {
+        match self {
+            ModeRecord::Final { .. } | ModeRecord::WidenedFinal { .. } => true,
+            ModeRecord::Seen { kind, .. } | ModeRecord::Removed { kind, .. } => {
+                kind == EntryKind::Symlink
+            }
+            ModeRecord::FirstTouchPending { .. }
+            | ModeRecord::FinalPending { .. }
+            | ModeRecord::Widened { .. }
+            | ModeRecord::WidenedFinalPending { .. }
+            | ModeRecord::FinalUnlanded { .. } => false,
+        }
+    }
+
+    /// The mode this identity must carry once settled. A SYMLINK has no mode
+    /// check, and a removed path has no mode left to check. An INTENDED mode is
+    /// checked even when it did not land, so a dropped mode is a verification
+    /// failure rather than being silently repaired by a restore. A
+    /// merely-widened path is checked against its original mode once
+    /// `include_restored` is set (after the restore ran). `None` means there is
+    /// nothing to check.
+    fn settled_mode(self, include_restored: bool) -> Option<Mode> {
+        match self {
+            ModeRecord::Final {
+                kind, final_mode, ..
+            }
+            | ModeRecord::WidenedFinal {
+                kind, final_mode, ..
+            } => (kind != EntryKind::Symlink).then_some(final_mode),
+            ModeRecord::FinalUnlanded { kind, intended, .. } => {
+                (kind != EntryKind::Symlink).then_some(intended)
+            }
+            ModeRecord::Widened { kind, original, .. }
+            | ModeRecord::WidenedFinalPending { kind, original, .. } => {
+                if kind == EntryKind::Symlink || !include_restored {
+                    None
+                } else {
+                    original.mode()
+                }
+            }
+            ModeRecord::Seen { .. }
+            | ModeRecord::FirstTouchPending { .. }
+            | ModeRecord::FinalPending { .. }
+            | ModeRecord::Removed { .. } => None,
+        }
+    }
+
+    /// What a restore must put back: the final mode when it landed (it
+    /// superseded the widen), otherwise the original mode. `None` when this
+    /// identity has no widen to undo or no mode of its own to return to (a path
+    /// this sync created).
+    fn restore_target(self) -> Option<Mode> {
+        match self {
+            ModeRecord::Widened { original, .. }
+            | ModeRecord::WidenedFinalPending { original, .. }
+            | ModeRecord::FinalUnlanded {
+                original,
+                widened: true,
+                ..
+            } => original.mode(),
+            ModeRecord::WidenedFinal { final_mode, .. } => Some(final_mode),
+            ModeRecord::Seen { .. }
+            | ModeRecord::FirstTouchPending { .. }
+            | ModeRecord::FinalPending { .. }
+            | ModeRecord::Final { .. }
+            | ModeRecord::FinalUnlanded { widened: false, .. }
+            | ModeRecord::Removed { .. } => None,
+        }
+    }
+}
+
+/// The single record of every mode this sync changes: at most one record per
+/// LIVE path identity, whose [`OriginalMode`] is fixed at that identity's first
+/// touch. Nothing here is drained or overwritten; the report derives from it and
+/// a restore reads it idempotently. A path this sync REMOVED ends its identity:
+/// if the same path is created again in the same run (a source file replacing a
+/// destination directory), `note_first_touch` starts a fresh record, because the
+/// old identity no longer exists to restore.
+///
+/// The journal's [`ModeRecord::Removed`] is NOT the same set as
+/// [`Applier::removed`]. The journal records that a path's mode IDENTITY is
+/// gone; [`Applier::removed`] is the removal ledger the removal passes read, and
+/// [`Applier::discard_partial`] takes a path back OUT of it when the original is
+/// renamed back over the partial this sync made, while the journal keeps
+/// `Removed` (the identity was ended; a later creation starts a fresh one).
+/// Neither set is derived from the other, and merging them would make a
+/// rolled-back removal look still-gone.
 #[derive(Debug, Default)]
 struct ModeJournal {
-    entries: BTreeMap<String, ModeEntry>,
+    entries: BTreeMap<String, ModeRecord>,
 }
 
 impl ModeJournal {
@@ -3110,143 +3302,321 @@ impl ModeJournal {
     /// the path's current identity). `None` means the path did not exist at
     /// first touch (this sync created it). A second call for the SAME identity
     /// never overwrites the first value; a call after the path was REMOVED
-    /// starts a fresh identity.
+    /// starts a fresh identity. A pending final whose mode nothing had read yet
+    /// takes the value recorded here as its identity's first touch.
     fn note_first_touch(&mut self, path: &str, kind: EntryKind, original: Option<Mode>) {
-        if let Some(entry) = self.entries.get_mut(path) {
-            if entry.removed {
-                *entry = ModeEntry {
+        let first = match original {
+            Some(mode) => OriginalMode::Observed(mode),
+            None => OriginalMode::Created,
+        };
+        match self.entries.entry(path.to_string()) {
+            Entry::Vacant(slot) => {
+                slot.insert(ModeRecord::Seen {
                     kind,
-                    original,
-                    final_mode: None,
-                    widened: false,
-                    final_applied: false,
-                    removed: false,
-                    abandoned: false,
+                    original: first,
+                });
+            }
+            Entry::Occupied(mut slot) => {
+                let record = slot.get_mut();
+                *record = match *record {
+                    ModeRecord::Removed { .. } => ModeRecord::Seen {
+                        kind,
+                        original: first,
+                    },
+                    ModeRecord::FirstTouchPending { kind, intended } => ModeRecord::FinalPending {
+                        kind,
+                        original: first,
+                        intended,
+                    },
+                    // FIRST TOUCH WINS: a later touch never overwrites the mode
+                    // the identity started from.
+                    other => other,
                 };
             }
-            return;
         }
-        self.entries.insert(
-            path.to_string(),
-            ModeEntry {
-                kind,
-                original,
-                final_mode: None,
-                widened: false,
-                final_applied: false,
-                removed: false,
-                abandoned: false,
-            },
-        );
     }
 
     /// Whether the journal recorded a widen for `path` (used by the report to
-    /// keep a mode-touched path out of `skipped`). This is NOT a "currently
-    /// widened" test: the live mode is always read before deciding a chmod, so
-    /// a directory whose read-only final mode was reinstated by `finalize` can
-    /// be widened again.
+    /// keep a mode-touched path out of `skipped`). See
+    /// [`ModeRecord::is_widened`].
     fn is_widened(&self, path: &str) -> bool {
-        self.entries.get(path).is_some_and(|e| e.widened)
+        self.entries
+            .get(path)
+            .is_some_and(|record| record.is_widened())
     }
 
-    /// Note that `path`'s mode was transiently changed. The caller has already
-    /// chmodded and counted it.
-    fn mark_widened(&mut self, path: &str) {
-        if let Some(entry) = self.entries.get_mut(path) {
-            entry.widened = true;
+    /// Record that this sync widened `path`, whose mode was `current`
+    /// immediately before the chmod. Records the identity's FIRST touch from
+    /// `current` when nothing has been recorded for it yet, so a widen can never
+    /// run ahead of the original mode it must be restored to. Called for a widen
+    /// that landed and for one that may not have (a chmod whose call failed may
+    /// still have applied), because either way the path must be restored and
+    /// named.
+    fn mark_widened(&mut self, path: &str, kind: EntryKind, current: Mode) {
+        let first = OriginalMode::Observed(current);
+        match self.entries.entry(path.to_string()) {
+            Entry::Vacant(slot) => {
+                slot.insert(ModeRecord::Widened {
+                    kind,
+                    original: first,
+                });
+            }
+            Entry::Occupied(mut slot) => {
+                let record = slot.get_mut();
+                *record = match *record {
+                    ModeRecord::Seen { kind, original } => ModeRecord::Widened { kind, original },
+                    ModeRecord::FirstTouchPending { kind, intended } => {
+                        ModeRecord::WidenedFinalPending {
+                            kind,
+                            original: first,
+                            intended,
+                        }
+                    }
+                    ModeRecord::FinalPending {
+                        kind,
+                        original,
+                        intended,
+                    } => ModeRecord::WidenedFinalPending {
+                        kind,
+                        original,
+                        intended,
+                    },
+                    ModeRecord::Widened { .. }
+                    | ModeRecord::WidenedFinalPending { .. }
+                    | ModeRecord::WidenedFinal { .. } => *record,
+                    ModeRecord::Final {
+                        kind,
+                        original,
+                        final_mode,
+                    } => ModeRecord::WidenedFinal {
+                        kind,
+                        original,
+                        final_mode,
+                    },
+                    ModeRecord::FinalUnlanded {
+                        kind,
+                        original,
+                        widened: _,
+                        intended,
+                    } => ModeRecord::FinalUnlanded {
+                        kind,
+                        original,
+                        widened: true,
+                        intended,
+                    },
+                    // The identity already ended, so a widen begins a fresh one
+                    // (`note_first_touch` would have restarted it).
+                    ModeRecord::Removed { .. } => ModeRecord::Widened {
+                        kind,
+                        original: first,
+                    },
+                };
+            }
         }
+    }
+
+    /// Record that [`Applier::finalize`] intends `intended` as `path`'s final
+    /// mode. Called by the directory transfer, so the kind is always
+    /// [`EntryKind::Dir`]. Only the INTENT is recorded here: the path's mode is
+    /// read by `finalize` (or, when a child widens the directory first, by that
+    /// widen), which is why a path nothing has mode-touched becomes
+    /// [`ModeRecord::FirstTouchPending`].
+    fn note_final_pending(&mut self, path: &str, intended: Mode) {
+        let kind = EntryKind::Dir;
+        match self.entries.entry(path.to_string()) {
+            Entry::Vacant(slot) => {
+                slot.insert(ModeRecord::FirstTouchPending { kind, intended });
+            }
+            Entry::Occupied(mut slot) => {
+                let record = slot.get_mut();
+                *record = match *record {
+                    ModeRecord::Seen { kind, original } => ModeRecord::FinalPending {
+                        kind,
+                        original,
+                        intended,
+                    },
+                    ModeRecord::Widened { kind, original } => ModeRecord::WidenedFinalPending {
+                        kind,
+                        original,
+                        intended,
+                    },
+                    // A spelling reaches its pending final ONCE: `transfer_dir`
+                    // queues it once and `finalize` runs after every transfer, so
+                    // a record that already carries one (or a final mode, or a
+                    // removal) cannot be reached here. Left as it stands rather
+                    // than inventing a second intent.
+                    other => other,
+                };
+            }
+        }
+    }
+
+    /// Drain the intended final modes [`Applier::finalize`] still has to apply,
+    /// leaving each drained record in the state the intent was recorded ON TOP
+    /// of: a record whose mode nothing had read disappears (it never recorded a
+    /// touch), and a first-touched record goes back to being merely touched. The
+    /// intent is consumed exactly ONCE, so a second `finalize` is a no-op even
+    /// when the first one failed.
+    fn take_pending_finals(&mut self) -> Vec<(String, Mode)> {
+        let mut pending: Vec<(String, Mode, Option<ModeRecord>)> = Vec::new();
+        for (path, record) in &self.entries {
+            let drained = match *record {
+                ModeRecord::FirstTouchPending { intended, .. } => (intended, None),
+                ModeRecord::FinalPending {
+                    kind,
+                    original,
+                    intended,
+                } => (intended, Some(ModeRecord::Seen { kind, original })),
+                ModeRecord::WidenedFinalPending {
+                    kind,
+                    original,
+                    intended,
+                } => (intended, Some(ModeRecord::Widened { kind, original })),
+                _ => continue,
+            };
+            pending.push((path.clone(), drained.0, drained.1));
+        }
+        for (path, _, rest) in &pending {
+            match rest {
+                Some(record) => {
+                    self.entries.insert(path.clone(), *record);
+                }
+                None => {
+                    self.entries.remove(path);
+                }
+            }
+        }
+        pending
+            .into_iter()
+            .map(|(path, intended, _)| (path, intended))
+            .collect()
     }
 
     /// Record `path`'s intended final mode and whether it actually landed
     /// (`live` is the mode read immediately after the operation). A mode the
-    /// transport never applied leaves `final_applied = false`, so the restore
-    /// targets the ORIGINAL mode and verification still requires the INTENDED
-    /// mode — a dropped chmod is loud, never repaired-and-forgotten.
+    /// transport never applied leaves the record in
+    /// [`ModeRecord::FinalUnlanded`], so the restore targets the ORIGINAL mode
+    /// and verification still requires the INTENDED mode — a dropped chmod is
+    /// loud, never repaired-and-forgotten.
     fn mark_final_mode(&mut self, path: &str, intended: Mode, live: Option<Mode>) {
-        if let Some(entry) = self.entries.get_mut(path) {
-            entry.final_mode = Some(intended);
-            entry.final_applied = live == Some(intended);
-        }
+        let landed = live == Some(intended);
+        let Some(record) = self.entries.get_mut(path) else {
+            return;
+        };
+        // The transition table, expressed ONCE: every record that is already
+        // first-touched (and not pending) re-decides the same two facts — the
+        // intended mode, and whether it landed — so the arms below name only the
+        // `(kind, original, widened)` the identity already has. `landed` is the
+        // old `final_applied` bit and `intended` the old `final_mode`.
+        let decided = |kind: EntryKind, original: OriginalMode, widened: bool| {
+            if landed {
+                if widened {
+                    ModeRecord::WidenedFinal {
+                        kind,
+                        original,
+                        final_mode: intended,
+                    }
+                } else {
+                    ModeRecord::Final {
+                        kind,
+                        original,
+                        final_mode: intended,
+                    }
+                }
+            } else {
+                ModeRecord::FinalUnlanded {
+                    kind,
+                    original,
+                    widened,
+                    intended,
+                }
+            }
+        };
+        *record = match *record {
+            ModeRecord::FinalPending { kind, original, .. } => decided(kind, original, false),
+            ModeRecord::WidenedFinalPending { kind, original, .. } => decided(kind, original, true),
+            ModeRecord::Seen { kind, original } => decided(kind, original, false),
+            ModeRecord::Widened { kind, original } => decided(kind, original, true),
+            ModeRecord::Final { kind, original, .. } => decided(kind, original, false),
+            ModeRecord::WidenedFinal { kind, original, .. } => decided(kind, original, true),
+            ModeRecord::FinalUnlanded {
+                kind,
+                original,
+                widened,
+                ..
+            } => decided(kind, original, widened),
+            // `FirstTouchPending` is first-touched (and so no longer pending)
+            // before `finalize` applies anything, and a removed path has no mode
+            // left to record. Neither can be reached here; both are left as they
+            // stand rather than inventing a state.
+            ModeRecord::FirstTouchPending { .. } | ModeRecord::Removed { .. } => *record,
+        };
     }
 
     /// Whether `path` has no mode step left to wait for. A path with no journal
     /// entry does not, and neither does a SYMLINK (its manifest mode is the
     /// fixed `0777` and is never chmodded); a recorded file/directory requires
-    /// its intended mode to have landed.
+    /// its intended mode to have landed. See [`ModeRecord::final_applied`].
     fn final_applied(&self, path: &str) -> bool {
         self.entries
             .get(path)
-            .is_none_or(|e| e.final_applied || e.kind == EntryKind::Symlink)
+            .is_none_or(|record| record.final_applied())
     }
 
-    /// Note that `path` was removed: it has no mode left to restore.
+    /// Note that `path` was removed: it has no mode left to restore. The record
+    /// keeps only its kind and widen answer; see [`ModeRecord::Removed`].
     fn mark_removed(&mut self, path: &str) {
-        if let Some(entry) = self.entries.get_mut(path) {
-            entry.removed = true;
+        if let Some(record) = self.entries.get_mut(path) {
+            let kind = record.kind();
+            let widened = record.is_widened();
+            *record = ModeRecord::Removed { kind, widened };
         }
     }
 
-    /// Note that `path` was deliberately LEFT IN PLACE as abandoned residue. It
-    /// still exists, so a transient widen is still restored; but it is no longer
-    /// a live subject of the transfer, so it is not reported transient.
-    fn mark_abandoned(&mut self, path: &str) {
-        if let Some(entry) = self.entries.get_mut(path) {
-            entry.abandoned = true;
-        }
-    }
-
-    /// Every path this sync widened and did NOT remove or abandon, ordered by
-    /// path. An abandoned path is reported [`SyncReport::residue`], never
+    /// Every path this sync widened and did NOT remove, ordered by path.
+    ///
+    /// A REMOVED identity is excluded: [`ModeJournal::mark_removed`] keeps the
+    /// widen answer (the record still answers [`ModeRecord::is_widened`] for the
+    /// bookkeeping that reads it), but the path itself is GONE — there is no
+    /// directory left to name and no mode left to restore. Naming it would
+    /// contradict [`SyncReport::transient_dirs`], which is a directory this run
+    /// widened and LEFT IN PLACE. A read-only destination directory replaced by
+    /// a source file is the shape: the claim-aside is widened on the way into it
+    /// and then removed, so its spelling no longer exists.
+    ///
+    /// A path LEFT IN PLACE as residue needs no exclusion of its own here: the
+    /// removal walk widens a directory only on the way INTO it, and it records a
+    /// path as residue exactly where it decided not to descend (a reserved name,
+    /// an unaddressed child, a child it could not remove, an aside). The one
+    /// widened-and-residue path is the root of the walk's own claim aside, which
+    /// [`Applier::note_residue`] also records in [`Applier::dest_residue`];
+    /// `derive_report` excludes every path in `dest_residue` or in
+    /// `indeterminate` (where [`Applier::reconcile_residue`] moves a candidate
+    /// before it leaves `dest_residue`), so such a path is never reported
     /// [`SyncReport::transient_dirs`].
     fn widened_paths(&self) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|(_, e)| e.widened && !e.removed && !e.abandoned)
-            .map(|(p, _)| p.clone())
+            .filter(|(_, record)| {
+                record.is_widened() && !matches!(**record, ModeRecord::Removed { .. })
+            })
+            .map(|(path, _)| path.clone())
             .collect()
     }
 
-    /// The mode a settled `path` must carry. A SYMLINK has no mode check (its
-    /// manifest mode is fixed and never chmodded). A path with an INTENDED mode
-    /// on record is checked against that intended mode — even when
-    /// `final_applied` is false, so a dropped mode is a verification failure
-    /// rather than being silently repaired by a restore. A merely-widened path
-    /// is checked against its original mode once `include_restored` is set.
-    /// `None` means there is nothing to check.
-    fn settled_mode(&self, entry: &ModeEntry, include_restored: bool) -> Option<Mode> {
-        if entry.removed || entry.kind == EntryKind::Symlink {
-            return None;
-        }
-        if entry.final_mode.is_some() {
-            return entry.final_mode;
-        }
-        if entry.widened {
-            return if include_restored {
-                entry.original
-            } else {
-                None
-            };
-        }
-        None
-    }
-
     /// The restore plan, deepest-first (so a read-only parent is restored only
-    /// after every descendant). Only a widened path whose final mode did not
-    /// supersede the widen, and that still exists, is planned. An ABANDONED
-    /// (residue) path is included: it was left in place, so its widen must be
-    /// undone — only a REMOVED path has no mode left to restore.
+    /// after every descendant). See [`ModeRecord::restore_target`]: a widened
+    /// path the final mode did not supersede is planned back to its original,
+    /// and a path left in place as residue is planned too (it still exists) —
+    /// only a REMOVED path has no mode left to restore.
     fn restore_plan(&self) -> Vec<(String, EntryKind, Mode)> {
         let mut plan: Vec<(String, EntryKind, Mode)> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.widened && !e.removed)
-            .filter_map(|(path, e)| {
-                let target = if e.final_applied {
-                    e.final_mode
-                } else {
-                    e.original
-                };
-                target.map(|mode| (path.clone(), e.kind, mode))
+            .filter_map(|(path, record)| {
+                record
+                    .restore_target()
+                    .map(|target| (path.clone(), record.kind(), target))
             })
             .collect();
         plan.sort_by(|a, b| {
@@ -3263,9 +3633,10 @@ impl ModeJournal {
     fn mode_targets(&self, include_restored: bool) -> Vec<(String, EntryKind, Mode)> {
         self.entries
             .iter()
-            .filter_map(|(path, e)| {
-                self.settled_mode(e, include_restored)
-                    .map(|mode| (path.clone(), e.kind, mode))
+            .filter_map(|(path, record)| {
+                record
+                    .settled_mode(include_restored)
+                    .map(|mode| (path.clone(), record.kind(), mode))
             })
             .collect()
     }
@@ -3670,7 +4041,7 @@ fn run(
     // source content (transferred) or destination content (removed), and carry
     // the source-side collisions and the destination-side residue in the
     // report. A source collision is a `ReservedName` conflict, not a silent
-    // skip; it is NOT also residue, because residue is the abandoned
+    // skip; it is NOT also residue, because residue is the LEFT-IN-PLACE
     // destination state (a path left in place that must still be restored),
     // and a source collision is neither left in place by this sync nor a
     // destination path at all.
@@ -3824,7 +4195,6 @@ fn run(
         verified: BTreeSet::new(),
         verify_failures: BTreeSet::new(),
         indeterminate: BTreeMap::new(),
-        pending_final: BTreeMap::new(),
         journal: ModeJournal::default(),
         removed: BTreeSet::new(),
         claim_failures: Vec::new(),
@@ -3964,10 +4334,8 @@ struct Applier<'a, 'b> {
     /// presence could not be confirmed: its location is unknown, and an unknown
     /// location is exactly what this map records.
     indeterminate: BTreeMap<String, PendingMutations>,
-    /// Directories whose final mode must be applied after every child is in
-    /// place (path -> intended mode). Applied deepest-first.
-    pending_final: BTreeMap<String, Mode>,
-    /// THE mode record.
+    /// THE mode record. It owns the intended final mode every directory has
+    /// pending as well as every mode this sync changed (see [`ModeRecord`]).
     journal: ModeJournal,
     /// Paths already removed this run, so a descendant of a removed directory
     /// is not removed again (ancestry via `Path`, never a literal separator).
@@ -4371,8 +4739,9 @@ impl Applier<'_, '_> {
 
     /// Record a path's intended final mode, reading the LIVE mode immediately
     /// after the operation that was supposed to apply it. A mode the transport
-    /// never applied leaves `final_applied = false`, so the restore targets the
-    /// original and verification still demands the intended mode.
+    /// never applied leaves the record in [`ModeRecord::FinalUnlanded`], so the
+    /// restore targets the original and verification still demands the intended
+    /// mode.
     fn note_final(&mut self, path: &str, intended: Mode, kind: EntryKind) -> Result<()> {
         let rel = rooted(path)?;
         let live = self.dest.mode_opt(&rel, kind)?;
@@ -4854,12 +5223,10 @@ impl Applier<'_, '_> {
         if target == current {
             return Ok(());
         }
-        self.journal
-            .note_first_touch(path, EntryKind::Dir, Some(current));
         self.begin_mutation(path, MutationKind::Mode);
         match self.dest.set_mode(rel, target, EntryKind::Dir) {
             Ok(()) => {
-                self.journal.mark_widened(path);
+                self.journal.mark_widened(path, EntryKind::Dir, current);
                 self.commit_mutation(path, MutationKind::Mode);
                 Ok(())
             }
@@ -4867,7 +5234,7 @@ impl Applier<'_, '_> {
                 // The chmod may or may not have landed. Record the widen so the
                 // single settle still tries to restore the original (and so the
                 // path is named); the path stays in `indeterminate`.
-                self.journal.mark_widened(path);
+                self.journal.mark_widened(path, EntryKind::Dir, current);
                 Err(error)
             }
         }
@@ -5555,13 +5922,13 @@ impl Applier<'_, '_> {
     }
 
     /// Record `path` as destination residue: it is deliberately LEFT IN PLACE.
-    /// The mode journal records the path as ABANDONED, not removed — it still
-    /// exists, so a transient widen of it must still be restored, but it is no
-    /// longer a live subject of the transfer, so it is never reported in
-    /// `transient_dirs`.
+    /// The path still EXISTS, so a transient widen of it is still restored (the
+    /// journal keeps the widen; only a REMOVED record has no mode left to
+    /// restore), but it is no longer a live subject of the transfer, so it is
+    /// never reported in `transient_dirs` — every reader excludes it because it
+    /// is named here.
     fn note_residue(&mut self, path: &str) {
         self.dest_residue.insert(path.to_string());
-        self.journal.mark_abandoned(path);
     }
 
     /// Re-root every recorded destination-residue path that is `from` or a
@@ -5759,11 +6126,11 @@ impl Applier<'_, '_> {
             // is a prefix of the destination), and a `Replace` over a file
             // with identical content is a MODE-only change — neither writes
             // into the parent, so neither is blocked. A DIRECTORY over an
-            // EXISTING destination directory is ALSO a mode-only change: it
-            // queues `pending_final` and `finalize` chmods the CHILD, so it
-            // needs traverse on the parent, never write. An append that does
-            // write is blocked inside `append_write`; every other transfer
-            // writes into the parent.
+            // EXISTING destination directory is ALSO a mode-only change: its
+            // final mode is recorded as pending on its [`ModeRecord`] and
+            // `finalize` chmods the CHILD, so it needs traverse on the parent,
+            // never write. An append that does write is blocked inside
+            // `append_write`; every other transfer writes into the parent.
             let defers_to_append = kind == EntryKind::File && policy == EntryPolicy::AppendTail;
             let mode_only_replace = kind == EntryKind::File
                 && policy == EntryPolicy::Replace
@@ -5897,7 +6264,7 @@ impl Applier<'_, '_> {
                     .note_first_touch(&entry.path, EntryKind::Dir, None);
             }
         }
-        self.pending_final.insert(entry.path.clone(), mode);
+        self.journal.note_final_pending(&entry.path, mode);
         self.outcomes
             .insert(entry.path.clone(), Outcome::Transferred);
         // A created or changed directory is a `Transferred` outcome: its KIND
@@ -6086,7 +6453,7 @@ impl Applier<'_, '_> {
             .set_mode(rel, current | OWNER_WRITE, EntryKind::File)
         {
             Ok(()) => {
-                self.journal.mark_widened(path);
+                self.journal.mark_widened(path, EntryKind::File, current);
                 self.commit_mutation(path, MutationKind::Mode);
                 Ok(())
             }
@@ -6094,7 +6461,7 @@ impl Applier<'_, '_> {
                 // The chmod may or may not have landed; keep the widen recorded
                 // so settle still restores the original, and leave the path
                 // indeterminate.
-                self.journal.mark_widened(path);
+                self.journal.mark_widened(path, EntryKind::File, current);
                 Err(error)
             }
         }
@@ -6464,11 +6831,11 @@ impl Applier<'_, '_> {
     /// Apply the intended final mode of every directory this sync created or
     /// changed, deepest-first so a read-only parent is finalized only after its
     /// children. A mode already in place is not chmodded again (no redundant
-    /// chmod, no transfer counted).
+    /// chmod, no transfer counted). The intent is DRAINED from the journal
+    /// ([`ModeJournal::take_pending_finals`]) before anything is applied, so a
+    /// second call is a no-op even when this one fails.
     fn finalize(&mut self) -> Result<()> {
-        let mut dirs: Vec<(String, Mode)> = std::mem::take(&mut self.pending_final)
-            .into_iter()
-            .collect();
+        let mut dirs: Vec<(String, Mode)> = self.journal.take_pending_finals();
         dirs.sort_by(|a, b| {
             // Depth over the MANIFEST's `/`-separated segments, not the host
             // component model (which splits a `\`-bearing name on Windows).
@@ -6479,8 +6846,9 @@ impl Applier<'_, '_> {
         for (path, mode) in dirs {
             let rel = rooted(&path)?;
             let current = self.dest.mode(&rel, EntryKind::Dir)?;
-            // First touch only: a directory already widened keeps its original
-            // (pre-widen) value.
+            // FIRST TOUCH ONLY: this read is the identity's first touch for a
+            // directory nothing in the transfer mode-touched, and a directory
+            // already widened keeps its original (pre-widen) value.
             self.journal
                 .note_first_touch(&path, EntryKind::Dir, Some(current));
             if current == mode {

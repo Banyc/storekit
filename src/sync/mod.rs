@@ -25,8 +25,8 @@
 //! [`apply`] states how each clause is realized: the prohibition is the conflict
 //! record read through the exhaustive [`apply::ConflictReason`] decision (there
 //! is no parallel blocked set), deletion requires the `Sanction` the caller
-//! holds, and a residue path is an explicit abandoned state distinct from
-//! `removed` (so it is reported, never deleted, and still restored).
+//! holds, and a residue path is a state of its own — distinct from a removed
+//! path, so it is reported, never deleted, and still restored.
 //!
 //! # The mode-record invariant
 //!
