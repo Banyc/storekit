@@ -3565,6 +3565,97 @@ fn a_dropped_mode_only_change_fails_verification() {
     assert_report_lists_disjoint(err.report());
 }
 
+/// The removal step is gated by the PRE-SETTLE verification pass by TYPE:
+/// `remove_extraneous` takes the [`PreSettleVerified`] token that
+/// `verify(VerifyPass::PreSettle)` returns, so `run_steps` cannot destroy
+/// anything on a run whose pre-settle pass failed. Behaviourally: an extraneous
+/// destination entry under `Delete` is still on disk when that pass fails, and
+/// gone when it passes.
+#[cfg(unix)]
+#[test]
+fn a_pre_settle_verification_failure_never_reaches_removal() {
+    if !the_filesystem_honours_modes() {
+        return;
+    }
+    // CONTROL: the same shape with no dropped chmod, so the assertion below is
+    // known not to be vacuous — the removal really does run when the pre-settle
+    // pass passes.
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"same");
+    write(&dst.join("f"), b"same");
+    write(&dst.join("extra"), b"e");
+    set_mode(&src.join("f"), 0o644);
+    set_mode(&dst.join("f"), 0o600);
+    let report = owned(Direction::Push, &src, &transport(&dst), &ReplaceAll, Delete).unwrap();
+    assert!(
+        !dst.join("extra").exists(),
+        "control: a passed pre-settle pass lets the removal run: {report:?}"
+    );
+
+    // The same shape whose PRE-SETTLE pass fails: the mode-only change never
+    // lands, so `verify(VerifyPass::PreSettle)` returns the error instead of the
+    // token and `remove_extraneous` is never reached.
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    write(&src.join("f"), b"same");
+    write(&dst.join("f"), b"same");
+    write(&dst.join("extra"), b"e");
+    set_mode(&src.join("f"), 0o644);
+    set_mode(&dst.join("f"), 0o600);
+
+    let mut remote = RecordingRemote::over(transport(&dst), true);
+    remote.drop_modes = true;
+    let err = owned(Direction::Push, &src, &remote, &ReplaceAll, Delete).unwrap_err();
+    assert!(
+        matches!(err.error(), Error::Integrity(_)),
+        "the dropped final mode fails the pre-settle pass, got {err:?}"
+    );
+    assert!(
+        err.report().verify_failures.contains(&"f".to_string()),
+        "the failed path is named: {:?}",
+        err.report()
+    );
+    assert_eq!(
+        read(&dst.join("extra")),
+        b"e",
+        "a failed pre-settle pass gates removal: the extraneous entry is still on disk"
+    );
+    assert!(
+        err.report().extraneous.contains(&"extra".to_string()),
+        "the surviving destination-only entry is still named `extraneous` (that list is not \
+         'removed'): {:?}",
+        err.report()
+    );
+}
+
+/// The pass accumulator keeps the FIRST error (a later failure in the same pass
+/// is subsumed, exactly as the `first_error.or(Some(error))` pairs it replaces
+/// did) and names EVERY failed path — including a path that failed without an
+/// error of its own.
+#[test]
+fn a_pass_report_keeps_the_first_error_and_names_every_failed_path() {
+    let mut report = PassReport::default();
+    report.fail("a", Error::integrity("the-first-error"));
+    report.fail("b", Error::integrity("the-second-error"));
+    report.fail_without_error("c");
+    report.note_error(Error::integrity("the-third-error"));
+    assert_eq!(
+        report.failed.iter().cloned().collect::<Vec<_>>(),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        "every failed path is named, in path order"
+    );
+    match report.first_error.as_ref().expect("an error is recorded") {
+        Error::Integrity(message) => assert_eq!(
+            message, "the-first-error",
+            "the FIRST error is kept, not replaced by a later one"
+        ),
+        other => panic!("the first error is the one recorded first, got {other:?}"),
+    }
+}
+
 /// A `Missing` directory child under a read-only `Same` parent is installed by
 /// widening the parent from its CURRENT mode and restoring it — push and pull.
 #[cfg(unix)]
@@ -7871,7 +7962,8 @@ fn a_created_directory_is_named_when_a_later_entry_fails() {
 
 /// FAILURE PATH COVERAGE: a file whose bytes LANDED and whose run then failed
 /// on a LATER entry is NAMED and its write is counted. Settle's post-failure
-/// `verify(true)` re-reads the landed file, so it reaches a verified final state
+/// post-settle pass (`VerifyPass::PostSettle`) re-reads the landed file, so it
+/// reaches a verified final state
 /// and is truthfully `applied` even though the run failed; the failed `b` is
 /// `indeterminate`. Before attempt-first, a landed file could be invisible on
 /// the failure path.
@@ -8487,8 +8579,8 @@ fn assert_dir_on_disk(root: &Path, rel: &str, mode: u32) {
 }
 
 /// HIGH: `applied` must mean "EVERY post-transfer verification check
-/// passed", including the post-`settle` pass. `verify(false)` runs in
-/// `run_steps` and `settle` runs `verify(true)` AFTER the restore; a path that
+/// passed", including the post-`settle` pass. `run_steps` runs the pre-settle
+/// pass and `settle` runs the post-settle pass AFTER the restore; a path that
 /// passed the first pass and FAILS the second used to stay in the cumulative
 /// `verified` set, so `derive_report`'s `applied` gate admitted it and the
 /// report advertised a genuine verification failure as an applied path. The

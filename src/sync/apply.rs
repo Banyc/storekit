@@ -4471,6 +4471,77 @@ struct Applier<'a, 'b> {
     transfers: usize,
 }
 
+/// WHICH verification pass [`Applier::verify`] is running. The boolean this
+/// replaces said the same thing at the call sites (`true` only in
+/// [`Applier::settle`]); naming the pass makes the two call sites read as the two
+/// moments they are, and gives the pre-settle one a return type
+/// ([`PreSettleVerified`]) that the removal step requires.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerifyPass {
+    /// The pass [`Applier::run_steps`] runs BEFORE
+    /// [`Applier::remove_extraneous`]: content, kind, names, and directory
+    /// listings, plus the final modes the mode journal recorded. A mode a
+    /// RESTORE wrote back is not required yet, because no restore has run.
+    PreSettle,
+    /// The pass [`Applier::settle`] runs AFTER its restore: the same checks plus
+    /// the mode of every path the restore wrote back.
+    PostSettle,
+}
+
+/// Proof that a verification pass completed with no failure, and therefore that
+/// the destination verified as it stood at that moment.
+///
+/// The field is private and this module is the only place that constructs a
+/// value, so no caller can manufacture one: the ONLY consumer,
+/// [`Applier::remove_extraneous`], is reachable only from a site holding a token
+/// [`Applier::verify`] returned, and the site that removes anything —
+/// [`Applier::run_steps`] — holds the token of the PRE-SETTLE pass. The ordering
+/// that used to rest on the line order of two statements is now a requirement of
+/// the removal call's TYPE. (A `PostSettle` pass returns a token too, because the
+/// signature is shared; [`Applier::settle`] discards it, and no removal follows.)
+struct PreSettleVerified(());
+
+/// The verdict accumulator of ONE verification pass: the paths whose check failed
+/// (surfaced as [`SyncReport::verify_failures`]), and the FIRST error the pass
+/// raised, which is the error the run fails with.
+///
+/// The checks that make up a pass each used to repeat the same
+/// `failed.insert(path); first_error = first_error.or(Some(error))` pair. The
+/// methods below are that pair, named for the two cases a check can report: a
+/// path WITH an error (a failed read, listing, or fidelity check) and a path
+/// WITHOUT one (an identity conflict already recorded in `self.conflicts`).
+/// Neither replaces an already-recorded first error: later failures in the same
+/// pass are subsumed by it, exactly as before.
+#[derive(Default)]
+struct PassReport {
+    failed: BTreeSet<String>,
+    first_error: Option<Error>,
+}
+
+impl PassReport {
+    /// Record `path` as failed, and `error` as the pass's FIRST error unless one
+    /// was already recorded.
+    fn fail(&mut self, path: &str, error: Error) {
+        self.failed.insert(path.to_string());
+        self.note_error(error);
+    }
+
+    /// Record `path` as failed without raising a new error: the reason is already
+    /// in the run's conflict records.
+    fn fail_without_error(&mut self, path: &str) {
+        self.failed.insert(path.to_string());
+    }
+
+    /// Record `error` as the pass's first error unless one was already recorded,
+    /// WITHOUT naming a path: a directory the pass could not enumerate, or an
+    /// entry whose content it could not read.
+    fn note_error(&mut self, error: Error) {
+        if self.first_error.is_none() {
+            self.first_error = Some(error);
+        }
+    }
+}
+
 impl Applier<'_, '_> {
     fn run(&mut self) -> SyncResult {
         let result = self.run_steps();
@@ -4525,10 +4596,11 @@ impl Applier<'_, '_> {
         self.transfer()?;
         self.finalize()?;
         // Verification gates removal: everything written and every final mode
-        // is checked BEFORE anything is destroyed. The restored-mode half of
-        // verification runs after settle.
-        self.verify(false)?;
-        self.remove_extraneous()?;
+        // is checked BEFORE anything is destroyed, and the token `verify` returns
+        // is what makes that a typing fact rather than a line order. The
+        // restored-mode half of verification runs after settle.
+        let verified = self.verify(VerifyPass::PreSettle)?;
+        self.remove_extraneous(&verified)?;
         Ok(())
     }
 
@@ -4536,7 +4608,9 @@ impl Applier<'_, '_> {
     /// still derives from it.
     fn settle(&mut self) -> (Vec<String>, Option<Error>) {
         let failures = self.restore();
-        let verify_error = self.verify(true).err();
+        // The post-settle pass requires the modes the restore wrote back. It
+        // discards its token: nothing is removed after a settle.
+        let verify_error = self.verify(VerifyPass::PostSettle).err();
         (failures, verify_error)
     }
 
@@ -6964,9 +7038,9 @@ impl Applier<'_, '_> {
 
     /// Re-read every written entry (file hash, symlink target) and check the
     /// MODE of every path the journal touched: a mode-only file change, a
-    /// directory's final mode, and — when `include_restored` is set — the mode
-    /// a restore wrote back.
-    fn verify(&mut self, include_restored: bool) -> Result<()> {
+    /// directory's final mode, and — on the [`VerifyPass::PostSettle`] pass, after
+    /// the restore ran — the mode a restore wrote back.
+    fn verify(&mut self, pass: VerifyPass) -> Result<PreSettleVerified> {
         // THE freshness point for the listing cache: this pass verifies the
         // destination as it stands NOW. Everything the transfers installed and
         // (on the post-removal pass) everything `remove_extraneous` removed
@@ -6975,16 +7049,15 @@ impl Applier<'_, '_> {
         // pass, so from here on one read per directory is exact.
         self.clear_listings();
         // A path is committed to `verified` only after EVERY check this pass
-        // makes for it has passed: the loops collect failures instead of
-        // returning immediately, and a path that failed any check is removed
-        // before the merge. This makes `verified` mean content AND mode
+        // makes for it has passed: the checks collect failures in ONE report
+        // instead of returning immediately, and a path that failed any check is
+        // removed before the merge. This makes `verified` mean content AND mode
         // verified, so a path whose content matched but whose mode check then
         // failed is never admitted to `applied` (the report is derived after
         // this returns, even on the error path), while a fully-passed peer is
         // still credited.
         let mut verified_now: BTreeSet<String> = BTreeSet::new();
-        let mut failed: BTreeSet<String> = BTreeSet::new();
-        let mut first_error: Option<Error> = None;
+        let mut report = PassReport::default();
         let items: Vec<(String, EntryKind, String)> = self
             .verify
             .iter()
@@ -7033,13 +7106,10 @@ impl Applier<'_, '_> {
                 Ok(()) => {
                     verified_now.insert(path);
                 }
-                Err(error) => {
-                    failed.insert(path);
-                    first_error = first_error.or(Some(error));
-                }
+                Err(error) => report.fail(&path, error),
             }
         }
-        for (path, kind, target) in self.journal.mode_targets(include_restored) {
+        for (path, kind, target) in self.journal.mode_targets(pass == VerifyPass::PostSettle) {
             let result = (|| -> Result<()> {
                 let rel = rooted(&path)?;
                 match self.dest.mode_opt(&rel, kind)? {
@@ -7056,16 +7126,13 @@ impl Applier<'_, '_> {
                 Ok(()) => {
                     verified_now.insert(path);
                 }
-                Err(error) => {
-                    failed.insert(path);
-                    first_error = first_error.or(Some(error));
-                }
+                Err(error) => report.fail(&path, error),
             }
         }
         // The NAME check is the third leg of the SAME pass: a manifest entry is
         // an ADDRESS, so its spelling must BE the on-disk name. It runs after
         // the content and mode checks so that one pass derives the whole report.
-        self.verify_names(&mut failed, &mut first_error);
+        self.verify_names(&mut report);
         // The STRUCTURAL per-directory backstop and the coverage of entries the
         // report claims to have left alone. Both run in the SAME pass as the
         // content/mode checks (and therefore BEFORE `remove_extraneous`), so a
@@ -7074,8 +7141,12 @@ impl Applier<'_, '_> {
         // error: an unplanned on-disk name no manifest spelling addresses, or a
         // directory that cannot be enumerated faithfully (against which no
         // verification is possible).
-        self.verify_directory_listings(&mut failed, &mut first_error);
-        self.verify_claimed_untouched(&mut failed, &mut first_error);
+        self.verify_directory_listings(&mut report);
+        self.verify_claimed_untouched(&mut report);
+        let PassReport {
+            failed,
+            first_error,
+        } = report;
         for path in &failed {
             verified_now.remove(path);
         }
@@ -7089,11 +7160,24 @@ impl Applier<'_, '_> {
         // would name it in `verify_failures` (which outranks `applied`) either
         // way, but `verified` itself must not claim a path passed: `applied`
         // requires the FINAL post-settle verification.
+        //
+        // The set stays CUMULATIVE (a `last_pass` field would be the same only
+        // if it were proven that the post-settle pass examines every path the
+        // pre-settle pass examined). That is not provable here: the two passes
+        // run on either side of `remove_extraneous`, which mutates the mode
+        // journal (`mark_removed`) and the touched-directory set, so the
+        // post-settle `mode_targets` set is not a superset of the pre-settle one
+        // by construction. The retain/extend pair below is what keeps the
+        // cumulative set honest against that: a failed path is dropped whatever
+        // the earlier pass recorded, and a passing path is credited.
         self.verified.retain(|path| !failed.contains(path));
         self.verified.extend(verified_now);
         match first_error {
             Some(error) => Err(error),
-            None => Ok(()),
+            // THE construction site of the proof token: it exists only for a pass
+            // that recorded no failure. While it lives, `remove_extraneous` is
+            // callable; nothing else in the crate can build one.
+            None => Ok(PreSettleVerified(())),
         }
     }
 
@@ -7102,7 +7186,7 @@ impl Applier<'_, '_> {
     /// is removed only after its children. Each removal widens its read-only
     /// parent through the ONE choke point; the widenings are reverted by the
     /// single settle.
-    fn remove_extraneous(&mut self) -> Result<()> {
+    fn remove_extraneous(&mut self, _: &PreSettleVerified) -> Result<()> {
         if self.extraneous_policy == Extraneous::Keep {
             return Ok(());
         }
@@ -7265,7 +7349,7 @@ impl Applier<'_, '_> {
     /// also runs for a parent that is NOT a source manifest entry, which is what
     /// makes an installed path under a folded ancestor a conflict instead of a
     /// false `applied` even if a crafted manifest reaches this point.
-    fn verify_names(&mut self, failed: &mut BTreeSet<String>, first_error: &mut Option<Error>) {
+    fn verify_names(&mut self, report: &mut PassReport) {
         // SCOPE: every source entry whose outcome is `Transferred`, AND every
         // source entry the report would call `Skipped` whose parent directory
         // this run TOUCHED. The second class is what covers a destination entry
@@ -7293,7 +7377,7 @@ impl Applier<'_, '_> {
                 .get(&path)
                 .is_some_and(|conflict| conflict.reason == ConflictReason::NameNotFaithful)
             {
-                failed.insert(path);
+                report.fail_without_error(&path);
                 continue;
             }
             if let Some(ancestor) = ancestor_paths(&path).into_iter().find(|ancestor| {
@@ -7306,7 +7390,7 @@ impl Applier<'_, '_> {
                     .get(&ancestor)
                     .and_then(|conflict| conflict.on_disk.clone());
                 self.name_conflict(&path, kind, on_disk);
-                failed.insert(path);
+                report.fail_without_error(&path);
                 continue;
             }
             // Verify EVERY ancestor COMPONENT of the manifest path against ITS
@@ -7328,7 +7412,7 @@ impl Applier<'_, '_> {
                     .and_then(|conflict| conflict.on_disk.clone());
                 if let Some(on_disk) = ancestor_conflict {
                     self.name_conflict(&path, kind, Some(on_disk));
-                    failed.insert(path.clone());
+                    report.fail_without_error(&path);
                     ancestor_failed = true;
                     break;
                 }
@@ -7356,13 +7440,13 @@ impl Applier<'_, '_> {
                                 &ancestor_name,
                             ),
                         }
-                        failed.insert(path.clone());
+                        report.fail_without_error(&path);
                         ancestor_failed = true;
                         break;
                     }
                     Err(error) => {
-                        note_listing_failure(first_error, &ancestor_parent, error.as_ref());
-                        failed.insert(path.clone());
+                        note_listing_failure(report, &ancestor_parent, error.as_ref());
+                        report.fail_without_error(&path);
                         ancestor_failed = true;
                         break;
                     }
@@ -7395,15 +7479,15 @@ impl Applier<'_, '_> {
                         // even though it cannot be named.
                         None => self.protect_extraneous_siblings(&parent, &path, &expected),
                     }
-                    failed.insert(path);
+                    report.fail_without_error(&path);
                 }
                 Err(error) => {
                     // The directory could not be read, so identity could not be
                     // confirmed at all: a run-level error carrying the cause,
                     // never a per-path `NameNotFaithful` conflict. The path is
                     // still named so the report accounts for it.
-                    note_listing_failure(first_error, &parent, error.as_ref());
-                    failed.insert(path);
+                    note_listing_failure(report, &parent, error.as_ref());
+                    report.fail_without_error(&path);
                 }
             }
         }
@@ -7430,19 +7514,15 @@ impl Applier<'_, '_> {
     /// every run examines), is an ERROR, not a report entry on an `Ok` run: it
     /// is a mutation the sync did not make (a concurrent or mirrored writer), it
     /// has no conflict entry for the caller to act on, and it would otherwise
-    /// live only in [`SyncReport::verify_failures`]. `first_error` carries it
-    /// out of this pass so the run fails loudly; the path is still named in
-    /// `verify_failures` and protected from removal through
+    /// live only in [`SyncReport::verify_failures`]. The report's first error
+    /// carries it out of this pass so the run fails loudly; the path is still
+    /// named in `verify_failures` and protected from removal through
     /// [`Applier::aliased_dest`]. A directory the run did NOT touch (a
     /// subdirectory not installed into, created, or removed from) is not
     /// listed, so an unplanned entry there is not detected by this pass. A
     /// directory that cannot be enumerated at all is likewise a run-level
     /// error: no claim about it can be confirmed.
-    fn verify_directory_listings(
-        &mut self,
-        failed: &mut BTreeSet<String>,
-        first_error: &mut Option<Error>,
-    ) {
+    fn verify_directory_listings(&mut self, report: &mut PassReport) {
         let dirs: Vec<String> = self.touched_dirs.iter().cloned().collect();
         for dir in dirs {
             // A directory the RUN REMOVED (or that lies UNDER one it removed) no
@@ -7463,7 +7543,7 @@ impl Applier<'_, '_> {
                 // with the underlying cause rather than silently skipping the
                 // check.
                 Err(error) => {
-                    note_listing_failure(first_error, &dir, error.as_ref());
+                    note_listing_failure(report, &dir, error.as_ref());
                     continue;
                 }
             };
@@ -7512,7 +7592,7 @@ impl Applier<'_, '_> {
                         self.aliased_dest
                             .entry(dest_path)
                             .or_insert_with(|| path.clone());
-                        failed.insert(path.clone());
+                        report.fail_without_error(path);
                         continue;
                     }
                     // Absent: fall through to the existing absent-name
@@ -7530,7 +7610,7 @@ impl Applier<'_, '_> {
                     }
                     None => self.protect_extraneous_siblings(&dir, path, expected),
                 }
-                failed.insert(path.clone());
+                report.fail_without_error(path);
             }
             // (b) The names the run DID intend in this directory: the source
             // spellings above, plus every destination manifest name that is
@@ -7582,7 +7662,7 @@ impl Applier<'_, '_> {
                         == Some(on_disk.as_str())
                     {
                         self.name_conflict(path, *kind, Some(on_disk.clone()));
-                        failed.insert(path.clone());
+                        report.fail_without_error(path);
                         named = true;
                     }
                 }
@@ -7591,13 +7671,13 @@ impl Applier<'_, '_> {
                     self.aliased_dest
                         .entry(on_disk_path.clone())
                         .or_insert_with(|| on_disk_path.clone());
-                    failed.insert(on_disk_path.clone());
-                    if first_error.is_none() {
-                        *first_error = Some(Error::integrity(format!(
+                    report.fail(
+                        &on_disk_path,
+                        Error::integrity(format!(
                             "post-transfer verification failed: {} holds the unplanned entry {on_disk_path}, which no manifest spelling addresses; reporting an error rather than claiming the directory was left as intended",
                             destination_dir_subject(&dir)
-                        )));
-                    }
+                        )),
+                    );
                 }
             }
         }
@@ -7616,11 +7696,7 @@ impl Applier<'_, '_> {
     /// instead of being reported as no-mutation. The KIND check is what catches
     /// a `Same` directory a writer replaced with a regular file, which keeps the
     /// name and so passes every name-only check.
-    fn verify_claimed_untouched(
-        &mut self,
-        failed: &mut BTreeSet<String>,
-        first_error: &mut Option<Error>,
-    ) {
+    fn verify_claimed_untouched(&mut self, report: &mut PassReport) {
         // Clone the claims first: the mutable bookkeeping below must not fight
         // the borrow of `self.diff`.
         let mut candidates: Vec<(String, EntryKind, Option<String>)> = Vec::new();
@@ -7662,8 +7738,8 @@ impl Applier<'_, '_> {
                     // no-mutation claim cannot be confirmed: fail closed and
                     // name the path, never silently skip the check.
                     Err(error) => {
-                        note_listing_failure(first_error, &parent, error.as_ref());
-                        failed.insert(path);
+                        note_listing_failure(report, &parent, error.as_ref());
+                        report.fail_without_error(&path);
                         continue;
                     }
                 },
@@ -7693,7 +7769,7 @@ impl Applier<'_, '_> {
                     (EntryKind::File, Some(expected)) => match self.dest.read(&rel) {
                         Ok(bytes) => crate::digest::sha256_bytes(&bytes) == expected,
                         Err(error) => {
-                            note_verify_read_failure(first_error, &path, error);
+                            note_verify_read_failure(report, &path, error);
                             false
                         }
                     },
@@ -7703,7 +7779,7 @@ impl Applier<'_, '_> {
                                 == expected
                         }
                         Err(error) => {
-                            note_verify_read_failure(first_error, &path, error);
+                            note_verify_read_failure(report, &path, error);
                             false
                         }
                     },
@@ -7717,7 +7793,7 @@ impl Applier<'_, '_> {
             };
             if !intact {
                 self.outcomes.remove(&path);
-                failed.insert(path);
+                report.fail_without_error(&path);
             }
         }
     }
@@ -8347,10 +8423,8 @@ fn destination_dir_subject(dir: &str) -> String {
 /// Record `dir`'s listing failure as the verification pass's FIRST error,
 /// keeping the underlying cause. Later failures in the same pass are subsumed:
 /// the pass fails once, with the cause the caller can act on.
-fn note_listing_failure(first_error: &mut Option<Error>, dir: &str, cause: &Error) {
-    if first_error.is_none() {
-        *first_error = Some(unenumerable_directory_error(dir, cause));
-    }
+fn note_listing_failure(report: &mut PassReport, dir: &str, cause: &Error) {
+    report.note_error(unenumerable_directory_error(dir, cause));
 }
 
 /// Record a FAILED VERIFICATION READ as the pass's FIRST error, PRESERVING the
@@ -8360,13 +8434,11 @@ fn note_listing_failure(first_error: &mut Option<Error>, dir: &str, cause: &Erro
 /// compared, so this is an infrastructure failure, never a claim that the
 /// bytes differed. See [`Applier::verify_claimed_untouched`], whose former
 /// `.unwrap_or(false)` turned exactly this into a content mismatch.
-fn note_verify_read_failure(first_error: &mut Option<Error>, path: &str, cause: Error) {
-    if first_error.is_none() {
-        *first_error = Some(cause.with_context(format!(
-            "post-transfer verification could not READ {path}: the entry's content could not be \
-             compared to the manifest — this is an infrastructure failure, NOT a content mismatch"
-        )));
-    }
+fn note_verify_read_failure(report: &mut PassReport, path: &str, cause: Error) {
+    report.note_error(cause.with_context(format!(
+        "post-transfer verification could not READ {path}: the entry's content could not be \
+         compared to the manifest — this is an infrastructure failure, NOT a content mismatch"
+    )));
 }
 
 /// The name in `names` that case-folds to `expected` without being
