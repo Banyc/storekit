@@ -689,14 +689,11 @@ pub trait Remote {
         if let Some(parent) = dest.parent() {
             self.create_dir_all(&parent)?;
         }
-        // (dest, final_mode, depth) collected during the walk for phase 2.
-        let mut dirs: Vec<(RootedRelativePath, u32, usize)> = Vec::new();
-        copy_tree_walk(self, src, dest, &mut dirs)?;
-        dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
-        for (d, mode, _depth) in dirs {
-            self.set_mode(&d, mode)?;
-        }
-        Ok(())
+        // Phase 2 applies the directories' real modes deepest-first (the walk
+        // recorded them in pre-order; see [`PendingFinalModes`]).
+        let mut pending = PendingFinalModes::new();
+        copy_tree_walk(self, src, dest, &mut pending)?;
+        pending.finalize(self)
     }
     /// Recursively fsync every file and directory under `rel` (the staged
     /// release bundle), making the WHOLE tree durable before the atomic
@@ -934,27 +931,59 @@ fn join(root: &Path, rel: &RootedRelativePath) -> PathBuf {
     root.join(rel.as_path())
 }
 
+/// The final modes a default [`Remote::copy_tree`] still owes the destination
+/// after its walk: directories are made OWNER-WRITABLE while the walk descends
+/// them, so their real (often read-only) modes are applied afterwards.
+///
+/// The recorded order IS the finalize order's input: [`PendingFinalModes`]
+/// records each directory in PRE-ORDER (a parent before its descendants) and
+/// [`PendingFinalModes::finalize`] applies them in REVERSE, so every child's
+/// mode is applied before its parent's. That deepest-first,
+/// parent-before-child property is the contract; the order among SIBLINGS is
+/// not part of it.
+pub(crate) struct PendingFinalModes(Vec<(RootedRelativePath, u32)>);
+
+impl PendingFinalModes {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Record a directory's final mode IN PRE-ORDER (the walk calls this when
+    /// it descends, so a parent is recorded before any of its descendants).
+    fn record(&mut self, rel: RootedRelativePath, final_mode: u32) {
+        self.0.push((rel, final_mode));
+    }
+
+    /// Apply every recorded mode DEEPEST-FIRST, consuming the list.
+    fn finalize(self, remote: &(impl Remote + ?Sized)) -> Result<()> {
+        for (rel, final_mode) in self.0.into_iter().rev() {
+            remote.set_mode(&rel, final_mode)?;
+        }
+        Ok(())
+    }
+}
+
 /// The iterative half of [`Remote::copy_tree`]'s default: walk `src` with
 /// [`Remote::list`], recreating every entry at `dest` (directories
 /// owner-writable during the walk, files/symlinks with their final modes),
-/// collecting `(dest, final_mode, depth)` for the caller's phase-2 finalize.
+/// recording each directory's final mode in [`PendingFinalModes`] for the
+/// caller's phase 2.
 ///
 /// The walk keeps an explicit heap `Vec` of frames instead of recursing one
 /// Rust frame per directory level: a deep tree used to exhaust the C stack,
 /// and Rust's stack-overflow handler ABORTS the host process — a library
 /// must surface a clean `Err` instead. Each frame holds the directory's
-/// `(src, dest, depth)` and the entries [`Remote::list`] returned, so the
-/// visit order is exactly the recursion's depth-first order.
+/// `(src, dest)` and the entries [`Remote::list`] returned, so the visit order
+/// is exactly the recursion's depth-first order.
 fn copy_tree_walk<R: Remote + ?Sized>(
     remote: &R,
     src: &RootedRelativePath,
     dest: &RootedRelativePath,
-    dirs: &mut Vec<(RootedRelativePath, u32, usize)>,
+    pending: &mut PendingFinalModes,
 ) -> Result<()> {
     struct Frame {
         src: RootedRelativePath,
         dest: RootedRelativePath,
-        depth: usize,
         entries: std::vec::IntoIter<RemoteEntry>,
     }
 
@@ -962,7 +991,6 @@ fn copy_tree_walk<R: Remote + ?Sized>(
     let mut stack: Vec<Frame> = vec![Frame {
         src: src.clone(),
         dest: dest.clone(),
-        depth: 0,
         entries: remote.list(src)?.into_iter(),
     }];
     while let Some(top) = stack.last_mut() {
@@ -978,7 +1006,7 @@ fn copy_tree_walk<R: Remote + ?Sized>(
             if e.is_dir {
                 remote.create_dir_all(&d)?;
                 remote.set_mode(&d, (e.mode | 0o200) & 0o7777)?;
-                dirs.push((d.clone(), e.mode & 0o7777, top.depth));
+                pending.record(d.clone(), e.mode & 0o7777);
                 // The recursion created the child directory a second time
                 // when it entered it; keep that prologue and the listing in
                 // the same order.
@@ -987,7 +1015,6 @@ fn copy_tree_walk<R: Remote + ?Sized>(
                 Some(Frame {
                     src: s,
                     dest: d,
-                    depth: top.depth + 1,
                     entries: entries.into_iter(),
                 })
             } else if e.is_symlink {
@@ -1007,6 +1034,99 @@ fn copy_tree_walk<R: Remote + ?Sized>(
     Ok(())
 }
 
+/// What ONE probe of the receiver marker observed: the identity, or a
+/// CONFIRMED absence. Every UNANSWERABLE probe (a metadata failure, a read
+/// failure, a non-UTF-8 marker, an unparsable marker) is an `Err`, never
+/// `Absent` — absence is never fabricated from a failure.
+#[derive(Debug)]
+pub(crate) enum MarkerState {
+    Present(ReceiverId),
+    Absent,
+}
+
+impl MarkerState {
+    /// THE probe of the receiver marker: metadata, read, UTF-8, the
+    /// legacy/malformed kind, and the parse. This is the ONE authority every
+    /// marker reader and the provisioner use, so the steps and their typed
+    /// failures cannot drift between them.
+    fn probe<R: Remote + ?Sized>(remote: &R, marker: &RootedRelativePath) -> Result<Self> {
+        if remote.metadata_opt(marker)?.is_none() {
+            return Ok(MarkerState::Absent);
+        }
+        let data = remote.read(marker)?;
+        let s = std::str::from_utf8(&data).map_err(|e| {
+            Error::transport_kind(
+                TransportKind::ReceiverIdMarkerMalformed,
+                format!(
+                    "deploy_dir {}: the receiver-id marker is not valid UTF-8: {e}",
+                    remote.root().display()
+                ),
+            )
+        })?;
+        // FAIL CLOSED, ACTIONABLY. The refusal keeps its `transport` class (a
+        // marker that is present but not this crate's format is a
+        // marker-protocol violation, and a caller must be able to tell it from a
+        // filesystem fault), but the message names the CONDITION (not a
+        // 40-hex-character receiver id), the likely CAUSE (a marker written by a
+        // tool that predates this crate's format — the source tool writes
+        // `recv-<uuid-v7>` — or a tampered/foreign file), and the fact that no
+        // adoption exists, so an operator does not have to read this source to
+        // diagnose it.
+        let trimmed = s.trim();
+        // The DISTINCTION the doctrine names: a marker in the SOURCE TOOL's
+        // legacy `recv-<uuid-v7>` format is a recognizable migration situation,
+        // while arbitrary garbage is a corrupted/foreign file. The message names
+        // both causes; the KIND says which one this content is, so an operator
+        // does not have to read the text to know whether to migrate or
+        // investigate.
+        let kind = if looks_like_legacy_receiver_marker(trimmed) {
+            TransportKind::ReceiverIdMarkerLegacyFormat
+        } else {
+            TransportKind::ReceiverIdMarkerMalformed
+        };
+        ReceiverId::parse(trimmed)
+            .map(MarkerState::Present)
+            .map_err(|e| {
+                Error::transport_kind(
+                    kind,
+                    format!(
+                    "deploy_dir {}: refusing the receiver-id marker at {marker}: its content is not a \
+                     {RECEIVER_ID_LEN}-character lowercase-hex receiver id ({e}). This is a FAIL-CLOSED \
+                     refusal — a marker this crate did not write, such as a legacy `recv-<uuid-v7>` \
+                     marker from a tool that predates this crate's format (or a tampered/foreign \
+                     file), is never adopted as a physical identity, because silently adopting a \
+                     foreign format would misidentify the deploy_dir. Point the store at a deploy_dir \
+                     this crate provisioned, or re-provision a fresh one.",
+                    remote.root().display()
+                ),
+                )
+            })
+    }
+
+    /// The identity, or the TYPED absent-marker refusal (verbatim).
+    fn require(
+        self,
+        remote: &(impl Remote + ?Sized),
+        marker: &RootedRelativePath,
+    ) -> Result<ReceiverId> {
+        match self {
+            MarkerState::Present(id) => Ok(id),
+            // The marker is CONFIRMED absent: the far side has no store yet.
+            // This is the TYPED absent-marker condition, not a transport
+            // failure, so a caller can tell "no store yet (provision it)" from
+            // "the host is unreachable (retry)" without string-matching. The
+            // class stays transport and the text is unchanged.
+            MarkerState::Absent => Err(Error::transport_kind(
+                TransportKind::ReceiverIdMarkerAbsent,
+                format!(
+                    "deploy_dir {}: no receiver-id marker ({marker} was never provisioned)",
+                    remote.root().display()
+                ),
+            )),
+        }
+    }
+}
+
 /// Read the immutable receiver-id marker at `marker` and parse it. Fails
 /// closed on a MISSING marker (the deploy_dir was never provisioned) and on
 /// a MALFORMED marker (a tampered/foreign marker is never accepted as a
@@ -1015,82 +1135,7 @@ pub(crate) fn read_receiver_id<R: Remote + ?Sized>(
     remote: &R,
     marker: &RootedRelativePath,
 ) -> Result<ReceiverId> {
-    read_receiver_id_opt(remote, marker)?.ok_or_else(|| {
-        // The marker is CONFIRMED absent: the far side has no store yet. This
-        // is the TYPED absent-marker condition, not a transport failure, so a
-        // caller can tell "no store yet (provision it)" from "the host is
-        // unreachable (retry)" without string-matching. The class stays
-        // transport and the text is unchanged.
-        Error::transport_kind(
-            TransportKind::ReceiverIdMarkerAbsent,
-            format!(
-                "deploy_dir {}: no receiver-id marker ({marker} was never provisioned)",
-                remote.root().display()
-            ),
-        )
-    })
-}
-
-/// Read the receiver-id marker, returning `Ok(None)` ONLY for a CONFIRMED
-/// absent marker (a not-yet-provisioned deploy_dir — the marker is created by
-/// [`provision_receiver_id`] during provisioning). A read failure or a
-/// malformed marker is an `Err` (fail closed — a marker that exists but
-/// cannot be parsed is never silently treated as absent).
-pub(crate) fn read_receiver_id_opt<R: Remote + ?Sized>(
-    remote: &R,
-    marker: &RootedRelativePath,
-) -> Result<Option<ReceiverId>> {
-    if remote.metadata_opt(marker)?.is_none() {
-        return Ok(None);
-    }
-    let data = remote.read(marker)?;
-    let s = std::str::from_utf8(&data).map_err(|e| {
-        Error::transport_kind(
-            TransportKind::ReceiverIdMarkerMalformed,
-            format!(
-                "deploy_dir {}: the receiver-id marker is not valid UTF-8: {e}",
-                remote.root().display()
-            ),
-        )
-    })?;
-    // FAIL CLOSED, ACTIONABLY. The refusal keeps its `transport` class (a
-    // marker that is present but not this crate's format is a
-    // marker-protocol violation, and a caller must be able to tell it from a
-    // filesystem fault), but the message names the CONDITION (not a
-    // 40-hex-character receiver id), the likely CAUSE (a marker written by a
-    // tool that predates this crate's format — the source tool writes
-    // `recv-<uuid-v7>` — or a tampered/foreign file), and the fact that no
-    // adoption exists, so an operator does not have to read this source to
-    // diagnose it.
-    let trimmed = s.trim();
-    // The DISTINCTION the doctrine names: a marker in the SOURCE TOOL's
-    // legacy `recv-<uuid-v7>` format is a recognizable migration situation,
-    // while arbitrary garbage is a corrupted/foreign file. The message names
-    // both causes; the KIND says which one this content is, so an operator
-    // does not have to read the text to know whether to migrate or
-    // investigate.
-    let kind = if looks_like_legacy_receiver_marker(trimmed) {
-        TransportKind::ReceiverIdMarkerLegacyFormat
-    } else {
-        TransportKind::ReceiverIdMarkerMalformed
-    };
-    ReceiverId::parse(trimmed)
-        .map_err(|e| {
-            Error::transport_kind(
-                kind,
-                format!(
-                "deploy_dir {}: refusing the receiver-id marker at {marker}: its content is not a \
-                 {RECEIVER_ID_LEN}-character lowercase-hex receiver id ({e}). This is a FAIL-CLOSED \
-                 refusal — a marker this crate did not write, such as a legacy `recv-<uuid-v7>` \
-                 marker from a tool that predates this crate's format (or a tampered/foreign \
-                 file), is never adopted as a physical identity, because silently adopting a \
-                 foreign format would misidentify the deploy_dir. Point the store at a deploy_dir \
-                 this crate provisioned, or re-provision a fresh one.",
-                remote.root().display()
-            ),
-            )
-        })
-        .map(Some)
+    MarkerState::probe(remote, marker)?.require(remote, marker)
 }
 
 /// Whether `content` has the SOURCE TOOL's legacy receiver-marker shape:
@@ -1128,18 +1173,22 @@ pub(crate) fn provision_receiver_id<R: Remote + ?Sized>(
     remote: &R,
     marker: &RootedRelativePath,
 ) -> Result<ReceiverId> {
-    // Fast path: the deploy_dir already carries its immutable identity.
-    if remote.metadata_opt(marker)?.is_some() {
-        return read_receiver_id(remote, marker);
-    }
-    let id = ReceiverId::generate()?;
-    match remote.try_write_new(marker, &id.wire_bytes())? {
-        CreateNewVerdict::Created => Ok(id),
-        // A concurrent provisioner won the create-new race (or the marker
-        // exists with different content): the deploy_dir's identity is
-        // whatever was created FIRST — adopt it, never replace it.
-        CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict(_) => {
-            read_receiver_id(remote, marker)
+    match MarkerState::probe(remote, marker)? {
+        // The deploy_dir already carries its immutable identity.
+        MarkerState::Present(id) => Ok(id),
+        MarkerState::Absent => {
+            let id = ReceiverId::generate()?;
+            match remote.try_write_new(marker, &id.wire_bytes())? {
+                CreateNewVerdict::Created => Ok(id),
+                // A concurrent provisioner won the create-new race (or the
+                // marker exists with different content): the deploy_dir's
+                // identity is whatever was created FIRST — adopt it, never
+                // replace it. The re-read's OWN typed error is what surfaces
+                // (a fuller diagnosis than the discarded conflict reason).
+                CreateNewVerdict::AlreadyPresent | CreateNewVerdict::Conflict(_) => {
+                    read_receiver_id(remote, marker)
+                }
+            }
         }
     }
 }
@@ -1853,7 +1902,7 @@ pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquival
 /// and the SSH transport's EEXIST verification), so the two can never drift.
 /// The verification is DESCRIPTOR-BOUND: the single `open` closure performs
 /// the ONE open→fstat→read sequence on a SINGLE opened inode
-/// ([`OpenedExisting::Entry`] carries the metadata from the fstat of the
+/// ([`OpenedExisting::Regular`] carries the RAW mode from the fstat of the
 /// OPENED descriptor AND the content read THROUGH THE SAME descriptor), so a
 /// concurrent actor that swaps the entry at the path between the checks can
 /// never mix two inodes' observations — a swap AFTER the open is irrelevant
@@ -1878,7 +1927,8 @@ pub(crate) fn content_equivalent(a: &[u8], b: &[u8], equivalence: ContentEquival
 ///    directory/symlink/other is [`VerifiedExisting::NotRegularFile`]. The
 ///    type check runs BEFORE readability, mode, and content: an unreadable or
 ///    wrong-mode DIRECTORY is still `NotRegularFile`, never `Unreadable` or
-///    `ModeMismatch`;
+///    `ModeMismatch`. A producer proves this BEFORE it can build
+///    [`OpenedExisting::Regular`], so the verifier never re-derives a kind;
 /// 3. **readability** — the content read happens BEFORE the mode check: a
 ///    regular file whose content cannot be read is
 ///    [`VerifiedExisting::Unreadable`] (never a fabricated verdict) even
@@ -1900,63 +1950,54 @@ pub(crate) fn verify_existing(
     required_mode: u32,
     equivalence: ContentEquivalence,
 ) -> Result<VerifiedExisting> {
-    // 1. open — the descriptor-bound open→fstat→read sequence (one inode).
-    let opened = open()?;
-    let OpenedExisting::Entry(entry) = opened else {
-        return Ok(match opened {
-            OpenedExisting::NotFound => VerifiedExisting::NotFound,
-            OpenedExisting::NotRegular { kind } => VerifiedExisting::NotRegularFile { kind },
-            OpenedExisting::Unreadable(m) => VerifiedExisting::Unreadable(m),
-            OpenedExisting::Entry(_) => unreachable!(),
-        });
-    };
-    let meta = entry.meta;
-    // 2. regular-file type — from the OPENED descriptor's fstat (a symlink
-    //    is unrepresentable here — the `O_NOFOLLOW` open never opened one —
-    //    but kept for defense in depth).
-    let kind = if meta.is_dir {
-        NotRegularFileKind::Directory
-    } else if meta.is_symlink {
-        NotRegularFileKind::Symlink
-    } else if meta.is_file {
-        // 3. exact mode — the mode is part of the immutable record.
-        let actual = meta.mode & 0o7777;
-        let required = required_mode & 0o7777;
-        if actual != required {
-            return Ok(VerifiedExisting::ModeMismatch { actual, required });
+    match open()? {
+        // The producer's descriptor-bound observation — the ladder's steps 1-3
+        // (open, regular-file type, readability): it built `Regular` only
+        // after proving the OPENED inode is a regular, readable file, so the
+        // other three arms map one-to-one and no kind is re-derived here.
+        OpenedExisting::Regular(observed) => {
+            // 4. exact mode — the mode is part of the immutable record.
+            let actual = observed.mode & 0o7777;
+            let required = required_mode & 0o7777;
+            if actual != required {
+                return Ok(VerifiedExisting::ModeMismatch { actual, required });
+            }
+            // 5. the caller's content equivalence.
+            if content_equivalent(&observed.content, intended, equivalence) {
+                return Ok(VerifiedExisting::Ok {
+                    mode_ok: true,
+                    content: equivalence,
+                });
+            }
+            Ok(VerifiedExisting::ContentMismatch)
         }
-        // 4. the caller's content equivalence.
-        if content_equivalent(&entry.content, intended, equivalence) {
-            return Ok(VerifiedExisting::Ok {
-                mode_ok: true,
-                content: equivalence,
-            });
-        }
-        return Ok(VerifiedExisting::ContentMismatch);
-    } else {
-        NotRegularFileKind::Other
-    };
-    Ok(VerifiedExisting::NotRegularFile { kind })
+        OpenedExisting::NotFound => Ok(VerifiedExisting::NotFound),
+        OpenedExisting::NotRegular { kind } => Ok(VerifiedExisting::NotRegularFile { kind }),
+        OpenedExisting::Unreadable(m) => Ok(VerifiedExisting::Unreadable(m)),
+    }
 }
 
-/// The descriptor-bound observation of an EXISTING create-new destination:
-/// the type/mode (from `fstat` on the OPENED descriptor) and the content
-/// (read THROUGH THE SAME descriptor). Metadata and content provably come
-/// from the SAME OPENED INODE — the property that closes the
+/// A CONFIRMED-REGULAR descriptor-bound observation of an EXISTING
+/// create-new destination: the RAW mode (from `fstat` on the OPENED
+/// descriptor, type bits included — the comparison site masks `& 0o7777`) and
+/// the content (read THROUGH THE SAME descriptor). Mode and content provably
+/// come from the SAME OPENED INODE — the property that closes the
 /// check-then-use (TOCTOU) hole: a concurrent actor that swaps the entry at
 /// the path AFTER the open is irrelevant, because the descriptor pins the
-/// inode.
+/// inode. A producer constructs this ONLY after proving the opened inode is a
+/// regular file, so the type booleans and the unread size have no home here.
 #[derive(Clone, Debug)]
-pub(crate) struct OpenedEntry {
-    pub(crate) meta: RemoteMeta,
+pub(crate) struct OpenedRegular {
+    pub(crate) mode: u32,
     pub(crate) content: Vec<u8>,
 }
 
 /// The OUTCOME of the descriptor-bound open — [`verify_existing`]'s single
 /// `open` step (the LOCAL [`open_verify_local`] / the ssh framed helper):
-/// the entry was opened with `O_NOFOLLOW` and its metadata + content were
-/// observed through the SAME opened descriptor ([`OpenedExisting::Entry`]),
-/// or the open/fstat/read failed with a TYPED reason — absent
+/// the entry was opened with `O_NOFOLLOW`, proven regular, and its raw mode +
+/// content were observed through the SAME opened descriptor
+/// ([`OpenedExisting::Regular`]), or the open/fstat/read failed with a TYPED
+/// reason — absent
 /// (ENOENT/ENOTDIR → [`OpenedExisting::NotFound`]), a symlink (the
 /// `O_NOFOLLOW` open's ELOOP — NEVER followed, even when the symlink points
 /// at a matching regular file), a directory (EISDIR from the open, or the
@@ -1964,9 +2005,10 @@ pub(crate) struct OpenedEntry {
 /// failure, never a fabricated verdict).
 #[derive(Clone, Debug)]
 pub(crate) enum OpenedExisting {
-    /// The opened inode's metadata (fstat) AND content (read through the
-    /// same descriptor): the checks run on ONE consistent inode.
-    Entry(OpenedEntry),
+    /// The opened inode is a REGULAR file, with its raw mode (fstat) AND
+    /// content (read through the same descriptor): the checks run on ONE
+    /// consistent inode.
+    Regular(OpenedRegular),
     /// The `O_NOFOLLOW` open reported the destination absent (ENOENT/ENOTDIR).
     NotFound,
     /// The opened (or fstat'd) inode is NOT a regular file: a directory, a
@@ -2165,7 +2207,10 @@ fn open_verify_local(p: &Path, #[cfg(test)] swap: Option<&VerifySwap>) -> Result
             p.display()
         )));
     }
-    Ok(OpenedExisting::Entry(OpenedEntry { meta, content }))
+    Ok(OpenedExisting::Regular(OpenedRegular {
+        mode: meta.mode,
+        content,
+    }))
 }
 
 /// Map a failed `O_NOFOLLOW` open to the TYPED reason in the
@@ -3850,6 +3895,385 @@ mod tests {
             Some(TransportKind::ReceiverIdMarkerAbsent),
             "a corrupted marker is not absence"
         );
+    }
+
+    /// [`MarkerState`] is the ONE probe: its two states are the identity and a
+    /// CONFIRMED absence, and every unanswerable probe (non-UTF-8, legacy,
+    /// corrupted) is an `Err` that can never be mistaken for `Absent`. The
+    /// read/provision tests pin the behaviour those functions expose; this
+    /// pins the classification the state type itself carries.
+    #[test]
+    fn marker_state_probe_classifies_every_observation() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let marker = RootedRelativePath::parse(Path::new("receiver-marker")).unwrap();
+        let layout = Layout {
+            receiver_marker: Some(marker.clone()),
+            ..Layout::empty()
+        };
+        // Deliberately NOT provisioned: the first observation is the absence
+        // of a store that was never created.
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("probes"), layout)
+            .unwrap();
+
+        let absent = MarkerState::probe(&t, &marker).expect("an absent marker is an observation");
+        assert!(
+            matches!(absent, MarkerState::Absent),
+            "a missing marker is the CONFIRMED absence state"
+        );
+        // `require` is the ONE place that turns that state into the typed
+        // refusal.
+        let err = absent
+            .require(&t, &marker)
+            .expect_err("a confirmed absence is never an identity");
+        assert_eq!(
+            err.transport_reason(),
+            Some(TransportKind::ReceiverIdMarkerAbsent),
+            "the absent state carries the typed refusal, got: {err:?}"
+        );
+
+        // PRESENT: the probe yields the identity every reader and the
+        // provisioner consume.
+        let id = ReceiverId::generate().expect("entropy for a receiver id");
+        t.write(&marker, &id.wire_bytes(), 0o644).unwrap();
+        match MarkerState::probe(&t, &marker).expect("a valid marker is an observation") {
+            MarkerState::Present(observed) => assert_eq!(observed, id, "the probe parses the id"),
+            MarkerState::Absent => panic!("a present marker is never the absence state"),
+        }
+        assert_eq!(
+            MarkerState::probe(&t, &marker)
+                .unwrap()
+                .require(&t, &marker)
+                .expect("a present marker satisfies require"),
+            id
+        );
+
+        // LEGACY: the source tool's `recv-<uuid-v7>` shape is a typed refusal,
+        // never absence.
+        t.write(
+            &marker,
+            b"recv-0190f3c2-7a1e-7b3c-8d4f-0123456789ab\n",
+            0o644,
+        )
+        .unwrap();
+        let legacy = MarkerState::probe(&t, &marker).expect_err("legacy fails closed");
+        assert_eq!(
+            legacy.transport_reason(),
+            Some(TransportKind::ReceiverIdMarkerLegacyFormat),
+            "a legacy marker is the typed legacy condition, got: {legacy:?}"
+        );
+
+        // MALFORMED: arbitrary garbage, a near-miss of the legacy shape, and
+        // non-UTF-8 bytes are all corruptions — never absence.
+        for content in [
+            b"not-a-receiver-id".as_slice(),
+            b"recv-not-a-uuid\n".as_slice(),
+            b"\xff\xfe".as_slice(),
+        ] {
+            t.write(&marker, content, 0o644).unwrap();
+            let malformed =
+                MarkerState::probe(&t, &marker).expect_err("a corrupt marker fails closed");
+            assert_eq!(
+                malformed.transport_reason(),
+                Some(TransportKind::ReceiverIdMarkerMalformed),
+                "a corrupted marker is the typed malformed condition, got: {malformed:?}"
+            );
+        }
+    }
+
+    /// The PRODUCERS of [`OpenedExisting`] classify the opened inode
+    /// THEMSELVES: `Regular` is constructible ONLY after the producer proved
+    /// the opened inode regular, and every other shape maps to its own typed
+    /// arm — the same [`VerifiedExisting`] classes the ladder has always
+    /// produced. The cross-product oracle in the ssh tests pins the LADDER;
+    /// this pins the observations that feed it.
+    #[cfg(unix)]
+    #[test]
+    fn opened_existing_producers_classify_their_observations() {
+        use std::ffi::CString;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        std::fs::create_dir_all(&base).unwrap();
+        let intended: &[u8] = b"payload";
+        let required_mode = 0o644u32;
+
+        let observe = |name: &str| {
+            let p = base.join(name);
+            open_verify_local(&p, None).expect("the local descriptor-bound open never errors")
+        };
+        let classify = |name: &str| {
+            verify_existing(
+                || Ok(observe(name)),
+                intended,
+                required_mode,
+                ContentEquivalence::Exact,
+            )
+            .expect("the ladder maps every observation")
+        };
+
+        // ABSENT: the destination was never created.
+        assert!(
+            matches!(observe("absent"), OpenedExisting::NotFound),
+            "a missing destination is the NotFound observation"
+        );
+        assert_eq!(classify("absent"), VerifiedExisting::NotFound);
+
+        // SYMLINK: the O_NOFOLLOW open reports ELOOP and never follows — the
+        // target matches the intent byte-for-byte and in mode.
+        let target = base.join("target");
+        std::fs::write(&target, intended).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(required_mode)).unwrap();
+        std::os::unix::fs::symlink(&target, base.join("link")).unwrap();
+        assert!(
+            matches!(
+                observe("link"),
+                OpenedExisting::NotRegular {
+                    kind: NotRegularFileKind::Symlink
+                }
+            ),
+            "a symlink is the typed Symlink observation, never Regular"
+        );
+        assert_eq!(
+            classify("link"),
+            VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Symlink
+            }
+        );
+
+        // DIRECTORY.
+        std::fs::create_dir(base.join("dir")).unwrap();
+        assert!(
+            matches!(
+                observe("dir"),
+                OpenedExisting::NotRegular {
+                    kind: NotRegularFileKind::Directory
+                }
+            ),
+            "a directory is the typed Directory observation, never Regular"
+        );
+        assert_eq!(
+            classify("dir"),
+            VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Directory
+            }
+        );
+
+        // OTHER: a fifo is opened (O_NONBLOCK) and classified by its fstat
+        // type, never read — the local view and the SSH view agree that an
+        // S_IFIFO entry is not a file.
+        let fifo = base.join("fifo");
+        let c = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+            0,
+            "mkfifo {}: {}",
+            fifo.display(),
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            matches!(
+                observe("fifo"),
+                OpenedExisting::NotRegular {
+                    kind: NotRegularFileKind::Other
+                }
+            ),
+            "a fifo is the typed Other observation, never Regular"
+        );
+        assert_eq!(
+            classify("fifo"),
+            VerifiedExisting::NotRegularFile {
+                kind: NotRegularFileKind::Other
+            }
+        );
+
+        // UNREADABLE: a regular file stripped of every permission — the read
+        // (precedence step 3) fails, so the observation is Unreadable BEFORE
+        // any mode/content check.
+        let hidden = base.join("unreadable");
+        std::fs::write(&hidden, intended).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            matches!(observe("unreadable"), OpenedExisting::Unreadable(_)),
+            "an unreadable regular file is the Unreadable observation"
+        );
+        assert!(matches!(
+            classify("unreadable"),
+            VerifiedExisting::Unreadable(_)
+        ));
+
+        // REGULAR: the ONLY shape that becomes `Regular`, carrying the RAW
+        // mode the comparison site masks.
+        let regular = base.join("regular");
+        std::fs::write(&regular, intended).unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(required_mode)).unwrap();
+        match observe("regular") {
+            OpenedExisting::Regular(observed) => {
+                assert_eq!(
+                    observed.mode & 0o7777,
+                    required_mode,
+                    "the observation carries the opened inode's mode"
+                );
+                assert_eq!(observed.content, intended, "and its fd-read content");
+            }
+            other => panic!("a proven regular file must be the Regular observation, got {other:?}"),
+        }
+        assert_eq!(
+            classify("regular"),
+            VerifiedExisting::Ok {
+                mode_ok: true,
+                content: ContentEquivalence::Exact
+            }
+        );
+
+        // The mode check reads the observation's mode (masked): a wrong mode
+        // is a ModeMismatch even with matching content.
+        let wrong = base.join("wrong-mode");
+        std::fs::write(&wrong, intended).unwrap();
+        std::fs::set_permissions(&wrong, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            classify("wrong-mode"),
+            VerifiedExisting::ModeMismatch {
+                actual: 0o600,
+                required: required_mode
+            }
+        );
+    }
+
+    /// A `Remote` wrapper that records the ORDER of `set_mode` calls — the only
+    /// mutation [`PendingFinalModes::finalize`] performs — and delegates every
+    /// other operation to the inner local transport untouched.
+    struct ModeOrderRemote {
+        inner: LocalTransport,
+        set_modes: std::sync::Mutex<Vec<(RootedRelativePath, u32)>>,
+    }
+
+    impl Remote for ModeOrderRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+
+        fn is_local(&self) -> bool {
+            true
+        }
+
+        fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+
+        fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+
+        fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
+            self.inner.try_write_new(rel, data)
+        }
+
+        fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+
+        fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+
+        fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()> {
+            self.set_modes
+                .lock()
+                .expect("the recording lock")
+                .push((rel.clone(), mode));
+            self.inner.set_mode(rel, mode)
+        }
+
+        fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+
+        fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+
+        fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+
+        fn read_link(&self, rel: &RootedRelativePath) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+
+        fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+
+        fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+
+        fn metadata(&self, rel: &RootedRelativePath) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+
+        fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// `PendingFinalModes` IS the finalize order: the walk records parent
+    /// directories in pre-order and `finalize` applies them deepest-first, so a
+    /// nested read-only source tree gets each child's mode before its parent's.
+    /// The recorded `set_mode` sequence is the witness (the final on-disk modes
+    /// cannot distinguish the orders, because a `0555` directory is still
+    /// traversable).
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_applies_child_directory_modes_before_their_parent() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("remote");
+        let src = base.join("src");
+        let nested = src.join("ro/child");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("file"), b"x").unwrap();
+        // A nested READ-ONLY tree: both directories may only become `0555`
+        // after everything below them has been recreated and finalized.
+        for p in [src.join("ro"), nested] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let t = ModeOrderRemote {
+            inner: LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty())
+                .unwrap(),
+            set_modes: std::sync::Mutex::new(Vec::new()),
+        };
+        let src_rel = RootedRelativePath::parse(Path::new("src")).unwrap();
+        let dest_rel = RootedRelativePath::parse(Path::new("dest")).unwrap();
+        t.copy_tree(&src_rel, &dest_rel).expect("copy_tree");
+
+        // The FINAL modes are the `0555` applications; the walk's own
+        // owner-writable `0755` prologue is filtered out.
+        let final_order: Vec<String> = t
+            .set_modes
+            .lock()
+            .expect("the recording lock")
+            .iter()
+            .filter(|(_, mode)| *mode == 0o555)
+            .map(|(rel, _)| rel.as_path().display().to_string())
+            .collect();
+        assert_eq!(
+            final_order,
+            vec!["dest/ro/child".to_string(), "dest/ro".to_string()],
+            "the deepest directory's final mode is applied BEFORE its parent's"
+        );
+        for rel in ["dest/ro", "dest/ro/child"] {
+            let mode = std::fs::symlink_metadata(base.join(rel))
+                .unwrap_or_else(|e| panic!("stat copied {rel}: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o555, "the read-only mode {rel} survives the copy");
+        }
     }
 
     /// Concurrent readers must only ever observe the destination file fully

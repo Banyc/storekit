@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use super::{
     ContentEquivalence, CreateNewVerdict, FarSideLockSession, FsBytes, IMMUTABLE_RECORD_MODE,
-    Layout, OpenedEntry, OpenedExisting, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict,
+    Layout, OpenedExisting, OpenedRegular, Remote, RemoteEntry, RemoteMeta, RemoveIfVerdict,
     RootedRelativePath, TimeoutCause, has_normal_component_below_root, provision_receiver_id,
     verified_to_verdict, verify_existing,
 };
@@ -2112,9 +2112,9 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
 
     /// Parse the SINGLE-frame stdout produced by
     /// [`SshTransport::verify_open_script`] into the descriptor-bound
-    /// [`OpenedExisting`] the shared verification maps: `O` (a regular file
+    /// [`OpenedExisting`] the shared verification maps: `O` (a REGULAR file
     /// opened with `O_NOFOLLOW` and fstat'd+read through the SAME
-    /// descriptor — mode from the raw mode bits, content the raw bytes after
+    /// descriptor — raw mode from the fd's fstat, content the raw bytes after
     /// the header line), `N` (opened+fstat'd non-regular entry — dir/symlink/
     /// other by the mode bits), or `E` (open/fstat/read failed —
     /// ENOENT/ENOTDIR → NotFound, ELOOP → NotRegularFile{Symlink} (the
@@ -2155,7 +2155,10 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
                         kind: Self::kind_of(&meta),
                     });
                 }
-                Ok(OpenedExisting::Entry(OpenedEntry { meta, content }))
+                Ok(OpenedExisting::Regular(OpenedRegular {
+                    mode: meta.mode,
+                    content,
+                }))
             }
             // Opened + fstat'd, NOT a regular file: the mode bits classify.
             Some("N") => {

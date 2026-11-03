@@ -588,12 +588,15 @@ published entry and its temp.
 `SshTransport::verify_open_script`; test-only `VerifySwap`.
 
 **States.** Open with `O_NOFOLLOW`; fstat the opened descriptor; read through the
-same descriptor. Outcomes: entry, not found, not regular, unreadable. For an
-entry: type, exact mode, content equivalence; readability is decided by the
-open/read step that produced the `Unreadable` outcome.
+same descriptor. The producer's typed observation is
+`OpenedExisting::{Regular, NotFound, NotRegular, Unreadable}`: `Regular` is
+constructed only after the opened inode is proven regular. For `Regular`: exact
+mode, content equivalence; readability is decided by the open/read step that
+produced `Unreadable`.
 
-**Carrier.** The single opened descriptor's metadata and content; the decision
-ladder evaluates them in order.
+**Carrier.** The single opened descriptor. A `Regular` carries that inode's raw
+mode (type bits included; the comparison masks `0o7777`) and its fd-read
+content, so the ladder evaluates one consistent observation in order.
 
 **Transitions.** The first applicable class wins: not-regular before
 unreadable/mode/content; unreadable before mode; mode before content. `Ok` is
@@ -676,16 +679,19 @@ owns.
 directory (owner-writable during the walk), file, or symlink; directory final
 modes applied deepest-first.
 
-**Carrier.** The walk's heap frame stack and the `dirs` vector of
-`(path, final_mode, depth)`. The default has no temp directory or final rename.
+**Carrier.** The walk's heap frame stack and `PendingFinalModes`, which records
+each directory's final mode in PRE-ORDER and applies them deepest-first. The
+default has no temp directory or final rename.
 
 **Transitions.** `copy_tree_walk` recreates the tree through `list`/`read`/`write`;
-the caller sorts `dirs` by depth and applies the final modes. The SSH override
-runs a same-filesystem `cp -a` instead.
+`PendingFinalModes::finalize` consumes the pre-order and applies it in reverse,
+so every child's mode precedes its parent's. The SSH override runs a
+same-filesystem `cp -a` instead.
 
 **Watch.** The default drops ownership, xattrs, ACLs, and timestamps; the SSH
 override preserves more metadata. A failed default copy leaves a partial
-destination tree.
+destination tree. The finalize contract is the deepest-first parent-before-child
+property, not the order among siblings.
 
 ### Far-side lock session
 
@@ -798,20 +804,25 @@ pin files are preparation residue that the crate never removes.
 
 ### Receiver identity and layout provisioning
 
-**Where.** `transport::{ReceiverId, read_receiver_id_opt, provision_receiver_id,
-Layout}`; `LocalTransport::provision_layout`; `SshTransport::provision_layout`.
+**Where.** `transport::{ReceiverId, MarkerState, read_receiver_id,
+provision_receiver_id, Layout}`; `LocalTransport::provision_layout`;
+`SshTransport::provision_layout`.
 
-**States.** Base absent or present; bootstrap directories absent or present;
-receiver marker absent, valid, malformed, legacy-format, or concurrently
-created. Provisioned.
+**States.** Base absent or present; bootstrap directories absent or present; the
+marker probe's outcome — `MarkerState::Present(id)`, `MarkerState::Absent`, or a
+typed error (non-UTF-8, legacy format, malformed, read/metadata failure).
+Provisioned.
 
-**Carrier.** Directories on disk and the immutable marker `<id>\n`.
+**Carrier.** Directories on disk and the immutable marker `<id>\n`. `MarkerState`
+is the one probe's outcome; only a CONFIRMED absence is `Absent`, so an
+unanswerable probe is never absence.
 
 **Transitions.** Provisioning creates the root and bootstrap directories, then
-reads or creates the receiver marker. A missing marker is created with
-`try_write_new`; `Created` returns the new id; `AlreadyPresent` or `Conflict`
-adopts the existing marker by reading it. A malformed or legacy marker fails
-closed.
+probes the marker: `Present` adopts the identity; `Absent` creates a fresh id
+with `try_write_new`, whose `Created` returns it and whose `AlreadyPresent` or
+`Conflict(_)` re-probes and requires the existing marker. A malformed or legacy
+marker fails closed; `require` turns a confirmed absence into the typed
+absent-marker refusal.
 
 **Watch.** The marker is created once and never replaced. A concurrent
 provisioner's existing marker is the truth. The default `Remote::provision_layout`
