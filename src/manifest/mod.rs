@@ -1696,6 +1696,56 @@ impl EntryAssembler {
     }
 }
 
+/// The classification of ONE walked entry: its kind TOGETHER with exactly the
+/// fields that kind carries. Both manifest views produce this value and neither
+/// names an [`EntryKind`] and a field set separately, so a `Dir` can never
+/// carry a content hash and a `File` never a link target.
+///
+/// A symlink carries no mode: its mode is the fixed [`SYMLINK_MODE`], which
+/// exists in ONE place — [`Classified::push_into`] — instead of in each view.
+enum Classified {
+    Dir {
+        mode: u32,
+    },
+    File {
+        mode: u32,
+        content_sha256: String,
+    },
+    Symlink {
+        content_sha256: String,
+        target: String,
+    },
+}
+
+/// The canonical mode of a symlink entry: never read through the
+/// (link-following) platform helper, which would fail on a dangling link.
+const SYMLINK_MODE: u32 = 0o777;
+
+impl Classified {
+    /// The ONE conversion from a classification plus the already-validated
+    /// path to the assembler call: the kind and its manifest fields come from
+    /// the SAME variant, so they cannot disagree.
+    fn push_into(self, assembler: &mut EntryAssembler, path: String) -> Result<()> {
+        let (entry_type, mode, content_sha256, symlink_target) = match self {
+            Classified::Dir { mode } => (EntryKind::Dir, mode, None, None),
+            Classified::File {
+                mode,
+                content_sha256,
+            } => (EntryKind::File, mode, Some(content_sha256), None),
+            Classified::Symlink {
+                content_sha256,
+                target,
+            } => (
+                EntryKind::Symlink,
+                SYMLINK_MODE,
+                Some(content_sha256),
+                Some(target),
+            ),
+        };
+        assembler.push(path, entry_type, mode, content_sha256, symlink_target)
+    }
+}
+
 fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Result<S::Output> {
     let mut assembler = EntryAssembler::new();
 
@@ -1741,23 +1791,14 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| Error::materialization(format!("stat {}: {e}", path.display())))?;
 
-        let entry_type: EntryKind;
-        // Symlink entries carry a fixed canonical mode (0777) — the mode is
-        // never read through the (symlink-following) platform helper, which
-        // would fail on a dangling link. Dirs/files read their mode via the
-        // platform helper (a documented 0o644 constant on Windows).
-        let mut mode = if meta.is_symlink() {
-            0o777
-        } else {
-            mode_bits(crate::platform::file_mode(path)?)
-        };
-        let mut content_sha256 = None;
-        let mut symlink_target = None;
-
-        if meta.is_dir() {
-            entry_type = EntryKind::Dir;
+        // Dirs and files read their mode via the platform helper (a documented
+        // 0o644 constant on Windows); a symlink's mode is fixed by its kind
+        // ([`SYMLINK_MODE`]), so the helper is never called for one.
+        let classified = if meta.is_dir() {
+            Classified::Dir {
+                mode: mode_bits(crate::platform::file_mode(path)?),
+            }
         } else if meta.is_symlink() {
-            entry_type = EntryKind::Symlink;
             let target = std::fs::read_link(path)
                 .map_err(|e| Error::materialization(format!("readlink {}: {e}", path.display())))?;
             if target.is_absolute() {
@@ -1788,11 +1829,12 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
                     ),
                 )
             })?;
-            symlink_target = Some(validate_symlink_target(&entry_path, target_str)?);
-            content_sha256 = Some(sha256_bytes(&target_bytes));
-            mode = 0o777;
+            Classified::Symlink {
+                content_sha256: sha256_bytes(&target_bytes),
+                target: validate_symlink_target(&entry_path, target_str)?,
+            }
         } else if meta.is_file() {
-            entry_type = EntryKind::File;
+            let mode = mode_bits(crate::platform::file_mode(path)?);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -1803,15 +1845,18 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
             }
             let data = std::fs::read(path)
                 .map_err(|e| Error::materialization(format!("read {}: {e}", path.display())))?;
-            content_sha256 = Some(sha256_bytes(&data));
+            Classified::File {
+                mode,
+                content_sha256: sha256_bytes(&data),
+            }
         } else {
             return Err(Error::materialization_kind(
                 MaterializationKind::SpecialFile,
                 format!("unsupported file type at {}", path.display()),
             ));
-        }
+        };
 
-        assembler.push(entry_path, entry_type, mode, content_sha256, symlink_target)?;
+        classified.push_into(&mut assembler, entry_path)?;
     }
 
     // POST-PASS: the ONE containment rule, over the SAME view the wire
@@ -2199,15 +2244,12 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
             Error::materialization(format!("invalid mode {mode_hex:?} for {entry_path}"))
         })?;
 
-        // The parsed kind and its fields; [`EntryAssembler::push`] validates
-        // the spelling, refuses a duplicate and appends.
-        let (entry_type, mode, content_sha256, symlink_target): (
-            EntryKind,
-            u32,
-            Option<String>,
-            Option<String>,
-        ) = match entry_type {
-            "d" => (EntryKind::Dir, mode_bits(mode), None, None),
+        // The parsed kind and its fields, as ONE value; [`Classified::push_into`]
+        // validates the spelling, refuses a duplicate and appends.
+        let classified = match entry_type {
+            "d" => Classified::Dir {
+                mode: mode_bits(mode),
+            },
             "f" => {
                 let n: u64 = nlink.parse().map_err(|_| {
                     Error::materialization(format!("invalid nlink {nlink:?} for {entry_path}"))
@@ -2228,12 +2270,10 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                 // error instead of silently producing a confusing digest
                 // mismatch.
                 validate_wire_hash(content_hash, &entry_path)?;
-                (
-                    EntryKind::File,
-                    mode_bits(mode),
-                    Some(content_hash.to_string()),
-                    None,
-                )
+                Classified::File {
+                    mode: mode_bits(mode),
+                    content_sha256: content_hash.to_string(),
+                }
             }
             "l" => {
                 if symlink_target.is_empty() {
@@ -2273,12 +2313,10 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                         "symlink target hash mismatch for {entry_path}: the far side hashed its raw target bytes as {content_hash}, but the target that crossed the wire hashes to {recomputed}; refusing rather than recording a hash of a target that is not what the far side saw"
                     )));
                 }
-                (
-                    EntryKind::Symlink,
-                    0o777,
-                    Some(recomputed),
-                    Some(symlink_target),
-                )
+                Classified::Symlink {
+                    content_sha256: recomputed,
+                    target: symlink_target,
+                }
             }
             other => {
                 return Err(Error::materialization_kind(
@@ -2287,7 +2325,7 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                 ));
             }
         };
-        assembler.push(entry_path, entry_type, mode, content_sha256, symlink_target)?;
+        classified.push_into(&mut assembler, entry_path)?;
     }
     // The manifest must be parent-closed (see [`require_parent_closed`]); the
     // wire walk emits parents first, so a complete far-side listing already
@@ -5383,6 +5421,73 @@ mod tests {
             "both canonicalizers must store the same target bytes"
         );
         assert_eq!(remote.tree_sha256, local.tree_sha256);
+    }
+
+    /// The carrier invariant, measured on BOTH walks: an entry's kind and the
+    /// fields it carries agree EXACTLY — a `dir` carries neither a content
+    /// hash nor a target, a `file` a hash over its own bytes and no target, a
+    /// `symlink` both, with the fixed `0o777` mode and a hash over its OWN
+    /// target. Neither walk keeps a kind and a field set as two independent
+    /// computations any more (one [`Classified`] variant per kind), and this is
+    /// the assertion that fails if a walk ever projects them separately again.
+    // unix-only: builds a symlink fixture with symlink(2).
+    #[cfg(unix)]
+    #[test]
+    fn both_walks_carry_exactly_the_fields_of_their_kind() {
+        skip_without_perl!("both_walks_carry_exactly_the_fields_of_their_kind");
+        let dir = fixture_tmpdir(&fixture_env()).unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), b"content").unwrap();
+        std::os::unix::fs::symlink("sub/file.txt", root.join("link")).unwrap();
+
+        let local = canonicalize_tree(&root).unwrap();
+        let out = run_remote_script(&root);
+        let wire =
+            canonicalize_remote_entries(CompleteListing::new(&out, &root, true).unwrap()).unwrap();
+        for meta in [&local, &wire] {
+            for entry in &meta.entries {
+                match entry.entry_type {
+                    EntryKind::Dir => {
+                        assert!(
+                            entry.content_sha256.is_none(),
+                            "a dir must carry no content hash: {entry:?}"
+                        );
+                        assert!(
+                            entry.symlink_target.is_none(),
+                            "a dir must carry no symlink target: {entry:?}"
+                        );
+                    }
+                    EntryKind::File => {
+                        assert_eq!(
+                            entry.content_sha256.as_deref(),
+                            Some(sha256_bytes(b"content").as_str()),
+                            "a file's hash must be over its own bytes: {entry:?}"
+                        );
+                        assert!(
+                            entry.symlink_target.is_none(),
+                            "a file must carry no symlink target: {entry:?}"
+                        );
+                    }
+                    EntryKind::Symlink => {
+                        assert_eq!(
+                            entry.mode, 0o777,
+                            "a symlink's mode is the fixed 0o777: {entry:?}"
+                        );
+                        assert_eq!(
+                            entry.symlink_target.as_deref(),
+                            Some("sub/file.txt"),
+                            "a symlink must carry its own target: {entry:?}"
+                        );
+                        assert_eq!(
+                            entry.content_sha256.as_deref(),
+                            Some(sha256_bytes(b"sub/file.txt").as_str()),
+                            "a symlink's hash must be over its own target: {entry:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A symlink target ending in CR is refused by the LOCAL walk. CR is not a

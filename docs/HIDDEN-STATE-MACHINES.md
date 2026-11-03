@@ -683,10 +683,17 @@ strict refusal or tolerated recording. Containment resolution: absent,
 non-symlink, or symlink; refusal: escapes root, through symlink, or
 plan-dependent.
 
-**Carrier.** `EntryAssembler`: the growing entry vector and the `seen` set,
-finished with the `ShownPath` the refusal names the link by. `CompleteListing`
-carries the listing text and the root it describes TOGETHER with the producing
-walk's exit status. The walk itself has no state type.
+**Carrier.** `Classified`: ONE per-entry classification — `Dir { mode }`,
+`File { mode, content_sha256 }`, `Symlink { content_sha256, target }` — whose
+`push_into` is the only conversion to the `EntryAssembler::push` call, so the
+kind and the fields an entry carries cannot disagree and the symlink's fixed
+`0o777` exists in one place (one variant per kind, not a kind plus a field set
+computed beside it). BOTH walks build this value and push it. `EntryAssembler`:
+the growing entry vector and the `seen` set, finished with the `ShownPath` the
+refusal names the link by. `CompleteListing` carries the listing text and the
+root it describes TOGETHER with the producing walk's exit status. The walk has
+no state type ACROSS entries: each classification is built, pushed and dropped
+inside one loop iteration.
 
 **Transitions.** `EntryAssembler::push` validates the spelling, refuses a
 duplicate, and appends; `EntryAssembler::finish` CONSUMES the assembler, runs
@@ -705,7 +712,10 @@ source manifest against the raw destination observation, not a precomputed
 result view. The fold must not be narrower than the destination host's fold. The
 post-pass and the duplicate rule exist ONCE, in `EntryAssembler`, so the two
 views cannot diverge; only the link's display differs (`ShownPath`: the local
-walk's `root.join(rel)` versus the wire's manifest spelling).
+walk's `root.join(rel)` versus the wire's manifest spelling). The
+kind-and-its-fields pairing exists ONCE, in `Classified`, so neither view can
+attribute one kind's field to another (a `Dir` with a hash, a `File` with a
+target).
 
 ## Transport
 
