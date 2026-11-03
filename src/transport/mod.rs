@@ -1236,12 +1236,13 @@ pub const SIDECAR_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// same reason as [`SIDECAR_WAIT_TIMEOUT`].
 pub const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
-// Thread-local re-entrancy depth for the sidecar critical section. When
-// `>0`, the current thread already holds the sidecar flock, so nested
-// transport calls for the lock path skip re-acquiring it. Depth is
-// incremented on entry and decremented on exit, even on error.
+// Thread-local re-entrancy bit for the sidecar critical section: `true` means
+// THIS thread already holds the sidecar flock, so a nested transport call for
+// the lock path must not re-acquire it (the `flock` is not recursive and
+// re-locking would deadlock). The bit is raised only once the lock is actually
+// held and cleared by [`SidecarHold`]'s RAII release on every exit path.
 thread_local! {
-    static SIDECAR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SIDECAR_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Ensure the sidecar mutex file exists durably: create the parent
@@ -1322,8 +1323,8 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(
 /// reserved-spelling gate: a caller could name the crate's own bookkeeping
 /// (`operation.lock`, a `.sync-aside.*` residue, or the sibling record
 /// `.<name>.operation.lock`) and create it. So [`crate::atomic::refuse_reserved_mutation`]
-/// runs with [`crate::atomic::Sanction::None`] BEFORE the depth check and before anything is
-/// created: a lock-record or residue spelling is refused TYPED ([`Error::Conflict`]
+/// runs with [`crate::atomic::Sanction::None`] BEFORE the re-entrancy answer and
+/// before anything is created: a lock-record or residue spelling is refused TYPED ([`Error::Conflict`]
 /// / [`Error::Reserved`]`{ResidueBelow}`) exactly as every guarded primitive
 /// refuses it, and no parent chain or record is created. The crate's own
 /// default [`Layout::lock_sidecar`] (`state/operation.lock.mutex`) is neither
@@ -1347,7 +1348,7 @@ pub(crate) fn ensure_operation_lock_sidecar_durable(
 ///
 /// Re-entrant PER THREAD: while THIS thread already holds the sidecar a nested
 /// call runs `f` directly, without re-locking (the `flock` is not recursive and
-/// re-locking would deadlock). The lock and the re-entrancy depth are released
+/// re-locking would deadlock). The lock and the thread's held bit are released
 /// by an RAII guard on EVERY exit path — an ordinary return, an error return,
 /// and a PANIC unwinding through `f` — so a caught panic cannot leave the
 /// thread believing it still holds a lock it released.
@@ -1374,14 +1375,58 @@ pub fn with_operation_lock_sidecar<R>(
     sidecar: &RootedRelativePath,
     f: impl FnOnce() -> Result<R>,
 ) -> Result<R> {
+    let _scope = acquire_sidecar(base, sidecar)?;
+    f()
+}
+
+/// The answer to ONE sidecar acquisition attempt: the critical section is a
+/// VALUE the caller holds, so "did I acquire it?" and "is this call nested?"
+/// are decided once, at acquisition, instead of being re-read from an ambient
+/// depth at every mutation.
+pub(crate) enum SidecarScope {
+    /// This call ACQUIRED the sidecar: the hold owns the read-only descriptor
+    /// the `flock` is attached to and releases it (clearing the thread-local
+    /// held bit) on EVERY exit path, including a panic unwinding through the
+    /// caller's work.
+    Owned(
+        // Carried ONLY for its `Drop`: releasing the lock and clearing the
+        // held bit IS the payload's whole job, so it is deliberately never
+        // read.
+        #[allow(dead_code)] SidecarHold,
+    ),
+    /// THIS THREAD already held the sidecar: a nested call runs inside the
+    /// outer critical section, so it acquires nothing and has nothing to
+    /// release.
+    Nested,
+}
+
+/// Acquire the operation-scoped sidecar critical section, or report that this
+/// thread already holds it.
+///
+/// ORDER IS THE CONTRACT. The reserved-spelling gate runs FIRST — before the
+/// re-entrancy answer and before anything is created — because `sidecar` is
+/// CALLER-CHOSEN: a lock-record or residue spelling is refused TYPED even from
+/// a thread that already holds a sidecar, and no parent chain or record is
+/// created. Only then does an already-holding thread get
+/// [`SidecarScope::Nested`] (the `flock` is not recursive; re-locking would
+/// deadlock).
+///
+/// A non-nested acquisition ensures the record durably
+/// ([`ensure_operation_lock_sidecar_durable`]: created once, never truncated,
+/// fsynced with its parent), opens it READ-ONLY, waits for the exclusive lock
+/// under the [`SIDECAR_WAIT_TIMEOUT`] policy ([`wait_for_sidecar_flock`] — a
+/// typed [`TransportKind::SidecarWaitTimeout`], never a hang), and only then
+/// raises the thread-local held bit. The returned [`SidecarHold`] owns the
+/// descriptor, so the record cannot be redirected away from the locked inode
+/// while the scope lives.
+pub(crate) fn acquire_sidecar(base: &Path, sidecar: &RootedRelativePath) -> Result<SidecarScope> {
     // The sidecar spelling is CALLER-CHOSEN; run the crate's ONE
-    // reserved-spelling gate at the PUBLIC entry, before the depth check and
-    // before anything is created, so this helper cannot create a lock record
-    // or a residue a guarded primitive would refuse.
+    // reserved-spelling gate at the PUBLIC entry, before the re-entrancy
+    // answer and before anything is created, so this helper cannot create a
+    // lock record or a residue a guarded primitive would refuse.
     crate::atomic::refuse_reserved_mutation(sidecar.as_path(), crate::atomic::Sanction::None)?;
-    let depth = SIDECAR_DEPTH.with(|c| c.get());
-    if depth > 0 {
-        return f();
+    if sidecar_held() {
+        return Ok(SidecarScope::Nested);
     }
     ensure_operation_lock_sidecar_durable(base, sidecar)?;
     let p = join(base, sidecar);
@@ -1405,30 +1450,31 @@ pub fn with_operation_lock_sidecar<R>(
         Instant::now,
         std::thread::sleep,
     )?;
-    // RAII release: restore the re-entrancy depth and unlock on EVERY exit
-    // path, including a panic. The previous manual release left the depth
+    // The held bit is raised only once the `flock` is held, and the RAII hold
+    // clears it again on EVERY exit path (a previous manual release left it
     // raised after a caught panic, so a later call on the SAME thread would
-    // have skipped the lock while another holder was live.
-    SIDECAR_DEPTH.with(|c| c.set(depth + 1));
-    let _hold = SidecarHold {
-        file: &file,
-        prev_depth: depth,
-    };
-    f()
+    // have skipped the lock while another holder was live).
+    SIDECAR_HELD.with(|c| c.set(true));
+    Ok(SidecarScope::Owned(SidecarHold { file }))
 }
 
-/// The RAII release for [`with_operation_lock_sidecar`]: restores the
-/// thread-local re-entrancy depth and unlocks the sidecar `flock` when it
-/// drops, so a panic unwinding through the critical section cannot leak either.
-struct SidecarHold<'a> {
-    file: &'a std::fs::File,
-    prev_depth: usize,
+/// Whether THIS thread currently holds the sidecar critical section.
+fn sidecar_held() -> bool {
+    SIDECAR_HELD.with(|c| c.get())
 }
 
-impl Drop for SidecarHold<'_> {
+/// The RAII release for an [`SidecarScope::Owned`] acquisition. It OWNS the
+/// read-only descriptor the `flock` is attached to, so dropping it clears the
+/// thread-local held bit and unlocks the sidecar on EVERY exit path, and a
+/// panic unwinding through the critical section cannot leak either.
+pub(crate) struct SidecarHold {
+    file: std::fs::File,
+}
+
+impl Drop for SidecarHold {
     fn drop(&mut self) {
-        SIDECAR_DEPTH.with(|c| c.set(self.prev_depth));
-        crate::lock::unlock(self.file);
+        SIDECAR_HELD.with(|c| c.set(false));
+        crate::lock::unlock(&self.file);
     }
 }
 
@@ -3152,12 +3198,16 @@ impl Remote for LocalTransport {
         // DISTINCT on-disk entry (a trailing-dot alias, or a case alias on a
         // case-sensitive filesystem) is refused.
         let guarded = self.guarded_mutation_target(rel)?;
-        if guarded.is_owned_lock_record() {
-            return with_operation_lock_sidecar(&self.base, &self.layout.lock_sidecar, || {
-                self.remove_file_if_inner(guarded, expected)
-            });
-        }
-        self.remove_file_if_inner(guarded, expected)
+        // WHICH destructive protocol runs is decided ONCE, here, and carried as
+        // a value: a mutation of the ONE owned lock record takes the sidecar,
+        // and a call made while THIS thread already holds it runs inside that
+        // critical section — both are SERIALIZED. Every other name is CLAIMED.
+        let route = if guarded.is_owned_lock_record() || sidecar_held() {
+            RemoveIfRoute::Serialized(acquire_sidecar(&self.base, &self.layout.lock_sidecar)?)
+        } else {
+            RemoveIfRoute::Claim
+        };
+        route.remove_if(&self.base, guarded, expected)
     }
 
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict> {
@@ -3356,123 +3406,6 @@ impl LocalTransport {
         crate::atomic::GuardedRel::new_for_owned_lock_record(rel.as_path(), &owned)
     }
 
-    // A GUARDED mutation worker, reached only with a
-    // `crate::atomic::GuardedRel<'_>` capability (the guard has already run on
-    // this name); this is the funnel's own `std::fs` use, so the crate-root deny
-    // is relaxed for exactly this method while the count pin watches it change.
-    #[allow(clippy::disallowed_methods)]
-    fn remove_file_if_inner(
-        &self,
-        guarded: crate::atomic::GuardedRel<'_>,
-        expected: &[u8],
-    ) -> Result<RemoveIfVerdict> {
-        let p = self.base.join(guarded.as_path());
-        // When already holding the sidecar (we are inside with_operation_lock_sidecar),
-        // the mutation is already serialized, so a simple read-compare-unlink
-        // keeps the record continuously visible for a mismatched remove (no
-        // transient absence) and is safe from TOCTOU.
-        if SIDECAR_DEPTH.with(|c| c.get() > 0) {
-            let cur = match std::fs::read(&p) {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(RemoveIfVerdict::Absent);
-                }
-                Err(e) => return Err(Error::transport(format!("read {}: {e}", p.display()))),
-            };
-            if cur == expected {
-                match std::fs::remove_file(&p) {
-                    Ok(()) => return Ok(RemoveIfVerdict::Removed),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(RemoveIfVerdict::Absent);
-                    }
-                    Err(e) => return Err(Error::transport(format!("remove {}: {e}", p.display()))),
-                }
-            } else {
-                return Ok(RemoveIfVerdict::Mismatch);
-            }
-        }
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        // Fallback claim path (when not under sidecar, e.g. non-lock paths
-        // or direct calls): atomic rename claim, verify, delete or restore.
-        // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
-        // destination's parent directory (same filesystem, same directory
-        // namespace as the lock), exactly like durable_create_new's temps.
-        // The marker is defined by the temp-name authority ([`crate::atomic`]),
-        // so the claim temp and the classification of a claim temp as a TEMP
-        // (rather than a reserved held-aside) can never disagree.
-        let marker = crate::atomic::CLAIM_SUFFIX_MARKER;
-        let suffix = format!(
-            "{marker}{}.{}",
-            std::process::id(),
-            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let tmp = p.with_file_name(format!(
-            ".{}{}",
-            crate::atomic::bounded_temp_trunk(
-                &p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                &suffix,
-            ),
-            suffix,
-        ));
-        // CLAIM: rename the entry to the temp — atomic, so only ONE
-        // contender can ever win the claim; every other breaker's rename
-        // fails with NotFound (the slot was already claimed or free).
-        match std::fs::rename(&p, &tmp) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RemoveIfVerdict::Absent);
-            }
-            Err(e) => {
-                return Err(Error::transport(format!("claim {}: {e}", p.display())));
-            }
-        }
-        // VERIFY the claimed entry against the expectation.
-        let content = match std::fs::read(&tmp) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::transport(format!("verify {}: {e}", tmp.display())));
-            }
-        };
-        if content == expected {
-            // MATCH: the claimed entry was EXACTLY the expected record —
-            // delete it; the slot is now free.
-            let _ = std::fs::remove_file(&tmp);
-            return Ok(RemoveIfVerdict::Removed);
-        }
-        // MISMATCH: the entry changed under the reader (a successor's newer
-        // generation). RESTORE it no-replace — the moved record is
-        // re-created with the canonical final mode only while the path is
-        // still free; a CONCURRENT install is never replaced (Conflict) and
-        // the moved claim is discarded, never destroying the winner. Either
-        // way a successor's lock survives untouched.
-        let restored = durable_create_new(
-            &self.base,
-            guarded,
-            &content,
-            CreateNewOptions {
-                mode: IMMUTABLE_RECORD_MODE,
-                content: ContentEquivalence::Exact,
-                fault: None,
-            },
-        );
-        let _ = std::fs::remove_file(&tmp);
-        match restored {
-            // Created (restored), AlreadyPresent (a concurrent identical
-            // restore), or Conflict (a different winner is in place): the
-            // lock is intact — the compare failed, never a delete.
-            Ok(_) => Ok(RemoveIfVerdict::Mismatch),
-            // A transport failure on the no-replace restore propagates
-            // EXPLICITLY (the moved claim was the only thing lost; the slot
-            // is not blocked — the lease is the backstop).
-            Err(e) => Err(e),
-        }
-    }
-
     fn try_write_new_inner(
         &self,
         guarded: crate::atomic::GuardedRel<'_>,
@@ -3497,6 +3430,217 @@ impl LocalTransport {
                 fault: None,
             },
         )
+    }
+}
+
+/// WHICH compare-and-delete protocol one [`Remote::remove_file_if`] call runs —
+/// and, for the serialized arm, the sidecar scope it runs under.
+///
+/// The route is a VALUE chosen ONCE by the caller
+/// ([`LocalTransport::remove_file_if`]) from the mutation's OWNERSHIP and the
+/// thread's held bit, never an ambient thread-local read re-taken inside the
+/// worker: a serialized mutation says so by carrying its [`SidecarScope`], and
+/// a mutation with no serialization says so by being [`RemoveIfRoute::Claim`].
+pub(crate) enum RemoveIfRoute {
+    /// The sidecar critical section is held (acquired by this call, or already
+    /// held by this thread): the record stays CONTINUOUSLY VISIBLE, so a direct
+    /// read-compare-unlink is the protocol and a mismatch leaves the entry —
+    /// inode included — untouched.
+    Serialized(SidecarScope),
+    /// No serialization: the entry is CLAIMED by an atomic rename to a unique
+    /// sibling, verified, and then deleted or restored no-replace, so no other
+    /// breaker can interleave between the compare and the delete.
+    Claim,
+}
+
+impl RemoveIfRoute {
+    /// Run this route's compare-and-delete against `guarded` (the capability
+    /// proves the reserved-spelling guard ran on the name). The serialized
+    /// scope, when present, is held for the whole read-compare-unlink and
+    /// released when this call returns.
+    ///
+    /// This is a GUARDED mutation worker: reached only with a
+    /// [`crate::atomic::GuardedRel`] proof, it is the funnel's own `std::fs`
+    /// use, so the crate-root deny is relaxed for exactly this method while the
+    /// count pin watches the call counts change.
+    #[allow(clippy::disallowed_methods)]
+    fn remove_if(
+        self,
+        base: &Path,
+        guarded: crate::atomic::GuardedRel<'_>,
+        expected: &[u8],
+    ) -> Result<RemoveIfVerdict> {
+        let p = base.join(guarded.as_path());
+        match self {
+            // The bound `_scope` is DELIBERATE: a `_` pattern would drop the
+            // sidecar scope at match time and release the lock BEFORE the
+            // read-compare-unlink; the binding holds it to the end of the arm.
+            RemoveIfRoute::Serialized(_scope) => {
+                let cur = match std::fs::read(&p) {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(RemoveIfVerdict::Absent);
+                    }
+                    Err(e) => {
+                        return Err(Error::transport(format!("read {}: {e}", p.display())));
+                    }
+                };
+                if cur != expected {
+                    return Ok(RemoveIfVerdict::Mismatch);
+                }
+                match std::fs::remove_file(&p) {
+                    Ok(()) => Ok(RemoveIfVerdict::Removed),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(RemoveIfVerdict::Absent)
+                    }
+                    Err(e) => Err(Error::transport(format!("remove {}: {e}", p.display()))),
+                }
+            }
+            RemoveIfRoute::Claim => match Claimed::claim(&p)? {
+                None => Ok(RemoveIfVerdict::Absent),
+                Some(claimed) if claimed.content == expected => Ok(claimed.delete()),
+                Some(claimed) => claimed.restore(base, guarded),
+            },
+        }
+    }
+}
+
+/// The claim the CLAIM protocol takes on an entry: the original name has been
+/// atomically renamed to a unique sibling (`aside`) and the claimed inode's
+/// content read, so the entry is out of every other breaker's reach and the
+/// delete-or-restore decision is made against a private copy.
+///
+/// The aside is OWNED by this value: [`Drop`] discards it best-effort, so the
+/// delete path, the restore path, and the read-error path all clean up exactly
+/// once. The ONE deliberate exception is [`Claimed::restore`]'s destructive
+/// edge: the aside is still discarded there, and after a mismatch the moved
+/// claim was the record's only copy.
+pub(crate) struct Claimed {
+    /// The claimed sibling name, inside the destination's parent directory.
+    aside: PathBuf,
+    /// The claimed inode's content, read after the claim so the comparison is
+    /// made against the bytes that were actually removed from the namespace.
+    content: Vec<u8>,
+}
+
+impl Claimed {
+    /// Rename `original` to a unique sibling and read the claimed inode.
+    /// `Ok(None)` is the genuine absence: the rename found no entry because a
+    /// concurrent claimer (or a remover) won first. A read failure discards the
+    /// claim — there is nothing to restore it to — and propagates the read
+    /// error.
+    ///
+    /// This is the funnel's own `std::fs` use for a name the guard has already
+    /// cleared, so the crate-root deny is relaxed for exactly this method while
+    /// the count pin watches the call counts change.
+    #[allow(clippy::disallowed_methods)]
+    fn claim(original: &Path) -> Result<Option<Claimed>> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CLAIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // The atomic CLAIM target: a unique dot-prefixed name INSIDE the
+        // destination's parent directory (same filesystem, same directory
+        // namespace as the lock), exactly like durable_create_new's temps.
+        // The marker is defined by the temp-name authority ([`crate::atomic`]),
+        // so the claim temp and the classification of a claim temp as a TEMP
+        // (rather than a reserved held-aside) can never disagree.
+        let marker = crate::atomic::CLAIM_SUFFIX_MARKER;
+        let suffix = format!(
+            "{marker}{}.{}",
+            std::process::id(),
+            CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let aside = original.with_file_name(format!(
+            ".{}{}",
+            crate::atomic::bounded_temp_trunk(
+                &original
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                &suffix,
+            ),
+            suffix,
+        ));
+        // CLAIM: rename the entry to the aside — atomic, so only ONE contender
+        // can ever win the claim; every other breaker's rename fails with
+        // NotFound (the slot was already claimed or free).
+        match std::fs::rename(original, &aside) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::transport(format!(
+                    "claim {}: {e}",
+                    original.display()
+                )));
+            }
+        }
+        // VERIFY the claimed entry against the expectation. From here the
+        // aside is OWNED, so a failed read has nothing to restore and discards
+        // the claim through the single `Drop` before propagating.
+        let content = match std::fs::read(&aside) {
+            Ok(c) => c,
+            Err(e) => {
+                let error = Error::transport(format!("verify {}: {e}", aside.display()));
+                drop(Claimed {
+                    aside,
+                    content: Vec::new(),
+                });
+                return Err(error);
+            }
+        };
+        Ok(Some(Claimed { aside, content }))
+    }
+
+    /// MATCH: the claimed entry carried EXACTLY the expected bytes, so the slot
+    /// is free. The claimed inode is unlinked — best-effort, like every temp
+    /// cleanup — by the `Drop`; `Removed` is the verdict the caller acts on.
+    fn delete(self) -> RemoveIfVerdict {
+        RemoveIfVerdict::Removed
+    }
+
+    /// MISMATCH: the entry changed under the reader (a successor's newer
+    /// generation). RESTORE it no-replace — the moved record is re-created with
+    /// the canonical final mode only while the path is still free; a CONCURRENT
+    /// install is never replaced (Conflict) and the moved claim is discarded,
+    /// never destroying the winner. Either way a successor's lock survives
+    /// untouched.
+    ///
+    /// DELIBERATE DESTRUCTIVE EDGE: a transport FAILURE on the no-replace
+    /// restore propagates EXPLICITLY, and the moved claim — discarded by the
+    /// `Drop` on the way out — was the only copy of the record. The slot is not
+    /// blocked (the lease is the backstop).
+    fn restore(
+        self,
+        base: &Path,
+        guarded: crate::atomic::GuardedRel<'_>,
+    ) -> Result<RemoveIfVerdict> {
+        let restored = durable_create_new(
+            base,
+            guarded,
+            &self.content,
+            CreateNewOptions {
+                mode: IMMUTABLE_RECORD_MODE,
+                content: ContentEquivalence::Exact,
+                fault: None,
+            },
+        );
+        // Created (restored), AlreadyPresent (a concurrent identical restore),
+        // or Conflict (a different winner is in place): the lock is intact —
+        // the compare failed, never a delete. A failure propagates unchanged.
+        restored.map(|_| RemoveIfVerdict::Mismatch)
+    }
+}
+
+impl Drop for Claimed {
+    /// Best-effort unlink of the claimed aside: the ONE discard site, shared by
+    /// the delete path, the restore path (Created, AlreadyPresent, Conflict,
+    /// and the deliberate failed-restore edge), and the read-error path. A
+    /// failure is ignored exactly as the hand-written temp cleanups ignored it;
+    /// the claim temp is a recognized residue, so a crashed strand is
+    /// recoverable and can never be a lock record.
+    #[allow(clippy::disallowed_methods)]
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.aside);
     }
 }
 
@@ -5067,6 +5211,116 @@ mod tests {
         drop(holder);
     }
 
+    /// THE ROUTE IS A VALUE: an ordinary record removed while this thread HOLDS
+    /// the sidecar is SERIALIZED (a direct read-compare-unlink, so a mismatch
+    /// leaves the record's inode untouched), and the SAME call with no sidecar
+    /// held is CLAIMED (the atomic rename-claim, which restores the winner under
+    /// a NEW inode). Pre-fix the worker re-read the ambient depth itself; the
+    /// selection is now carried on `RemoveIfRoute`.
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_is_serialized_under_the_sidecar_and_claimed_outside_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let rel = RootedRelativePath::parse(Path::new("state/op.lock")).unwrap();
+        let record = base.join(rel.as_path());
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, b"current").unwrap();
+
+        // NO sidecar held: the Claim route moves the entry aside and restores
+        // the mismatched winner no-replace, so the bytes survive under a fresh
+        // inode.
+        let claimed_before = std::fs::metadata(&record).unwrap().ino();
+        assert_eq!(
+            t.remove_file_if(&rel, b"stale").unwrap(),
+            RemoveIfVerdict::Mismatch,
+            "a mismatched claimed compare is still a Mismatch"
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            b"current",
+            "the claim route restores the winner byte-for-byte"
+        );
+        let claimed_after = std::fs::metadata(&record).unwrap().ino();
+        assert_ne!(
+            claimed_after, claimed_before,
+            "the Claim route renames the entry aside and re-publishes the restore, so the inode \
+             changes (this is the route the ambient depth used to select)"
+        );
+
+        // WITH the sidecar held by THIS thread: the Serialized route
+        // read-compares and leaves the mismatched entry, inode included, alone.
+        let scope = acquire_sidecar(&base, &t.layout.lock_sidecar)
+            .expect("the sidecar acquisition must own the record here");
+        assert!(
+            matches!(&scope, SidecarScope::Owned(_)),
+            "the first acquisition on this thread must be Owned"
+        );
+        let serialized_before = std::fs::metadata(&record).unwrap().ino();
+        assert_eq!(
+            t.remove_file_if(&rel, b"stale").unwrap(),
+            RemoveIfVerdict::Mismatch,
+            "a mismatched serialized compare is still a Mismatch"
+        );
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().ino(),
+            serialized_before,
+            "the Serialized route must leave the mismatched record's inode untouched — pre-fix \
+             the ambient-depth selection was re-read inside the worker, not chosen once"
+        );
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            b"current",
+            "the serialized route never moves the record"
+        );
+        drop(scope);
+    }
+
+    /// A claim whose claimed inode cannot be read back has nothing to restore:
+    /// the claimed aside is DISCARDED through the single `Drop` and the READ
+    /// error propagates. The fixture puts a DANGLING SYMLINK at the record,
+    /// which the rename claim moves aside successfully (rename never follows)
+    /// while the read-back follows it and fails — so the claim really is taken
+    /// and the aside really must be discarded.
+    #[cfg(unix)]
+    #[test]
+    fn remove_file_if_discards_the_claim_aside_when_the_verify_read_fails() {
+        let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let base = dir.path().join("r");
+        let t =
+            LocalTransport::new(&SysEnv::from_process(), base.clone(), Layout::empty()).unwrap();
+        let rel = RootedRelativePath::parse(Path::new("state/op.lock")).unwrap();
+        let record = base.join(rel.as_path());
+        let parent = record.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::os::unix::fs::symlink(base.join("no-such-target"), &record).unwrap();
+
+        let err = t
+            .remove_file_if(&rel, b"whatever")
+            .expect_err("a claimed entry that cannot be read back must propagate the read error");
+        assert!(
+            format!("{err}").contains("verify"),
+            "the propagated error must be the verify-read failure, got: {err}"
+        );
+        let left: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "the claimed aside must be discarded by the single Drop after a failed verify read, \
+             but these entries remain: {left:?}"
+        );
+        assert!(
+            record.symlink_metadata().is_err(),
+            "the claim renamed the record aside, so the record name must be free after the error"
+        );
+    }
+
     /// The durability property's scenario dimension: the healthy install, a
     /// one-shot crash/failure at one of the SEVEN stages, and the
     /// pre-existing-winner retry cases (identical / different content /
@@ -6135,8 +6389,10 @@ mod tests {
         drop(holder);
     }
 
-    /// RE-ENTRANCY, per thread: a nested call on the SAME thread runs `f`
-    /// directly (the `flock` is not recursive, so re-locking would deadlock).
+    /// RE-ENTRANCY, per thread: a nested acquisition on the SAME thread runs
+    /// `f` directly (the `flock` is not recursive, so re-locking would
+    /// deadlock) and REPORTS [`SidecarScope::Nested`], so the critical section
+    /// is carried as a value instead of an ambient depth.
     #[test]
     fn operation_lock_sidecar_is_re_entrant_on_one_thread() {
         let (_dir, base, sidecar) = sidecar_fixture();
@@ -6152,12 +6408,51 @@ mod tests {
         assert!(inner_ran, "the nested critical section must run");
     }
 
-    /// RELEASE ON A PANIC UNWIND, and re-entrancy depth restored. A panicking
-    /// `f` (caught here) must leave the sidecar FREE and the thread's
-    /// re-entrancy depth back to zero: a later call on the SAME thread must
-    /// contend with a live holder instead of skipping the lock.
+    /// The SCOPE ITSELF answers ownership once: the first acquisition on a
+    /// thread is [`SidecarScope::Owned`], a nested one is
+    /// [`SidecarScope::Nested`], dropping the nested scope leaves the outer
+    /// hold (and the held bit) in place, and dropping the owned one releases
+    /// both.
     #[test]
-    fn operation_lock_sidecar_releases_and_resets_depth_after_a_panic() {
+    fn sidecar_scope_is_owned_then_nested_on_one_thread() {
+        let (_dir, base, sidecar) = sidecar_fixture();
+        let outer = acquire_sidecar(&base, &sidecar).expect("the first acquisition must succeed");
+        assert!(
+            matches!(&outer, SidecarScope::Owned(_)),
+            "the first acquisition on this thread must be Owned"
+        );
+        assert!(sidecar_held(), "the owned scope must raise the held bit");
+        let inner = acquire_sidecar(&base, &sidecar)
+            .expect("a nested acquisition must answer without re-locking");
+        assert!(
+            matches!(&inner, SidecarScope::Nested),
+            "a call made while this thread holds the sidecar must be Nested"
+        );
+        drop(inner);
+        assert!(
+            sidecar_held(),
+            "dropping the Nested scope must not release the outer hold"
+        );
+        drop(outer);
+        assert!(
+            !sidecar_held(),
+            "dropping the Owned scope must clear the thread's held bit"
+        );
+        assert!(
+            matches!(
+                &acquire_sidecar(&base, &sidecar).expect("a later acquisition must lock again"),
+                SidecarScope::Owned(_)
+            ),
+            "after both scopes drop, a fresh acquisition owns the record again"
+        );
+    }
+
+    /// RELEASE ON A PANIC UNWIND, and the held bit cleared. A panicking `f`
+    /// (caught here) must leave the sidecar FREE and the thread no longer
+    /// believing it holds it: a later call on the SAME thread must contend with
+    /// a live holder instead of skipping the lock.
+    #[test]
+    fn operation_lock_sidecar_releases_and_clears_the_held_bit_after_a_panic() {
         let (_dir, base, sidecar) = sidecar_fixture();
         with_operation_lock_sidecar(&base, &sidecar, || Ok(())).unwrap();
 
@@ -6167,10 +6462,14 @@ mod tests {
             });
         }));
         assert!(caught.is_err(), "the injected panic must unwind");
+        assert!(
+            !sidecar_held(),
+            "the panic unwind must clear the thread's held bit through the RAII release"
+        );
 
-        // A live holder now. If the panic had leaked the re-entrancy depth,
-        // the next call would see depth > 0 and run its closure WITHOUT
-        // locking; with the RAII release restored it contends and waits.
+        // A live holder now. If the panic had leaked the held bit, the next
+        // call would see it raised and run its closure WITHOUT locking; with
+        // the RAII release restored it contends and waits.
         let holder = hold_sidecar(&base, &sidecar);
         let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_for_waiter = std::sync::Arc::clone(&ran);
@@ -6185,7 +6484,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert!(
             !ran.load(std::sync::atomic::Ordering::SeqCst),
-            "the post-panic call must CONTEND (the depth was reset), not run unlocked"
+            "the post-panic call must CONTEND (the held bit was cleared), not run unlocked"
         );
         crate::lock::unlock(&holder);
         drop(holder);
