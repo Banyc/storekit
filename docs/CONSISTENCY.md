@@ -9,33 +9,34 @@ known it is recorded as a residual with its window named, not pursued.
 
 ## The axes
 
-| # | two things that must agree | what it has caught |
-|---|---|---|
-| A | a doc claim ↔ the code | a path-limit formula; a paragraph titled "the delta, measured" that was never measured; stale line citations; counts written from memory; a claim that a fix existed |
-| B | `foo` ↔ `foo_fd` (one spelling guarded, the other not) | the lock-record guard; the residue guard; a path guard re-derived at every `_fd` primitive |
-| C | local view ↔ wire view ↔ copy view | three accepted out-of-root escapes; a view prepared for one purpose (the diff) reused to decide another (what survives the run) |
-| D | a predicate's name ↔ the question it answers | `is_reserved_name` offered as a "may I use this name" oracle; a token whose check answered "same path spelling" while claiming "same destination" |
-| E | what `parse` accepts ↔ what every operation does with it | totality gaps; a manifest path the applier addressed with the host's path model |
-| F | a constant ↔ its derivation ↔ the resource's limit | `NAME_MAX` temp overflow; the `sun_path` reserve; path-limit parity between ports |
-| G | an error class ↔ the condition it reports | a legacy marker read as corruption; a removal-worded message on a create |
-| H | a test's name ↔ the failure it can express | tautological assertions; a count-based bound test blind to quadratic behaviour; a guard that cannot fail; a check whose derivation came from the value it certified |
-| I | an audit pin ↔ the actual count | the funnel `openat` count (moved deliberately, twice; the number is a reviewed constant that a change must update, which is what forces the review) |
-| J | the `unix` ↔ `windows` twin surface | a public function present on one platform only |
-| K | the revision you are READING ↔ the revision you BELIEVE you are reading | a surface count and a whole gate read from a checkout parented to the previous tip |
-| L | the platform you COMPILE ↔ the platform you claim | a call site inside `#[cfg(target_os = "linux")]` that a macOS gate never compiles; a lint that never compiles `#[cfg(windows)]` code, so the device was absent on that target |
-| M | the evidence cited for a change ↔ the population it covers | "our production never did" used to DELETE a name a consumer's interface declares |
+| # | two things that must agree |
+|---|---|
+| A | a doc claim ↔ the code |
+| B | `foo` ↔ `foo_fd` (one spelling guarded, the other not) |
+| C | local view ↔ wire view ↔ copy view |
+| D | a predicate's name ↔ the question it answers |
+| E | what `parse` accepts ↔ what every operation does with it |
+| F | a constant ↔ its derivation ↔ the resource's limit |
+| G | an error class ↔ the condition it reports |
+| H | a test's name ↔ the failure it can express |
+| I | an audit pin ↔ the actual count (a pinned number is a reviewed constant that a change must update) |
+| J | the `unix` ↔ `windows` twin surface |
+| K | the revision you are READING ↔ the revision you BELIEVE you are reading |
+| L | the platform you COMPILE ↔ the platform you claim |
+| M | the evidence cited for a change ↔ the population it covers |
 
 ## Rules this crate earned
 
-Each of these was learned by finding the opposite in the code. They are binding.
+They are binding.
 
 - **A claim is a measurement or it is a label.** A behavioural or countable claim
   either names the command, test or table that produced it, or says in the sentence
   that it is unmeasured. Cite items by NAME, never by line number. A bare count with
   no counting rule is a label.
 - **A guarantee belongs at ONE authority every path passes through.** A caller
-  supplies kinds, never a resolution function; one funnel, one mode authority, one
-  conversion from a wire path to a host path.
+  supplies kinds, never a resolution function; one funnel (`crate::atomic`), one
+  mode authority (`crate::platform::chmod`), one conversion from a wire path to a
+  host path (`crate::relpath::RootedRelativePath::from_manifest`).
 - **A fold is a DENIAL tool, never a PERMISSION tool.** Over-refusal is the safe
   direction. Where the result of a run would decide a safety property, refuse rather
   than model the plan: state the cost, with its number, instead of guessing.
@@ -61,15 +62,17 @@ Each of these was learned by finding the opposite in the code. They are binding.
 
 ## Stated residuals
 
-- **The contract is PROSE, and prose drifts from the code.** Every claim in this repository
-  — the README's contract, this file's axes, doc comments — is a sentence someone has to
-  keep true. Two devices reduce the drift: each rule has ONE authoritative home with the
-  restatements deleted, and the measured figures that no test here could reproduce were
-  DELETED rather than qualified. Neither device CHECKS a sentence against the code: the
-  compiler checks types and the gate checks tests, so keeping this file honest is a review
-  responsibility, and a claim narrowed in one place while a sibling copy keeps the old
-  wording is the defect class that responsibility covers.
-
+**The contract is PROSE, and prose drifts from the code.** Every claim in this repository
+— the README's contract, this file's axes, doc comments — is a sentence someone has to
+keep true. No test checks an arbitrary sentence against the code: prose AS PROSE is not
+machine-checked. The compiler checks types (the `compile_fail` doctests are the type-level
+claims being checked), the gate checks tests, and the FEW claims tests do pin are the
+derived lists and the counted figures. `pair_less_mutation_enumeration_is_the_derived_public_surface`
+derives the pair-less mutation list; `std_fs_name_mutation_counts_are_pinned` and
+`every_production_libc_reference_is_pinned` pin the audit's counted `std::fs` and `libc`
+figures. Keeping the rest true is a review responsibility, and a claim narrowed in one
+place while a sibling copy keeps the old wording is the defect class that responsibility
+covers.
 
 Named, scoped, not pursued:
 
@@ -79,12 +82,12 @@ Named, scoped, not pursued:
   numbers, third-party code). What the crate enforces is bounded: the symbols it
   funnels — including the `libc` symbols its wrappers call, which is what closes the
   cross-module alias route — are denied by the compiler in every module without the
-  allow, on each target that EXPORTS the symbol (the six `libc::…at` symbols the Unix
-  wrappers call do not resolve on Windows, so those entries are inert there; see the
-  resolution residual below); every production `libc` reference, in a funnel module or not,
-  is NAMED in the audit's pin, with the unpinned map asserted empty; and the funnel's
-  own call counts are pinned. The pin records a review, not a proof. Completeness of
-  the SYMBOL SET is a review responsibility.
+  allow, on each target that EXPORTS the symbol (the six denied `libc::…at` symbols the
+  Unix wrappers call do not resolve on Windows, so those entries are inert there; see
+  the resolution residual below); every production `libc` reference, in a funnel module
+  or not, is NAMED in the audit's pin, with the unpinned map asserted empty; and the
+  funnel's own call counts are pinned. The pin records a review, not a proof.
+  Completeness of the SYMBOL SET is a review responsibility.
 - **The far-side root of an `SshTransport` is unresolvable from here, on EITHER side.**
   `refuse_overlapping_roots` returns early when the REMOTE is not local — that is the
   condition, not "the destination is remote". So a `sync` whose two roots are not both
@@ -95,14 +98,14 @@ Named, scoped, not pursued:
   overlap, and nothing this host can see establishes otherwise.
   `a_far_side_source_overlap_is_not_refused_and_the_source_check_is_what_catches_it`
   measures the pull direction: no `RootsOverlap` is raised, the run WRITES INTO ITS
-  SOURCE, and the end-of-run source re-check is what fails it — after the writes. The caller that
-  co-locates them owns the check. Stated in `src/sync/apply.rs`'s module docs.
+  SOURCE, and the end-of-run source re-check is what fails it — after the writes. The
+  caller that co-locates them owns the check. Stated in `src/sync/apply.rs`'s module
+  docs.
 - **The count pins pin CALL COUNTS, not arguments.** An argument change at a call site
   inside a reviewed allow region moves no `std::fs` count, and the deny is allowed
   there. An argument that introduces a NEW counted symbol IS noticed, by the same token
   scan: adding `libc::O_CREAT` to a funnel's `custom_flags` adds a reference the pin
-  does not expect (no test ships for it — it is a property of the scan, not a case the
-  suite exercises). An argument that introduces none (a constant, a length, a bit
+  does not expect. An argument that introduces none (a constant, a length, a bit
   already spelled) is a review responsibility, and on Windows an added flag is
   invisible to that pin because the funnel's `custom_flags` sites spell `windows_sys`
   constants there.
@@ -120,9 +123,8 @@ Named, scoped, not pursued:
   function pointer moves no pinned count, and inside a funnel module the deny is allowed
   there, so nothing else refuses it either. A CANONICAL path spelled inside a
   `macro_rules!` body IS counted (a test pins that); an ALIASED or non-canonical
-  spelling there is not. That
-  shape is outside the pin's guarantee rather than a hole in a promise, and the
-  contract's clause (c) says so.
+  spelling there is not. That shape is outside the pin's guarantee rather than a hole
+  in a promise, and the contract's clause (c) says so.
 - **The `libc` pin is a TOKEN SCAN, not a call resolver.** Its miss-set is therefore not
   the std::fs pin's: inside a funnel module, a `c::openat(…)` reached through an
   existing `use libc as c;` is neither NAMED nor counted by the pin (the `use` was
@@ -142,7 +144,7 @@ Named, scoped, not pursued:
   with its own typed kind; the far-side holder's `perl` tests the directory with `-d`,
   which FOLLOWS a symlinked parent, and a symlinked record surfaces as a generic
   far-side script error. Mutual exclusion and the record-content rule still hold on
-  both arms; the difference is the typed refusal, and no document claims parity on it.
+  both arms; the difference is the typed refusal.
 - **`FileLock::acquire` checks the record's IMMEDIATE PARENT only.** It `lstat`s that
   parent's final component, so a symlink THERE is refused; a symlink in ANY HIGHER
   ancestor (grandparent and above) is still followed by its path-based helpers, and the
@@ -162,7 +164,7 @@ Named, scoped, not pursued:
   OTHER `libc` entry naming a symbol no code path references there is no witness at
   all: deleting it leaves the suite green. Those entries are kept as the reviewed
   record rather than pruned.
-- **The wire reader validates SHAPES, not cross-field consistency.** The reader now
+- **The wire reader validates SHAPES, not cross-field consistency.** The reader
   refuses an unknown kind, an invalid mode, a malformed path, and a malformed schema
   version, algorithm or tree digest — so a consumer reading `tree.json` with bare serde
   still gets those. It does NOT check `content_sha256`/`symlink_target` (the target's
