@@ -23,6 +23,11 @@ them.
   contents and symlink targets, byte for byte. Nothing is normalised or guessed.
 - **Callable without reading the source.** The rules live in the types, the
   errors and the tests, not in comments.
+- **Small, curated trees.** The unit is a state or artifact directory — a config
+  set, a ledger, a build output — not a whole language-ecosystem workspace.
+- **Cooperating writers.** Concurrent runs on one destination serialise on the
+  destination's operation lock; a write made outside it is detected over the
+  paths the run reads.
 - **Linux and macOS.** Windows is compiled and type-checked, but unverified: the
   Windows replace is not atomic, and its path handling follows symlinks.
 
@@ -41,6 +46,14 @@ them.
   arbitrary commands.
 - **An application's model.** Deployment slots, retention policy and the rest of
   a consumer's domain stay in that consumer.
+- **Whole-project snapshots.** A tree containing a Python venv, `node_modules`
+  or a pnpm store is refused: absolute symlinks and hard links are outside the
+  model. Sync the state or artifact subtree, or normalize the tree first.
+- **Per-step incrementality.** Every run scans and hashes the whole synced tree;
+  there is no dirty tracking and no exclusion input. Checkpoint per meaningful
+  state change, not per agent turn.
+- **Cross-entry transactions.** A run applies entry by entry, so a crash mid-run
+  can leave a partial destination; all-or-nothing apply belongs to the consumer.
 
 ## Design rules
 

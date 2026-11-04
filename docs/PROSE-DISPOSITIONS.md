@@ -293,3 +293,4 @@ Overruled finding (naming nit): "the ONE entry point" names the public `try_writ
 | MIGRATION.md | 14 headings | dissolved into 3 sections with bold lead-ins; every module-map row, conflict decision, change id and test name kept | `deploy`, `ckpt`, change ids `vylurynk`/`rkqqztok`, commit `47e0e092` |
 | EXTRACTION.md | whole document | rewritten in plain prose; 8 adaptations and the slice table kept | slice table sources |
 | src/sync/apply.rs | `AppendTail` doc | corrected: dangling README citation removed | `EntryPolicy::AppendTail` |
+| README.md | Goals / Non-goals | corrected for the agentic-workspace envelope: added small curated trees, cooperating writers; added whole-project snapshot, per-step incrementality and cross-entry transaction non-goals | `sync`, `Extraneous`, `EntryPolicy`, `DestinationOwnership`, manifest scope |
