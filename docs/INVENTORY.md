@@ -57,8 +57,9 @@ representation and no second filter.
   (rule 2); the sibling record is outside the root and cannot be named.
 - The run's overlap refusal is unaffected: exclusions do not make a nested source and
   destination disjoint.
-- `copy_tree_verbatim` is not a substitute for an exclusion: it turns hard links into
-  independent files but reproduces absolute symlink targets verbatim.
+- `copy_tree_verbatim` is not a substitute for an exclusion: on Unix it REFUSES a
+  hard link (`CopyHardLink`), reproduces absolute symlink targets verbatim, and refuses
+  special files. It cannot turn a source the strict walk refuses into one it accepts.
 
 **Acceptance.**
 
@@ -75,33 +76,44 @@ representation and no second filter.
 
 ## tolerant-staging-docs
 
-**Goal.** State the recipe for a source the strict walk refuses: stage a verbatim copy
-and sync the staged tree. The docs must say exactly what that copy fixes and what it
-does not.
+**Goal.** State the real boundary. The strict source walk refuses a hard link (Unix),
+an absolute or escaping symlink, and a special file. The crate's own copy cannot
+normalize any of them: `copy_tree_verbatim` refuses a hard link on Unix (the Windows
+port duplicates it), reproduces an absolute symlink target verbatim, and refuses FIFOs,
+sockets and devices. So a hard-link or symlink-heavy source must either be normalized
+OUTSIDE the crate into a staging root before it is synced, or kept out of the synced
+root by `sync-exclusions`.
 
 **Carrier.** `src/sync/mod.rs` module docs, the `copy_tree_verbatim` docs in
 `src/atomic`, and the README's "What is carried" and non-goals (which say "normalize
-first" without naming the tool or its limit).
+first" without naming the tool, the limit, or the alternative).
 
 **Content.**
 
-- Hard links: `copy_tree_verbatim` copies each name's content separately, so the staged
-  tree has no hard links and the strict walk accepts it.
-- Absolute and escaping symlink targets: the copy reproduces them verbatim, so the
-  staged tree is still refused. Rewrite the targets, or replace the link with its
-  target's content, before syncing.
-- Non-regular entries: the copy refuses FIFOs, sockets and devices, so remove them
-  first.
-- The staged destination is an ordinary directory, not a store root; never hand it to
-  the recovery sweep.
+- Name what the strict walk refuses: a hard link on Unix, an absolute or escaping
+  symlink, a FIFO/socket/device.
+- `copy_tree_verbatim` is NOT a normalizer: it refuses a hard link on Unix with
+  `StoreKind::CopyHardLink`, reproduces an absolute or escaping symlink target
+  verbatim, and refuses special files. A tree it copies is still refused by the strict
+  walk when it contains either link form.
+- The external quiet copy: materialise symlink targets and split hard links before the
+  sync, for example `rsync -a --copy-links` WITHOUT `-H` (GNU tar's
+  `--dereference --hard-dereference` is the equivalent). Either changes the tree (a link
+  becomes a copy), so the choice is the caller's.
+- `sync-exclusions` is the in-crate alternative for known-heavy subtrees (`.git`,
+  `node_modules`, a venv): they never enter the walk at all.
+- The staged tree is an ordinary directory, not a store root; never hand it to the
+  recovery sweep.
 
-**Watch.** The docs must not claim the copy normalizes symlinks. A reader following them
-with a venv must hit the rewrite step, not a second unexplained failure.
+**Watch.** Do not claim that any crate primitive normalizes symlinks or hard links, and
+  do not present `copy_tree_verbatim` as the staging step. A reader following the docs
+  with a venv must reach the external normalization step, not a second unexplained
+  refusal.
 
 **Acceptance.**
 
-- An integration test: a source with a hard link refuses `sync`; after
-  `copy_tree_verbatim` into a staging root, the same sync succeeds.
-- A second test: a source with an absolute symlink is still refused after the verbatim
-  copy, which is the documented limit.
-- Both tests are cited by name from the docs they back.
+- A test pins `copy_tree_verbatim` refusing a hard-linked source with
+  `StoreKind::CopyHardLink` on Unix (the Windows claim is the documented duplication).
+- A test pins an absolute symlink surviving `copy_tree_verbatim` and still being
+  refused by `sync`, which is the documented limit.
+- The docs name the external normalization step and cite both tests by name.
