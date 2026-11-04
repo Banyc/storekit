@@ -246,3 +246,11 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/atomic/unix.rs | overlap/copy identity (`refuse_overlapping_copy`, `copy_dir_recursive_fd`) | kept-corrected | `open_destination_anchor` (`openat`), `fd_entry_identity` (`st_dev`,`st_ino`), `dir_chain_contains`; no reliance on `realpath` case behaviour |
 | src/atomic/unix.rs | heap cost (`dir_entry_names`), removal walks, reads | kept-corrected | open-frame name lists, `remove_dir_contents_fd` |
 | src/atomic/unix.rs | test docs (fault stages) + inline comments | kept-corrected | the fault point's actual position in `replace_core` |
+
+## Slice 12 — `src/transport/runner/**`, `src/transport/ssh/runner/**` (change `wooyxnsm`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| runner/mod.rs | module docs: bounded lifecycle, reap per platform (`try_wait` Windows; `waitid(WNOWAIT)` + `Child::wait` Unix; drop backstop), `RunError::Background` (in-group leftover with group termination; pipe-holder with none), `Termination`/`Escalating`/`KillFailure`, `ChildLifecycle`, `DrainState` | kept-corrected | `child_exited_unreaped`, `OwnedChild::{wait,try_wait,live_child}`, `Termination::{termed,group_killed,child_killed}`, `drain_to_eof` |
+| runner/unix.rs, runner/windows.rs | per-arm claims (group enumeration/termination, reader threads, bounded vs unbounded drain, `proc_listpgrppids`) | kept-corrected | each arm's code; `proc_listpgrppids` extern |
+| ssh/runner/mod.rs, unix.rs, windows.rs | `WaitStatus`/`WaitStatusCell`/`WaitResult`, SSH timeout/drain accounting (Unix 4.2 s; Windows unbounded), `SpawnedChild::kill` (group TERM→KILL; owned kill fallback), test docs | kept-corrected | seam closures, `TERM_TO_KILL_GRACE`, `KILL_REAP_BOUND`, `recv`/`recv_bounded` |
