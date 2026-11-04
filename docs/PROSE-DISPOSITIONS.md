@@ -217,3 +217,21 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/transport/mod.rs | create-new seven-stage/verification/sidecar claims | kept-corrected | `CreateNewTemp`, `Publish`, `OpenedExisting`, `SidecarScope`, `SIDECAR_HELD`, `durable_create_new` |
 | src/transport/mod.rs | copy-tree walk/finalize; record modes; stated residuals | kept-corrected | `copy_tree_walk`, `PendingFinalModes`, `IMMUTABLE_RECORD_MODE`, lock-record `0o600` |
 | src/transport/mod.rs | item docs and inline comments | kept-corrected | each item's body |
+
+## Slice 9 — `src/atomic/{mod,windows,dirchain}.rs` (change `qlntrnmk`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/atomic/mod.rs | module docs: atomic surface, temp/replace/CAS, guard/`GuardedRel` (three minters; primitives run the gate too) | kept-corrected | `GuardedRel::{new,new_for_owned_lock_record,new_for_residue}`, `guard::refuse_reserved_mutation` call sites |
+| src/atomic/windows.rs | module docs, `rel_join` (boundary refuses; join only joins), copy/compare claims | kept-corrected | `rel_join`, `RootedRelativePath`, `write_atomic_if_match_fd` |
+| src/atomic/dirchain.rs | chain sealing (`CreatedProof`, `ChainCommit`, `Sealed`) and commit order | kept-corrected | `DirChain`, `CreatedChain`, `ChainCommit`, both ports |
+
+## Slice 10 — `src/{lib,root,relpath,reserved,error,id,platform,casefold,digest,env,trace,test_support}.rs` + `src/lock/mod.rs` (change `nklzlmtr`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/lib.rs | module map + constitution | kept-corrected | module list, `#![deny(clippy::disallowed_methods)]` |
+| src/lock/mod.rs | record format, modes, adoption, symlink guards, fsync claims | kept-corrected | `RECORD_HEADER`, `FileLock::acquire`, `0o600` chmod, `PreflightKind` |
+| src/reserved.rs | reserved predicates; containment fold order (NFD → case_fold → NFC → strip) | kept-corrected | `is_reserved_*`, `is_unaddressable_*`, `manifest::fold_component` |
+| src/error.rs, src/id.rs, src/relpath.rs, src/root.rs | typed kinds, id rules, path boundary, owned-root registry | kept-corrected | `*_kind` constructors, `valid_name`, `RootedRelativePath`, `OwnedRoot` |
+| src/platform.rs, src/casefold.rs, src/digest.rs, src/env.rs, src/trace.rs, src/test_support.rs | port helpers, fold provenance, digest, env snapshot, tracer, test support | kept-corrected | `chmod`/`file_mode`, `case_fold`, `sha256_bytes`, `SysEnv`, `Tracer`, fixtures |
