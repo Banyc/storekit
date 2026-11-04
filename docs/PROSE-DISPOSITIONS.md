@@ -62,3 +62,43 @@ derived from, so a later reader can re-check it.
 | docs/HIDDEN-STATE-MACHINES.md | Child-process orchestration | kept-corrected | `fifo_regression`, `deep_tree_regression`, `ChildOutcome`, `RLIMIT_NOFILE` |
 | deferred | src/sync/apply.rs | `prepare` doc | pending: "so a refusal leaves no residue" is false on the SSH path | `prepare`, `prepare_identity` |
 | deferred | src/sync/apply.rs | `lock_with_in_root_lock` doc | pending: the parent dir is refused as a `ResidueBelow` conflict, not "reported as residue" | `delete_verdict`, `ConflictReason::ResidueBelow` |
+
+## Slice 3 — `README.md`, `EXTRACTION.md`, `MIGRATION.md` (change `nlzqzopu`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| README.md | Title + intro | kept | `src/lib.rs` |
+| README.md | The constitution (rules 1–9) | kept | `error.rs`, `lib.rs` deny, `DestinationOwnership`, `Extraneous`, `FileLock`, `fold_component`, `casefold::case_fold`, `reserved::is_unaddressable_name`, `id::valid_name`, `canonicalize_tree_with`, `TreeEntry`, `MaterializationKind`, `verify*`, `GuardedRel`, `Sanction`, `begin_mutation`/`commit_mutation`, `ReplaceOutcome` |
+| README.md | Refused, by rule | kept | `reserved::{is_unaddressable_*,is_reserved_*,is_residue_path,is_lock_record_name}`, `id::valid_name`, `sync::diff::strip_reserved`, `canonicalize_tree`, `roots_overlap`, `refuse_overlapping_copy` |
+| README.md | Fidelity scope | kept | `manifest` fidelity docs, `TreeEntry`, `#[cfg(unix)]` nlink |
+| README.md | This is not a backup or checkpoint format | kept | `check_relative_symlink_target_two_views`, `ContainmentViews`, `write_atomic_replace_fd` |
+| README.md | Durability and atomicity | kept | `write_atomic_replace_fd`, `ReplaceOutcome`, `EntryPolicy::AppendTail`, `Remote::{write,fsync_tree,fsync_parent}` |
+| README.md | What a snapshot costs | corrected (probe linear / work quadratic / fresh destination cubic) | `sync` cost docs, `install_file`, `canonicalize_tree`, `upload_deadline` |
+| README.md | Destination provisioning | kept | `provision_layout`, `Layout` |
+| README.md | Platform | corrected ("both are exercised" scoped to one userland per run) | `ssh_farside_portability`, `remote_lock`, `COMPONENT_CONFINED` |
+| README.md | Assumptions the logic rests on | kept | manifest path-limit docs, `deep_tree_regression`, `dirchain`, `lock` fsync docs, `casefold` |
+| README.md | Design conflicts (a) sibling vs in-root lock | corrected (residue is spelling-scoped) | `DestinationOwnership`, `destination_lock_path`, `is_residue_path`, `SyncReport::residue` |
+| README.md | Design conflicts (b) remote ownership | kept | `lock_remote`, `Remote::lock_far_side`, `RECORD_HEADER`, `Error::LockContended`, `Prepared` |
+| README.md | Design conflicts (c) fd-confined helpers | kept | `copy_dir_recursive_fd`, `copy_tree_verbatim`, `fsync_tree_recursive_fd`, `with_operation_lock_sidecar` |
+| README.md | The contract (Enforced/Guaranteed/NOT promised) | kept (87-entry count re-measured) | `clippy.toml`, `every_production_libc_reference_is_pinned`, windows clippy |
+| README.md | The contract — operative funnel definition | kept | `rg allow(clippy::disallowed_methods)` (61), `atomic` module allow |
+| README.md | The gate | kept (counts re-measured) | `test_support::{slow_tests_enabled,proptest_cases}`, the four widened tests, `remote_lock` |
+| README.md | Rules for changing this crate | kept | `tests/consumer_fit.rs`, `docs/CONSISTENCY.md` |
+| EXTRACTION.md | Header + intro | not-a-claim (historical record) | — |
+| EXTRACTION.md | Adaptations 1, 3–7 | kept | `error.rs`, `test_support`, `src` module list |
+| EXTRACTION.md | Adaptations 2 (Visibility) | corrected (stale `ckpt` dependency sentence deleted) | `tests/consumer_fit.rs`, `relpath::from_validated` |
+| EXTRACTION.md | Adaptations 8 (Windows) | corrected ("no Windows host has executed it" deleted as unverifiable) | `cargo check --target x86_64-pc-windows-msvc`, `#[cfg(unix)]` gates |
+| EXTRACTION.md | Slices table + closing serde note | kept | `id_newtype!`, `atomic`, `OwnedRoot`, `FileLock`, `Remote`, `manifest`, `sync`, `__serde` |
+| MIGRATION.md | Intro + Status | not-a-claim (declared record) | — |
+| MIGRATION.md | What the migration is not | kept | nlink cfg split, manifest fidelity scope |
+| MIGRATION.md | Order | not-a-claim | — |
+| MIGRATION.md | Module map | corrected | `sync_parent_dir`, `ensure_private_dir_durable`, `write_atomic_replace`, `EndpointKey`, `from_validated`, `LocalTransport::new`, `canonicalize_tree_destination`, `copy_tree_verbatim`, `with_operation_lock_sidecar`, `SIDECAR_*` |
+| MIGRATION.md | Ownership (a) and (b) | kept | `lock`, `lock_with_in_root_lock`, `is_residue_path`, `lock_remote`, `lock_far_side`, `RECORD_HEADER`, `LockContended`, `Unowned` |
+| MIGRATION.md | The lock record is self-describing | kept | `FileLock::acquire`, `RECORD_HEADER`, `LockRecordNotRecognized`, `perl_hold_lock`, `far_side_lock_refusal`, `remote_lock` test |
+| MIGRATION.md | The one real data migration | kept | `RECEIVER_ID_LEN`, `ReceiverId::parse`, `MarkerState`, `TransportKind::ReceiverIdMarker*` |
+| MIGRATION.md | The `manifest`/`canonical` split | kept | `canonicalize_remote_entries_checked`, `require_parent_closed`, `validate_entry_path`, wire assembler |
+| MIGRATION.md | How each step was validated / Riskiest step | not-a-claim | — |
+| MIGRATION.md | Out of scope | corrected ("never executed" → the crate's stated unverified status) | windows gate command |
+| MIGRATION.md | `ckpt` intro | not-a-claim | — |
+| MIGRATION.md | `ckpt` adopts table | corrected (hard-link sentence scoped to the adopted primitives) | `atomic::{path_kind_fd,read_fd,write_atomic_cas_fd,...}`, `ensure_private_dir_durable_fd`, `RootedRelativePath` |
+| MIGRATION.md | `ckpt` does not adopt / Validation | kept / not-a-claim | `EntryPolicy::AppendTail`, `id_newtype!`, `LockFileEx`/`flock` |
