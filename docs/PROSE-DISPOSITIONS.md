@@ -208,3 +208,12 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/manifest/mod.rs | containment / relative-target rule (the "complete list" framing deleted; shapes described, not enumerated) | kept-corrected | `walk_relative_symlink_target`, `SymlinkTargetRefusal`, `ContainmentViews::refuses`, `SymlinkContainmentIndex` |
 | src/manifest/mod.rs | `EntryAssembler`, `UnsupportedSink`, `CompleteListing`, `ShownPath`, post-pass | kept-corrected | `finish`, `require_parent_closed`, `CompleteListing::new` |
 | src/manifest/mod.rs | item docs + inline comments (canonicalize_tree_with, wire assembler, scripts) | kept-corrected | each item's body |
+
+## Slice 8 — `src/transport/mod.rs` (change `ztzrqwvx`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/transport/mod.rs | `Remote` trait contract and every default (`provision_layout`, `fsync_tree`/`fsync_parent`, `remove_file_if`, `exists`/`metadata_opt`, `lock_far_side`, `exec`, `copy_tree`, `write_new`) | kept-corrected | default bodies, `LocalTransport`/`SshTransport` overrides, `RemoveIfRoute`, `sidecar_held`, `is_owned_lock_record` |
+| src/transport/mod.rs | create-new seven-stage/verification/sidecar claims | kept-corrected | `CreateNewTemp`, `Publish`, `OpenedExisting`, `SidecarScope`, `SIDECAR_HELD`, `durable_create_new` |
+| src/transport/mod.rs | copy-tree walk/finalize; record modes; stated residuals | kept-corrected | `copy_tree_walk`, `PendingFinalModes`, `IMMUTABLE_RECORD_MODE`, lock-record `0o600` |
+| src/transport/mod.rs | item docs and inline comments | kept-corrected | each item's body |
