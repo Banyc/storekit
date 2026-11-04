@@ -1,11 +1,13 @@
 //! The SEALED filesystem-ownership root ([`OwnedRoot`]): the canonical,
 //! non-root, non-symlink directory a store owns, registered per resolved
-//! endpoint so two owners can never overlap.
+//! endpoint so two SIMULTANEOUS owners in one process cannot overlap.
 //!
-//! Filesystem ownership is LEXICAL today: two stores (or two deployment
-//! roots) can be created on the same directory, or on ancestor/descendant
-//! directories of each other, and nothing rejects it — two owners over
-//! overlapping state. The [`OwnedRoot`] closes that class:
+//! Filesystem ownership is LEXICAL: nothing in the provisioning path relates
+//! one root to another, so two stores (or two store roots) can be created on
+//! the same directory, or on ancestor/descendant directories of each other —
+//! two owners over overlapping state (the sync's source/destination check is a
+//! separate rule relating one run's two roots, not two owners). The
+//! [`OwnedRoot`] closes that class:
 //!
 //! * **Sealed** — the fields are private and there is NO unchecked
 //!   constructor; the ONLY construction path is [`OwnedRoot::parse`], which
@@ -16,17 +18,17 @@
 //!   with EQUAL canonical roots, or with one an ANCESTOR/DESCENDANT of the
 //!   other, are refused at construction — before any filesystem mutation.
 //!   The refusal happens against the process-global ownership registry, and
-//!   the registration is released when the owning [`OwnedRoot`] (and the
-//!   store holding it) is dropped: two SIMULTANEOUS owners over overlapping
+//!   the registration is released when the LAST clone of the owning
+//!   [`OwnedRoot`] is dropped: two SIMULTANEOUS owners over overlapping
 //!   state are refused, while a released root can be re-owned.
 //!
-//! The store's mutations are additionally descriptor-relative ON UNIX (see
-//! [`crate::atomic`]'s `_fd` primitives): every mutation resolves paths
-//! component-wise relative to the owned root's open directory descriptor with
-//! `openat(O_NOFOLLOW)`, so a symlink injected into a path component can never
-//! redirect a mutation outside the owned root. The Windows port is path-based
-//! (`crate::atomic::COMPONENT_CONFINED` is `false` there), so this confinement
-//! is the UNIX arm's.
+//! The store's descriptor-relative mutating primitives are additionally
+//! confined ON UNIX (see [`crate::atomic`]'s `_fd` primitives): they resolve
+//! paths component-wise relative to the owned root's open directory descriptor
+//! with `openat(O_NOFOLLOW)`, so a symlink injected into a path component can
+//! never redirect one of those mutations outside the owned root. The Windows
+//! port is path-based (`crate::atomic::COMPONENT_CONFINED` is `false` there),
+//! so this confinement is the UNIX arm's.
 
 use crate::error::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,12 +37,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The physical host identity of a filesystem-ownership endpoint: a single
-/// filesystem-safe ASCII token — non-empty, no path separators, no
-/// whitespace or control characters — or the constant `local` marker for a
-/// pathless local connection. This is the minimal domain-free stand-in for
-/// the source application's `crate::identity::EndpointKey` (see
-/// `EXTRACTION.md` slice-root): the ownership registry only needs a value
-/// that identifies the endpoint.
+/// token — non-empty, no path separators, no whitespace or control
+/// characters — or the constant `local` marker for a pathless local
+/// connection. The ownership registry only needs a value that identifies the
+/// endpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EndpointKey(String);
 
@@ -75,8 +75,8 @@ impl fmt::Display for EndpointKey {
 }
 
 /// The constant endpoint marker of the pathless LOCAL connection kind: a
-/// local server has no SSH address, so its physical host identity is the
-/// local marker itself and the deploy_dir is the sole physical root.
+/// local connection has no SSH address, so its physical host identity is the
+/// local marker itself.
 pub const LOCAL_ENDPOINT_MARKER: &str = "local";
 
 /// THE overlap rule: whether two CANONICAL directories are EQUAL or one is an
@@ -86,9 +86,7 @@ pub const LOCAL_ENDPOINT_MARKER: &str = "local";
 /// writing a second comparison, so the two can never drift apart. The
 /// comparison is component-wise ([`Path::starts_with`]), so `a/bc` is not
 /// treated as a descendant of `a/b` — and because `starts_with` is true when the
-/// paths are EQUAL, one comparison covers equality, ancestry and descent: the
-/// equal term that used to stand here was a subset of this one and could not
-/// change the result.
+/// paths are EQUAL, one comparison covers equality, ancestry and descent.
 pub(crate) fn roots_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
@@ -110,9 +108,8 @@ static OWNED_ROOTS: Mutex<BTreeMap<EndpointKey, BTreeSet<PathBuf>>> = Mutex::new
 /// root that equals — or is an ancestor or descendant of — an already-owned
 /// root on the same endpoint. The registration is REFCOUNTED: clones share
 /// one registration token, and the registration is released when the LAST
-/// clone is dropped (a root can be shared — e.g. every provisioned slot of
-/// a validated project is bound to the project's store root — without
-/// releasing the ownership while any clone is alive).
+/// clone is dropped, so a root can be shared without releasing the ownership
+/// while any clone is alive.
 #[derive(Clone, Debug)]
 pub struct OwnedRoot {
     /// The REFCOUNTED registration: the ONE owner of this root's
@@ -157,7 +154,8 @@ impl OwnedRoot {
     /// not be a symlink; and the canonical root must not equal — nor be an
     /// ancestor or descendant of — any already-owned root on the same
     /// endpoint. The refusal happens HERE, before any filesystem mutation
-    /// (this constructor only reads and updates the in-memory registry).
+    /// (this constructor performs no filesystem mutation: it stats,
+    /// canonicalizes, and updates the in-memory registry).
     pub fn parse(endpoint: &EndpointKey, path: &Path) -> Result<OwnedRoot> {
         // The root must be a REAL directory, not a symlink: the final
         // component of the given path must not be a symlink (a symlink
@@ -273,8 +271,8 @@ mod tests {
     // candidate must be refused at construction, and the refusal must
     // happen BEFORE creating or deleting anything (the directory tree is
     // byte-for-byte unchanged after each failed construction). Bounded
-    // `proptest_cases(16)` (full 16 with `STOREKIT_FULL_TESTS=1`, fast
-    // default), fixed seed 0x5EED_5EED (house style), no persistence.
+    // `proptest_cases(16)` (16 with `STOREKIT_FULL_TESTS=1`, 4 by default),
+    // fixed seed 0x5EED_5EED (house style), no persistence.
     // -------------------------------------------------------------------
     proptest! {
         #![proptest_config(ProptestConfig {

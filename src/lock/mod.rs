@@ -1,4 +1,4 @@
-//! Advisory locking for push transactions.
+//! Advisory locking for a store's operation records.
 //!
 //! `FileLock` is an advisory lock held by an open file descriptor — `flock`
 //! on Unix, `LockFileEx` on Windows (the platform split lives in the
@@ -6,18 +6,16 @@
 //! boundary).
 //! While the guard is alive the kernel prevents any other process from
 //! acquiring the same lock, and the lock is released automatically if the
-//! owning process dies — so a stale lock from a crashed controller can never
+//! owning process dies — so a stale lock from a dead owner can never
 //! be double-owned, and two live contenders can never both win the
-//! acquisition. Locks are taken in a fixed local-then-target order — the
-//! application-store `operation.lock` first, then the target lock — so every
-//! caller pipeline that touches both, a push or a checkpoint pass alike, runs
-//! under the same lock discipline.
+//! acquisition. The record is held for the guard's lifetime, and every
+//! acquirer of the same path contends on it.
 //!
-//! [`crate::sync`] is deliberately OUTSIDE that discipline: it locks the
+//! [`crate::sync`] is deliberately OUTSIDE that in-root record: it locks the
 //! SIBLING record `<parent>/.<name>.operation.lock`
-//! ([`crate::sync::destination_lock_path`]), not this in-root `operation.lock`,
-//! so a `sync` and a push/checkpoint pass do NOT exclude each other in either
-//! direction.
+//! ([`crate::sync::destination_lock_path`]), not the destination's in-root
+//! `operation.lock`, so a `sync` and a holder of the in-root record do NOT
+//! exclude each other in either direction.
 //!
 //! The in-root record's own spelling, `operation.lock`, is the crate's
 //! APPLICATION lock record name ([`crate::reserved::APPLICATION_LOCK_NAME`])
@@ -50,7 +48,7 @@
 //! rule refuses the record spelling ([`crate::reserved::is_unaddressable_name`]),
 //! the sync's manifest-path model refuses it at every component
 //! ([`crate::reserved::is_unaddressable_path`]), so a whole-store sync can
-//! neither transfer it nor destroy it, and every mutating primitive —
+//! neither transfer it nor destroy it, and the mutating primitives —
 //! [`crate::atomic::remove_file_fd`], [`crate::atomic::remove_dir_all_fd`]
 //! (including each entry its walk unlinks), [`crate::atomic::write_atomic_replace_fd`],
 //! [`crate::atomic::write_atomic_if_match_fd`], [`crate::atomic::write_atomic_cas_fd`],
@@ -114,18 +112,17 @@ pub(crate) enum LockAttempt {
 /// An advisory (flock) lock held by an open file descriptor. While the guard
 /// is alive the kernel prevents any other process from acquiring the same lock,
 /// and the lock is released automatically if the owning process dies. This
-/// makes the stale-lock double-ownership race impossible: a dead controller's
+/// makes the stale-lock double-ownership race impossible: a dead owner's
 /// lock is released by the kernel rather than lingering, and two live
 /// contenders can never both win the acquisition.
 ///
 /// The lock file is created once on the first acquisition and is NEVER
 /// removed by a release or drop (the STABLE-INODE discipline above): every
-/// acquisition flocks the same inode, so the old delete-on-release design's
-/// unlock→unlink inode-split window cannot exist.
+/// acquisition flocks the same inode, so an unlock→unlink inode-split window
+/// cannot exist.
 ///
-/// Public so a caller's checkpoint pass runs under the SAME lock discipline as
-/// its pushes: the application-store lock then the target lock, in the one
-/// fixed order.
+/// Public so a caller can hold the same advisory lock around its own
+/// multi-step operation on the same record.
 pub struct FileLock {
     file: std::fs::File,
 }
@@ -135,8 +132,8 @@ impl FileLock {
     /// FIRST acquisition only — after that the persistent inode is reused),
     /// then `flock LOCK_EX|LOCK_NB`. The parent directory is durably created
     /// by [`crate::atomic::ensure_private_dir_durable`] before the lock
-    /// is taken (see the durable-first-append machinery the lock path must
-    /// never bypass).
+    /// is taken, so a lock acquisition never performs a plain unsynced
+    /// mkdir.
     ///
     /// The file is OPENED with `create(true).truncate(false)`: when it already
     /// exists (always, after the first acquisition of this path) the SAME
@@ -160,22 +157,23 @@ impl FileLock {
     ///   ordinary content is left byte-for-byte and mode-for-mode untouched.
     ///   `acquire` never truncates an entry it did not write.
     ///
-    /// The persistent file does not disturb the durable-first-append
+    /// The persistent file does not disturb the durable-directory
     /// machinery: directory creation is detected by the directory-entry
     /// fsyncs in [`crate::atomic::ensure_private_dir_durable`] (which
     /// reports what it CREATED), never by files inside the directory, so a
-    /// surviving `operation.lock` changes nothing for a first append.
+    /// surviving `operation.lock` changes nothing for a durable directory
+    /// creation.
     ///
     /// The record is PRIVATE (`0o600`), like the store's other records (the
-    /// index is `0o600` and the directories `0o700`): the mode is requested at
-    /// creation AND re-applied on every acquisition, so a record an earlier
-    /// version created with the umask-derived `0644`/`0664` is tightened on the
-    /// next acquisition (the chmod is idempotent and never changes the inode).
-    /// On Windows there are no Unix mode bits and the chmod is a no-op.
+    /// directories are `0o700`): the mode is requested at
+    /// creation AND re-applied on every acquisition, so a record created with
+    /// a wider umask-derived mode is tightened on the next acquisition (the
+    /// chmod is idempotent and never changes the inode).
+    /// On Windows there are no Unix mode bits, so no chmod runs.
     ///
     /// Contention is reported as the typed
-    /// [`crate::error::Error::LockContended`] (see [`Self::acquire`]'s
-    /// module-level note); a real open/flock failure stays
+    /// [`crate::error::Error::LockContended`] (see the module-level contention
+    /// section); a real open/flock failure stays
     /// [`crate::error::Error::Preflight`]. The lock is NON-BLOCKING, so a
     /// caller that wants to wait must retry on the contention variant.
     pub fn acquire(path: &Path, op_id: &str) -> Result<Self> {
@@ -183,15 +181,11 @@ impl FileLock {
         // created with EVERY newly created directory entry fsynced (see
         // [`crate::atomic::ensure_private_dir_durable`]) BEFORE the
         // lock is taken. A lock acquisition that creates a directory must
-        // never do so with a plain unsynced mkdir — the first write into a
-        // freshly created directory used to let the lock path create the
-        // directory that way, bypassing the durable first-append helper (the
-        // directory already existed when the append's creation detection ran,
-        // so no parent sync happened) and a reported-successful first write
-        // could recover with the directory missing after power loss (on Linux —
-        // see the README's durability assumption). A caller
-        // that needs a durable directory ahead of locking pre-creates it
-        // itself; this helper makes the lock path itself durable for every
+        // never do so with a plain unsynced mkdir: a reported-successful
+        // first write could then recover with the directory missing after
+        // power loss (on Linux — see the README's durability assumption). A
+        // caller that needs a durable directory ahead of locking pre-creates
+        // it itself; this helper makes the lock path itself durable for every
         // caller.
         if let Some(parent) = path.parent() {
             // A symlink at the record's OWN PARENT would redirect the whole
@@ -275,8 +269,8 @@ impl FileLock {
             ));
         }
         // We hold the lock: make the record PRIVATE (the mode request above is
-        // subject to the umask AND does not tighten a record an earlier version
-        // created world-readable), then record our operation id for
+        // subject to the umask AND does not tighten an already-wider record),
+        // then record our operation id for
         // diagnostics. The chmod opens no new inode, so the stable-inode
         // discipline is untouched.
         #[cfg(unix)]
@@ -307,7 +301,7 @@ impl std::ops::Drop for FileLock {
         // the SAME inode and the unlock→unlink inode-split window (a second
         // process flocking the old inode while a third creates and flocks a
         // new one — two simultaneous holders) is structurally impossible.
-        // Best-effort by design, like the other Drop fallbacks: this runs on
+        // Best-effort by design: this runs on
         // every return path (including panic/unwind), so a failure must not
         // surface, and the flock itself is released by the kernel when the
         // fd drops even if the explicit unlock below never ran. The file is
@@ -317,19 +311,14 @@ impl std::ops::Drop for FileLock {
     }
 }
 
-/// A typed ADMINISTRATIVE capability: owns the local application-store lock
-/// (`FileLock` on the store's `operation.lock`) for the duration of an
-/// explicit remote-lock recovery (the administrative entry point that has
-/// confirmed the remote holder is dead).
+/// A typed ADMINISTRATIVE capability: owns a local [`FileLock`] for the
+/// duration of an explicit administrative operation.
 ///
-/// Recovery is an administrative operation that is legal ONLY while the local
-/// application lock is held: every live controller holds that lock while it
-/// operates, so a recovery performed under it cannot race a live controller
-/// on the same store. The TYPE enforces the precondition — the recovery
-/// routine accepts only `&AdministrativeRecoveryGuard` — and the guard can be
-/// constructed only by actually acquiring the local `FileLock`
-/// ([`Self::acquire`]); there is no free constructor, so a library caller
-/// cannot recover a remote lock without first holding the local lock.
+/// The guard can be constructed only by actually acquiring a local
+/// `FileLock` ([`Self::acquire`]); there is no free constructor, so a library
+/// caller cannot hold the capability without holding the lock. Holding the
+/// guard for the whole operation is what serializes that operation against
+/// any other holder of the same record.
 ///
 /// The local lock is held for exactly the guard's lifetime. Its release is
 /// the `FileLock` release above: unlock + close, never unlink (the stable
@@ -339,12 +328,10 @@ pub struct AdministrativeRecoveryGuard {
 }
 
 impl AdministrativeRecoveryGuard {
-    /// Construct the recovery capability by ACQUIRING the local
-    /// application-store lock at `lock_path` (the store's `operation.lock`).
-    /// The caller must be an administrative path that has confirmed the
-    /// remote holder is dead; holding this guard for the whole recovery is
-    /// what serializes a recovery against any LIVE controller on the same
-    /// store.
+    /// Construct the capability by ACQUIRING the local lock at `lock_path`.
+    /// The caller must be an administrative path that has decided this
+    /// operation may run; holding this guard for the whole operation is what
+    /// serializes it against any other holder of the same record.
     pub fn acquire(lock_path: &Path, op_id: &str) -> Result<Self> {
         Ok(Self {
             _local_lock: FileLock::acquire(lock_path, op_id)?,
@@ -373,11 +360,11 @@ mod tests {
         (m.dev(), m.ino())
     }
 
-    /// The delete-window shape is gone: a release NEVER removes the lock
-    /// file (unlock → unlink is the old inode-split window), a re-acquire
-    /// reuses the SAME inode (never a recreated one), and the durable
-    /// directory machinery is untouched (the persistent file changes nothing
-    /// for a first append's directory-creation detection).
+    /// A release NEVER removes the lock
+    /// file (unlock → unlink would be the inode-split window), a re-acquire
+    /// reuses the SAME inode (never a recreated one), and the persistent file
+    /// changes nothing for the durable directory machinery's creation
+    /// detection.
     #[test]
     fn release_never_removes_the_lock_file() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -431,9 +418,8 @@ mod tests {
     }
 
     /// The lock record is PRIVATE (`0o600`), not the umask-derived mode the
-    /// process happens to have: the one non-private record in a store of
-    /// `0o600` files and `0o700` directories. This also tightens a record
-    /// an earlier version created with a wider mode, without changing its inode.
+    /// process happens to have. This also tightens a pre-existing wider
+    /// record, without changing its inode.
     #[cfg(unix)]
     #[test]
     fn the_lock_record_is_private() {
@@ -471,8 +457,8 @@ mod tests {
     // tries to acquire — at NO point may two contenders both hold the flock.
     // With the stable-inode release this is structural (there is no unlink,
     // so no old-inode/new-inode split is reachable), but the property pins
-    // the invariant across the interleaving SHAPES of the old delete-window
-    // design:
+    // the invariant across the interleaving SHAPES a delete-on-release design
+    // would expose:
     //
     //   * unlock→unlink               — covered structurally by
     //                                   [release_never_removes_the_lock_file]:
@@ -684,12 +670,10 @@ mod tests {
         Ok(())
     }
 
-    /// A SYMLINK at the lock-record path must not be followed. PRE-FIX the
-    /// `create(true).truncate(false)` open plus `set_permissions`/`set_len(0)`/
-    /// write opened THROUGH the link: the victim was truncated to the op id and
-    /// chmodded 0600. Now the open fails closed (`O_NOFOLLOW` -> ELOOP) with a
-    /// typed `Preflight` refusal naming the symlink, and the victim's content
-    /// AND mode are intact while the record is untouched.
+    /// A SYMLINK at the lock-record path must not be followed. The open fails
+    /// closed (`O_NOFOLLOW` -> ELOOP) with a typed `Preflight` refusal naming
+    /// the symlink, and the victim's content AND mode are intact while the
+    /// record is untouched.
     #[test]
     fn acquire_refuses_a_symlink_at_the_record_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -753,9 +737,7 @@ mod tests {
     /// spelling: a pre-existing NON-EMPTY file that is not a record this crate
     /// wrote is REFUSED with the typed
     /// [`PreflightKind::LockRecordNotRecognized`] and left byte-for-byte and
-    /// mode-for-mode untouched. PRE-FIX `acquire` accepted the path, chmodded
-    /// it `0600`, truncated it and wrote the op id (the 51-byte
-    /// "precious data ..." became the 2-byte "op").
+    /// mode-for-mode untouched.
     #[test]
     fn acquire_refuses_a_pre_existing_non_record_file_without_destroying_it() {
         use std::os::unix::fs::PermissionsExt;
@@ -832,9 +814,9 @@ mod tests {
             ..proptest::test_runner::Config::default()
         })]
         /// The three-contender no-split property: for every schedule of the
-        /// old delete-window shapes around a real release, at no observable
-        /// point do two contenders both hold the flock, and the stable inode
-        /// is never recreated.
+        /// interleaving shapes around a real release, at no observable point
+        /// do two contenders both hold the flock, and the stable inode is
+        /// never recreated.
         #[test]
         fn no_two_contenders_hold_the_flock(schedule in 0u8..3u8) {
             run_three_contender_case(schedule)?;

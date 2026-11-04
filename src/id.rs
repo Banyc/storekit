@@ -110,13 +110,6 @@ macro_rules! id_newtype {
             }
         }
 
-        /// UNCHECKED conversion — TEST FIXTURES ONLY (mirrors `$name::new`,
-        /// which is `#[cfg(test)]` gated like this conversion).
-        /// NOTE: deliberately NO `From<String>`/`From<&str>` impl — clap's
-        /// value-parser inference prefers those over `FromStr`, which would
-        /// silently bypass validation in test builds (and `From<&str>` would
-        /// conflict with the validated `TryFrom<&str>`).
-
         /// The serde `Serialize` impl, written by hand (never derived) so the
         /// expansion needs no `#[serde(...)]` helper attribute at the call
         /// site: the wire form is a single JSON/string scalar, the same bytes
@@ -146,8 +139,8 @@ macro_rules! id_newtype {
     };
 }
 
-/// A valid 64-lowercase-hex sha256 digest, shared by test fixtures that need
-/// a well-formed digest.
+/// A valid 64-lowercase-hex sha256 digest (the digest of the empty input),
+/// used by the digest test below.
 #[cfg(test)]
 const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -200,12 +193,12 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// a temp shape on any supported host. A caller that needs two ids to stay
 /// distinct on a folding host must not choose names that fold together.
 ///
-/// RESIDUAL: a trailing `.`/` ` is the one half of that alias a per-name rule
-/// COULD close, by refusing it. It is left open and stated here rather than
-/// closed, with its reach: on a folding host two ids differing only by a
-/// trailing `.`/` ` address one entry, and the crate does not refuse the
-/// spelling. (A `.` elsewhere is unaffected — `a.b` is one component on every
-/// supported host.)
+/// RESIDUAL: a trailing `.` — the one half of that alias a per-name rule
+/// COULD close — is left open and stated here rather than closed, with its
+/// reach: on a folding host two ids differing only by a trailing `.` address
+/// one entry, and the crate does not refuse the spelling. (A ` ` is not in the
+/// accepted charset at all, and a `.` elsewhere is unaffected — `a.b` is one
+/// component on every supported host.)
 ///
 /// The reason it is not closed is not convenience, and it is worth writing
 /// down because the opposite choice looks free: this rule also validates
@@ -213,9 +206,9 @@ const DIGEST_TEST_HEX_1: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
 /// ABSOLUTE spelling (`example.com.` is a valid FQDN and resolvers and
 /// provisioning tools emit it). Refusing the spelling would reject a real value
 /// and push a normalization the crate cannot perform onto every consumer. So
-/// of the two halves, the case-fold half is impossible to close per name and
-/// the dot half would refuse a valid host spelling — which is why BOTH are
-/// stated here rather than one of them being closed silently.
+/// the case-fold half is impossible to close per name and the dot half would
+/// refuse a valid host spelling — which is why both are stated here rather
+/// than one of them being closed silently.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= crate::atomic::NAME_MAX
@@ -237,10 +230,7 @@ pub fn valid_hex_digest(s: &str) -> bool {
 id_newtype!(
     Identifier,
     valid_name,
-    "A validated identifier (a server, slot, target, or variant name): \
-     non-empty, no surrounding whitespace, no control characters. Used for \
-     the id-bearing fields that have no dedicated id type; fields with a \
-     dedicated type keep it."
+    "A validated identifier: a single safe path segment (see `valid_name`)."
 );
 
 impl AsRef<std::path::Path> for Identifier {
@@ -301,7 +291,7 @@ mod tests {
             Identifier::parse(bad).expect_err("invalid identifier must be rejected");
             assert!(bad.parse::<Identifier>().is_err(), "{bad:?}");
         }
-        // The near-miss `operation.lock` is NO LONGER a valid id: it is the
+        // The near-miss `operation.lock` is NOT a valid id: it is the
         // crate's own application-store lock record, which FileLock::acquire
         // truncates and rewrites, so an id that named it could not coexist
         // with the lock. Its case aliases are refused too.
@@ -310,7 +300,7 @@ mod tests {
         assert!(Identifier::parse(".sync-aside").is_ok());
     }
 
-    /// The reserved spellings the identifier refuses are the SAME set the
+    /// The reserved spellings the identifier refuses include the ones the
     /// crate's public reservation predicate names, and the identifier's
     /// rejection is observable through every construction path (parse,
     /// `FromStr`, and wire deserialization — fail closed).
@@ -568,8 +558,6 @@ mod tests {
     /// `.foo.tmp.1.0` are the SAME directory entry, so accepting the alias
     /// would make the id rule's stated purpose ("an accepted id can never
     /// alias the crate's own bookkeeping on a supported filesystem") false.
-    /// Pre-fix: `valid_name(".FOO.TMP.1.0")` was `true` while
-    /// `is_crate_temp_name(".foo.tmp.1.0")` was `true`.
     #[test]
     fn case_aliases_of_crate_temp_shapes_are_refused() {
         for alias in [

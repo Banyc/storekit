@@ -140,9 +140,10 @@ pub fn is_application_lock_name(name: &str) -> bool {
 /// Whether `name` is a CASE ALIAS of a spelling the crate reserves for its own
 /// bookkeeping: its FULL Unicode case fold ([`crate::casefold`]) is a reserved
 /// spelling or the application lock record while `name` itself is byte-different.
-/// This is the fold-only step: the containment index wraps the same primitive in
-/// NFD/NFC and trims trailing dots and spaces, and the sync's destination-alias
-/// model uses `str::to_lowercase` instead — three folds, none of them the same.
+/// This is the fold-only step: the containment index applies that primitive to the
+/// NFD-DECOMPOSED name, wraps the result in NFC, and then strips trailing dots and
+/// spaces, and the sync's destination-alias model uses `str::to_lowercase`
+/// instead — three folds, none of them the same.
 ///
 /// On a case-insensitive filesystem (macOS APFS by default, Windows by
 /// default) `name` and the reserved spelling are the SAME directory entry, so
@@ -222,7 +223,7 @@ pub fn is_unaddressable_name(name: &str) -> bool {
 /// own TEMP shapes ([`crate::atomic::is_crate_temp_shape`]) while being
 /// byte-different. See [`is_unaddressable_name`].
 ///
-/// The identifier keeps its historical `case_alias` name; the fold it applies
+/// The identifier keeps its `case_alias` name; the fold it applies
 /// is the crate's shared DENIAL fold ([`fold_lock_record_component`], the full
 /// case fold plus the Win32 trailing `.`/` ` strip), the same one
 /// [`is_lock_record_name`] uses. Sharing it is what keeps the TEMP family's
@@ -248,7 +249,7 @@ fn is_crate_temp_case_alias(name: &str) -> bool {
 /// consults, and it is what a whole-store sync uses to decide whether a
 /// manifest entry may be transferred or destroyed. It is deliberately
 /// BROADER than [`is_reserved_path`], which stays byte-exact for callers that
-/// need the historical reserved MATCH: a name the id rule refuses — the
+/// need the byte-exact reserved MATCH: a name the id rule refuses — the
 /// application lock record `operation.lock` and every case alias of a reserved
 /// spelling included — is also unaddressable as a manifest path, so the id
 /// rule and the sync's manifest-path model can never disagree about what the
@@ -301,7 +302,7 @@ pub fn is_residue_path(path: &str) -> bool {
 ///
 /// Every name-mutating primitive of the [`crate::atomic`] SUBSTRATE consults
 /// this spelling through the ONE guard authority (`atomic::guard`), which
-/// now runs at the SYSCALL CHOKEPOINTS (`unlinkat`, `renameat`, `linkat`,
+/// runs at the SYSCALL CHOKEPOINTS (`unlinkat`, `renameat`, `linkat`,
 /// `symlinkat`, `mkdirat`, and a mutating `openat`) rather than by
 /// enumerating call sites. The rel-path mutators
 /// ([`crate::atomic::remove_file_fd`], [`crate::atomic::remove_dir_all_fd`]
@@ -340,16 +341,15 @@ pub fn is_residue_path(path: &str) -> bool {
 ///   byte-exact spelling fallback only while that entry does not exist yet),
 ///   so a bare `operation.lock`, a nested `snapshots/.001.operation.lock`, a
 ///   case/dot alias that resolves to a DISTINCT entry, or any other spelling
-///   can no longer be claimed away. The recognition is IDENTITY-based rather
+///   cannot be claimed away. The recognition is IDENTITY-based rather
 ///   than spelling-fold-based on purpose: a fold is sound for refusing a
 ///   spelling but unsound for authorizing a mutation, because it would grant
 ///   ownership of a different on-disk entry a live holder owns.
 /// * the PATH-BASED helpers the manifest/retention machinery uses take an
 ///   ordinary path. `ensure_private_dir_durable`, the PATH-BASED
 ///   `write_atomic_replace`, and the descriptor-relative `set_private_fd`
-///   consult the guard too (the Unix path-based chmod helper was removed when
-///   the replace's temp chmod moved onto its create-time handle; the Windows
-///   port keeps its documented no-op `set_private`). The
+///   consult the guard too (the Windows port additionally keeps its
+///   documented no-op `set_private`). The
 ///   local transport's crate-INTERNAL staged-publish workers
 ///   (`durable_create_new` and `RemoveIfRoute::remove_if`, with the linear
 ///   `CreateNewTemp`/`Claimed` values they drive) run INSIDE the funnel:
@@ -576,7 +576,7 @@ mod tests {
         }
         // The byte-exact family is deliberately NARROWER: the application lock
         // record is not a byte-exact reserved spelling, so a caller that needs
-        // the historical match still gets it.
+        // the byte-exact match still gets it.
         assert!(!is_reserved_path("state/operation.lock"));
         assert!(is_reserved_path("snapshots/.001.operation.lock"));
         // Every spelling the id rule accepts is NOT unaddressable as a path.
@@ -639,9 +639,7 @@ mod tests {
     /// `str::to_lowercase`. A full-fold-only character (`ſ`, U+017F, folds to
     /// `s`; `to_lowercase` leaves it unchanged) is an ALIAS of a reserved or
     /// crate-temp spelling on a case-folding host, so narrowing a fold would
-    /// silently reopen an alias. PRE-FIX this test is the only coverage: the
-    /// suite was green under a `to_lowercase` mutation because nothing used a
-    /// full-fold-only alias.
+    /// silently reopen an alias.
     ///
     /// The lock-record SPELLING (`operation.lock` / `.operation.lock`) is pure
     /// ASCII with no `s`, ligature, or other full-fold-only target character, so
@@ -775,18 +773,13 @@ mod tests {
         }
     }
 
-    /// The Win32 trailing-dot/space fold the LOCK-RECORD DENIAL already
-    /// applies is ALSO extended to the id rule's authority, so a name that
-    /// ALIASES a lock record is unaddressable and refused as an identity.
-    /// Pre-fix `is_unaddressable_name(".dest.operation.lock.")` was `false`
-    /// and `crate::id::valid_name(".dest.operation.lock.")` was `true` — while
-    /// the mutating guard already denied the spelling as a lock record — so a
-    /// consumer could pass a name the id rule's stated purpose should have
-    /// refused, and on Windows the spelling IS the very record
-    /// `FileLock::acquire` rewrites. Refusing it is the fold-for-denial rule
-    /// applied to the id boundary (denial may refuse more), and it is
-    /// deliberately platform-INDEPENDENT so an id does not mean different
-    /// things on different hosts.
+    /// The Win32 trailing-dot/space fold the LOCK-RECORD DENIAL applies is
+    /// ALSO applied by the id rule's authority, so a name that ALIASES a lock
+    /// record is unaddressable and refused as an identity. On Windows the
+    /// spelling IS the very record `FileLock::acquire` rewrites, so refusing
+    /// it is the fold-for-denial rule applied to the id boundary (denial may
+    /// refuse more), and it is deliberately platform-INDEPENDENT so an id does
+    /// not mean different things on different hosts.
     #[test]
     fn trailing_dot_and_space_lock_aliases_are_unaddressable() {
         for alias in [
@@ -825,14 +818,11 @@ mod tests {
     /// reserved entry on a folding host is unaddressable as an identity and
     /// refused by [`crate::id::valid_name`].
     ///
-    /// PRE-FIX the crate TEMP family was the one holdout: its identity check
-    /// (`is_crate_temp_shape` byte-exact plus a CASE-only alias) had no
-    /// trailing-dot arm, so `is_unaddressable_name(".foo.tmp.1.2.")` was
-    /// `false` and `crate::id::valid_name(".foo.tmp.1.2.")` was `true` while
-    /// on Windows the spelling resolves to the crate's own temp
-    /// `.foo.tmp.1.2` — the very entry the documented recovery sweep REMOVES.
-    /// THIS test pins the trailing fold for all four families together, so a
-    /// later narrowing of any one family fails here.
+    /// A trailing-dot/space spelling of ANY of the four families resolves, on
+    /// Windows, to the reserved entry — the crate's own temp `.foo.tmp.1.2` is
+    /// the very entry the documented recovery sweep REMOVES. THIS test pins
+    /// the trailing fold for all four families together, so a later narrowing
+    /// of any one family fails here.
     #[test]
     fn trailing_dot_and_space_aliases_are_unaddressable_for_every_reserved_family() {
         let families: [(&str, &[&str]); 4] = [
@@ -870,18 +860,14 @@ mod tests {
         }
     }
 
-    /// FLIPPED, EXPLICITLY: the test that lived here asserted that
-    /// `state/operation.lock.` / `state/operation.lock ` / `state/OPERATION.LOCK`
-    /// were "the same record" as `state/operation.lock` because the lock-record
-    /// fold maps them together. That is the UNSAFE half of the old rule — a fold
-    /// is sound for REFUSING a spelling but unsound for GRANTING ownership, and
-    /// on macOS/Linux a trailing-dot spelling is a DISTINCT on-disk entry, so the
-    /// old assertion pinned the very two-holder hole. The permission predicate
-    /// [`is_same_lock_record_path`] is removed; ownership is decided by identity
-    /// in [`crate::atomic::OwnedLockRecord::owns`]. What survives from the old
-    /// test, correctly, is the DENIAL fold, restated below. Removing the old
-    /// assertion is not a coverage loss: the on-disk identity behaviour is pinned
-    /// by `transport::tests::remove_file_if_grants_ownership_only_to_the_owned_inode`
+    /// The lock-record DENIAL fold recognises every case and Win32
+    /// trailing-dot/space ALIAS of a lock record, while leaving a genuinely
+    /// distinct near-miss ordinary. A fold is sound for REFUSING a spelling
+    /// and unsound for GRANTING ownership: on macOS/Linux a trailing-dot
+    /// spelling is a DISTINCT on-disk entry, so ownership is decided by
+    /// identity in [`crate::atomic::OwnedLockRecord::owns`], never by this
+    /// predicate. The on-disk identity behaviour is pinned by
+    /// `transport::tests::remove_file_if_grants_ownership_only_to_the_owned_inode`
     /// on both platforms, and the denial fold by `is_lock_record_name` here.
     #[test]
     fn lock_record_recognition_folds_for_denial_only() {

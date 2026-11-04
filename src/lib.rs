@@ -22,10 +22,9 @@
 //! [`mod@env`], [`digest`], [`platform`], and [`trace`] are the small shared
 //! helpers the rest of the crate is built on.
 //!
-//! The crate is deliberately free of any application's domain model: no
-//! deployment, release, ledger, or record-book concept appears here. A store
-//! is a root directory; a name is a validated string; a transfer is a
-//! comparison of two manifests.
+//! The crate carries no application's domain model: no deployment, release,
+//! ledger, or record-book type appears here. A store is a root directory; a
+//! name is a validated string; a transfer is a comparison of two manifests.
 //!
 //! # The name-mutation funnel: what the compiler refuses, and what is NOT promised
 //!

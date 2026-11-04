@@ -1,7 +1,7 @@
 //! The validated relative path that names every entry a mutation touches.
 //!
-//! This module sits BELOW [`crate::atomic`] and [`crate::sync`]: it has no
-//! dependencies inside the crate, so the descriptor-relative primitives and
+//! This module sits BELOW [`crate::atomic`] and [`crate::sync`]: it depends on
+//! neither, only on [`crate::error`], so the descriptor-relative primitives and
 //! the transport can both name a path with the same validated type. It is
 //! re-exported from [`crate::transport`] and from the crate root, so no
 //! existing consumer path changes.
@@ -9,7 +9,7 @@
 //! A [`RootedRelativePath`] is validated at construction to reject ABSOLUTE
 //! paths, `.`/`..` components, a literal `.` SEGMENT, and EMPTY paths, so a
 //! `root.join(rel)` is safe by construction — a caller can never escape the
-//! deployment root through a transport operation or a mutating primitive, and
+//! owned root through a transport operation or a mutating primitive, and
 //! a traversal path can never be joined onto the root.
 //!
 //! The traversal/absolute decision in [`RootedRelativePath::parse`] is made
@@ -61,7 +61,7 @@ impl RootedRelativePath {
     /// model, [`Path::components`], never with a hardcoded `'/'`: only
     /// [`Component::Normal`] is admitted, so `RootDir`/`Prefix` (an absolute
     /// path, or a Windows `\`-root that `Path::join` uses to REPLACE the
-    /// deployment root), `ParentDir`, and `CurDir` are all refused — and on
+    /// owned root), `ParentDir`, and `CurDir` are all refused — and on
     /// Windows a `\` IS a separator, so `..\escape`, `\absolute`, and
     /// `a\..\b` are seen for what they are. On Unix a `\` is an ordinary
     /// filename byte, so those same spellings are each ONE literal component
@@ -85,7 +85,7 @@ impl RootedRelativePath {
         // is refused, and this single rule is what refuses an ABSOLUTE path too
         // (a leading `/` makes the first component a `RootDir`): `ParentDir` walks
         // above the root; `RootDir`/`Prefix` name an absolute location (and on Windows `Path::join` REPLACES
-        // the base for a rooted/`\`-leading path, cancelling the deployment
+        // the base for a rooted/`\`-leading path, cancelling the owned
         // root entirely); `CurDir` names a directory rather than an entry.
         if !p.components().all(|c| matches!(c, Component::Normal(_))) {
             return Err(Error::transport(format!(
@@ -317,12 +317,10 @@ mod tests {
         }
     }
 
-    /// THE DELTA between the former private `validate_rel` guard and this
-    /// type, pinned: `Path::components` ERASES a non-leading `.` segment, so a
-    /// pure component-model check accepts `a/./b`; this type scans the literal
+    /// `Path::components` ERASES a non-leading `.` segment, so a pure
+    /// component-model check accepts `a/./b`; this type scans the literal
     /// spelling and REFUSES it. That is the one input the two disagree on, in
-    /// the STRICTER direction, and the reason adopting the boundary is a
-    /// behaviour change rather than a refactor.
+    /// the STRICTER direction.
     #[test]
     fn a_literal_dot_segment_is_invisible_to_components_but_refused_here() {
         let p = Path::new("a/./b");
@@ -459,10 +457,10 @@ mod tests {
     /// root and no root/prefix can reset it, so the resolved path stays
     /// strictly under the root.
     ///
-    /// RUNS ON BOTH PLATFORMS. The Windows arm cannot be RUN here (Windows
-    /// is type-checked only), so this pins the Unix behavior by construction
-    /// and the Windows behavior by the same component-model argument; no
-    /// runtime Windows claim is made.
+    /// RUNS ON BOTH PLATFORMS. The Windows arm is type-checked only in this
+    /// repository, so this pins the Unix behavior by construction and the
+    /// Windows behavior by the same component-model argument; no runtime
+    /// Windows claim is made.
     #[test]
     fn accepted_paths_join_cannot_escape_the_root() {
         let root = std::env::temp_dir().join("storekit-rooted-join-property");
@@ -561,16 +559,13 @@ mod tests {
     /// port is type-checked only, so this is an UNVERIFIED-at-runtime assertion
     /// rather than a measured result).
     ///
-    /// FLIPPED: this test previously asserted that `parse` ACCEPTED
-    /// `a\b` and `a\b\c.json` because the Windows path model treats `\` as a
-    /// separator. That acceptance IS the defect. The manifest path `a\b` is
-    /// ONE component (a literal backslash name, legal on Unix); the host-model
-    /// parse silently maps it onto the two-component host path `a/b`, so the
-    /// DISTINCT manifest entries `a\b` and `a/b` would address the SAME file
-    /// and one could clobber the other. The manifest conversion therefore
-    /// REFUSES a backslash-bearing segment on Windows. `parse` still refuses
-    /// the genuine HOST traversals, and the ordinary manifest spellings (no
-    /// backslash) convert.
+    /// The manifest path `a\b` is ONE component (a literal backslash name, legal
+    /// on Unix); the host-model parse silently maps it onto the two-component
+    /// host path `a/b`, so the DISTINCT manifest entries `a\b` and `a/b` would
+    /// address the SAME file and one could clobber the other. The manifest
+    /// conversion therefore REFUSES a backslash-bearing segment on Windows.
+    /// `parse` still refuses the genuine HOST traversals, and the ordinary
+    /// manifest spellings (no backslash) convert.
     #[cfg(windows)]
     #[test]
     fn windows_backslash_is_a_separator_so_a_manifest_segment_is_refused() {
@@ -598,7 +593,6 @@ mod tests {
     /// UNIX: name fidelity end to end — a source file literally named
     /// `..\escape` (and `a\..\b`) round-trips through the filesystem as ONE
     /// directory entry, and `root.join(rel)` addresses exactly that entry.
-    /// This is what would break if the fix refused backslash-bearing names.
     #[cfg(unix)]
     #[test]
     fn unix_backslash_name_round_trips_through_the_filesystem() {
@@ -624,15 +618,16 @@ mod tests {
         }
     }
 
-    /// THE DEFECT, PINNED AT THE CONVERSION. The HOST path model is not the
+    /// THE CONVERSION'S PREMISE. The HOST path model is not the
     /// manifest model: it treats a byte as a separator exactly where the
     /// platform says so. On Windows `\` IS a separator, so the two DISTINCT
     /// manifest paths `a\b` (ONE component) and `a/b` (TWO) both join to the
-    /// same host path — the injectivity failure this fix removes. On Unix the
-    /// same two paths stay distinct, so the collision is an accident of the
-    /// host and NO Unix run can expose it. This test RUNS on both platforms
-    /// (the assertion is selected by cfg); it is the honest evidence that no
-    /// executed Unix test can catch the defect.
+    /// same host path — the injectivity failure
+    /// [`RootedRelativePath::from_manifest`] removes. On Unix the same two
+    /// paths stay distinct, so the collision is an accident of the host and NO
+    /// Unix run can expose it. This test RUNS on both platforms (the assertion
+    /// is selected by cfg); it is the honest evidence that no executed Unix
+    /// test can catch the defect.
     #[test]
     fn the_host_path_model_collapses_distinct_manifest_paths_on_a_backslash_host() {
         let backslash = Path::new(r"a\b");
@@ -670,7 +665,7 @@ mod tests {
         }
     }
 
-    /// THE FIX. `from_manifest` splits on `/` ONLY, so the manifest's segment
+    /// `from_manifest` splits on `/` ONLY, so the manifest's segment
     /// sequence is exactly the host path's component sequence and the
     /// conversion is INJECTIVE: two DISTINCT manifest paths never yield the
     /// same host path. `a/b` is TWO components; on Unix `a\b` is ONE component
@@ -739,8 +734,8 @@ mod tests {
         );
     }
 
-    /// THE FIX refuses a manifest path the host cannot represent instead of
-    /// folding it. Platform-independent: on Unix `\` is an ordinary byte so
+    /// A manifest path the host cannot represent is REFUSED, not folded.
+    /// Platform-independent: on Unix `\` is an ordinary byte so
     /// the path is ACCEPTED as one component; on Windows the same conversion
     /// is REFUSED. Both directions are asserted here so the one authority's
     /// host-dependence is explicit.

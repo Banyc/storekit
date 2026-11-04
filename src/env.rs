@@ -8,12 +8,14 @@
 //! environment itself.
 //!
 //! The house pattern: the process boundary takes [`SysEnv::from_process`]
-//! ONCE and threads it down. The only other place `std::env::` is allowed is
-//! the child-process boundary ([`SysEnv::apply_to_command`]): every spawned
-//! child receives this snapshot as its ENTIRE environment (`env_clear` + the
-//! snapshot's variables), so a child's `PATH` (and any fake-bin/test
-//! variable) is the deterministic snapshot, never whatever `PATH` won the
-//! race in the parent — and nothing else leaks in.
+//! ONCE and threads it down, and no subsystem reads a process-environment
+//! VARIABLE from the live process environment. The other production
+//! `std::env::` use resolves the current directory
+//! (`sync::apply`'s `std::env::current_dir`); every spawned child receives
+//! this snapshot as its ENTIRE environment (`env_clear` + the snapshot's
+//! variables, [`SysEnv::apply_to_command`]), so a child's `PATH` (and any
+//! fake-bin/test variable) is the deterministic snapshot, never whatever
+//! `PATH` won the race in the parent — and nothing else leaks in.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -58,8 +60,8 @@ impl SysEnv {
         self.get("PATH")
     }
 
-    /// The temp directory: `TMPDIR` when set and non-empty, else the platform
-    /// temp dir (`/tmp` on Unix). Pure: no process reads.
+    /// The temp directory: `TMPDIR` when set and non-empty, else `/tmp` (a
+    /// fixed fallback on every platform). Pure: no process reads.
     pub fn temp_dir(&self) -> PathBuf {
         self.get("TMPDIR")
             .filter(|s| !s.is_empty())
@@ -98,8 +100,7 @@ impl SysEnv {
     }
 
     /// The full variable list as `(key, value)` pairs. Used by tests to build
-    /// snapshot-based fixtures and by [`SysEnv::apply_to_command`] internally.
-    /// Production child-process boundaries MUST call
+    /// snapshot-based fixtures. Production code goes through
     /// [`SysEnv::apply_to_command`] instead: a bare `envs` overlay would let
     /// the parent env leak into a supposedly-hermetic snapshot.
     pub fn child_env(&self) -> Vec<(OsString, OsString)> {

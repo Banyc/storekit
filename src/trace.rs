@@ -3,13 +3,14 @@
 //! A tiny, dependency-free tracer: when verbose is enabled, each traced
 //! step is emitted to STDERR as a `[trace]` line carrying the step name,
 //! the time spent since the previous step (and since the trace start), and
-//! a free-form detail line. Stderr keeps the report on stdout
-//! machine-parseable. A disabled tracer is a zero-cost no-op.
+//! a free-form detail line. The sink is stderr, so a caller's stdout stays
+//! machine-parseable, and a disabled tracer emits nothing and records
+//! nothing.
 //!
-//! The tracer is the debugging surface for the multi-step operations in
-//! this crate: a caller records each step (parse, resolve, transfer) so a
-//! future agent can see exactly what an operation did, in what order, and
-//! how long each step took — `grep '\[trace\]'` on the captured stderr.
+//! The tracer is the debugging surface for a caller's multi-step operations: a
+//! caller records each step (parse, resolve, transfer) so the captured stderr
+//! shows what an operation did, in what order, and how long each step took —
+//! `grep '\[trace\]'` on the captured stderr.
 
 use std::time::Instant;
 

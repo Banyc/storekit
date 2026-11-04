@@ -1,20 +1,23 @@
 //! Platform helpers: the small Unix/Windows divergences (file mode bits,
-//! symlinks) consolidated behind ONE cfg switch at this module boundary.
+//! symlinks) consolidated at this module boundary.
 //!
-//! * [`chmod`] — set a file's mode bits; a no-op on Windows (no Unix mode
-//!   bits; file ACLs are the privacy mechanism).
+//! * [`chmod`] — set a file's mode bits; a no-op on Windows (there are no
+//!   Unix mode bits).
 //! * [`file_mode`] — read a file's mode bits; a fixed conventional mode on
 //!   Windows.
+//! * [`metadata_mode`] — the mode bits of an already-read metadata value; the
+//!   same fixed conventional mode on Windows.
 //! * [`symlink`] — create a symlink; on Windows, best-effort via the
 //!   platform symlink API (which requires admin/developer mode — a failure
 //!   propagates, documented).
 //!
-//! The rest of the crate calls these helpers and never sees the switch.
+//! The crate's PATH-BASED mode-bit and symlink decisions go through these
+//! helpers; the descriptor-bound chmod sites (listed on [`chmod`]) are
+//! Unix-only and use the `File::set_permissions` method directly.
 
 use std::path::Path;
 
-/// Set a file's mode bits — a no-op on Windows (no Unix mode bits; file
-/// ACLs are the privacy mechanism).
+/// Set a file's mode bits — a no-op on Windows (there are no Unix mode bits).
 ///
 /// This is the crate's ONE PATH-BASED mode authority, so the crate-root
 /// `#![deny(clippy::disallowed_methods)]` is relaxed here for this single
@@ -33,15 +36,15 @@ use std::path::Path;
 /// FD-bound sites are:
 /// `lock::FileLock::acquire` (the newly opened lock record);
 /// `sync::apply`'s `set_local_mode`; the `atomic::unix` fd-bound helpers
-/// (`open_verbatim_source`, `replace_core`, `write_atomic_cas_fd`,
-/// `ensure_private_dir_fd`, `ensure_private_dir_durable_fd_chain`,
-/// `set_private_fd`, `create_destination_chain`, `copy_dir_recursive_fd`,
-/// `set_dir_mode_fd`), the linear temps' `Temp::make_private`/`Temp::sync` and
-/// `PathTemp::make_private`/`PathTemp::sync` (on the create-time handle); and
-/// `transport::LocalTransport`'s `write_confined` /
+/// (`copy_tree_verbatim`, `replace_core` through `Temp::make_private`,
+/// `write_atomic_cas_fd`, `ensure_private_dir_fd`,
+/// `ensure_private_dir_durable_fd_chain`, `set_private_fd`,
+/// `create_destination_chain`, `copy_dir_recursive_fd`, `set_dir_mode_fd`),
+/// the linear temps' `Temp::make_private` and `PathTemp::make_private` (on the
+/// create-time handle); and `transport::LocalTransport`'s `write_confined` /
 /// `set_mode_confined`. Every receiver is a descriptor obtained from an
-/// `O_NOFOLLOW` `openat`/`dup`, the temp's create handle, or the newly opened
-/// lock-record [`File`].
+/// `O_NOFOLLOW` `openat`/`dup`, a temp's create handle, a create-new
+/// destination handle, or the newly opened lock-record [`File`].
 ///
 /// [`std::fs::set_permissions`]: std::fs::set_permissions
 /// [`File`]: std::fs::File
@@ -108,7 +111,7 @@ pub fn metadata_mode(m: &std::fs::Metadata) -> u32 {
 /// `symlink_verbatim`, which `crate::atomic::copy_tree_verbatim` uses because a
 /// verbatim copy must CARRY reserved and temp spellings into its destination.
 /// Its name states the weakness (API constraint #8); a caller outside the
-/// crate always reaches the guarded form below.
+/// crate always reaches the guarded [`symlink`].
 pub fn symlink(target: &Path, link: &Path) -> crate::Result<()> {
     crate::atomic::refuse_reserved_mutation(link, crate::atomic::Sanction::None)?;
     symlink_verbatim(target, link).map_err(crate::Error::from)
@@ -126,8 +129,8 @@ pub fn symlink(target: &Path, link: &Path) -> crate::Result<()> {
 ///
 /// This is the crate's ONE production std-symlink site (a name CREATION), so
 /// the crate-root `#![deny(clippy::disallowed_methods)]` is relaxed here for
-/// exactly this function: the three platform-symlink wrappers below are on the
-/// deny list and this is the single reviewed entry point to them. No other
+/// exactly this function: the three platform-symlink wrappers are on the deny
+/// list and this is the single reviewed entry point to them. No other
 /// production site may call them.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn symlink_verbatim(target: &Path, link: &Path) -> std::io::Result<()> {

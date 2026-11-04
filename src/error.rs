@@ -13,14 +13,11 @@
 //! Within a class, where a caller has to DISTINGUISH one condition from
 //! another in the same class, the condition is a TYPED value carried alongside
 //! the message: [`MaterializationKind`], [`StoreKind`], [`TransportKind`],
-//! [`PreflightKind`], and the pre-existing [`ReservedKind`]. The message is preserved VERBATIM
-//! (the `Display` impl is byte-identical to the pre-typing one), so a caller
-//! that already matches the text keeps working; the typed value is what a
-//! caller should branch on. A class that carries no typed kind is one where
-//! nothing in the crate — not a caller, not a test, not the crate's own
-//! recovery advice — has to tell its conditions apart: the text is for a
-//! human. `Error::materialization`/`store`/`transport` remain as the
-//! untyped shorthand and produce the `Unclassified` kind.
+//! [`PreflightKind`], and [`ReservedKind`]. The message is preserved VERBATIM
+//! (the `Display` impl prints it unmangled), so a caller that already matches
+//! the text keeps working; the typed value is what a caller should branch on.
+//! `Error::materialization`/`store`/`transport` remain as the untyped shorthand
+//! and produce the `Unclassified` kind.
 
 use thiserror::Error;
 
@@ -78,12 +75,14 @@ pub enum Error {
     #[error("invalid reference: {0}")]
     Ref(String),
 
-    /// A refusal to break the crate's own bookkeeping. The reserved-spelling
-    /// authority raises it for a LOCK-record spelling: the public, PATH-BASED
-    /// [`crate::platform::symlink`] runs that authority before any syscall, so
-    /// a caller cannot create `operation.lock` / `.<name>.operation.lock` (or
-    /// a case / trailing-dot alias) through it; the descriptor-confined twin
-    /// [`crate::atomic::symlink_fd`] raises the same variant.
+    /// A refusal to break the crate's own bookkeeping, or a compare-and-swap
+    /// refusal: the reserved-spelling authority raises it for a LOCK-record
+    /// spelling — the public, PATH-BASED [`crate::platform::symlink`] runs that
+    /// authority before any syscall, so a caller cannot create `operation.lock`
+    /// / `.<name>.operation.lock` (or a case / trailing-dot alias) through it,
+    /// and the descriptor-confined twin [`crate::atomic::symlink_fd`] raises
+    /// the same variant — while a CAS that finds the live entry different from
+    /// the content it was given raises it too.
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -92,9 +91,8 @@ pub enum Error {
     /// of string-matching the message. The public [`crate::platform::symlink`]
     /// raises it for a `.sync-aside.…` residue spelling, and the
     /// descriptor-confined mutators raise it for a residue on any component.
-    /// The message KEEPS the historical
-    /// `ResidueBelow` token, so a caller that already matches the text is
-    /// unaffected.
+    /// The message carries the [`crate::reserved::RESIDUE_BELOW`] token, so a
+    /// caller that already matches the text is unaffected.
     #[error("reserved spelling: {reason:?}: {message}")]
     Reserved {
         reason: ReservedKind,
@@ -201,10 +199,8 @@ pub enum MaterializationKind {
 ///
 /// These are the substrate refusals a caller or the crate's own external
 /// tests distinguish from a plain mechanical I/O failure: the tree copy's
-/// source-audit refusals (what the source IS, the shape and name it has, and whether
-/// it overlaps the destination — the `Copy*` arms below are the definition, and this
-/// sentence deliberately does not re-list them), the residue gate, and the
-/// visible-but-not-durable outcome a
+/// source-audit refusals (the `Copy*` arms below are the definition), the
+/// residue gate, and the visible-but-not-durable outcome a
 /// caller must not read as a plain failure. Every other store error is a
 /// mechanical I/O failure with no consumer-side branch, and stays
 /// [`Self::Unclassified`].
@@ -578,7 +574,7 @@ mod tests {
 
     /// Constraint #4, the text-compatibility half: typing the reasons did NOT
     /// change what a caller that matches the message sees. Every class keeps
-    /// its historical `Display` prefix and prints the message VERBATIM.
+    /// its `Display` prefix and prints the message VERBATIM.
     #[test]
     fn typed_reasons_preserve_the_historical_message_text() {
         assert_eq!(

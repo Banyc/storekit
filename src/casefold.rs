@@ -10,9 +10,9 @@
 //! uppercase letters to their separately-encoded lowercase forms (where case
 //! folding deliberately goes the other way). A case-insensitive host does the
 //! FULL fold, and the fold this crate implements is the Unicode C+F caseless
-//! match. On a host that resolves case-folded spellings, a fold:
-//! macOS APFS is measured to resolve `straße == STRASSE == strasse`,
-//! `ς == σ == Σ`, and `ﬁle == file == FILE` (the family test pins it); the Linux
+//! match. On a host that resolves case-folded spellings, the fold must match
+//! the host's: macOS APFS is measured to resolve `straße == STRASSE == strasse`,
+//! `ς == σ == Σ`, and `ﬁle == file == FILE` (the family test pins the fold); the Linux
 //! `ext4 -O casefold` half is NOT verified here — `manifest`'s module doc says why,
 //! and it rests on the fold being the Unicode match rather than on a measurement. A
 //! lower-case fold therefore UNDER-matches the host, and an under-matching
@@ -42,13 +42,8 @@
 //! the version declared by the pinned `unicode-normalization 0.1.25`
 //! (`UNICODE_VERSION = (17, 0, 0)`); regenerating it at 16.0.0 instead would
 //! leave the normalization step ([`crate::manifest`] folds from NFD) on 17.0.0
-//! data while the fold skipped the 28 code points 17.0.0 added. (A prior
-//! revision of this comment said the table was generated from "Unicode 16.0.0,
-//! the version `unicode-normalization` is built from" — that was wrong about
-//! the dependency and the pin; 16.0.0 does differ from 17.0.0 by 28 added
-//! `C`/`F` mappings, though it changes no existing one.) The same table is the
-//! `C` + `F` fold (`str.casefold` semantics, no `T` Turkic mappings), which is
-//! the default case fold used by filesystems.
+//! data while the fold skipped the 28 code points 17.0.0 added. The same table
+//! is the `C` + `F` fold (`str.casefold` semantics, no `T` Turkic mappings).
 //!
 //! The table is sorted by code point so [`case_fold_into`] can binary-search
 //! it; `the_table_is_sorted` below pins that precondition,
