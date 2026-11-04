@@ -863,7 +863,8 @@
 //!
 //! A manifest path is used as a filesystem ADDRESS (through [`rooted`]), so the
 //! stored spelling must BE the on-disk name. That guarantee belongs to the
-//! canonicalizer, not to this module: [`canonicalize_tree`] and
+//! canonicalizer, not to this module:
+//! [`canonicalize_tree`](crate::manifest::canonicalize_tree) and
 //! [`canonicalize_remote_entries`](crate::manifest::canonicalize_remote_entries)
 //! refuse any name that is not already NFC and UTF-8, so a stored path can never
 //! be a spelling the filesystem does not contain. This module therefore never
@@ -920,7 +921,7 @@
 //!   EVERY ancestor component against its own parent's live listing, not only
 //!   the final one. A source manifest whose path has a parent that is not itself
 //!   an entry (`d/x` with no `d`) cannot reach this module at all: the manifest
-//!   assemblers ([`canonicalize_tree`] and
+//!   assemblers ([`canonicalize_tree`](crate::manifest::canonicalize_tree) and
 //!   [`canonicalize_remote_entries`](crate::manifest::canonicalize_remote_entries))
 //!   both enforce parent-closure, and the local walk is closed by construction.
 //!   That assembler gate is THE guarantee; the applier does not repeat it,
@@ -1008,13 +1009,14 @@ use crate::error::{Error, MaterializationKind, PreflightKind, Result, StoreKind,
 use crate::lock::FileLock;
 use crate::manifest::{
     ContainmentViews, DestinationTree, TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata,
-    canonicalize_tree, canonicalize_tree_destination, check_relative_symlink_target_two_views,
-    compute_tree_digest, symlink_target_refusal_message,
+    canonicalize_tree_destination, canonicalize_tree_omitting,
+    check_relative_symlink_target_two_views, compute_tree_digest, symlink_target_refusal_message,
 };
 use crate::sync::diff::{
     EntryDiff, EntryKind, TreeDiff, apply_manifests, diff_source_and_destination, diff_trees,
-    remote_destination_manifest, remote_manifest,
+    remote_destination_manifest_omitting, remote_manifest_omitting,
 };
+use crate::sync::exclusions::Exclusions;
 use crate::transport::{FarSideLockSession, Layout, Remote, RootedRelativePath};
 use std::cell::{OnceCell, RefCell};
 use std::collections::btree_map::Entry;
@@ -1120,6 +1122,49 @@ pub enum Extraneous {
     /// prohibition rules are unchanged: a conflict or residue leaves the
     /// entry in place and reports it.
     Delete,
+}
+
+/// One [`sync`] RUN's caller-chosen inputs that are not the policy and not the
+/// ownership: what it does with destination-only entries, and which
+/// root-relative subtrees it OMITS from both views.
+///
+/// The two travel together because they are the run's DECISIONS about the two
+/// trees; the [`Exclusions`] value is also what the ownership constructors plan
+/// the source manifest with, so a token records the set it was minted for and
+/// [`sync`] REFUSES a run that presents a different one
+/// ([`crate::error::PreflightKind::ExclusionsMismatch`]).
+///
+/// [`SyncOptions::default`] is [`Extraneous::Keep`] with no exclusions —
+/// exactly the behaviour a run had before this value existed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncOptions {
+    /// What the run does with a destination-only entry. [`Extraneous::Keep`]
+    /// leaves every one in place; [`Extraneous::Delete`] removes the ones no
+    /// conflict forbids removing.
+    pub extraneous: Extraneous,
+    /// The root-relative subtrees the run OMITS from both views. Empty is the
+    /// no-exclusion run.
+    pub exclusions: Exclusions,
+}
+
+impl SyncOptions {
+    /// The options for a run with the given destination-only policy and the
+    /// given exclusions.
+    pub fn new(extraneous: Extraneous, exclusions: Exclusions) -> SyncOptions {
+        SyncOptions {
+            extraneous,
+            exclusions,
+        }
+    }
+
+    /// The options for a run with NO exclusions and the given destination-only
+    /// policy.
+    pub fn without_exclusions(extraneous: Extraneous) -> SyncOptions {
+        SyncOptions {
+            extraneous,
+            exclusions: Exclusions::none(),
+        }
+    }
 }
 
 /// What to do with one `Missing`/`Changed` destination entry.
@@ -1636,6 +1681,19 @@ pub struct SyncReport {
     /// field is the ONLY signal that the two names are aliased by a hard link,
     /// which the caller must break before the source can be mirrored faithfully.
     pub unsupported_destination: Vec<crate::manifest::UnsupportedEntry>,
+    /// The caller's [`SyncOptions::exclusions`] that covered AT LEAST ONE entry
+    /// on either side of the run, as validated root-relative manifest
+    /// spellings, sorted. Derived from the same value the three views were
+    /// filtered with, so it names what actually omitted something.
+    ///
+    /// An exclusion that covered NOTHING is absent — deliberately: reporting it
+    /// would read as "the exclusion was applied" and hide a typo. A caller
+    /// reads this list against the spellings it supplied, so a spelling that is
+    /// missing here is one that matched no entry in either tree (and an EMPTY
+    /// list is the signal that none of them did). This is an ANNOTATION, not a
+    /// partition list: it names no destination path and changes no other count
+    /// (see watch rule 9 of the exclusions contract).
+    pub matched_exclusions: Vec<String>,
 }
 
 /// [`SyncError`]-carrying result: on failure the partial [`SyncReport`] is
@@ -2169,9 +2227,17 @@ fn acquire_in_root_lock(
 /// [`DestinationOwnership::lock`] and
 /// [`DestinationOwnership::lock_with_in_root_lock`]), so the weaker choice is
 /// stated in the TYPE at the call site and cannot be made by omission.
-/// `extraneous` selects whether destination-only entries are
-/// [`Extraneous::Keep`] or [`Extraneous::Delete`]d after the transfers and the
-/// verification have succeeded.
+///
+/// `options` carries the run's two decisions: [`SyncOptions::extraneous`]
+/// selects whether destination-only entries are [`Extraneous::Keep`] or
+/// [`Extraneous::Delete`]d after the transfers and the verification have
+/// succeeded, and [`SyncOptions::exclusions`] names the root-relative subtrees
+/// the run OMITS from both views (see [`Exclusions`]). The SAME exclusions must
+/// have been handed to the acquiring constructor, which read the source
+/// manifest with them; a run presenting another set is refused with
+/// [`crate::error::PreflightKind::ExclusionsMismatch`] before any mutation.
+/// [`SyncOptions::default`] is [`Extraneous::Keep`] with no exclusions — the
+/// behaviour a run had before this value existed.
 ///
 /// The local root descriptor is opened (pinned) BEFORE either manifest is
 /// read, when the root exists; see the module docs for exactly what that does
@@ -2322,14 +2388,15 @@ pub fn sync(
     local_root: &Path,
     remote: &dyn Remote,
     policy: &dyn Policy,
-    extraneous: Extraneous,
+    options: SyncOptions,
     ownership: DestinationOwnership,
 ) -> SyncResult {
     // The token is BOUND to the run it was acquired for: a token acquired for
     // another direction, another local root, another transport PATH spelling,
-    // another transport ENDPOINT, or another transport LOCALNESS is refused
-    // rather than used, so a caller cannot take the lock on one destination
-    // (or read a plan from one source) and mutate another.
+    // another transport ENDPOINT, another transport LOCALNESS, or another
+    // EXCLUSION SET is refused rather than used, so a caller cannot take the
+    // lock on one destination (or read a plan from one source) and mutate
+    // another.
     //
     // The FAR-SIDE session lives HERE, in this stack frame, for the whole run
     // (exactly as `HeldLocks` does for the local records), so it is dropped
@@ -2342,10 +2409,16 @@ pub fn sync(
     // refused on exactly the same path as before (nothing acquired, nothing
     // mutated, the far-side session dropped with the token), and `Unowned`
     // carries no binding to check.
-    if let Some(prepared) = ownership.binding()
-        && let Err(error) = prepared.matches(direction, local_root, remote)
-    {
-        return Err(SyncError::from(error));
+    if let Some(prepared) = ownership.binding() {
+        if let Err(error) = prepared.matches(direction, local_root, remote, &options.exclusions) {
+            return Err(SyncError::from(error));
+        }
+        // The SOURCE WALK ran while the token was minted, so the exclusions it
+        // covered are recorded on the TOKEN's set. Both sets are equal (just
+        // checked), so carry those observations into the run's set: the report
+        // must name every exclusion that covered an entry on either side,
+        // including the side read before the run began.
+        options.exclusions.adopt_matches(&prepared.exclusions);
     }
     let (prepared, locks) = match ownership {
         DestinationOwnership::Locked(locked) => (
@@ -2373,7 +2446,7 @@ pub fn sync(
             (locked.prepared, None)
         }
         DestinationOwnership::Unowned => (
-            match prepare(direction, local_root, remote, false) {
+            match prepare(direction, local_root, remote, false, &options.exclusions) {
                 Ok(prepared) => prepared,
                 Err(error) => return Err(SyncError::from(error)),
             },
@@ -2389,7 +2462,7 @@ pub fn sync(
         &source,
         &dest,
         policy,
-        extraneous,
+        &options,
         locks,
         prepared.source_meta,
     );
@@ -2629,12 +2702,19 @@ impl DestinationOwnership {
     /// [`DestinationOwnership::lock_remote`]. The guard is held inside the
     /// returned token; [`sync`] consumes the token and releases the lock only
     /// when the run returns.
+    ///
+    /// `exclusions` is the [`Exclusions`] value the run will present in its
+    /// [`SyncOptions`]: the SOURCE manifest is read with it (so an entry inside
+    /// an excluded subtree never refuses the run), and the token records it, so
+    /// [`sync`] REFUSES a token whose set differs from the run's
+    /// ([`crate::error::PreflightKind::ExclusionsMismatch`]).
     pub fn lock(
         direction: Direction,
         local_root: &Path,
         remote: &dyn Remote,
+        exclusions: &Exclusions,
     ) -> Result<DestinationOwnership> {
-        let prepared = prepare(direction, local_root, remote, true)?;
+        let prepared = prepare(direction, local_root, remote, true, exclusions)?;
         require_endpoint_identity(remote)?;
         let guard = lock_destination(direction, prepared.dest_is_local(), prepared.dest_root())?;
         Ok(DestinationOwnership::Locked(LockedDestination {
@@ -2665,6 +2745,10 @@ impl DestinationOwnership {
     /// refuse overlapping roots, prepare the transport identity, read the strict
     /// source manifest) with the LOCAL sibling-record refusal DISABLED, then:
     ///
+    /// `exclusions` plays the same role as in [`DestinationOwnership::lock`]:
+    /// the source manifest is read with it, and the token records it so [`sync`]
+    /// refuses a run presenting another set.
+    ///
     /// * a LOCAL destination is REFUSED (a PULL's destination is always local) —
     ///   use [`DestinationOwnership::lock`];
     /// * a destination whose record cannot be derived is REFUSED;
@@ -2685,13 +2769,14 @@ impl DestinationOwnership {
         direction: Direction,
         local_root: &Path,
         remote: &dyn Remote,
+        exclusions: &Exclusions,
     ) -> Result<DestinationOwnership> {
         // The whole preflight EXCEPT the local sibling-record refusal: a remote
         // destination has no local record, and the remote-specific checks live
         // below. The identity is prepared and the source manifest read BEFORE
         // the far-side record is created, so a run refused for its SOURCE (or an
         // unreachable host) leaves no far-side lock record behind.
-        let prepared = prepare(direction, local_root, remote, false)?;
+        let prepared = prepare(direction, local_root, remote, false, exclusions)?;
         if prepared.dest_is_local() {
             return Err(Error::preflight_kind(
                 PreflightKind::LocalDestinationViaRemoteLock,
@@ -2801,7 +2886,10 @@ impl DestinationOwnership {
     /// (pin the local root, refuse overlapping roots, refuse an unlockable
     /// destination, prepare the transport identity, read the strict source
     /// manifest) and then the root check, the sibling lock, and the in-root
-    /// lock. A REMOTE (far-side) destination is REFUSED by the sibling check
+    /// lock. `exclusions` plays the same role as in
+    /// [`DestinationOwnership::lock`]: the source manifest is read with it, and
+    /// the token records it so [`sync`] refuses a run presenting another set.
+    /// A REMOTE (far-side) destination is REFUSED by the sibling check
     /// exactly as for the plain form, because neither record can be taken from
     /// this host.
     pub fn lock_with_in_root_lock(
@@ -2809,8 +2897,9 @@ impl DestinationOwnership {
         local_root: &Path,
         remote: &dyn Remote,
         in_root_lock: &RootedRelativePath,
+        exclusions: &Exclusions,
     ) -> Result<DestinationOwnership> {
-        let prepared = prepare(direction, local_root, remote, true)?;
+        let prepared = prepare(direction, local_root, remote, true, exclusions)?;
         require_endpoint_identity(remote)?;
         // The composed form never creates the destination ROOT: refuse a root
         // that is absent (or not a directory) BEFORE the sibling record is
@@ -2882,6 +2971,12 @@ struct Prepared {
     /// DESTINATION for a PUSH, the SOURCE for a PULL), and for a PULL it can be
     /// `false` while the destination is legitimately local.
     remote_is_local: bool,
+    /// The run's EXCLUSIONS at acquisition. Not a derived value: the source
+    /// manifest in [`Self::source_meta`] was read with this set, so a run that
+    /// presents a different set would filter its destination view with one set
+    /// and plan against a source read with another. [`Self::matches`] compares
+    /// it, so that run is refused.
+    exclusions: Exclusions,
     source_meta: TreeMetadata,
 }
 
@@ -2904,15 +2999,24 @@ impl Prepared {
 
     /// Whether this preflight was taken for exactly this run. A token acquired
     /// for another direction, another LOCAL root, another transport PATH
-    /// spelling, another transport ENDPOINT, or another transport LOCALNESS is
-    /// refused rather than used.
+    /// spelling, another transport ENDPOINT, another transport LOCALNESS, or
+    /// another EXCLUSION SET is refused rather than used.
     ///
     /// The remote checks run for BOTH directions. For a PUSH the remote is the
     /// DESTINATION, so they bind the host the run will mutate; for a PULL the
     /// remote is the SOURCE, so they bind the tree the token's
     /// [`Self::source_meta`] plan was read from — without them a PULL token
-    /// would be replayed against a different live source.
-    fn matches(&self, direction: Direction, local_root: &Path, remote: &dyn Remote) -> Result<()> {
+    /// would be replayed against a different live source. The exclusion axis
+    /// binds the PLAN itself: `source_meta` was read with the token's set, so a
+    /// run that filters its views with a different set would diff one tree
+    /// against another.
+    fn matches(
+        &self,
+        direction: Direction,
+        local_root: &Path,
+        remote: &dyn Remote,
+        exclusions: &Exclusions,
+    ) -> Result<()> {
         // (1) The direction and the pinned LOCAL root.
         if self.direction != direction || normalize_root(local_root) != self.local.root_path {
             return Err(Error::preflight_kind(
@@ -2992,6 +3096,22 @@ impl Prepared {
                     } else {
                         "a non-local endpoint"
                     },
+                ),
+            ));
+        }
+        // (5) The EXCLUSION SET, for BOTH directions. The token's source plan
+        // was read with the token's set, so a run presenting another set would
+        // filter its destination view with one filter and diff the source read
+        // with another. The comparison is SET equality: order and the recorded
+        // matches are not part of a set's identity.
+        if self.exclusions != *exclusions {
+            return Err(Error::preflight_kind(
+                PreflightKind::ExclusionsMismatch,
+                format!(
+                    "the destination ownership was taken for a {:?} run whose SOURCE manifest was read with the exclusions [{}] but called with the exclusions [{}]: the token's plan and the run's views would omit different paths, so they would describe different trees. Acquire ownership with the options the run will use.",
+                    self.direction,
+                    self.exclusions.spellings().collect::<Vec<_>>().join(", "),
+                    exclusions.spellings().collect::<Vec<_>>().join(", "),
                 ),
             ));
         }
@@ -3093,6 +3213,7 @@ fn prepare(
     local_root: &Path,
     remote: &dyn Remote,
     require_lock: bool,
+    exclusions: &Exclusions,
 ) -> Result<Prepared> {
     // Pin the local root BEFORE the manifests: the manifest walk and the
     // mutations must describe the same inode (checked on Unix after the walk,
@@ -3150,12 +3271,17 @@ fn prepare(
     // preparation residue may already exist — see the module docs'
     // write-footprint partition). The manifest is read once and handed to `run` as
     // the plan (`run` re-reads it at the END for the source-quiescence check,
-    // so the two samples still detect a source that moved during the run).
+    // so the two samples still detect a source that moved during the run). It
+    // is read with the run's EXCLUSIONS, which is why the acquiring
+    // constructors take them: an entry inside an excluded subtree would
+    // otherwise be refused here (an absolute symlink, a hard link, or a special
+    // file), and the plan and the views would disagree about what the source
+    // tree is.
     let source = match direction {
         Direction::Push => Side::Local(&local),
         Direction::Pull => Side::Remote(remote),
     };
-    let source_meta = source.manifest()?;
+    let source_meta = source.manifest(exclusions)?;
     // (4) RECORD THE TRANSPORT BINDING, all THREE axes, for BOTH directions:
     // the remote's PATH spelling, its ENDPOINT identity, and its LOCALNESS.
     // This is what `matches` re-checks before the run mutates anything. A push
@@ -3169,6 +3295,7 @@ fn prepare(
         remote_root,
         remote_identity,
         remote_is_local,
+        exclusions: exclusions.clone(),
         source_meta,
     })
 }
@@ -4181,10 +4308,14 @@ fn run(
     source: &Side<'_>,
     dest: &Side<'_>,
     policy: &dyn Policy,
-    extraneous: Extraneous,
+    options: &SyncOptions,
     locks: Option<HeldLocks>,
     source_meta: TreeMetadata,
 ) -> SyncResult {
+    // The run's ONE exclusion set. Every view below is handed THIS value, so
+    // the source walk, the far-side assembly and the destination view cannot
+    // disagree about what is omitted.
+    let exclusions = &options.exclusions;
     // Hold the destination's operation lock(s) for the WHOLE run: `_lock` lives
     // until this function returns, so each flock is released only after the last
     // mutation, the verification, and the source-quiescence re-read. The
@@ -4229,7 +4360,7 @@ fn run(
     // its live kind, so the diff classifies it and the report names it. A
     // SOURCE manifest (`source.manifest()` above) stays strict, so an
     // unrepresentable source entry still fails the run.
-    let destination = match dest.destination_manifest() {
+    let destination = match dest.destination_manifest(exclusions) {
         Ok(tree) => tree,
         Err(error) => return Err(SyncError::from(error)),
     };
@@ -4266,6 +4397,14 @@ fn run(
     // RAW destination entries (the very observation the enclosing function
     // read) and index THOSE, so a residue entry constrains the walk exactly as
     // the entry that will still be there does.
+    //
+    // EXCLUSIONS ARE ALREADY APPLIED to that observation, because they are
+    // applied where it is READ (`destination_manifest(exclusions)`): an
+    // excluded component is absent from this view exactly as it is absent from
+    // the diff, so a source symlink whose target walks through one is judged
+    // against the views WITHOUT it. That is the cost of an exclusion and it is
+    // stated at [`Exclusions`]: the caller declared the subtree outside the
+    // transfer, so the crate does not read it and cannot index it.
     let destination_result_view = &destination;
     // The strip is the PUBLIC diff surface's own authority
     // ([`apply_manifests`]), so a consumer that builds a status on the raw
@@ -4274,7 +4413,7 @@ fn run(
     // The destination stays a [`DestinationTree`] through the strip and the
     // diff: API constraint #7 keeps the source and destination directions in
     // distinct types, so the observation can never be fed as a source.
-    let (source_meta, destination) = apply_manifests(&source_meta, &destination);
+    let (source_meta, destination) = apply_manifests(&source_meta, &destination, exclusions);
     let dest_unsupported = destination.unsupported.clone();
     let diff = diff_source_and_destination(&source_meta, &destination);
     // An unsupported DESTINATION entry may be DELETED under a sanction
@@ -4383,7 +4522,8 @@ fn run(
         source,
         dest,
         policy,
-        extraneous_policy: extraneous,
+        extraneous_policy: options.extraneous,
+        exclusions,
         diff: &diff,
         outcomes: BTreeMap::new(),
         conflicts: BTreeMap::new(),
@@ -4422,7 +4562,7 @@ fn run(
     // the paths that moved. A source read that cannot be repeated is itself a
     // failure. Either way the engine's own result (and, on failure, its partial
     // report) is preserved by [`fail_run`].
-    match source_plan.confirm(source.manifest()) {
+    match source_plan.confirm(source.manifest(exclusions)) {
         Ok(()) => result,
         Err(error) => fail_run(result, error),
     }
@@ -4465,6 +4605,11 @@ struct Applier<'a, 'b> {
     dest: &'b Side<'a>,
     policy: &'b dyn Policy,
     extraneous_policy: Extraneous,
+    /// The run's exclusion set: the ONE filter the post-transfer live-listing
+    /// verification reads, so an excluded name in a TOUCHED directory is
+    /// INTENDED (it survives the run by design) instead of being reported as an
+    /// unplanned entry.
+    exclusions: &'b Exclusions,
     diff: &'b TreeDiff,
     /// Per-source-entry outcome, keyed by path (a `BTreeMap` so iteration and
     /// the derived report are path-ordered and a path cannot be recorded
@@ -5139,6 +5284,9 @@ impl Applier<'_, '_> {
             indeterminate,
             transfers: self.transfers,
             unsupported_destination,
+            // READ from the run's ONE exclusion set, so the report names what
+            // the views actually omitted rather than what the caller hoped to.
+            matched_exclusions: self.exclusions.matched(),
         }
     }
 
@@ -8122,6 +8270,17 @@ impl Applier<'_, '_> {
                 if intended.contains(name) {
                     continue;
                 }
+                // An EXCLUDED name is intended too: it is not in the diff's
+                // destination view (the run omits it), it SURVIVES the run by
+                // design, and reporting it as unplanned would fail every run
+                // whose destination holds an omitted subtree. The spelling is
+                // tested through the SAME matcher the views use.
+                if self
+                    .exclusions
+                    .omits(&join_manifest_path(&dir, OsStr::new(name_text.as_ref())))
+                {
+                    continue;
+                }
                 unexpected.push(name_text.into_owned());
             }
             for on_disk in unexpected {
@@ -9386,10 +9545,10 @@ impl Side<'_> {
         crate::atomic::COMPONENT_CONFINED && matches!(self, Side::Local(_))
     }
 
-    fn manifest(&self) -> Result<TreeMetadata> {
+    fn manifest(&self, exclusions: &Exclusions) -> Result<TreeMetadata> {
         match self {
-            Side::Local(local) => local.manifest(),
-            Side::Remote(remote) => remote_manifest(*remote),
+            Side::Local(local) => local.manifest(exclusions),
+            Side::Remote(remote) => remote_manifest_omitting(*remote, exclusions.set()),
         }
     }
 
@@ -9398,10 +9557,19 @@ impl Side<'_> {
     /// [`crate::manifest::canonicalize_tree_destination`]), which are returned
     /// in [`DestinationTree::unsupported`] instead of failing the run. A SOURCE
     /// uses [`Side::manifest`], which stays strict.
-    fn destination_manifest(&self) -> Result<DestinationTree> {
+    fn destination_manifest(&self, exclusions: &Exclusions) -> Result<DestinationTree> {
         match self {
+            // A LOCAL destination is read WHOLE and its VIEW is filtered before
+            // the diff ([`apply_manifests`]): the raw observation is what the
+            // destination-aware containment check indexes, so an excluded
+            // destination entry that SURVIVES the run must still constrain a
+            // source link's target walk. See [`Exclusions`].
             Side::Local(local) => local.destination_manifest(),
-            Side::Remote(remote) => remote_destination_manifest(*remote),
+            // A FAR-SIDE destination can only be read ONCE (one listing), and
+            // its excluded lines are dropped BEFORE assembly so they cannot
+            // trip a kind refusal (rule 7). `remote_destination_manifest_omitting`
+            // does the same for a transport that reports its root LOCAL.
+            Side::Remote(remote) => remote_destination_manifest_omitting(*remote, exclusions.set()),
         }
     }
 
@@ -9750,10 +9918,10 @@ impl LocalSide {
     /// absent. (An absent REMOTE root is an error — see `remote_manifest`.)
     /// A non-directory root is always an error, and a missing SOURCE root is an
     /// error, never `empty`.
-    fn manifest(&self) -> Result<TreeMetadata> {
+    fn manifest(&self, exclusions: &Exclusions) -> Result<TreeMetadata> {
         match std::fs::symlink_metadata(&self.root_path) {
             Ok(meta) if meta.is_dir() => {
-                let manifest = canonicalize_tree(&self.root_path)?;
+                let manifest = canonicalize_tree_omitting(&self.root_path, exclusions.set())?;
                 self.confirm_pinned_root()?;
                 Ok(manifest)
             }

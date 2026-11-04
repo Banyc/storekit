@@ -45,6 +45,27 @@
 //! single idempotent restore on the success and failure path; a report derived
 //! from the journal and the per-entry outcome record).
 //!
+//! # Exclusions
+//!
+//! A run may OMIT a caller-named set of root-relative subtrees from both of its
+//! views ([`exclusions::Exclusions`], carried in [`apply::SyncOptions`]): a
+//! `.git`, `node_modules` or virtual-environment subtree that lives inside the
+//! synced root but is not part of what the run manages. An excluded entry is
+//! not walked, not transferred, not removed by
+//! [`apply::Extraneous::Delete`], and not reported as extraneous, so an
+//! absolute symlink or hard link inside it never refuses the run. The set is
+//! one value shared by the local walk, the far-side assembly and the
+//! destination view, and [`apply::SyncReport::matched_exclusions`] names the
+//! exclusions that actually covered something — an exclusion that covered
+//! nothing is NOT reported as applied, so a typo is visible.
+//!
+//! An exclusion is not ownership and not a lock: it changes which entries the
+//! run considers, never who owns the destination, and it does not make a
+//! nested source and destination disjoint. It also does not police what lives
+//! under the excluded path — the crate does not read it — so a source symlink
+//! whose relative target walks through an excluded component is checked against
+//! the views WITHOUT that component.
+//!
 //! # The contract, and how the crate enforces it
 //!
 //! * **The transport's host identity is prepared before the first remote
@@ -130,6 +151,7 @@
 
 pub mod apply;
 pub mod diff;
+pub mod exclusions;
 pub mod residue;
 
 pub use residue::Residue;
@@ -137,9 +159,10 @@ pub use residue::Residue;
 pub use apply::{
     Conflict, ConflictReason, DestinationOwnership, Direction, EntryPolicy, Extraneous, InRootLock,
     LockedDestination, LockedRemoteDestination, Policy, ReplaceAll, RetireOutcome, SyncError,
-    SyncReport, SyncResult, destination_lock_path, retire_destination_lock, sync,
+    SyncOptions, SyncReport, SyncResult, destination_lock_path, retire_destination_lock, sync,
 };
 pub use diff::{
     EntryDiff, EntryKind, REMOTE_MANIFEST_TIMEOUT, TreeDiff, apply_manifests,
     diff_source_and_destination, diff_trees, local_manifest, remote_manifest,
 };
+pub use exclusions::Exclusions;

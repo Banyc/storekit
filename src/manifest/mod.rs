@@ -262,6 +262,7 @@ use crate::error::{Error, MaterializationKind, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -561,6 +562,11 @@ pub(crate) enum SymlinkTargetRefusal {
 /// The CONTAINMENT fold for the physical walk: the full Unicode case fold
 /// ([`crate::casefold`]), not `str::to_lowercase`.
 ///
+/// This fold has TWO callers, and sharing it is what keeps them from
+/// disagreeing: the containment rule ([`fold_path`], [`SymlinkContainmentIndex`],
+/// [`ContainmentViews`]) and the exclusion matcher
+/// ([`ExclusionSet`]).
+///
 /// `str::to_lowercase` is the Unicode *lowercase* mapping, which UNDER-matches
 /// a case-insensitive host: it maps `ß` to `ß` (not `ss`), the `ﬁ`/`ﬂ`/`ﬃ`
 /// ligatures to themselves, and U+03C2 FINAL SIGMA to itself, while macOS APFS
@@ -621,6 +627,190 @@ fn fold_path(path: &str) -> String {
         out.push_str(&fold_component(component));
     }
     out
+}
+
+/// What a VIEW OMITS: a set of root-relative MANIFEST spellings, each naming
+/// one entry or a whole subtree.
+///
+/// This is the ONE exclusion matcher, and the fold it compares with is
+/// [`fold_component`] — the SAME fold the containment rule uses — so the local
+/// walk and the far-side assembler cannot exclude a spelling in one view and
+/// miss it in the other. [`crate::sync::Exclusions`] is the public, VALIDATED
+/// form (it refuses a spelling no manifest entry could equal); it owns one of
+/// these, and every view is handed that one value rather than rebuilding the
+/// filter.
+///
+/// A spelling matches at COMPONENT BOUNDARIES: `a/b` covers `a/b` and `a/b/c`,
+/// never `a/bc`. Because the comparison is folded, a spelling that is not
+/// byte-identical but folds onto an excluded component is covered too — the
+/// same DENIAL direction the containment fold errs in, so a folding host cannot
+/// exclude a subtree in one view and miss it in another.
+///
+/// Matching is IDEMPOTENT and records WHICH spellings matched
+/// ([`ExclusionSet::matched_spellings`]); recording changes what a report says,
+/// never what the filter does.
+pub(crate) struct ExclusionSet {
+    entries: Vec<ExclusionEntry>,
+}
+
+struct ExclusionEntry {
+    /// The spelling as supplied, already validated as a root-relative manifest
+    /// path. Stored so a report can name it back.
+    spelling: String,
+    /// The folded component sequence, compared component-by-component.
+    folded: Vec<String>,
+    /// Set when [`ExclusionSet::omits`] covers an entry with this spelling.
+    /// `Relaxed` is enough: the record is written and read by one run, which
+    /// has no concurrent reader.
+    matched: AtomicBool,
+}
+
+impl ExclusionSet {
+    /// The empty set: no spelling matches, so every view is the view the crate
+    /// builds without exclusions.
+    pub(crate) fn none() -> ExclusionSet {
+        ExclusionSet {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Build the set from ALREADY-VALIDATED manifest spellings (see
+    /// [`crate::sync::Exclusions::parse`], the ONE validator). A repeated
+    /// spelling is ONE member of the set, not two, so a report cannot name the
+    /// same exclusion twice.
+    pub(crate) fn from_spellings<I: IntoIterator<Item = String>>(spellings: I) -> ExclusionSet {
+        let mut entries: Vec<ExclusionEntry> = Vec::new();
+        for spelling in spellings {
+            if entries.iter().any(|entry| entry.spelling == spelling) {
+                continue;
+            }
+            entries.push(ExclusionEntry {
+                folded: spelling.split('/').map(fold_component).collect(),
+                spelling,
+                matched: AtomicBool::new(false),
+            });
+        }
+        ExclusionSet { entries }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The spellings, in the order they were supplied.
+    pub(crate) fn spellings(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.spelling.as_str())
+    }
+
+    /// Whether `path` (a root-relative MANIFEST spelling) is covered by an
+    /// exclusion. Every covering spelling is recorded as matched, so a
+    /// duplicate spelling (impossible after [`Self::from_spellings`]'s dedupe)
+    /// would still be reported, and a second call is a no-op.
+    pub(crate) fn omits(&self, path: &str) -> bool {
+        let mut omits = false;
+        for entry in &self.entries {
+            if entry.covers(path) {
+                entry.matched.store(true, Ordering::Relaxed);
+                omits = true;
+            }
+        }
+        omits
+    }
+
+    /// Take the observations `from` made as this set's own, for the equal sets
+    /// the ownership token and the run carry as two VALUES. The source manifest
+    /// is read while the token is minted — one of the three filter sites — so
+    /// its matches are recorded on the token's set; without this, an equal but
+    /// distinct run set would report only the matches made after the run began.
+    /// A spelling `from` matched that this set does not hold cannot exist for
+    /// EQUAL sets, and an unequal pair is refused before this runs.
+    pub(crate) fn adopt_matches(&self, from: &ExclusionSet) {
+        for entry in &self.entries {
+            if let Some(from_entry) = from
+                .entries
+                .iter()
+                .find(|candidate| candidate.folded == entry.folded)
+                && from_entry.matched.load(Ordering::Relaxed)
+            {
+                entry.matched.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The spellings that covered at least one entry, sorted so a report is
+    /// deterministic.
+    pub(crate) fn matched_spellings(&self) -> Vec<String> {
+        let mut matched: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.matched.load(Ordering::Relaxed))
+            .map(|entry| entry.spelling.clone())
+            .collect();
+        matched.sort();
+        matched
+    }
+}
+
+impl ExclusionEntry {
+    /// Whether this spelling covers `path` at a component boundary. The
+    /// exclusion's components are the PREFIX of the path's, compared with
+    /// [`fold_component`] on both sides.
+    fn covers(&self, path: &str) -> bool {
+        let mut components = path.split('/');
+        for folded in &self.folded {
+            match components.next() {
+                Some(component) if fold_component(component) == *folded => {}
+                _ => return false,
+            }
+        }
+        // Every exclusion component matched, and a `/`-separated path cannot
+        // stop mid-component, so what remains (if anything) is a descendant.
+        true
+    }
+}
+
+impl Clone for ExclusionSet {
+    /// An EQUAL set, observations included: a clone made after a view was
+    /// filtered reports what that view matched.
+    fn clone(&self) -> ExclusionSet {
+        ExclusionSet {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| ExclusionEntry {
+                    spelling: entry.spelling.clone(),
+                    folded: entry.folded.clone(),
+                    matched: AtomicBool::new(entry.matched.load(Ordering::Relaxed)),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PartialEq for ExclusionSet {
+    /// Set equality: the same members, in any order (matching is order-free).
+    fn eq(&self, other: &Self) -> bool {
+        if self.entries.len() != other.entries.len() {
+            return false;
+        }
+        let mut ours: Vec<&[String]> = self.entries.iter().map(|e| e.folded.as_slice()).collect();
+        let mut theirs: Vec<&[String]> =
+            other.entries.iter().map(|e| e.folded.as_slice()).collect();
+        ours.sort();
+        theirs.sort();
+        ours == theirs
+    }
+}
+
+impl Eq for ExclusionSet {}
+
+impl std::fmt::Debug for ExclusionSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExclusionSet")
+            .field("spellings", &self.spellings().collect::<Vec<_>>())
+            .field("matched", &self.matched_spellings())
+            .finish()
+    }
 }
 
 /// What a SPELLED root-relative path resolves to in one view of a tree.
@@ -1265,7 +1455,20 @@ pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<
 /// design cost of the manifest-and-hash model, not a bug; reusing a
 /// caller-supplied previous manifest would remove it but is not implemented.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
-    canonicalize_tree_with(root, RefuseUnsupported)
+    canonicalize_tree_with(root, RefuseUnsupported, &ExclusionSet::none())
+}
+
+/// The SOURCE walk with a caller-named OMITTED set: every entry an exclusion
+/// covers is skipped, and an excluded DIRECTORY is never descended into, so an
+/// absolute symlink, a hard link, a special file, or an unrepresentable name
+/// inside it is never read and never refused. The manifest it produces is the
+/// same one [`canonicalize_tree`] produces for the tree with those subtrees
+/// absent, and the tree digest is computed over the reduced entry set.
+pub(crate) fn canonicalize_tree_omitting(
+    root: &Path,
+    omits: &ExclusionSet,
+) -> Result<TreeMetadata> {
+    canonicalize_tree_with(root, RefuseUnsupported, omits)
 }
 
 /// One DESTINATION entry that the manifest model can carry as PRESENT but that
@@ -1396,7 +1599,7 @@ impl DestinationTree {
 /// [`canonicalize_tree`], so an unrepresentable SOURCE entry still fails the
 /// run.
 pub fn canonicalize_tree_destination(root: &Path) -> Result<DestinationTree> {
-    canonicalize_tree_with(root, RecordUnsupported::default())
+    canonicalize_tree_with(root, RecordUnsupported::default(), &ExclusionSet::none())
 }
 
 /// What a canonicalizing walk does when the address-fidelity rules refuse an
@@ -1672,7 +1875,11 @@ impl Classified {
     }
 }
 
-fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Result<S::Output> {
+fn canonicalize_tree_with<S: UnsupportedSink>(
+    root: &Path,
+    mut sink: S,
+    omits: &ExclusionSet,
+) -> Result<S::Output> {
     let mut assembler = EntryAssembler::new();
 
     let root_c = root
@@ -1685,7 +1892,12 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
         )));
     }
 
-    for entry in WalkDir::new(root).min_depth(1).into_iter() {
+    // One iterator, so an excluded DIRECTORY can have its subtree SKIPPED
+    // (`skip_current_dir`) instead of being walked and dropped: not descending
+    // is what keeps an absolute symlink, a hard link, a special file, or an
+    // unrepresentable name inside it from being read, hashed, or refused.
+    let mut walk = WalkDir::new(root).min_depth(1).into_iter();
+    while let Some(entry) = walk.next() {
         let entry = entry.map_err(|e| Error::materialization(format!("walk {e}")))?;
         let path = entry.path();
         let rel_os = path
@@ -1713,6 +1925,19 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
         // per-entry refusals below NAME this spelling; `push` re-validates so
         // the assembler's invariant does not depend on this call.
         let entry_path = validate_entry_path(&joined)?;
+
+        // THE ONE EXCLUSION FILTER for this view. It runs AFTER the spelling is
+        // validated (the matcher compares that same spelling) and BEFORE the
+        // entry is stat'ed or read, so an omitted entry is never described. An
+        // omitted DIRECTORY's contents are skipped outright: `skip_current_dir`
+        // stops the walk descending, so nothing inside it is yielded, stat'ed,
+        // hashed, or refused.
+        if omits.omits(&entry_path) {
+            if entry.file_type().is_dir() {
+                walk.skip_current_dir();
+            }
+            continue;
+        }
 
         let meta = std::fs::symlink_metadata(path)
             .map_err(|e| Error::materialization(format!("stat {}: {e}", path.display())))?;
@@ -2040,7 +2265,20 @@ impl<'a> CompleteListing<'a> {
 /// that mis-describes the tree — a correctness/completeness bug at the caller,
 /// never a containment hole here.
 pub(crate) fn canonicalize_remote_entries(listing: CompleteListing<'_>) -> Result<TreeMetadata> {
-    canonicalize_remote_entries_with(listing, RefuseUnsupported)
+    canonicalize_remote_entries_with(listing, RefuseUnsupported, &ExclusionSet::none())
+}
+
+/// The raw SOURCE assembler with a caller-named OMITTED set: a listing line an
+/// exclusion covers is dropped BEFORE the entry is assembled, so the excluded
+/// entry never becomes part of the manifest and cannot reach the kind,
+/// hard-link, duplicate, parent-closure, or containment refusals that the
+/// remaining entries still undergo. Because an excluded path's parent chain is
+/// excluded with it, the filtered entry set stays parent-closed.
+pub(crate) fn canonicalize_remote_entries_omitting(
+    listing: CompleteListing<'_>,
+    omits: &ExclusionSet,
+) -> Result<TreeMetadata> {
+    canonicalize_remote_entries_with(listing, RefuseUnsupported, omits)
 }
 
 /// The CHECKED constructor for a remote SOURCE listing: it takes the far-side
@@ -2068,6 +2306,20 @@ pub fn canonicalize_remote_entries_checked(
     canonicalize_remote_entries(CompleteListing::new(output, root, exited_zero)?)
 }
 
+/// [`canonicalize_remote_entries_checked`] with a caller-named OMITTED set: the
+/// same completeness precondition, and the exclusion filter is applied before
+/// assembly (see [`canonicalize_remote_entries_omitting`]). The crate's remote
+/// SOURCE path uses this form; the exclusion-carrying sync never assembles a
+/// far-side listing any other way.
+pub(crate) fn canonicalize_remote_entries_checked_omitting(
+    output: &str,
+    root: &Path,
+    exited_zero: bool,
+    omits: &ExclusionSet,
+) -> Result<TreeMetadata> {
+    canonicalize_remote_entries_omitting(CompleteListing::new(output, root, exited_zero)?, omits)
+}
+
 /// The destination-tolerant form of [`canonicalize_remote_entries`]: the same
 /// wire validation, but the strict refusals are RECORDED in
 /// [`DestinationTree::unsupported`] (and kept in the
@@ -2079,7 +2331,17 @@ pub fn canonicalize_remote_entries_checked(
 pub(crate) fn canonicalize_remote_entries_destination(
     listing: CompleteListing<'_>,
 ) -> Result<DestinationTree> {
-    canonicalize_remote_entries_with(listing, RecordUnsupported::default())
+    canonicalize_remote_entries_with(listing, RecordUnsupported::default(), &ExclusionSet::none())
+}
+
+/// The destination-tolerant form with a caller-named OMITTED set: an excluded
+/// listing line is dropped before assembly, so it is in neither the observation
+/// nor [`DestinationTree::unsupported`].
+pub(crate) fn canonicalize_remote_entries_destination_omitting(
+    listing: CompleteListing<'_>,
+    omits: &ExclusionSet,
+) -> Result<DestinationTree> {
+    canonicalize_remote_entries_with(listing, RecordUnsupported::default(), omits)
 }
 
 /// The DESTINATION-side checked constructor: [`canonicalize_remote_entries_checked`]
@@ -2095,9 +2357,25 @@ pub fn canonicalize_remote_entries_destination_checked(
     canonicalize_remote_entries_destination(CompleteListing::new(output, root, exited_zero)?)
 }
 
+/// [`canonicalize_remote_entries_destination_checked`] with a caller-named
+/// OMITTED set, filtered before assembly exactly as on the SOURCE side. The
+/// crate's remote DESTINATION path uses this form.
+pub(crate) fn canonicalize_remote_entries_destination_checked_omitting(
+    output: &str,
+    root: &Path,
+    exited_zero: bool,
+    omits: &ExclusionSet,
+) -> Result<DestinationTree> {
+    canonicalize_remote_entries_destination_omitting(
+        CompleteListing::new(output, root, exited_zero)?,
+        omits,
+    )
+}
+
 fn canonicalize_remote_entries_with<S: UnsupportedSink>(
     listing: CompleteListing<'_>,
     mut sink: S,
+    omits: &ExclusionSet,
 ) -> Result<S::Output> {
     let (output, _root) = listing.parts();
     let mut assembler = EntryAssembler::new();
@@ -2150,6 +2428,16 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
         // trees. Validated here as well as in [`EntryAssembler::push`] because
         // the per-field refusals below NAME this spelling.
         let entry_path = validate_entry_path(path)?;
+
+        // THE ONE EXCLUSION FILTER for this view, BEFORE assembly: an excluded
+        // line never becomes a manifest entry, so it cannot trip the hard-link,
+        // kind, duplicate, or containment refusals below and cannot appear in
+        // the assembled metadata (or its digest). The parent-closure gate that
+        // follows the loop still holds because a path's ancestors are covered
+        // by the same exclusion whenever it is.
+        if omits.omits(&entry_path) {
+            continue;
+        }
 
         let mode = u32::from_str_radix(mode_hex, 16).map_err(|_| {
             Error::materialization(format!("invalid mode {mode_hex:?} for {entry_path}"))

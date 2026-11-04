@@ -57,7 +57,10 @@ use storekit::atomic::{
     write_atomic_replace, write_atomic_replace_fd,
 };
 use storekit::env::SysEnv;
-use storekit::sync::{DestinationOwnership, Direction, Extraneous, ReplaceAll, SyncReport, sync};
+use storekit::sync::{
+    DestinationOwnership, Direction, Exclusions, Extraneous, ReplaceAll, SyncOptions, SyncReport,
+    sync,
+};
 use storekit::transport::{
     Layout, LocalTransport, Remote, SIDECAR_WAIT_TIMEOUT, with_operation_lock_sidecar,
 };
@@ -292,7 +295,7 @@ fn push_once(src: &Path, dst: &Path, ownership: DestinationOwnership) -> SyncRep
         src,
         &transport,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         ownership,
     )
     .expect("the local push runs")
@@ -315,8 +318,9 @@ fn sync_entry_point_in_both_ownership_states() {
         std::fs::write(src.join("f"), b"OWNED").expect("seed the source");
 
         let transport = local_transport(&dst);
-        let ownership = DestinationOwnership::lock(Direction::Push, &src, &transport)
-            .expect("acquire the destination's operation lock");
+        let ownership =
+            DestinationOwnership::lock(Direction::Push, &src, &transport, &Exclusions::none())
+                .expect("acquire the destination's operation lock");
         assert!(
             matches!(ownership, DestinationOwnership::Locked(_)),
             "the acquiring constructor must produce the unforgeable Locked token"

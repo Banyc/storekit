@@ -38,7 +38,8 @@ use storekit::RootedRelativePath;
 use storekit::env::SysEnv;
 use storekit::lock::FileLock;
 use storekit::sync::{
-    DestinationOwnership, Direction, Extraneous, ReplaceAll, destination_lock_path, sync,
+    DestinationOwnership, Direction, Exclusions, Extraneous, ReplaceAll, SyncOptions,
+    destination_lock_path, sync,
 };
 use storekit::transport::{Layout, LocalTransport};
 
@@ -120,11 +121,12 @@ impl Pair {
             self.local_root(),
             transport,
             &layout_lock(),
+            &Exclusions::none(),
         )
     }
 
     fn plain(&self, transport: &LocalTransport) -> storekit::Result<DestinationOwnership> {
-        DestinationOwnership::lock(self.dir, self.local_root(), transport)
+        DestinationOwnership::lock(self.dir, self.local_root(), transport, &Exclusions::none())
     }
 }
 
@@ -186,7 +188,7 @@ fn composed_excludes_plain_and_composed(dir: Direction) {
         pair.local_root(),
         &transport,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         owned,
     )
     .expect("the composed run succeeds");
@@ -375,6 +377,7 @@ fn composed_in_root_record_is_residue_and_is_never_destroyed() {
         &src,
         &transport,
         &layout_lock(),
+        &Exclusions::none(),
     )
     .unwrap();
     let record = in_root_path(&dst);
@@ -394,7 +397,7 @@ fn composed_in_root_record_is_residue_and_is_never_destroyed() {
         &ReplaceAll,
         // DELIBERATELY Delete: even a run that deletes destination-only
         // entries must not destroy the record or the directory that holds it.
-        Extraneous::Delete,
+        SyncOptions::without_exclusions(Extraneous::Delete),
         owned,
     )
     .unwrap();
@@ -443,6 +446,7 @@ fn composed_requires_an_existing_root_and_refuses_without_creating() {
         &src,
         &transport,
         &layout_lock(),
+        &Exclusions::none(),
     ) {
         Err(storekit::Error::NotFound(message)) => {
             assert!(
@@ -468,6 +472,7 @@ fn composed_requires_an_existing_root_and_refuses_without_creating() {
         &src,
         &transport,
         &layout_lock(),
+        &Exclusions::none(),
     ) {
         Err(storekit::Error::Materialization { .. }) => {}
         Ok(_) => panic!("a non-directory root must be refused"),
@@ -499,7 +504,7 @@ fn plain_form_never_takes_the_in_root_record(dir: Direction) {
         pair.local_root(),
         &transport,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         plain,
     )
     .expect("the plain run succeeds");

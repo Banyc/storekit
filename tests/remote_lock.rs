@@ -41,8 +41,8 @@ use storekit::env::SysEnv;
 use storekit::error::{Error, PreflightKind};
 use storekit::lock::FileLock;
 use storekit::sync::{
-    DestinationOwnership, Direction, Extraneous, ReplaceAll, SyncResult, destination_lock_path,
-    sync,
+    DestinationOwnership, Direction, Exclusions, Extraneous, ReplaceAll, SyncOptions, SyncResult,
+    destination_lock_path, sync,
 };
 use storekit::transport::{Layout, SshTransport};
 
@@ -471,13 +471,13 @@ impl Fixture {
     /// Acquire the far-side lock for a PUSH of `self.src` into `self.far_root`.
     fn acquire(&self) -> DestinationOwnership {
         let t = self.harness.transport(&self.far_root);
-        DestinationOwnership::lock_remote(Direction::Push, &self.src, &t)
+        DestinationOwnership::lock_remote(Direction::Push, &self.src, &t, &Exclusions::none())
             .expect("acquire the far-side lock")
     }
 
     fn try_acquire(&self) -> Result<DestinationOwnership, Error> {
         let t = self.harness.transport(&self.far_root);
-        DestinationOwnership::lock_remote(Direction::Push, &self.src, &t)
+        DestinationOwnership::lock_remote(Direction::Push, &self.src, &t, &Exclusions::none())
     }
 
     fn sync_owned(&self, ownership: DestinationOwnership) -> SyncResult {
@@ -487,7 +487,7 @@ impl Fixture {
             &self.src,
             &t,
             &ReplaceAll,
-            Extraneous::Keep,
+            SyncOptions::without_exclusions(Extraneous::Keep),
             ownership,
         )
     }
@@ -766,7 +766,7 @@ fn lock_remote_refuses_a_local_destination() {
         Layout::empty(),
     )
     .expect("local transport");
-    let err = DestinationOwnership::lock_remote(Direction::Push, &src, &t)
+    let err = DestinationOwnership::lock_remote(Direction::Push, &src, &t, &Exclusions::none())
         .err()
         .expect("a local destination must be refused by lock_remote");
     assert_eq!(

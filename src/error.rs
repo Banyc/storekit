@@ -234,6 +234,20 @@ pub enum StoreKind {
     /// file, a directory, or a symlink, so it cannot be recovered or discarded
     /// by name.
     ResidueNotAnEntry,
+    /// A sync EXCLUSION spelling is not a rooted relative path this crate can
+    /// name: the empty path (the root itself), an absolute path, a `.`/`..`
+    /// component, a wire-unrepresentable character (NUL/LF/CR/TAB), a name that
+    /// is not UTF-8 or not NFC, or a component longer than the filesystem name
+    /// bound. Refused when the [`crate::sync::Exclusions`] value is built, so
+    /// an exclusion can never be a spelling no manifest entry could equal.
+    ExclusionSpelling,
+    /// A sync EXCLUSION spelling names the crate's own bookkeeping: the lock
+    /// record, the `.sync-aside.` namespace, a crate temp shape, or a
+    /// case/trailing-dot alias of any of them. Excluding such a path would
+    /// bypass the residue and recovery rules, so it is refused for the same
+    /// reason [`crate::reserved::is_unaddressable_name`] refuses it as an
+    /// identity.
+    ExclusionReserved,
     /// The entry is VISIBLE but its durability is UNCONFIRMED: the publish
     /// step committed, but a later fsync failed, so the previous content is
     /// gone and the new content may not survive a crash. A caller must not
@@ -366,6 +380,11 @@ pub enum PreflightKind {
     /// transport names a far-side root whose in-root record cannot be held
     /// from this host.
     ComposedRequiresLocalDestination,
+    /// The token was minted with a DIFFERENT set of sync exclusions than the
+    /// run presents: the token's source plan was read with one set and the run
+    /// would filter its views with another, so the two sides would not describe
+    /// the same tree. Acquire ownership with the exclusions the run will use.
+    ExclusionsMismatch,
     /// The transport did not override [`crate::transport::Remote::lock_far_side`],
     /// whose default refuses, so it cannot hold a far-side operation lock.
     FarSideLockUnsupported,

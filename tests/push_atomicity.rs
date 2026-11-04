@@ -18,7 +18,8 @@
 
 use storekit::env::SysEnv;
 use storekit::sync::{
-    DestinationOwnership, Direction, Extraneous, Policy, ReplaceAll, SyncError, SyncResult, sync,
+    DestinationOwnership, Direction, Exclusions, Extraneous, Policy, ReplaceAll, SyncError,
+    SyncOptions, SyncResult, sync,
 };
 use storekit::transport::{Layout, LocalTransport, Remote};
 
@@ -31,13 +32,13 @@ fn owned_push(
     remote: &dyn Remote,
     policy: &dyn Policy,
 ) -> SyncResult {
-    match DestinationOwnership::lock(Direction::Push, local_root, remote) {
+    match DestinationOwnership::lock(Direction::Push, local_root, remote, &Exclusions::none()) {
         Ok(ownership) => sync(
             Direction::Push,
             local_root,
             remote,
             policy,
-            Extraneous::Keep,
+            SyncOptions::without_exclusions(Extraneous::Keep),
             ownership,
         ),
         Err(error) => Err(SyncError::from(error)),

@@ -43,10 +43,12 @@
 
 use crate::error::{Error, Result, TransportKind};
 use crate::manifest::{
-    DestinationTree, TreeEntry, TreeMetadata, canonicalize_remote_entries_checked,
-    canonicalize_remote_entries_destination_checked, canonicalize_tree,
-    canonicalize_tree_destination, remote_tree_verify_script,
+    DestinationTree, ExclusionSet, TreeEntry, TreeMetadata,
+    canonicalize_remote_entries_checked_omitting,
+    canonicalize_remote_entries_destination_checked_omitting, canonicalize_tree,
+    canonicalize_tree_destination, canonicalize_tree_omitting, remote_tree_verify_script,
 };
+use crate::sync::Exclusions;
 use crate::transport::{ExecOutcome, Remote, TimeoutCause};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -202,6 +204,17 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// that a far-side `die` propagates, so the script's own anchored words
 /// outrank the bare status.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
+    remote_manifest_omitting(remote, &ExclusionSet::none())
+}
+
+/// [`remote_manifest`] with a caller-named OMITTED set: an omitted entry is not
+/// part of the manifest on EITHER branch (the in-process walk for a local
+/// remote, the far-side listing filtered before assembly for a real one), so it
+/// cannot be transferred and cannot trip the source-side refusals.
+pub(crate) fn remote_manifest_omitting(
+    remote: &dyn Remote,
+    omits: &ExclusionSet,
+) -> Result<TreeMetadata> {
     // SELF-PREPARE: the public primitive a consumer calls must not depend on an
     // undocumented extra caller step. The sync entry points already call
     // `prepare_identity` themselves before their first remote request; this
@@ -217,7 +230,7 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
         // would let an `Extraneous::Delete` sync read unreadable far-side state
         // as "nothing is there" and destroy it.
         return match std::fs::symlink_metadata(root) {
-            Ok(meta) if meta.is_dir() => canonicalize_tree(root),
+            Ok(meta) if meta.is_dir() => canonicalize_tree_omitting(root, omits),
             Ok(_) => Err(Error::transport_kind(
                 TransportKind::RootNotADirectory,
                 format!(
@@ -251,17 +264,18 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     }
     // The completeness precondition is ENFORCED at this call site: the checked
     // constructor refuses `exited_zero == false`, so the assembler can never
-    // describe an incomplete walk as a (possibly empty) faithful tree.
-    canonicalize_remote_entries_checked(&out.stdout, root, out.success())
+    // describe an incomplete walk as a (possibly empty) faithful tree. The
+    // omitted set is applied to the LISTING, before assembly.
+    canonicalize_remote_entries_checked_omitting(&out.stdout, root, out.success(), omits)
 }
 
 /// The DESTINATION-side counterpart of [`remote_manifest`]: the same branch on
 /// [`Remote::is_local`] and the same failure classification, but the manifest
 /// is built TOLERANT of the address-fidelity refusals a destination may
 /// legitimately hold (see [`canonicalize_tree_destination`] and
-/// [`canonicalize_remote_entries_destination_checked`]). The tolerated entries are
-/// returned in [`DestinationTree::unsupported`] so the sync can classify them
-/// as destination-only and let a caller-sanctioned
+/// [`crate::manifest::canonicalize_remote_entries_destination_checked`]). The
+/// tolerated entries are returned in [`DestinationTree::unsupported`] so the
+/// sync can classify them as destination-only and let a caller-sanctioned
 /// [`crate::sync::Extraneous::Delete`] remove them, and can REFUSE to write a
 /// source entry over them.
 ///
@@ -280,6 +294,26 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
 /// report a stranded `.sync-aside` as `Extraneous` (deletable) where the
 /// engine reports it as `residue`.
 pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTree> {
+    remote_destination_manifest_omitting(remote, &ExclusionSet::none())
+}
+
+/// [`remote_destination_manifest`] with a caller-named OMITTED set. The filter
+/// applies to the FAR-SIDE listing, before assembly: an excluded line is never
+/// assembled, so it cannot trip the kind refusals a destination listing can
+/// carry (a special-file line is refused even by the tolerant assembler).
+///
+/// A LOCAL remote root is read WHOLE, exactly as [`remote_destination_manifest`]
+/// reads it: a destination observation is what the destination-aware
+/// containment check indexes, and an excluded destination entry SURVIVES the
+/// run, so it must still constrain a source link's target walk. The excluded
+/// entries are removed from the destination VIEW before the diff
+/// ([`apply_manifests`]) on both branches, so they are neither extraneous nor a
+/// deletion target; only the FAR-SIDE branch must also drop them from the
+/// observation, because a far-side listing can be read exactly once.
+pub(crate) fn remote_destination_manifest_omitting(
+    remote: &dyn Remote,
+    omits: &ExclusionSet,
+) -> Result<DestinationTree> {
     // SELF-PREPARE, exactly as the source-side primitive does: a consumer
     // calling this directly on a fresh transport must not need a separate
     // `prepare_identity` call.
@@ -318,15 +352,22 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
     if !out.success() {
         return Err(remote_manifest_failure(root, &out));
     }
-    // Same enforced completeness precondition on the DESTINATION side.
-    canonicalize_remote_entries_destination_checked(&out.stdout, root, out.success())
+    // Same enforced completeness precondition on the DESTINATION side, and the
+    // same filter applied to the LISTING before assembly.
+    canonicalize_remote_entries_destination_checked_omitting(
+        &out.stdout,
+        root,
+        out.success(),
+        omits,
+    )
 }
 
 /// The pair of manifests `crate::sync::apply` actually DIFFS: the SOURCE with
 /// every unaddressable path removed and the DESTINATION with its RESIDUE
 /// removed, both through the crate's ONE reserved authority
-/// ([`crate::reserved`]). `diff_trees(&source, &dest)` of the results is the
-/// engine's transfer decision surface.
+/// ([`crate::reserved`]), and both with every path the caller's
+/// [`Exclusions`] cover removed. `diff_trees(&source, &dest)` of the results is
+/// the engine's transfer decision surface.
 ///
 /// A consumer building a status from the RAW manifest primitives MUST apply
 /// this first. Without it the raw diff classifies a stranded destination
@@ -336,6 +377,16 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
 /// [`EntryDiff::Missing`] while the engine refuses it with a `ReservedName`
 /// conflict. Acting on the raw list therefore risks destroying a stranded
 /// original or writing into the crate's reserved namespace.
+///
+/// `exclusions` is the SAME value the run's [`crate::sync::SyncOptions`] holds,
+/// applied to the DESTINATION view so an excluded destination entry is neither
+/// extraneous nor a deletion target under either [`crate::sync::Extraneous`]
+/// value, and applied to the SOURCE as well so this public surface is
+/// idempotent: the engine's own source manifest was already built without the
+/// excluded entries, and filtering it again changes nothing. An excluded entry
+/// is also dropped from [`DestinationTree::unsupported`], because a tolerated
+/// destination entry inside an excluded subtree is no more part of the view
+/// than the subtree is.
 ///
 /// The two sides strip DIFFERENT sets on purpose (see [`crate::sync::apply`]):
 /// a reserved-namespaced CRATE TEMP is stripped from the source so it is never
@@ -361,13 +412,23 @@ pub fn remote_destination_manifest(remote: &dyn Remote) -> Result<DestinationTre
 pub fn apply_manifests(
     source: &TreeMetadata,
     dest: &DestinationTree,
+    exclusions: &Exclusions,
 ) -> (TreeMetadata, DestinationTree) {
-    let stripped_dest = strip_reserved(dest.meta.clone(), crate::reserved::is_residue_path);
+    let stripped_dest = strip_paths(dest.meta.clone(), |path| {
+        !crate::reserved::is_residue_path(path) && !exclusions.omits(path)
+    });
     (
-        strip_reserved(source.clone(), crate::reserved::is_unaddressable_path),
+        strip_paths(source.clone(), |path| {
+            !crate::reserved::is_unaddressable_path(path) && !exclusions.omits(path)
+        }),
         DestinationTree {
             meta: stripped_dest,
-            unsupported: dest.unsupported.clone(),
+            unsupported: dest
+                .unsupported
+                .iter()
+                .filter(|entry| !exclusions.omits(&entry.path))
+                .cloned()
+                .collect(),
         },
     )
 }
@@ -378,8 +439,22 @@ pub fn apply_manifests(
 /// ([`apply_manifests`]). The recomputed digest depends only on the STRIPPED
 /// content: [`crate::manifest::compute_tree_digest`] clears `tree_sha256`
 /// itself, so the old digest cannot be folded into the new one.
-pub(crate) fn strip_reserved(mut meta: TreeMetadata, reserved: fn(&str) -> bool) -> TreeMetadata {
-    meta.entries.retain(|entry| !reserved(&entry.path));
+///
+/// The production strip is [`apply_manifests`], which applies the reserved
+/// predicate AND the run's exclusions in ONE pass; this reserved-only form is
+/// kept as the smallest witness of the digest rule
+/// (`strip_reserved_recomputes_the_canonical_digest`).
+#[cfg(test)]
+pub(crate) fn strip_reserved(meta: TreeMetadata, reserved: fn(&str) -> bool) -> TreeMetadata {
+    strip_paths(meta, |path| !reserved(path))
+}
+
+/// The ONE strip: keep only the entries `keep` admits, then recompute the tree
+/// digest so the result is self-consistent. [`strip_reserved`] and
+/// [`apply_manifests`] both funnel through here, so the reserved strip and the
+/// separated exclusion filter cannot disagree about the digest.
+fn strip_paths(mut meta: TreeMetadata, keep: impl Fn(&str) -> bool) -> TreeMetadata {
+    meta.entries.retain(|entry| keep(&entry.path));
     meta.tree_sha256 = crate::manifest::compute_tree_digest(&meta);
     meta
 }
@@ -966,7 +1041,8 @@ mod tests {
             "the RAW destination diff shows a stranded aside as deletable"
         );
 
-        let (source_stripped, dest_stripped) = apply_manifests(&source, &destination);
+        let (source_stripped, dest_stripped) =
+            apply_manifests(&source, &destination, &Exclusions::none());
         let decision = diff_source_and_destination(&source_stripped, &dest_stripped);
         assert_eq!(
             decision.classify(".sync-aside.7.0"),
@@ -1044,7 +1120,7 @@ mod tests {
             "fixture: the crate temp is in the raw source manifest"
         );
 
-        let (stripped, _) = apply_manifests(&source, &destination);
+        let (stripped, _) = apply_manifests(&source, &destination, &Exclusions::none());
         let paths: Vec<&str> = stripped
             .entries
             .iter()

@@ -48,10 +48,15 @@ them.
   a consumer's domain stay in that consumer.
 - **Whole-project snapshots.** A tree containing a Python venv, `node_modules`
   or a pnpm store is refused: absolute symlinks and hard links are outside the
-  model. Sync the state or artifact subtree, or normalize the tree first.
+  model. Sync the state or artifact subtree, normalize the tree first, or name
+  the subtree in `sync::Exclusions`, which omits it from both views so nothing
+  inside it is walked, transferred or removed.
 - **Per-step incrementality.** Every run scans and hashes the whole synced tree;
-  there is no dirty tracking and no exclusion input. Checkpoint per meaningful
-  state change, not per agent turn.
+  there is no dirty tracking and no reuse of a previous manifest. The one input
+  that REMOVES work is `sync::Exclusions`, and it does so at subtree
+  granularity: an excluded subtree is not walked at all, but every other entry
+  is still scanned and hashed on every run. Checkpoint per meaningful state
+  change, not per agent turn.
 - **Cross-entry transactions.** A run applies entry by entry, so a crash mid-run
   can leave a partial destination; all-or-nothing apply belongs to the consumer.
 
@@ -178,14 +183,14 @@ is public for a caller that needs exactly the byte-exact question, and this
 crate's production code does not call it (a unit test does).
 
 The sync strips with the broad authority: `is_unaddressable_path` for the source
-view and `is_residue_path` for the destination view, at `sync::diff`'s
-`strip_reserved` call sites. An unaddressable spelling is refused as an
-identifier and is never transferred. A residue spelling — unaddressable, but not
-a crate temp — is also never destroyed by `Extraneous::Delete`: it survives every
-extraneous policy and is reported in `SyncReport::residue`. A crate temp shape is
-the exception; it is the documented target of the recovery sweep, so
-`Extraneous::Delete` does remove it and reports it in `Extraneous`.
-"Unaddressable" therefore does not mean "undeletable".
+view and `is_residue_path` for the destination view, in `sync::diff`'s
+`apply_manifests`, which applies the run's exclusions in the same pass. An
+unaddressable spelling is refused as an identifier and is never transferred. A
+residue spelling — unaddressable, but not a crate temp — is also never destroyed
+by `Extraneous::Delete`: it survives every extraneous policy and is reported in
+`SyncReport::residue`. A crate temp shape is the exception; it is the documented
+target of the recovery sweep, so `Extraneous::Delete` does remove it and reports
+it in `Extraneous`. "Unaddressable" therefore does not mean "undeletable".
 
 ## What is carried
 
@@ -214,7 +219,9 @@ Two consequences follow, and they are why this is not a backup format:
 - A source containing a hard link (on a Unix source), an absolute symlink, or an
   escaping symlink cannot be snapshotted at all: the strict source manifest
   refuses the run. Normalize such a tree first, by copying the hard-linked
-  content and making the symlink relative. A relative target that contains `/`
+  content and making the symlink relative, or exclude the subtree that holds it
+  with `sync::Exclusions` (an excluded subtree is not read, so it cannot refuse
+  the run). A relative target that contains `/`
   or `..` but stays inside the root without walking through a symlink component
   (`dir/link -> ../other`) is lawful and is not one of these refusals. A target
   whose walk reaches a symlink component is refused even when it lands inside,

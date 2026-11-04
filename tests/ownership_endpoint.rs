@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use storekit::env::SysEnv;
 use storekit::error::PreflightKind;
-use storekit::sync::{DestinationOwnership, Direction, Extraneous, ReplaceAll, sync};
+use storekit::sync::{
+    DestinationOwnership, Direction, Exclusions, Extraneous, ReplaceAll, SyncOptions, sync,
+};
 use storekit::transport::{
     CreateNewVerdict, ExecOutcome, FarSideLockSession, FsBytes, Layout, LocalTransport, Remote,
     RemoteEntry, RemoteMeta, RootedRelativePath,
@@ -263,8 +265,9 @@ fn a_remote_token_is_refused_across_endpoints_with_the_same_root() {
         Some("ssh://host-b:22"),
     );
 
-    let token = DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a)
-        .expect("mint a remote token against host A");
+    let token =
+        DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a, &Exclusions::none())
+            .expect("mint a remote token against host A");
     assert_eq!(
         host_a.far_side_lock_calls(),
         1,
@@ -281,7 +284,7 @@ fn a_remote_token_is_refused_across_endpoints_with_the_same_root() {
         &f.src,
         &host_b,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a token minted against host A must be refused for host B");
@@ -316,14 +319,15 @@ fn a_remote_token_is_refused_across_roots_with_the_same_endpoint() {
         Some("ssh://shared-host:22"),
     );
 
-    let token = DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a)
-        .expect("mint a remote token against host A");
+    let token =
+        DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a, &Exclusions::none())
+            .expect("mint a remote token against host A");
     let error = sync(
         Direction::Push,
         &f.src,
         &host_b,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a token minted for another root spelling must be refused");
@@ -345,14 +349,15 @@ fn the_transport_that_minted_a_push_token_is_accepted() {
         f.shared_root.clone(),
         Some("ssh://host-a:22"),
     );
-    let token = DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a)
-        .expect("mint a remote token against host A");
+    let token =
+        DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a, &Exclusions::none())
+            .expect("mint a remote token against host A");
     let report = sync(
         Direction::Push,
         &f.src,
         &host_a,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect("the transport that minted the token must be accepted");
@@ -393,14 +398,15 @@ fn a_pull_token_is_refused_against_a_different_source_endpoint() {
     std::fs::write(source_a.data("x"), b"from-a").expect("seed source A");
     std::fs::write(source_b.data("x"), b"from-b").expect("seed source B");
 
-    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &source_a)
-        .expect("mint a pull token against source A");
+    let token =
+        DestinationOwnership::lock(Direction::Pull, &local_dst, &source_a, &Exclusions::none())
+            .expect("mint a pull token against source A");
     let error = sync(
         Direction::Pull,
         &local_dst,
         &source_b,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a pull token minted against source A must be refused for source B");
@@ -436,14 +442,15 @@ fn a_pull_token_is_refused_against_a_different_source_root() {
     std::fs::write(source_a.data("x"), b"from-a").expect("seed source A");
     std::fs::write(source_b.data("x"), b"from-b").expect("seed source B");
 
-    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &source_a)
-        .expect("mint a pull token against source A");
+    let token =
+        DestinationOwnership::lock(Direction::Pull, &local_dst, &source_a, &Exclusions::none())
+            .expect("mint a pull token against source A");
     let error = sync(
         Direction::Pull,
         &local_dst,
         &source_b,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a pull token minted for another source root must be refused");
@@ -483,14 +490,15 @@ fn a_pull_token_is_refused_against_a_different_local_destination_root() {
     );
     std::fs::write(source.data("f"), b"from-source").expect("seed the source");
 
-    let token = DestinationOwnership::lock(Direction::Pull, &local_dst_a, &source)
-        .expect("mint a pull token for destination A");
+    let token =
+        DestinationOwnership::lock(Direction::Pull, &local_dst_a, &source, &Exclusions::none())
+            .expect("mint a pull token for destination A");
     let error = sync(
         Direction::Pull,
         &local_dst_b,
         &source,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a pull token minted for destination A must be refused for destination B");
@@ -527,14 +535,15 @@ fn the_transport_that_minted_a_pull_token_is_accepted() {
     );
     std::fs::write(source.data("x"), b"from-a").expect("seed source");
 
-    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &source)
-        .expect("mint a pull token against the source");
+    let token =
+        DestinationOwnership::lock(Direction::Pull, &local_dst, &source, &Exclusions::none())
+            .expect("mint a pull token against the source");
     let report = sync(
         Direction::Pull,
         &local_dst,
         &source,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect("the source that minted the token must be accepted");
@@ -558,7 +567,12 @@ fn a_transport_without_an_endpoint_identity_cannot_mint_a_remote_token() {
     let f = fixture();
     let host = EndpointRemote::new(f.dir.path().join("data"), f.shared_root.clone(), None);
 
-    let error = match DestinationOwnership::lock_remote(Direction::Push, &f.src, &host) {
+    let error = match DestinationOwnership::lock_remote(
+        Direction::Push,
+        &f.src,
+        &host,
+        &Exclusions::none(),
+    ) {
         Err(error) => error,
         Ok(_) => panic!("a transport without an endpoint identity must not mint a token"),
     };
@@ -593,11 +607,15 @@ fn the_endpoint_and_root_refusals_carry_distinct_typed_kinds() {
     // (a) The missing-endpoint-identity refusal.
     let f = fixture();
     let anonymous = EndpointRemote::new(f.dir.path().join("data"), f.shared_root.clone(), None);
-    let missing_identity =
-        match DestinationOwnership::lock_remote(Direction::Push, &f.src, &anonymous) {
-            Err(error) => error,
-            Ok(_) => panic!("a transport without an endpoint identity must not mint a token"),
-        };
+    let missing_identity = match DestinationOwnership::lock_remote(
+        Direction::Push,
+        &f.src,
+        &anonymous,
+        &Exclusions::none(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a transport without an endpoint identity must not mint a token"),
+    };
     let identity_kind = missing_identity.preflight_reason();
 
     // (b) The remote-root-mismatch refusal: mint against root A, run against
@@ -613,14 +631,15 @@ fn the_endpoint_and_root_refusals_carry_distinct_typed_kinds() {
         f.dir.path().join("other").join("store"),
         Some("ssh://shared-host:22"),
     );
-    let token = DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a)
-        .expect("mint a remote token against host A");
+    let token =
+        DestinationOwnership::lock_remote(Direction::Push, &f.src, &host_a, &Exclusions::none())
+            .expect("mint a remote token against host A");
     let root_mismatch = sync(
         Direction::Push,
         &f.src,
         &host_b,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a token minted for another root spelling must be refused");
@@ -681,14 +700,19 @@ fn a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local() {
     std::fs::write(non_local_source.data("x"), b"from-non-local")
         .expect("seed the non-local source");
 
-    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &local_source)
-        .expect("mint a pull token against the LOCAL source");
+    let token = DestinationOwnership::lock(
+        Direction::Pull,
+        &local_dst,
+        &local_source,
+        &Exclusions::none(),
+    )
+    .expect("mint a pull token against the LOCAL source");
     let error = sync(
         Direction::Pull,
         &local_dst,
         &non_local_source,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err("a pull token minted against a local source must be refused for a non-local one");
@@ -723,14 +747,19 @@ fn a_pull_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip(
         EndpointRemote::new(f.dir.path().join("src-b"), f.shared_root.clone(), None);
     std::fs::write(non_local_source.data("x"), b"same").expect("seed the non-local source");
 
-    let token = DestinationOwnership::lock(Direction::Pull, &local_dst, &local_source)
-        .expect("mint a pull token against the LOCAL source");
+    let token = DestinationOwnership::lock(
+        Direction::Pull,
+        &local_dst,
+        &local_source,
+        &Exclusions::none(),
+    )
+    .expect("mint a pull token against the LOCAL source");
     let error = sync(
         Direction::Pull,
         &local_dst,
         &non_local_source,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err(
@@ -797,8 +826,9 @@ fn a_push_token_is_refused_when_the_destination_flips_from_local_to_non_local() 
     )
     .expect("a LocalTransport over the shared root");
 
-    let token = DestinationOwnership::lock(Direction::Push, &f.src, &local_dest)
-        .expect("mint a push token against the LOCAL destination");
+    let token =
+        DestinationOwnership::lock(Direction::Push, &f.src, &local_dest, &Exclusions::none())
+            .expect("mint a push token against the LOCAL destination");
 
     // The non-local destination the run is handed: the SAME root spelling, NO
     // endpoint identity, and DIFFERENT content.
@@ -813,7 +843,7 @@ fn a_push_token_is_refused_when_the_destination_flips_from_local_to_non_local() 
         &f.src,
         &non_local_dest,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err(
@@ -857,8 +887,9 @@ fn a_push_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip(
     )
     .expect("a LocalTransport over the shared root");
 
-    let token = DestinationOwnership::lock(Direction::Push, &f.src, &local_dest)
-        .expect("mint a push token against the LOCAL destination");
+    let token =
+        DestinationOwnership::lock(Direction::Push, &f.src, &local_dest, &Exclusions::none())
+            .expect("mint a push token against the LOCAL destination");
 
     let non_local_dest =
         EndpointRemote::new(f.dir.path().join("dst-b"), f.shared_root.clone(), None);
@@ -871,7 +902,7 @@ fn a_push_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip(
         &f.src,
         &non_local_dest,
         &ReplaceAll,
-        Extraneous::Keep,
+        SyncOptions::without_exclusions(Extraneous::Keep),
         token,
     )
     .expect_err(

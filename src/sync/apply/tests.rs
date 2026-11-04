@@ -44,8 +44,34 @@ fn owned(
     policy: &dyn Policy,
     extraneous: Extraneous,
 ) -> SyncResult {
-    match DestinationOwnership::lock(direction, local_root, remote) {
-        Ok(ownership) => sync(direction, local_root, remote, policy, extraneous, ownership),
+    owned_with(
+        direction,
+        local_root,
+        remote,
+        policy,
+        &SyncOptions::without_exclusions(extraneous),
+    )
+}
+
+/// The OWNED path with the caller's WHOLE [`SyncOptions`]: the token is acquired
+/// with the options' exclusions (the acquisition reads the source manifest with
+/// them) and the SAME options are handed to [`sync`].
+fn owned_with(
+    direction: Direction,
+    local_root: &Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+    options: &SyncOptions,
+) -> SyncResult {
+    match DestinationOwnership::lock(direction, local_root, remote, &options.exclusions) {
+        Ok(ownership) => sync(
+            direction,
+            local_root,
+            remote,
+            policy,
+            options.clone(),
+            ownership,
+        ),
         Err(error) => Err(SyncError::from(error)),
     }
 }
@@ -59,12 +85,29 @@ fn unowned(
     policy: &dyn Policy,
     extraneous: Extraneous,
 ) -> SyncResult {
+    unowned_with(
+        direction,
+        local_root,
+        remote,
+        policy,
+        SyncOptions::without_exclusions(extraneous),
+    )
+}
+
+/// The UNOWNED path with the caller's whole [`SyncOptions`].
+fn unowned_with(
+    direction: Direction,
+    local_root: &Path,
+    remote: &dyn Remote,
+    policy: &dyn Policy,
+    options: SyncOptions,
+) -> SyncResult {
     sync(
         direction,
         local_root,
         remote,
         policy,
-        extraneous,
+        options,
         DestinationOwnership::Unowned,
     )
 }
@@ -4724,7 +4767,10 @@ fn root_spelling_normalizes_and_refuses_a_symlinked_root() {
     let plain = LocalSide::open(&real, LocalRole::Source).unwrap();
     let slashed = LocalSide::open(&with_slash, LocalRole::Source).unwrap();
     assert_eq!(plain.root_path, slashed.root_path);
-    assert_eq!(plain.manifest().unwrap(), slashed.manifest().unwrap());
+    assert_eq!(
+        plain.manifest(&Exclusions::none()).unwrap(),
+        slashed.manifest(&Exclusions::none()).unwrap()
+    );
 
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -5438,7 +5484,10 @@ fn manifest_refuses_a_pinned_root_that_disappeared() {
     let side = LocalSide::open(&root, LocalRole::Destination).unwrap();
     fs::remove_dir_all(&root).unwrap();
     assert!(
-        matches!(side.manifest(), Err(Error::Materialization { .. })),
+        matches!(
+            side.manifest(&Exclusions::none()),
+            Err(Error::Materialization { .. })
+        ),
         "a pinned root that disappeared is an error, not an empty tree"
     );
 }
@@ -5659,7 +5708,12 @@ fn a_racily_created_non_empty_destination_root_is_not_adopted() {
     let root = dir.path().join("root");
     let side = LocalSide::open(&root, LocalRole::Destination).unwrap();
     // The manifest pass describes the absent destination as the empty tree.
-    assert!(side.manifest().unwrap().entries.is_empty());
+    assert!(
+        side.manifest(&Exclusions::none())
+            .unwrap()
+            .entries
+            .is_empty()
+    );
     // A racer creates a NON-EMPTY directory at the path.
     write(&root.join("racer"), b"x");
     assert!(
@@ -5670,7 +5724,12 @@ fn a_racily_created_non_empty_destination_root_is_not_adopted() {
     // An EMPTY racer-created directory is exactly what the sync would create.
     let empty_root = dir.path().join("empty-root");
     let side = LocalSide::open(&empty_root, LocalRole::Destination).unwrap();
-    assert!(side.manifest().unwrap().entries.is_empty());
+    assert!(
+        side.manifest(&Exclusions::none())
+            .unwrap()
+            .entries
+            .is_empty()
+    );
     fs::create_dir_all(&empty_root).unwrap();
     assert!(side.root_for_mutation().is_ok(), "an empty root is adopted");
 }
@@ -5688,7 +5747,10 @@ fn a_source_refuses_an_absent_local_root_while_a_destination_treats_it_as_empty(
     let source = LocalSide::open(&root, LocalRole::Source).unwrap();
     assert!(!source.is_destination());
     assert!(
-        matches!(source.manifest(), Err(Error::Materialization { .. })),
+        matches!(
+            source.manifest(&Exclusions::none()),
+            Err(Error::Materialization { .. })
+        ),
         "an absent SOURCE root is an error, never an empty tree"
     );
     assert!(
@@ -5707,7 +5769,11 @@ fn a_source_refuses_an_absent_local_root_while_a_destination_treats_it_as_empty(
     let destination = LocalSide::open(&root, LocalRole::Destination).unwrap();
     assert!(destination.is_destination());
     assert!(
-        destination.manifest().unwrap().entries.is_empty(),
+        destination
+            .manifest(&Exclusions::none())
+            .unwrap()
+            .entries
+            .is_empty(),
         "an absent destination is the empty tree"
     );
     assert!(
@@ -13246,6 +13312,7 @@ fn composed_ownership_refuses_a_remote_destination_like_the_plain_form() {
         &src,
         &remote,
         &RootedRelativePath::parse(Path::new("state/operation.lock")).unwrap(),
+        &Exclusions::none(),
     ) {
         Err(err) => err,
         Ok(_) => panic!("the composed form must refuse a destination it cannot lock"),
@@ -13339,7 +13406,7 @@ fn the_derived_destination_shape_follows_the_direction_and_the_transport() {
             Direction::Pull => (&dst, &src),
         };
         let remote = RecordingRemote::over(transport(transport_root), remote_is_local);
-        let prepared = prepare(direction, local_root, &remote, false).unwrap();
+        let prepared = prepare(direction, local_root, &remote, false, &Exclusions::none()).unwrap();
         assert_eq!(
             prepared.dest_root(),
             normalized_dst.as_path(),
@@ -13376,7 +13443,12 @@ fn lock_remote_refuses_a_transport_without_far_side_locking() {
     let before = canonicalize_tree(&dst).unwrap();
     let remote = RecordingRemote::over(transport(&dst), false)
         .with_endpoint_identity("test://recording-remote");
-    let error = match DestinationOwnership::lock_remote(Direction::Push, &src, &remote) {
+    let error = match DestinationOwnership::lock_remote(
+        Direction::Push,
+        &src,
+        &remote,
+        &Exclusions::none(),
+    ) {
         Err(error) => error,
         Ok(_) => panic!("a transport without far-side locking must be refused"),
     };
@@ -13417,7 +13489,12 @@ fn lock_remote_refuses_a_remote_destination_with_no_derivable_record() {
     let remote = RecordingRemote::over(transport(&dst), false)
         .with_endpoint_identity("test://recording-remote")
         .with_reported_root(PathBuf::from("/"));
-    let error = match DestinationOwnership::lock_remote(Direction::Push, &src, &remote) {
+    let error = match DestinationOwnership::lock_remote(
+        Direction::Push,
+        &src,
+        &remote,
+        &Exclusions::none(),
+    ) {
         Err(error) => error,
         Ok(_) => panic!("a remote destination with no derivable lock record must be refused"),
     };
@@ -13499,7 +13576,7 @@ fn a_non_local_source_without_an_endpoint_identity_cannot_mint_a_token() {
     // A NON-LOCAL source (a third-party remote) that states NO endpoint.
     let remote = RecordingRemote::over(transport(&src), false).without_endpoint_identity();
 
-    let err = DestinationOwnership::lock(Direction::Pull, &dst, &remote)
+    let err = DestinationOwnership::lock(Direction::Pull, &dst, &remote, &Exclusions::none())
         .err()
         .expect("a non-local transport without an endpoint identity must not mint a token");
     assert_eq!(
@@ -13548,6 +13625,7 @@ fn a_composed_mint_refuses_a_non_local_source_without_an_endpoint_identity() {
         &dst,
         &remote,
         &in_root_lock,
+        &Exclusions::none(),
     )
     .err()
     .expect(
@@ -13590,15 +13668,20 @@ fn a_destination_ownership_token_is_bound_to_its_run() {
     let before = canonicalize_tree(&other_dst).unwrap();
 
     // Take ownership for `locked_dst`...
-    let ownership = DestinationOwnership::lock(Direction::Push, &src, &transport(&locked_dst))
-        .expect("acquiring the lock for the real destination");
+    let ownership = DestinationOwnership::lock(
+        Direction::Push,
+        &src,
+        &transport(&locked_dst),
+        &Exclusions::none(),
+    )
+    .expect("acquiring the lock for the real destination");
     // ...and hand it to a run against `other_dst`.
     let err = sync(
         Direction::Push,
         &src,
         &transport(&other_dst),
         &ReplaceAll,
-        Keep,
+        SyncOptions::without_exclusions(Keep),
         ownership,
     )
     .expect_err("a token taken for another destination must be refused");
@@ -13630,14 +13713,19 @@ fn a_destination_ownership_token_is_bound_to_its_local_root() {
     fs::create_dir_all(&dst).unwrap();
     let before = canonicalize_tree(&dst).unwrap();
 
-    let ownership = DestinationOwnership::lock(Direction::Push, &src_a, &transport(&dst))
-        .expect("acquiring the lock for the destination");
+    let ownership = DestinationOwnership::lock(
+        Direction::Push,
+        &src_a,
+        &transport(&dst),
+        &Exclusions::none(),
+    )
+    .expect("acquiring the lock for the destination");
     let err = sync(
         Direction::Push,
         &src_b,
         &transport(&dst),
         &ReplaceAll,
-        Keep,
+        SyncOptions::without_exclusions(Keep),
         ownership,
     )
     .expect_err("a token minted for another local root must be refused");
@@ -13680,14 +13768,19 @@ fn a_pull_destination_ownership_token_is_bound_to_its_local_root() {
     let before_a = canonicalize_tree(&dst_a).unwrap();
     let before_b = canonicalize_tree(&dst_b).unwrap();
 
-    let ownership = DestinationOwnership::lock(Direction::Pull, &dst_a, &transport(&src))
-        .expect("minting a PULL token for destination root A");
+    let ownership = DestinationOwnership::lock(
+        Direction::Pull,
+        &dst_a,
+        &transport(&src),
+        &Exclusions::none(),
+    )
+    .expect("minting a PULL token for destination root A");
     let err = sync(
         Direction::Pull,
         &dst_b,
         &transport(&src),
         &ReplaceAll,
-        Keep,
+        SyncOptions::without_exclusions(Keep),
         ownership,
     )
     .expect_err("a PULL token minted for another local root must be refused");
@@ -13723,15 +13816,20 @@ fn a_destination_ownership_token_is_bound_to_its_direction() {
     // The PUSH token's destination root spelling is the local root itself, so
     // the PULL run's derived destination (the local root) is the SAME and
     // cannot distinguish the swap.
-    let ownership = DestinationOwnership::lock(Direction::Push, &root, &transport(&root))
-        .expect("minting a PUSH token whose destination root equals the local root");
+    let ownership = DestinationOwnership::lock(
+        Direction::Push,
+        &root,
+        &transport(&root),
+        &Exclusions::none(),
+    )
+    .expect("minting a PUSH token whose destination root equals the local root");
 
     let err = sync(
         Direction::Pull,
         &root,
         &transport(&root),
         &ReplaceAll,
-        Keep,
+        SyncOptions::without_exclusions(Keep),
         ownership,
     )
     .expect_err("a PUSH token must be refused for a PULL run");
@@ -13770,15 +13868,20 @@ fn a_pull_destination_ownership_token_is_bound_to_its_direction() {
     // The PULL token's derived destination is its local root, which is ALSO
     // the PUSH run's destination spelling, so both directions name the same
     // tree and only the direction can distinguish them.
-    let ownership = DestinationOwnership::lock(Direction::Pull, &root, &transport(&root))
-        .expect("minting a PULL token whose local root equals the transport root");
+    let ownership = DestinationOwnership::lock(
+        Direction::Pull,
+        &root,
+        &transport(&root),
+        &Exclusions::none(),
+    )
+    .expect("minting a PULL token whose local root equals the transport root");
 
     let err = sync(
         Direction::Push,
         &root,
         &transport(&root),
         &ReplaceAll,
-        Keep,
+        SyncOptions::without_exclusions(Keep),
         ownership,
     )
     .expect_err("a PULL token must be refused for a PUSH run");
@@ -13808,14 +13911,15 @@ fn a_destination_ownership_token_refuses_a_derived_destination_shape_swap() {
     let src_before = canonicalize_tree(&src).unwrap();
     let dst_before = canonicalize_tree(&dst).unwrap();
 
-    let ownership = DestinationOwnership::lock(Direction::Push, &src, &transport(&dst))
-        .expect("minting a PUSH token for the destination");
+    let ownership =
+        DestinationOwnership::lock(Direction::Push, &src, &transport(&dst), &Exclusions::none())
+            .expect("minting a PUSH token for the destination");
     let err = sync(
         Direction::Pull,
         &src,
         &transport(&dst),
         &ReplaceAll,
-        Keep,
+        SyncOptions::without_exclusions(Keep),
         ownership,
     )
     .expect_err("a PUSH token must be refused for a PULL run");
@@ -14939,6 +15043,13 @@ fn the_deletion_verdict_answers_in_the_documented_order() {
 /// Build an [`Applier`] over `diff` with every field at the empty default the
 /// run constructor uses. Tests that interrogate a private guard DIRECTLY
 /// (rather than through `run`) start from here, so the guard is exercised
+/// The empty exclusion set, for the test-only [`Applier`] constructors below
+/// (the `Applier` borrows its set for the run's lifetime).
+fn no_exclusions() -> &'static Exclusions {
+    static NONE: std::sync::OnceLock<Exclusions> = std::sync::OnceLock::new();
+    NONE.get_or_init(Exclusions::none)
+}
+
 /// against a freshly built record rather than a hand-rolled partial state.
 fn applier_over<'a, 'b>(
     source: &'b Side<'a>,
@@ -14951,6 +15062,7 @@ fn applier_over<'a, 'b>(
         dest,
         policy,
         extraneous_policy: Keep,
+        exclusions: no_exclusions(),
         diff,
         outcomes: BTreeMap::new(),
         conflicts: BTreeMap::new(),
@@ -15706,4 +15818,134 @@ fn a_source_entry_over_an_unsupported_destination_entry_is_refused_before_any_tr
         fs::symlink_metadata(dst.join("ok")).is_err(),
         "NOTHING was transferred before the refusal: {message}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `sync-exclusions` rule 7: the FAR-SIDE listing is filtered BEFORE assembly.
+//
+// This is the one filter site a `LocalTransport` cannot reach (it reads the
+// tree in process), so the source is a crafted far-side manifest: a listing
+// line the exclusion covers must never become a manifest entry, and therefore
+// must never reach the hard-link, kind, or containment refusals that the
+// remaining lines still undergo.
+// ---------------------------------------------------------------------------
+
+/// The far-side SOURCE listing carries a HARD LINK inside `.git` (a strict
+/// assembly refusal) and an ABSOLUTE symlink beside it. With `.git` excluded the
+/// pull neither refuses on it nor transfers it.
+#[test]
+fn the_far_side_source_listing_is_filtered_before_assembly() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let remote_root = dir.path().join("remote");
+    let dst = dir.path().join("dst");
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    write(&remote_root.join("f"), b"payload");
+    let payload = crate::digest::sha256_bytes(b"payload");
+    let link_target = "/etc/passwd";
+    let link_hash = crate::digest::sha256_bytes(link_target.as_bytes());
+    // `.git/d` first, then the hard link (`nlink` 2), then the absolute link.
+    let manifest = format!(
+        "f\tf\t1a4\t1\t{payload}\t\n\
+         .git\td\t1ed\t1\t\t\n\
+         .git/a\tf\t1a4\t2\t{payload}\t\n\
+         .git/absolute\tl\t1ff\t1\t{link_hash}\t{link_target}\n"
+    );
+
+    // WITHOUT the exclusion the strict assembler refuses the hard link, naming
+    // the typed reason: the listing really does describe an unrepresentable
+    // tree, so the exclusion is doing the work below.
+    let refused = RecordingRemote::over(transport(&remote_root), false)
+        .with_manifest_output(manifest.clone());
+    let error = owned(Direction::Pull, &dst, &refused, &ReplaceAll, Keep)
+        .expect_err("the unexcluded listing must be refused");
+    assert_eq!(
+        error.error().materialization_reason(),
+        Some(MaterializationKind::HardLink),
+        "the refusal must be the typed hard-link condition: {error:?}"
+    );
+    assert!(
+        !dst.join("f").exists(),
+        "the refused pull transferred nothing"
+    );
+
+    // WITH the exclusion the excluded lines are dropped BEFORE assembly, so the
+    // hard-link and absolute-symlink refusals are never reached.
+    let remote =
+        RecordingRemote::over(transport(&remote_root), false).with_manifest_output(manifest);
+    let report = owned_with(
+        Direction::Pull,
+        &dst,
+        &remote,
+        &ReplaceAll,
+        &SyncOptions::new(
+            Keep,
+            Exclusions::parse([".git"]).expect("the exclusion spelling is valid"),
+        ),
+    )
+    .expect("the excluded far-side entries must not be assembled");
+    assert_eq!(report.applied, vec!["f".to_string()]);
+    assert!(!dst.join(".git").exists(), "no excluded entry is created");
+    assert_eq!(read(&dst.join("f")), b"payload");
+    assert_eq!(report.matched_exclusions, vec![".git".to_string()]);
+}
+
+/// The far-side DESTINATION listing carries a SPECIAL FILE inside the excluded
+/// subtree. Even the destination-tolerant assembler REFUSES a special-file line
+/// (the kind model cannot carry one), so this pins rule 7 on the destination
+/// side: filtered before assembly, it is neither refused nor removed.
+#[test]
+fn the_far_side_destination_listing_is_filtered_before_assembly() {
+    let dir = fixture_tmpdir(&env()).unwrap();
+    let src = dir.path().join("src");
+    let remote_root = dir.path().join("remote");
+    write(&src.join("f"), b"payload");
+    fs::create_dir_all(remote_root.join(".git")).unwrap();
+    write(&remote_root.join("stale"), b"destination-only");
+    let listing = |git_pipe_kind: &str| {
+        // The `stale` hash is the hash of the bytes ON DISK: a claimed-untouched
+        // entry is content-verified, so a listing that lied about it would fail
+        // verification for a reason that has nothing to do with exclusions.
+        let stale = crate::digest::sha256_bytes(b"destination-only");
+        format!(
+            "stale\tf\t1a4\t1\t{stale}\t\n\
+             .git\td\t1ed\t1\t\t\n\
+             .git/pipe\t{git_pipe_kind}\t1a0\t1\t\t\n"
+        )
+    };
+
+    // WITHOUT the exclusion the special-file line is refused by the tolerant
+    // destination assembler (it can carry neither kind nor removal for it).
+    let refused =
+        RecordingRemote::over(transport(&remote_root), false).with_manifest_output(listing("o"));
+    let error = unowned(Direction::Push, &src, &refused, &ReplaceAll, Delete)
+        .expect_err("an unexcluded special-file destination entry must be refused");
+    assert_eq!(
+        error.error().materialization_reason(),
+        Some(MaterializationKind::SpecialFile),
+        "the refusal must be the typed special-file condition: {error:?}"
+    );
+
+    // WITH the exclusion the line is dropped before assembly; `Delete` then
+    // removes the ORDINARY destination-only entry and leaves the subtree alone.
+    let remote =
+        RecordingRemote::over(transport(&remote_root), false).with_manifest_output(listing("o"));
+    let report = unowned_with(
+        Direction::Push,
+        &src,
+        &remote,
+        &ReplaceAll,
+        SyncOptions::new(
+            Delete,
+            Exclusions::parse([".git"]).expect("the exclusion spelling is valid"),
+        ),
+    )
+    .expect("the excluded far-side destination entry must not be assembled");
+    assert_eq!(report.extraneous, vec!["stale".to_string()]);
+    assert!(!remote_root.join("stale").exists());
+    assert!(
+        remote_root.join(".git").is_dir(),
+        "the excluded destination subtree survives Delete"
+    );
+    assert_eq!(report.matched_exclusions, vec![".git".to_string()]);
 }
