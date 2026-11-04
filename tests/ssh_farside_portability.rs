@@ -17,12 +17,11 @@
 //!
 //! WHAT THE SHIM PROVES. The exact command string `SshTransport` builds is
 //! re-parsed by a REAL POSIX shell and run against a REAL filesystem with the
-//! host's real userland. On macOS (this repository's CI/development host) that
-//! host userland is **BSD** (`mv`, `stat`, `cp`, `ln`, `find`, ... are BSD),
-//! so the BSD side of every divergence is genuinely exercised; on Linux it is
-//! GNU. A GNU-only far-side command therefore FAILS these tests when they run
-//! on macOS and PASSES them when they run on Linux — the exact asymmetry this
-//! file exists to close.
+//! host's real userland. On macOS that host userland is **BSD** (`mv`, `stat`,
+//! `cp`, `ln`, `find`, ... are BSD), so the BSD side of every divergence is
+//! genuinely exercised; on Linux it is GNU. A GNU-only far-side command
+//! therefore fails these tests on macOS and passes them on Linux: the
+//! asymmetry these tests detect.
 //!
 //! WHAT THE SHIM DOES NOT PROVE. It does not talk to any network and does not
 //! exercise the SSH protocol or a real remote login shell: no handshake, no
@@ -258,17 +257,20 @@ fn symlink(target: &str, link: impl AsRef<Path>) {
 // ---------------------------------------------------------------------------
 // The far-side rename primitive.
 //
-// Pre-fix `rename_cmd` produced `mv -T` (GNU-only). On a BSD/macOS remote
-// `mv` rejects `-T` as an illegal option and exits 64, so EVERY kind-changing
-// replacement failed. Every POSITIVE test in this section therefore fails on
-// macOS pre-fix with `mv: illegal option -- T`, and passes on Linux; the
-// REFUSAL test is the one negative case a GNU host also satisfies pre-fix.
+// The rename must work on both userlands: GNU `mv -T` is an ILLEGAL option on
+// BSD/macOS, so the command is built from `perl rename` operands, which have no
+// option parsing at all. The POSITIVE tests exercise rename/replace across the
+// kind pairs a manifest walk can present — symlink over symlink (replacing a
+// link that points INTO a directory, retargeting to a different target,
+// replacing a self-loop), file over symlink, file over a path left absent by a
+// delete, and directory over a claimed non-directory — plus metacharacters in
+// the operands. The REFUSAL test pins that a file is never moved INTO a
+// directory target.
 // ---------------------------------------------------------------------------
 
-/// THE REPORTED BUG, reduced: replace the top-level `current` symlink that
-/// points INTO a directory. A bare `mv src dst` treats the symlink-to-dir
-/// destination as the directory itself and moves `src` INSIDE it; pre-fix
-/// `-T` prevented that on GNU — and made the whole command illegal on BSD.
+/// Replace the top-level `current` symlink that points INTO a directory. A bare
+/// `mv src dst` treats the symlink-to-dir destination as the directory itself
+/// and moves `src` INSIDE it, so the primitive must replace the link itself.
 #[test]
 fn rename_replaces_a_top_level_symlink_to_a_directory() {
     let h = Harness::new("dst");
@@ -401,9 +403,9 @@ fn rename_replaces_a_claimed_nondir_with_a_directory() {
     );
 }
 
-/// The GUARD `-T` existed to provide, and which a portable primitive must keep
-/// providing: a file must NOT be moved INTO a directory target. The rename must
-/// fail loudly (nonzero) and leave both the file and the directory intact.
+/// The GUARD a portable primitive must provide: a file must NOT be moved INTO a
+/// directory target. The rename must fail loudly (nonzero) and leave both the
+/// file and the directory intact.
 #[test]
 fn rename_refuses_a_file_onto_a_directory_target() {
     let h = Harness::new("dst");
@@ -461,9 +463,9 @@ fn rename_with_metacharacters_in_the_path_round_trips() {
 // ---------------------------------------------------------------------------
 // `RemoteEntry.mode`.
 //
-// Pre-fix the list script ran `stat -c '%f'`; BSD `stat` rejects `-c`, the mode
-// column is empty, and the parser silently defaulted it to 0. The test below
-// therefore fails on macOS pre-fix (mode 0) and passes on Linux.
+// BSD `stat` has no `-c`, so a list script built on `stat -c '%f'` reports an
+// empty mode column on a macOS remote. The list must use a portable `lstat`
+// (the perl primitive) and report the RAW mode, type bits included.
 // ---------------------------------------------------------------------------
 
 /// `Remote::list` must report the REAL mode on a BSD userland too.
@@ -495,7 +497,7 @@ fn list_reports_the_real_mode_on_bsd_userland() {
             .clone()
     };
     // RAW `st_mode`, type bits INCLUDED: the value `LocalTransport::list`
-    // reports from `symlink_metadata`, not the old perm-only `& 0o7777` mask.
+    // reports from `symlink_metadata`.
     assert_eq!(
         by_name("script.sh").mode,
         0o100755,
@@ -549,11 +551,10 @@ fn list_frames_tab_and_newline_names_with_real_modes() {
 // ---------------------------------------------------------------------------
 // Durability.
 //
-// Pre-fix `fsync_tree`/`fsync_parent`/`write_new_cmd` used `sync <operand>`,
-// which GNU coreutils >= 8.24 treats as "fsync this path" but BSD/macOS treats
-// as a NO-OP (`sync /nonexistent` exits 0). The probe tests below record the
-// fsync calls the far-side script actually makes, so pre-fix the log is EMPTY
-// on every platform (the operand-less `sync` command is not perl at all).
+// The far-side fsync helpers must use the portable `perl` primitive: `sync
+// <operand>` is GNU coreutils behaviour, while BSD/macOS `sync` treats its
+// operands as a NO-OP. The probe tests below record the fsync calls the
+// far-side script actually makes.
 // ---------------------------------------------------------------------------
 
 /// `fsync_parent` must fsync the PARENT directory (the entry's dirname), via
@@ -623,10 +624,7 @@ fn fsync_parent_failure_propagates() {
 /// The TRANSPORT-side AlreadyPresent retry: when `try_write_new` finds a
 /// byte-and-mode-identical record already installed it must still make the
 /// parent DIRECTORY durable, through the SAME portable perl primitive the
-/// script uses. The retry used to run a bare `sync <parent>`, which the perl
-/// probe never sees (and which is a silent no-op on BSD/macOS).
-///
-/// Pre-fix the log is EMPTY, so this test FAILED on every platform.
+/// script uses.
 #[test]
 fn try_write_new_already_present_fsyncs_the_parent_portably() {
     let h = Harness::new("dst");
@@ -656,17 +654,11 @@ fn try_write_new_already_present_fsyncs_the_parent_portably() {
     );
 }
 
-/// THE HOLE: `fsync_tree` used `find -depth -exec perl … {} ;`, and
-/// `find` IGNORES the invoked command's exit status for `;`, so a tree whose
-/// EVERY far-side fsync failed still made `find` exit 0 and `fsync_tree` return
-/// `Ok(())`. The probe's fake perl exits 9 on the directory-fsync hook; the
-/// walk must surface that as an `Err`, never a swallowed success.
-///
-/// Pre-fix this test FAILED with `Ok(())`, and the hole reproduces over a real
-/// sshd: measured against a GNU sshd on 2222 and a BSD sshd on 2223, a tree
-/// whose every far-side fsync failed still made `find` exit 0. `fsync_parent`
-/// already propagated (`fsync_parent_failure_propagates`), so this is the one
-/// hole.
+/// A failed far-side fsync ANYWHERE in the tree must be a propagated `Err`,
+/// never a swallowed success: the probe's fake perl exits 9 on the
+/// directory-fsync hook. `find` IGNORES the invoked command's exit status for
+/// `;`, so the walk must use `-exec … {} +` and stop at the first failure; a
+/// walk built the other way would exit 0 with every fsync failed.
 #[test]
 fn fsync_tree_failure_propagates() {
     let h = Harness::new("dst");
@@ -689,10 +681,9 @@ fn fsync_tree_failure_propagates() {
     );
 }
 
-/// The old fsync primitive opened with `"<"`, which BLOCKS FOREVER
-/// on a FIFO (a read open waits for a writer). `fsync_tree` must terminate —
-/// and, matching the LOCAL walk (which skips non-regular entries), succeed by
-/// never opening the fifo.
+/// A FIFO in a tree must not block: `fsync_tree` must terminate, and — matching
+/// the LOCAL walk (which skips non-regular entries) — succeed by never opening
+/// the FIFO.
 #[test]
 fn fsync_tree_over_a_fifo_terminates() {
     let h = Harness::new("dst");
@@ -715,9 +706,7 @@ fn fsync_tree_over_a_fifo_terminates() {
 
 /// An ABSENT directory must list EMPTY, agreeing with
 /// `LocalTransport::list` (which deliberately treats `NotFound` as empty so an
-/// unprovisioned remote root is inspectable). The rewrite's bare
-/// `opendir … or die` made the SSH view error while the pre-fix glob (and the
-/// local view) returned empty.
+/// unprovisioned remote root is inspectable).
 #[test]
 fn list_absent_directory_agrees_with_local_empty() {
     let h = Harness::new("dst");
@@ -735,9 +724,9 @@ fn list_absent_directory_agrees_with_local_empty() {
 
 /// A present-but-unreadable directory must fail the listing on
 /// BOTH views. A `chmod 400` directory has the READ bit (so `opendir`
-/// succeeds) but no SEARCH bit (so every `lstat` fails EACCES): pre-fix the
-/// remote script's `next unless @s` dropped every entry and returned an empty
-/// `Ok` for a NON-EMPTY directory, while the local view returned `Permission
+/// succeeds) but no SEARCH bit (so every `lstat` fails EACCES), so a remote
+/// script that dropped entries whose `lstat` failed would return an empty `Ok`
+/// for a NON-EMPTY directory while the local view returned `Permission
 /// denied`. A `chmod 111` directory fails `opendir` itself. This pins
 /// remote/local AGREEMENT in both directions.
 #[test]
@@ -775,11 +764,9 @@ fn list_unreadable_directory_agrees_with_local_error() {
 
 /// THE CROSS-VIEW PIN: the SSH listing and the LOCAL listing of the
 /// SAME tree must agree FIELD BY FIELD (`name`, `is_dir`, `is_symlink`,
-/// `size`, `mode`). Pre-fix the SSH view masked `mode` with `& 0o7777` and
-/// hardcoded `size: 0`, so for `exec.sh` it reported `755:0` where local
-/// reported `100755:10`; the two views of one directory could never agree.
-/// Positives preserved: a symlink reports its OWN mode/size (never the
-/// target's), a dangling symlink is listed, and tab/newline names round-trip.
+/// `size`, `mode`), including RAW modes (type bits included) and real sizes;
+/// a symlink reports its OWN mode/size (never the target's), a dangling
+/// symlink is listed, and tab/newline names round-trip.
 #[test]
 fn list_remote_and_local_agree_field_by_field_on_the_same_tree() {
     let h = Harness::new("dst");

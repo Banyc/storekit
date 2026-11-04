@@ -1,18 +1,14 @@
 //! THE OWNED-ROOT CONFINEMENT PROPERTY, re-established against this crate's
 //! own primitives.
 //!
-//! The store's `_fd` family resolves every path COMPONENT-WISE relative to
-//! the owned root's open directory descriptor with `openat(O_NOFOLLOW)`. A
-//! symlink injected into a path component must therefore never redirect a
-//! mutation or a read outside the owned root: the operation is refused by the
-//! component-wise open (the error names `openat`/`open`, never a byte from the
-//! outside target), and the outside target is left byte-for-byte untouched.
-//!
-//! This is the crate-level re-establishment of the two tests the source crate
-//! carried in `src/store/local/owned_root.rs`
-//! (`symlink_injected_path_component_cannot_redirect_a_mutation` /
-//! `..._a_read`), which drove the property through application types
-//! (`LocalStore`/`TargetName`/`retention_debt`) that do not exist here.
+//! The store's `_fd` family resolves paths COMPONENT-WISE relative to the
+//! owned root's open directory descriptor with `openat(O_NOFOLLOW)`. A
+//! symlink injected into a path component never redirects a mutation or a read
+//! outside the owned root: an operation that OPENS the final entry is refused
+//! by that open (the error names `openat`/`open`, never a byte from the outside
+//! target), the REPLACE path (which never opens the final entry) lands at the
+//! link's own in-root path, and the outside target is left byte-for-byte
+//! untouched in both cases.
 
 #![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
@@ -164,9 +160,8 @@ fn final_component_symlink_refuses_create_new_writes_and_never_touches_outside()
         .expect_err("a create-or-truncate write to a symlink final component must be refused");
     assert_open_refusal(&err, "openat entry");
 
-    // The CAS refusal text names `open` (the CAS opens the final component
-    // directly and formats its own error), not `openat` — asserted as it
-    // really is, not as the source's mutation path phrases it.
+    // The CAS formats its own `open {rel}` error (not `openat {rel}`) because
+    // it reports the failed final-component open itself.
     let err = write_atomic_cas_fd(&root, &rp("entry"), b"IN-ROOT-NEW")
         .expect_err("a creating CAS write to a symlink final component must be refused");
     assert_open_refusal(&err, "open entry");
@@ -195,8 +190,8 @@ fn final_component_symlink_refuses_create_new_writes_and_never_touches_outside()
 /// link is never followed and the outside target is never opened or modified,
 /// so the replace cannot escape the root, race-free (the rename cannot follow
 /// the link). A caller that must instead REFUSE a foreign final entry uses a
-/// primitive that opens it with `O_NOFOLLOW` — `openat_no_follow`,
-/// `write_file_fd`, `write_atomic_cas_fd`, `read_fd`, or `path_state_fd`.
+/// primitive that opens it with `O_NOFOLLOW` — `write_file_fd`,
+/// `write_atomic_cas_fd`, `read_fd`, or `path_state_fd`.
 /// This test pins the safety-critical half (no escape) plus the designed
 /// non-refusal.
 #[test]
@@ -259,16 +254,14 @@ fn root_dir_open_refuses_a_symlink_root_but_opens_the_real_directory() {
     assert_open_refusal(&err, "open root");
 }
 
-/// Production-lib reproduction: the atomic REPLACE must consult the
-/// lock-record guard, or a holder's record is swapped for a fresh inode and a
-/// second acquisition flocks the NEW inode while the first holder still holds
-/// the old one — TWO simultaneous holders. Pre-fix the PATH-BASED replace had
-/// no guard; as of API constraint #8 that unconfined form is no longer public,
-/// so this test drives the CONFINED public replace (`write_atomic_replace_fd`,
-/// the only atomic replace a caller can name). The record lives INSIDE the
-/// root, so the confined primitive can address it; the guard is on the spelling,
-/// not the location. The replace is refused, the inode is unchanged, and the
-/// second acquisition contends.
+/// The atomic REPLACE consults the lock-record guard: without it a holder's
+/// record could be swapped for a fresh inode and a second acquisition would
+/// flock the NEW inode while the first holder still holds the old one — TWO
+/// simultaneous holders. This test drives the CONFINED public replace
+/// (`write_atomic_replace_fd`). The record lives INSIDE the root, so the
+/// confined primitive can address it; the guard is on the spelling, not the
+/// location. The replace is refused, the inode is unchanged, and the second
+/// acquisition contends.
 #[test]
 fn write_atomic_replace_cannot_swap_the_lock_record_inode() {
     use std::os::unix::fs::MetadataExt;
@@ -299,12 +292,10 @@ fn write_atomic_replace_cannot_swap_the_lock_record_inode() {
     drop(holder);
 }
 
-/// Production-lib reproduction: `renameat_paths` guarded only the
-/// endpoints' FINAL components, so renaming a directory CONTAINING the record
-/// moved the record with its inode and freed the old path; a second
-/// acquisition at the old path then created a DIFFERENT inode — TWO holders.
-/// The source SUBTREE is now walked and the rename is refused, so the record's
-/// path cannot move.
+/// `renameat_paths` walks the SOURCE SUBTREE and refuses a rename whose tree
+/// contains the lock record, so renaming an ancestor cannot move the record
+/// with its inode or free its old path (a second acquisition at the old path
+/// would then create a DIFFERENT inode — TWO holders).
 #[test]
 fn renameat_paths_cannot_move_an_ancestor_of_the_lock_record() {
     use std::os::unix::fs::MetadataExt;

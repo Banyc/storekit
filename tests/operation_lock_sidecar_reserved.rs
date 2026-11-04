@@ -1,18 +1,15 @@
 //! The PUBLIC operation-scoped sidecar critical section
-//! (`transport::with_operation_lock_sidecar`) must run the crate's ONE
+//! (`transport::with_operation_lock_sidecar`) runs the crate's ONE
 //! reserved-spelling gate BEFORE it creates anything.
 //!
-//! THE DEFECT this file pins: `with_operation_lock_sidecar` is the ONE public
-//! CREATE path that reached `ensure_operation_lock_sidecar_durable` — a raw
-//! `create_dir_all` + `create_new` + `chmod` on `base.join(sidecar)` — without
-//! `refuse_reserved_mutation`. A caller that passed one of the crate's own
-//! bookkeeping spellings as its `sidecar` therefore CREATED a lock record /
-//! residue that every guarded path refuses. The guard now runs at the public
-//! entry, so the same spelling is refused, typed, with nothing created.
+//! `with_operation_lock_sidecar` reaches
+//! `ensure_operation_lock_sidecar_durable` — a raw `create_dir_all` +
+//! `create_new` + `chmod` on `base.join(sidecar)` — and its `sidecar` argument
+//! is CALLER-CHOSEN, so the guard runs at the public entry: one of the crate's
+//! own bookkeeping spellings is refused, typed, with nothing created.
 //!
 //! The control group below shows the comparator guarded path
-//! (`atomic::write_atomic_replace`) already refused these spellings; the fix
-//! makes the sidecar helper agree with it.
+//! (`atomic::write_atomic_replace`) refuses these spellings too.
 
 // Test fixtures drive the same name-creating primitives the funnel guards.
 #![allow(clippy::disallowed_methods)]
@@ -42,8 +39,8 @@ enum Expected {
 /// Every spelling here NAMES or descends THROUGH the crate's own bookkeeping,
 /// so a caller-chosen `sidecar` may not spell one: `operation.lock` /
 /// `snapshots/.001.operation.lock` / `OPERATION.LOCK` are the application lock
-/// record (and its case alias), and `a/b/.sync-aside.1` is a byte-exact
-/// reserved residue component in a NON-final position.
+/// record (and its case alias), and `a/b/.sync-aside.1` is a reserved residue
+/// component in a NON-final position.
 const RESERVED: &[(&str, Expected)] = &[
     ("operation.lock", Expected::LockRecord),
     ("OPERATION.LOCK", Expected::LockRecord),
@@ -69,9 +66,8 @@ fn assert_typed_refusal(spelling: &str, expected: Expected, err: &Error) {
     }
 }
 
-/// THE FIX. Every reserved spelling is refused BEFORE anything is created, and
-/// the refusal is typed. Run against the PRE-FIX tree, this fails on the first
-/// (and every) entry with `Ok` and an on-disk entry, which is the defect.
+/// Every reserved spelling is refused BEFORE anything is created, and the
+/// refusal is typed.
 #[test]
 fn sidecar_helper_refuses_reserved_spellings_before_creating() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -113,9 +109,8 @@ fn sidecar_helper_refuses_reserved_spellings_before_creating() {
     );
 }
 
-/// THE CONTROL: the guarded comparator path already refused these exact
-/// spellings. This stays red-free before and after the fix, and is the
-/// evidence that the sidecar helper was the odd one out.
+/// THE CONTROL: the guarded comparator path refuses these exact spellings too,
+/// which is the evidence that the sidecar helper is not the odd one out.
 #[test]
 fn guarded_comparator_refuses_the_same_spellings() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -145,8 +140,8 @@ fn guarded_comparator_refuses_the_same_spellings() {
 
 /// THE PRODUCTION SPELLING. The crate's own default
 /// `Layout::empty().lock_sidecar` (`state/operation.lock.mutex`) is NOT a
-/// lock-record or residue spelling, so the guard must let it through: the
-/// critical section runs and the record is created durably.
+/// lock-record or residue spelling, so the guard lets it through: the critical
+/// section runs and the record is created, empty.
 #[test]
 fn default_layout_sidecar_spelling_still_works() {
     let tmp = tempfile::tempdir().expect("tempdir");

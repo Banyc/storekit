@@ -1,27 +1,25 @@
 //! Regressions for the PUBLIC tree-copy primitive
 //! [`storekit::atomic::copy_dir_recursive_fd`], written from a CONSUMER's
-//! point of view (the public API only), so they can be run unchanged against
-//! the pre-fix tree in a scratch workspace at the parent revision.
+//! point of view (the public API only).
 //!
-//! The defects pinned here are the ones the primitive's consumer meets using
-//! it the way `~/code/deploy` does — an arbitrary out-of-root source,
-//! a fresh staging destination, then the caller's own canonicalize + digest
-//! + fsync + rename:
+//! The shapes pinned here are the ones a consumer meets running a copy into a
+//! fresh staging destination and then canonicalizing the result:
 //!
-//! * The overlap refusal was decided by PATH SPELLING, so a bind-mount
-//!   (Linux) or firmlink (macOS) alias of the root evaded it and the walk
-//!   recursed without bound. The fix decides overlap by directory IDENTITY.
-//! * A case-fold-equal `dst_rel` on a folding filesystem (macOS APFS)
-//!   was not seen as overlap, and the copy MUTATED ITS OWN SOURCE's mode. The
-//!   fix refuses by identity and restores every mode it changes on failure.
-//! * A mid-walk failure left a destination directory the crate's own
-//!   `remove_dir_all_fd` could not remove (a `0o200` directory). The fix
-//!   restores the modes it changed on failure.
-//! * A copied symlink UNLINKED and REPLACED a live destination file and
-//!   returned `Ok`. The fix refuses, all-or-nothing like the file/dir rules.
-//! * A trailing-slash symlink source was FOLLOWED while the error text
-//!   claimed it was not. The fix normalizes the source spelling first.
-//! * The copy had no `RLIMIT_NOFILE` subprocess regression.
+//! * The overlap refusal decides by directory IDENTITY (`(st_dev, st_ino)`),
+//!   not by path spelling: a bind-mount (Linux) or firmlink (macOS) alias of
+//!   the root is refused. The case-fold-equal DESTINATION is NOT pinned to that
+//!   decision — the test for it discards the copy result and asserts only that
+//!   the source's mode survives, so it establishes neither that the copy failed
+//!   nor which refusal fired.
+//! * A copy that fails mid-walk restores every mode it changed: a directory the
+//!   call created is left at the removable store-private `0o700`, so the
+//!   crate's own `remove_dir_all_fd` can remove the partial destination.
+//! * A copied symlink never replaces a live destination entry: it refuses,
+//!   all-or-nothing like the file/dir rules.
+//! * A symlink source is refused regardless of a trailing separator (the
+//!   source spelling is normalized first).
+//! * A lowered `RLIMIT_NOFILE` surfaces a clean descriptor-exhaustion `Err`,
+//!   never a process abort.
 #![cfg(unix)]
 // Test-only fixtures drive the same name-mutating primitives the funnel guards;
 // the production name-mutation rule does not apply to this test crate.
@@ -98,7 +96,7 @@ fn a_trailing_separator_does_not_let_a_symlink_source_be_followed() {
     // The spelling WITH a trailing separator: POSIX resolves the final
     // component as an intermediate one, so `lstat("srclink/")` follows the
     // link and reports a directory — the very thing the refusal exists to
-    // stop. PRE-FIX the copy FOLLOWED it and returned `Ok`.
+    // stop.
     let err = copy_dir_recursive_fd(&root, &base.path().join("srclink/"), &rp("dst"))
         .expect_err("a symlink source must be refused regardless of a trailing separator");
     let msg = err.to_string();
@@ -182,15 +180,13 @@ const ANCHOR_NOFILE: u64 = 64;
 /// The destination's ANCHOR (the deepest existing directory on `dst_rel`) lies
 /// STRICTLY INSIDE the source: `src = <root>/tree`, a pre-existing
 /// `<root>/tree/sub`, and `dst = "tree/sub/deeper"`. The anchor `tree/sub` is
-/// neither the source itself nor ABOVE it, so ONLY the
-/// anchor-inside-the-source arm can refuse; with that one arm replaced by
-/// `false` the walk creates `tree/sub/deeper` inside its own source, re-yields
-/// it, and recurses without bound.
+/// neither the source itself nor ABOVE it, so only the
+/// anchor-inside-the-source arm of the overlap refusal can refuse this shape.
 ///
 /// The copy runs in a CHILD of this test binary with `RLIMIT_NOFILE` lowered,
-/// so the arm-deleted run fails FAST (a clean descriptor-exhaustion `Err`,
-/// never a disk-filling runaway) and the typed-overlap assertion in the child
-/// then fails on that wrong error — the arm is observed, not merely exercised.
+/// so a would-be runaway walk fails FAST with a clean descriptor-exhaustion
+/// `Err` rather than filling the disk, and the child's typed-overlap assertion
+/// then observes the wrong error.
 #[test]
 fn a_destination_anchor_strictly_inside_the_source_is_refused() {
     let tmp = tmpdir();
@@ -230,8 +226,8 @@ fn copy_anchor_inside_source_child() {
     let tree = root_path.join("tree");
     std::fs::create_dir_all(tree.join("sub")).expect("create the pre-existing tree/sub");
     let root = RootDir::open(&root_path).expect("open the owned root");
-    // Bound the arm-deleted runaway: without the anchor-inside-source arm the
-    // walk descends one level per iteration; a low descriptor limit makes it
+    // Bound a would-be runaway: without the anchor-inside-source arm the walk
+    // descends one level per iteration, and a low descriptor limit makes it
     // surface a clean EMFILE instead of filling the disk.
     let saved = set_nofile_soft(ANCHOR_NOFILE).expect("lower RLIMIT_NOFILE");
     let result = copy_dir_recursive_fd(&root, &tree, &rp("tree/sub/deeper"));
@@ -265,11 +261,11 @@ fn a_non_overlapping_source_still_copies() {
 }
 
 /// On a host that folds ASCII case, `dst_rel = "TREE"` resolves to the
-/// SOURCE directory `tree`. PRE-FIX the path comparison saw two spellings and
-/// did not refuse; `ensure_private_dir_fd` reused the existing (fold-equal)
-/// directory, chmodded it, and the two-phase widening left the SOURCE at
-/// `0o755` (it was `0o555`) when the copy failed on the first `O_EXCL` clash.
-/// The run ended `Err(openat TREE/f: File exists)` and the source was MUTATED.
+/// SOURCE directory `tree`. This pins only that the source's own mode survives
+/// the attempt: the result is discarded and only the source's mode is asserted,
+/// so it establishes neither that the copy failed nor which refusal fired (a
+/// copy with the case-fold directory-identity refusal removed still fails on the
+/// first `O_EXCL` clash and restores the mode).
 #[test]
 fn a_fold_equal_destination_is_refused_by_identity_and_never_mutates_the_source() {
     let base = tmpdir();
@@ -323,9 +319,8 @@ fn a_failed_copy_restores_the_modes_it_widened_and_leaves_a_removable_destinatio
         .expect_err("the escaping symlink must refuse the copy");
     assert!(err.to_string().contains("escaping symlink"), "{err}");
 
-    // PRE-FIX `dst/keep` was left at `(0o555 | 0o200) = 0o755` — the widened
-    // walk mode, which nothing restored. Post-fix a directory the call CREATED
-    // is restored to the removable store-private `0o700`.
+    // A directory the call CREATED is restored to the removable
+    // store-private `0o700` on failure (the widened walk mode is not left).
     assert_eq!(
         mode_of(&base.path().join("dst/keep")),
         0o700,
@@ -386,12 +381,10 @@ fn a_failed_nested_copy_restores_modes_and_keeps_the_created_ancestors_removable
     set_mode(&src.join("keep"), 0o755);
 }
 
-/// CHARACTERIZATION of the defect this pins: pre-fix, a `src/bad` directory of
-/// mode `0o000` walked through to the destination and left `dst/bad` at
-/// `0o200`; at THIS revision the FAIL-CLOSED containment enumeration catches it
-/// before any destination mutation, so nothing is created. (The undo journal
-/// still closes the general class: any reachable mid-walk failure now restores
-/// every mode it changed.)
+/// An unenumerable source subtree (`src/bad` at mode `0o000`) is caught by the
+/// FAIL-CLOSED containment enumeration before any destination mutation, so
+/// nothing is created; a reachable mid-walk failure restores every mode the
+/// walk changed.
 #[test]
 fn a_mode_0000_source_directory_fails_closed_before_creating_anything() {
     let base = tmpdir();
@@ -452,10 +445,10 @@ fn a_copied_symlink_never_replaces_a_live_destination_file() {
     );
 }
 
-/// The COMPLETE kind-pair table: every combination of a copied entry kind over
-/// a pre-existing destination kind. The file/directory rules already refuse
-/// (O_EXCL / mkdirat); the SYMLINK rules must too, which pre-fix they did NOT
-/// for a symlink over a file or a symlink.
+/// The kind pairs the copy's landing rules must refuse: a file over a file and
+/// a directory over a directory (O_EXCL / mkdirat), a symlink over a file, a
+/// directory, or a symlink, and a file or a directory over a symlink (the
+/// destination's own kind does not matter, only that the entry exists).
 #[test]
 fn every_kind_pair_refuses_to_replace_a_live_destination_entry() {
     #[derive(Clone, Copy, Debug)]
@@ -543,10 +536,9 @@ fn every_kind_pair_refuses_to_replace_a_live_destination_entry() {
 fn a_firmlink_alias_of_the_root_is_refused_by_identity() {
     // A tempdir under /tmp, so the canonical spelling is
     // `/private/tmp/...` and the Data-volume firmlink spelling is
-    // `/System/Volumes/Data/private/tmp/...`. `realpath(3)` does NOT unify the
-    // two (verified: python `os.path.realpath` returns the alias unchanged),
-    // while the `(st_dev, st_ino)` pair IS identical — which is why the fix
-    // decides by identity.
+    // `/System/Volumes/Data/private/tmp/...`. `std::fs::canonicalize` does NOT
+    // unify the two (asserted below), while the `(st_dev, st_ino)` pair IS
+    // identical — which is why the copy decides by identity.
     let tmp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     let root_path = tmp.path().join("root");
     std::fs::create_dir(&root_path).unwrap();
@@ -565,8 +557,8 @@ fn a_firmlink_alias_of_the_root_is_refused_by_identity() {
     );
 
     let root = RootDir::open(&root_path).unwrap();
-    // PRE-FIX the walk recursed into its own source; bound the damage with a low
-    // descriptor limit so the pre-fix run fails FAST instead of filling the disk.
+    // A low descriptor limit bounds a would-be runaway walk so a failure
+    // surfaces fast instead of filling the disk.
     let saved = set_nofile_soft(64).unwrap();
     let result = copy_dir_recursive_fd(&root, &aliased, &rp("sub"));
     restore_nofile(saved).unwrap();
@@ -649,10 +641,9 @@ fn bind_mount_child() {
     let root_path = PathBuf::from(root_os);
     let alias = PathBuf::from(std::env::var_os("STOREKIT_BIND_ALIAS").unwrap());
     // The owned root is opened at the BIND-MOUNT ALIAS; the source is the
-    // ORIGINAL spelling. Pre-fix the path comparison saw two spellings and the
-    // walk created `sub` inside its own source and recursed: bound the damage
-    // with a low descriptor limit so the pre-fix run fails FAST (at ~57 levels)
-    // instead of filling the disk.
+    // ORIGINAL spelling, so only an identity comparison can see the overlap. A
+    // low descriptor limit bounds a would-be runaway walk so a failure surfaces
+    // fast instead of filling the disk.
     let root = RootDir::open(&alias).unwrap();
     let saved = set_nofile_soft(64).unwrap();
     let result = copy_dir_recursive_fd(

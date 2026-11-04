@@ -1,18 +1,7 @@
-//! The PUBLIC, path-based symlink creator (`platform::symlink`) must run the
-//! crate's ONE reserved-spelling authority, exactly as its descriptor-confined
-//! twin (`atomic::symlink_fd`) does.
-//!
-//! THE DEFECT this file pins: `platform::symlink` was `pub`, took a raw
-//! `&Path` link name, and never ran `refuse_reserved_mutation`. Measured with
-//! the public API alone, `platform::symlink("/etc/hostname",
-//! root.join("operation.lock"))` returned `Ok` and created the record
-//! spelling, while `atomic::symlink_fd` refused the same name. A consumer
-//! could therefore create `operation.lock`, `.<name>.operation.lock`, and
-//! `.sync-aside.…` names at will. `symlink(2)` fails `EEXIST` on an existing
-//! entry, so the defect cannot REPLACE an existing record — it is bounded to a
-//! fail-closed confusion, not an inode split — but the class it belongs to (a
-//! path-based primitive shipped missing the guard its `_fd` twin had) is
-//! closed by the guard these tests exercise.
+//! The PUBLIC, path-based symlink creator (`platform::symlink`) runs the
+//! crate's ONE reserved-spelling authority (`atomic::refuse_reserved_mutation`)
+//! before creating the link, exactly as its descriptor-confined twin
+//! (`atomic::symlink_fd`) does.
 //!
 //! The verbatim COPY keeps its UNGUARDED creator: `copy_tree_verbatim`
 //! deliberately carries reserved and temp spellings into its destination, and

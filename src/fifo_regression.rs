@@ -2,35 +2,29 @@
 //! removal primitives.
 //!
 //! `path_state_fd`, `read_fd`/`read_json_fd`, `write_atomic_cas_fd`, and
-//! `write_atomic_if_match_fd` all used to open the final entry `O_RDONLY`
-//! without `O_NONBLOCK`. `open(2)` of a FIFO read-only BLOCKS until a writer
-//! appears, so ONE FIFO in a store — from another tool, or an attacker — hung
-//! a consumer's verify/recovery and a sync's `AppendTail` compare FOREVER: an
-//! unbounded hang on user data. The primitives now open with `O_NONBLOCK` (a
-//! no-op for a regular file) and classify the OPENED inode, refusing a
-//! FIFO/socket/device with a clear error.
+//! `write_atomic_if_match_fd` open the final entry with `O_NONBLOCK` (a no-op
+//! for a regular file) and classify the OPENED inode, refusing a
+//! FIFO/socket/device with a clear error. `open(2)` of a FIFO read-only BLOCKS
+//! until a writer appears, so one FIFO at a recorded path would otherwise hang
+//! every read of that path for as long as the writer stays away.
 //!
-//! The pre-fix failure is a HANG, so an in-process assertion cannot observe it
+//! A blocking open is a HANG, so an in-process assertion cannot observe it
 //! (the test process would block). These tests therefore RE-EXEC this test
 //! binary as a child (behind [`MODE_ENV`]) that performs its probe, and the
 //! parent enforces a HARD WALL-CLOCK TIMEOUT: a child that does not finish
 //! is KILLED and reported, so the suite itself can never hang.
 //!
-//! Three more shapes shared the defect. [`crate::transport::Remote::list`]
-//! (the Unix `_confined` arm) opened every non-symlink child `O_RDONLY` to
-//! `fstat` it, so one FIFO in a listed directory blocked the listing FOREVER;
-//! it now classifies each child first and NEVER opens a non-regular entry, so
-//! a FIFO is LISTED as an `Other` entry — `is_dir`/`is_symlink` false with the
-//! entry's own size and mode — exactly as the path-based and far-side arms
-//! list it. [`crate::transport::Remote::set_mode`] (the `_confined` arm) had
-//! the same blocking open and now opens with `O_NONBLOCK` and REFUSES a
-//! FIFO/socket/device with the typed
+//! [`crate::transport::Remote::list`] (the Unix `_confined` arm) classifies
+//! each child first and NEVER opens a non-regular entry, so a FIFO is LISTED
+//! as an `Other` entry — `is_dir`/`is_symlink` false with the entry's own size
+//! and mode — exactly as the path-based and far-side arms list it.
+//! [`crate::transport::Remote::set_mode`] (the `_confined` arm) opens with
+//! `O_NONBLOCK` and REFUSES a FIFO/socket/device with the typed
 //! [`crate::error::MaterializationKind::SpecialFile`] kind, never blocking and
 //! never chmodding one. The removal-failure `NotFound` existence probe
-//! (`remove_dir_all`) also opened `O_RDONLY` and now opens `O_NONBLOCK`, so a
-//! FIFO is a prompt failure instead of a hang. Each has its OWN re-exec child
-//! and hard-timeout parent below, so a pre-fix hang in any of them fails on
-//! its own.
+//! (`remove_dir_all`) opens `O_NONBLOCK`, so a FIFO is a prompt failure instead
+//! of a hang. Each has its OWN re-exec child and hard-timeout parent below, so
+//! a hang in any of them fails on its own.
 #![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
@@ -78,16 +72,21 @@ const REMOVE_CHILD_MODE: &str = "remove_dir_all";
 /// Printed by the remove_dir_all child after the prompt refusal returned with
 /// the FIFO still in place.
 const REMOVE_DONE_MARKER: &str = "STOREKIT_FIFO_REMOVE_DIR_ALL_CHILD_DONE";
-/// The per-probe wall-clock bound the CHILD asserts. Well above any scheduling
-/// jitter, far below a hang.
+/// The per-probe wall-clock bound the CHILD asserts. The assertion is checked
+/// only AFTER the probe closure returns, so it catches a SLOW probe that returns
+/// late, never a block: an open that never returns is caught by the parent's
+/// [`CHILD_LIMIT`] cap and the child kill.
 const PROBE_LIMIT: Duration = Duration::from_secs(5);
-/// The parent's HARD wall-clock cap on a child: the probes at [`PROBE_LIMIT`]
-/// plus process startup fit comfortably; a pre-fix child (which blocks on the
-/// probing open) is killed here and the test fails.
+/// The parent's HARD wall-clock cap on a child; a child that blocks on the
+/// probing open is killed here and the test fails. It is NOT the per-probe
+/// bounds plus startup: the read-side child admits four probes of up to
+/// [`PROBE_LIMIT`] each, which sum to exactly this cap, so a probe that is
+/// merely slow late in the run is killed here rather than reported by its own
+/// assertion.
 const CHILD_LIMIT: Duration = Duration::from_secs(20);
 
-/// A FIFO in a store is refused promptly by every read-side primitive, never
-/// opened blocking.
+/// A FIFO in a store is refused promptly by the four read-side primitives this
+/// probe exercises, never opened blocking.
 #[test]
 fn fifo_entries_do_not_hang_the_read_side_primitives() {
     let tmp = crate::test_support::fixture_tmpdir(&SysEnv::from_process())
@@ -197,8 +196,8 @@ fn fifo_child() {
     let owned = RootDir::open(&root).expect("open the owned root");
     let rel = &crate::relpath::RootedRelativePath::parse(Path::new("fifo")).unwrap();
 
-    // FOUR probes, each of which must return promptly: a FIFO must never block
-    // an open.
+    // FOUR probes, each of which must return promptly and REFUSE the FIFO:
+    // the FIFO open is non-blocking and the opened kind is classified.
     probe("state", || crate::atomic::path_state_fd(&owned, rel));
     probe("read", || crate::atomic::read_fd(&owned, rel));
     probe("cas", || {
@@ -219,9 +218,6 @@ fn fifo_child() {
 /// listing of the SAME directory (a transport rooted at the directory itself,
 /// listed through the EMPTY root-relative path). `RemoteEntry` has no
 /// `PartialEq`, so the comparable shape is compared as sorted tuples.
-///
-/// Pre-fix this child BLOCKS in the `list` call (the `_confined` open of the
-/// FIFO), so the parent kills it and reports the hang.
 #[test]
 #[ignore = "spawned by the FIFO list regression test via MODE_ENV"]
 fn fifo_list_child() {
@@ -296,9 +292,6 @@ fn fifo_list_child() {
 /// then requires `set_mode` on the FIFO path to return promptly, to fail with
 /// the crate's typed special-file kind, and to have left the FIFO's mode
 /// EXACTLY as it was (never chmodded).
-///
-/// Pre-fix this child BLOCKS in the `set_mode` call (the `_confined` open of
-/// the FIFO), so the parent kills it and reports the hang.
 #[test]
 #[ignore = "spawned by the FIFO set_mode regression test via MODE_ENV"]
 fn fifo_set_mode_child() {
@@ -365,8 +358,7 @@ fn fifo_set_mode_child() {
 /// set [`MODE_ENV`] to [`REMOVE_CHILD_MODE`]. It requires `remove_dir_all` of a
 /// FIFO to return promptly, to FAIL (a FIFO is not a directory), and to have
 /// left the FIFO in place. The removal-failure path's `NotFound` existence
-/// probe used to open the FIFO `O_RDONLY`, so pre-fix this child BLOCKS in the
-/// probe and the parent kills it.
+/// probe opens with `O_NONBLOCK`, so the probe cannot block.
 #[test]
 #[ignore = "spawned by the FIFO remove_dir_all regression test via MODE_ENV"]
 fn fifo_remove_dir_all_child() {
@@ -440,7 +432,7 @@ enum ChildOutcome {
 
 /// The comparable shape of a listing: [`RemoteEntry`] carries no `PartialEq`,
 /// and the two list arms must agree on EVERY field, so the entries are mapped
-/// to tuples and sorted by name before comparison.
+/// to tuples and sorted before comparison.
 fn listing_shape(entries: &[RemoteEntry]) -> Vec<(String, bool, bool, u64, u32)> {
     let mut out: Vec<(String, bool, bool, u64, u32)> = entries
         .iter()
@@ -451,19 +443,19 @@ fn listing_shape(entries: &[RemoteEntry]) -> Vec<(String, bool, bool, u64, u32)>
 }
 
 /// Turn a child's verdict into the assertions every parent test makes: a
-/// child past the HARD cap was killed (a pre-fix hang) and is reported as
-/// such; a child that exited non-zero is reported; a child that exited 0
-/// without reaching `done` ran no assertion and is reported rather than
-/// passing vacuously. Returns the child's stdout on success.
+/// child past the HARD cap was killed and is reported as such; a child that
+/// exited non-zero is reported; a child that exited 0 without reaching `done`
+/// ran no assertion and is reported rather than passing vacuously. Returns the
+/// child's stdout on success.
 fn assert_child_reached(outcome: ChildOutcome, limit: Duration, done: &str, what: &str) -> String {
     match outcome {
         ChildOutcome::TimedOut(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             panic!(
-                "the {what} child did not finish within {limit:?} and was killed: it opened the \
-                 FIFO blocking (the pre-fix hang). A hang is an unbounded failure on user data \
-                 and is never acceptable.\n\
+                "the {what} child did not finish within {limit:?} and was killed: a blocking \
+                 open on the FIFO is the failure this bound catches. A hang is an unbounded \
+                 failure on user data and is never acceptable.\n\
                  --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
             );
         }
@@ -490,7 +482,7 @@ fn assert_child_reached(outcome: ChildOutcome, limit: Duration, done: &str, what
 /// Spawn the parent's own test binary as a child (running `child_test` under
 /// the `mode` value of [`MODE_ENV`]) and wait for it with a HARD wall-clock
 /// cap: past the cap the child is killed and its (partial) output returned, so
-/// a pre-fix hang fails the test instead of hanging the suite.
+/// a hang fails the test instead of hanging the suite.
 fn run_child(child_test: &str, mode: &str, root: &Path, limit: Duration) -> ChildOutcome {
     let exe = std::env::current_exe().expect("the running test binary path");
     let mut child = std::process::Command::new(exe)

@@ -1,18 +1,16 @@
 //! The destination-ownership token is bound to the transport's ENDPOINT, not
 //! only to its root spelling.
 //!
-//! # The defect these tests pin
+//! # The binding
 //!
 //! `DestinationOwnership` records the destination identity so a caller cannot
-//! take the lock on one destination and mutate another. Before the fix the
-//! recorded identity was the PATH spelling only: `Prepared` had no transport
-//! identity, and `Prepared::matches` compared the direction, the local root
-//! spelling, the normalized remote ROOT, and `remote.is_local()`. A token
-//! minted against host A was therefore accepted for a run against host B
-//! whenever both reported the same `root()` spelling — and for
-//! `Direction::Pull`, where the remote is the SOURCE, `matches` ignored the
-//! remote entirely, so a plan read from source A was applied against a live
-//! source B.
+//! take the lock on one destination and mutate another. `Prepared` records the
+//! direction, the pinned local root, the transport's ROOT spelling, its
+//! ENDPOINT identity, and its LOCALNESS, and `Prepared::matches` compares all
+//! of them for BOTH directions: a token minted against one host is refused for
+//! a run against another host that reports the same `root()` spelling, and a
+//! PULL token binds the SOURCE whose plan the token's `source_meta` was read
+//! from.
 //!
 //! # The double
 //!
@@ -224,8 +222,7 @@ impl FarSideLockSession for FakeFarSideSession {
     }
 }
 
-/// A source tree, a local destination, and the SHARED layout spelling two
-/// endpoints report.
+/// A source tree and the SHARED layout spelling two endpoints report.
 struct Fixture {
     dir: tempfile::TempDir,
     src: PathBuf,
@@ -249,10 +246,9 @@ fn fixture() -> Fixture {
 // PUSH: the token binds the HOST (the remote is the destination)
 // ---------------------------------------------------------------------------
 
-/// THE REPRO. A token minted against host A is accepted pre-fix for a run
-/// against host B when both report the SAME root spelling; the run then
-/// mutates host B while host A is untouched. Post-fix it is REFUSED, naming
-/// the endpoint axis, and host B is unmutated.
+/// A token minted against host A is REFUSED for a run against host B when both
+/// report the SAME root spelling, naming the endpoint axis; host B is
+/// unmutated.
 #[test]
 fn a_remote_token_is_refused_across_endpoints_with_the_same_root() {
     let f = fixture();
@@ -305,9 +301,7 @@ fn a_remote_token_is_refused_across_endpoints_with_the_same_root() {
 }
 
 /// The ROOT axis is compared too: two endpoints with the SAME identity but
-/// different root spellings are refused (pre-fix this was already caught for a
-/// PUSH by the destination-root comparison; the test pins that it stays
-/// caught, now through the explicit root axis).
+/// different root spellings are refused through the explicit root axis.
 #[test]
 fn a_remote_token_is_refused_across_roots_with_the_same_endpoint() {
     let f = fixture();
@@ -378,9 +372,8 @@ fn the_transport_that_minted_a_push_token_is_accepted() {
 // PULL: the token binds the SOURCE (the remote is the source)
 // ---------------------------------------------------------------------------
 
-/// THE PULL REPRO. A token minted against source A is accepted pre-fix for a
-/// run whose live source is B (the same root spelling, a different endpoint),
-/// so the plan read from A is applied against B. Post-fix it is REFUSED.
+/// A token minted against source A is REFUSED for a run whose live source is B
+/// (the same root spelling, a different endpoint).
 #[test]
 fn a_pull_token_is_refused_against_a_different_source_endpoint() {
     let f = fixture();
@@ -422,8 +415,8 @@ fn a_pull_token_is_refused_against_a_different_source_endpoint() {
     );
 }
 
-/// The ROOT axis for a PULL: pre-fix `matches` ignored the remote entirely, so
-/// even a different source root was accepted. Post-fix it is REFUSED.
+/// The ROOT axis for a PULL: a token minted against source root A is refused
+/// against source root B.
 #[test]
 fn a_pull_token_is_refused_against_a_different_source_root() {
     let f = fixture();
@@ -473,13 +466,6 @@ fn a_pull_token_is_refused_against_a_different_source_root() {
 /// minted for destination root A, replayed with destination root B and the
 /// SAME source transport, is refused with the typed RUN-BINDING mismatch and
 /// neither root is mutated.
-///
-/// DIRECTION GATE. Gating the ROOT half of step 1 on
-/// `direction == Direction::Push` leaves the whole suite green without this
-/// test. The impact is BOUNDED and stated: the run uses the TOKEN's
-/// `prepared.local` (A), so the `local_root` argument (B) is a silently IGNORED
-/// argument, not a containment breach; A is the root the un-pinned run would
-/// mutate.
 #[test]
 fn a_pull_token_is_refused_against_a_different_local_destination_root() {
     let f = fixture();
@@ -660,22 +646,18 @@ fn the_endpoint_and_root_refusals_carry_distinct_typed_kinds() {
 // PULL: the token binds the SOURCE's LOCALNESS (the `None`-identity hole)
 // ---------------------------------------------------------------------------
 
-/// The `None`-IDENTITY REPRO. A token minted against a LOCAL source records no
+/// The `None`-IDENTITY case. A token minted against a LOCAL source records no
 /// endpoint identity (a `LocalTransport` states none, exactly as a path on
-/// this host needs none) and `Prepared::matches` step 3 compared the identity
-/// only as an `Option`, so `None == None` PASSED. Step 4 derives
-/// `dest_is_local` as `remote.is_local()` for a PUSH but HARDCODES `true` for a
-/// PULL, so a LOCAL->NON-LOCAL flip of the remote was never compared on a
-/// PULL: a non-local source that states no identity and reports the same root
-/// spelling was accepted, and the plan read from the local source was applied
-/// against the non-local one.
+/// this host needs none), so the identity axis alone would compare
+/// `None == None`. `Prepared::matches` step 4 therefore records the transport's
+/// LOCALNESS separately and compares it for BOTH directions: a non-local source
+/// that states no identity and reports the same root spelling is REFUSED with
+/// the typed localness mismatch before anything is mutated.
 ///
-/// MISMATCHED CONTENT: before the fix this run mutates the destination with
-/// the NON-LOCAL source's bytes and fails only afterwards on the
-/// post-transfer digest, so `preflight_reason()` is `None` and no ownership
-/// refusal ever fires. Post-fix the remote's LOCALNESS is its own recorded
-/// axis, compared for BOTH directions, and the run is REFUSED with the typed
-/// localness mismatch before anything is mutated.
+/// MISMATCHED CONTENT: without that axis the run would mutate the destination
+/// with the NON-LOCAL source's bytes and fail only afterwards on the
+/// post-transfer digest, so `preflight_reason()` would be `None` and no
+/// ownership refusal would fire.
 #[test]
 fn a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local() {
     let f = fixture();
@@ -721,11 +703,9 @@ fn a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local() {
     );
 }
 
-/// The EQUAL-CONTENT variant of the same hole: when the two sources' content
+/// The EQUAL-CONTENT variant of the same case: when the two sources' content
 /// is byte-identical the post-transfer digest cannot see the substitution, so
-/// before the fix `sync` returned **`Ok`** — the plan read from the LOCAL
-/// source was applied against the non-local source silently. The localness
-/// axis is what makes this run refusable at all.
+/// the localness axis is what makes this run refusable at all.
 #[test]
 fn a_pull_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip() {
     let f = fixture();
@@ -793,19 +773,14 @@ fn entry_names(dir: &Path) -> Vec<String> {
 /// [`a_pull_token_is_refused_when_the_source_flips_from_local_to_non_local`].
 ///
 /// `Prepared::matches` step 4 compares the remote's LOCALNESS for BOTH
-/// directions, but before this test only the PULL direction was pinned: gating
-/// step 4 on `direction == Direction::Pull` left the ENTIRE suite green, so a
-/// future edit could re-open the PUSH half of the localness binding. A token minted
-/// against a LOCAL destination — `DestinationOwnership::lock(Direction::Push,
-/// src, &LocalTransport over P)` records `remote_is_local == true` and states
-/// no endpoint identity — is replayed against a NON-LOCAL third-party `Remote`
-/// that states the SAME root spelling and NO identity. Direction, local root,
-/// remote root and identity (`None == None`) therefore all match, and ONLY the
-/// localness axis can refuse.
-///
-/// Before the fix this run MUTATES the non-local destination (the token's
-/// lock was taken on a different, local tree). The refusal now precedes
-/// `run`, so the non-local destination is byte-for-byte unmutated.
+/// directions. A token minted against a LOCAL destination —
+/// `DestinationOwnership::lock(Direction::Push, src, &LocalTransport over P)`
+/// records `remote_is_local == true` and states no endpoint identity — is
+/// replayed against a NON-LOCAL third-party `Remote` that states the SAME root
+/// spelling and NO identity. Direction, local root, remote root and identity
+/// (`None == None`) therefore all match, and ONLY the localness axis can
+/// refuse: the refusal precedes `run`, so the non-local destination is
+/// byte-for-byte unmutated.
 #[test]
 fn a_push_token_is_refused_when_the_destination_flips_from_local_to_non_local() {
     let f = fixture();
@@ -866,11 +841,9 @@ fn a_push_token_is_refused_when_the_destination_flips_from_local_to_non_local() 
     );
 }
 
-/// The EQUAL-CONTENT variant of the PUSH hole: when the non-local destination
+/// The EQUAL-CONTENT variant of the PUSH case: when the non-local destination
 /// already holds byte-identical content, the run has nothing left to write, so
-/// before the fix `sync` would verify cleanly and return **`Ok`** — the token
-/// minted for a LOCAL destination applied to a non-local one with nothing to
-/// catch it. The localness axis is what makes this run refusable at all.
+/// the localness axis is what makes this run refusable at all.
 #[test]
 fn a_push_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip() {
     let f = fixture();

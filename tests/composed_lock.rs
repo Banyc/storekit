@@ -4,12 +4,11 @@
 //! `Layout::lock`.
 //!
 //! The sibling record and the in-root layout lock are DIFFERENT files, so on
-//! their own they do NOT exclude each other. `DestinationOwnership::lock` is
-//! unchanged and takes the sibling record alone; a caller that needs both
-//! records held asks for it by name with
-//! `DestinationOwnership::lock_with_in_root_lock`, which acquires the sibling
-//! record and then the caller's in-root record — the ONE canonical order,
-//! enforced in the constructor.
+//! their own they do NOT exclude each other. `DestinationOwnership::lock` takes
+//! the sibling record alone; a caller that needs both records held asks for it
+//! by name with `DestinationOwnership::lock_with_in_root_lock`, which acquires
+//! the sibling record and then the caller's in-root record — the ONE canonical
+//! order, enforced in the constructor.
 //!
 //! These tests run against the PUBLIC API only. They pin, on BOTH directions
 //! (PUSH and PULL):
@@ -26,7 +25,7 @@
 //! * the in-root record is destination RESIDUE: it is stripped from the view
 //!   the run judges, reported in `residue` (never `extraneous`), and never
 //!   destroyed;
-//! * the PLAIN form is unchanged: it never creates or holds the in-root record.
+//! * the PLAIN form never creates or holds the in-root record.
 
 // Test fixtures drive the same name-creating primitives the funnel guards.
 #![allow(clippy::disallowed_methods)]
@@ -304,8 +303,7 @@ fn composed_order_is_sibling_first_pull() {
 /// `LockFileEx` with `LOCKFILE_FAIL_IMMEDIATELY`), neither thread can WAIT while
 /// holding a record, so no deadlock is possible by construction. The test
 /// proves both threads RETURN (a bounded `recv_timeout`, not a `join` that can
-/// hang) and that every attempt ended in an acquisition or the typed
-/// `LockContended`, never a hang or another error class.
+/// hang).
 #[test]
 fn opposite_order_acquisitions_do_not_deadlock() {
     let tmp = tempfile::tempdir().unwrap();
@@ -361,8 +359,8 @@ fn opposite_order_acquisitions_do_not_deadlock() {
 /// EVIDENCE 3 (the premise check + fresh destination): the in-root record is
 /// RESIDUE, invisible to the run's diff, reported in `residue` and never in
 /// `extraneous`, and never destroyed. The record's PARENT directory is ordinary
-/// content; under `Extraneous::Delete` its removal is refused because it holds
-/// residue, so neither the directory nor the record is destroyed.
+/// content; under `Extraneous::Delete` it survives because it holds residue, so
+/// neither the directory nor the record is destroyed.
 #[test]
 fn composed_in_root_record_is_residue_and_is_never_destroyed() {
     let tmp = tempfile::tempdir().unwrap();

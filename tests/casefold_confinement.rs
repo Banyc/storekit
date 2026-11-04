@@ -1,4 +1,4 @@
-//! The widened case fold and the fold-ORDER fix through the public API: a case-insensitive
+//! The full case fold and its ORDER through the public API: a case-insensitive
 //! DESTINATION must not be able to resolve a source link's target component
 //! onto a destination symlink the source view never saw.
 //!
@@ -12,20 +12,19 @@
 //! (`src/sync/apply.rs`) must refuse it, and the canary a sibling of the
 //! destination root must stay unreachable.
 //!
-//! Before the fold fix the crate's containment fold was `str::to_lowercase`,
-//! which does NOT map `STRASSE` to `straße` (nor `FILE` to `ﬁle`, nor `Σ` to
-//! `ς`), so the preflight answered `Absent` and `push` returned `Ok`. The full
-//! Unicode case fold matches them, so `push` now returns `Err`.
+//! The fold is `manifest::fold_component`: `NFD ->` the full Unicode
+//! case fold `-> NFC`, so `STRASSE`/`straße`, `FILE`/`ﬁle`, and `Σ`/`ς` are
+//! one fold key: the spelled component has no exact entry, and the fold-equal
+//! entry is a symlink, so the preflight answers
+//! `manifest::ComponentResolution::Symlink` for it rather than `Absent`.
 //!
-//! ORDER fix (this revision): the fold then took its input to NFC *before*
-//! case-folding, but Unicode caseless matching is NFD-based. That under-folded
-//! exactly the three Greek precomposed perispomeni+ypogegrammeni forms
-//! (U+1FB7/U+1FC7/U+1FF7) whose canonically-related capital spellings
-//! (U+1FBC U+0342, U+1FCC U+0342, U+1FFC U+0342, and the fully decomposed
-//! U+0391/U+0397/U+03A9 U+0342 U+0345 family) a folding host resolves onto the
-//! same entry. The fold now runs `NFD -> case_fold -> NFC`, so both spellings
-//! merge and every view refuses. The `greek_*` tests below fail on the parent
-//! revision.
+//! The order matters: Unicode caseless matching is NFD-based, so the fold takes
+//! its input to NFD BEFORE case-folding. The three Greek precomposed
+//! perispomeni+ypogegrammeni forms below (U+1FB7/U+1FC7/U+1FF7) and their
+//! canonically-related capital spellings (U+1FBC U+0342, U+1FCC U+0342,
+//! U+1FFC U+0342, and the decomposed U+0391/U+0397/U+03A9 U+0342 U+0345
+//! family) merge under `NFD -> case_fold -> NFC`, so both spellings reach one
+//! fold key and every view refuses; the `greek_*` tests below pin that.
 
 #![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
@@ -90,9 +89,8 @@ fn host_folds_pair(written: &str, spelled: &str) -> bool {
 /// require the SOURCE manifest to ACCEPT the tree while `push` REFUSES it,
 /// with the canary unreachable.
 ///
-/// PRE-FIX, when the fold missed the pair, `push` returned `Ok`; the test then
-/// READS the destination canary and panics with the leaked bytes, so the escape
-/// is observed rather than merely asserted.
+/// If `push` returns `Ok`, the test READS the destination canary and panics with
+/// the leaked bytes, so the escape is observed rather than merely asserted.
 fn push_refuses_a_destination_only_fold_escape(on_disk: &str, spelled: &str) {
     let base = tempfile::tempdir().expect("tempdir");
     let src = base.path().join("src");
@@ -122,8 +120,8 @@ fn push_refuses_a_destination_only_fold_escape(on_disk: &str, spelled: &str) {
     if outcome.is_ok() {
         let leaked = std::fs::read(dst.join("dir/link/secret"));
         panic!(
-            "PRE-FIX ESCAPE OBSERVED for on_disk={on_disk:?} spelled={spelled:?}: the push was \
-             ACCEPTED and the destination canary reads {leaked:?}"
+            "ESCAPE OBSERVED (the push was ACCEPTED) for on_disk={on_disk:?} \
+             spelled={spelled:?}: the destination canary reads {leaked:?}"
         );
     }
     let err = outcome.expect_err(
@@ -149,9 +147,8 @@ fn push_refuses_a_destination_only_fold_escape(on_disk: &str, spelled: &str) {
 /// folds `<spelled>` onto `<on_disk>` the resolution walks the symlink and
 /// leaves the root, so the LOCAL walk, the WIRE assembler, and `push` (whose
 /// canonicalizer IS the source walk) must all refuse naming `<spelled>`, and
-/// the DESTINATION canary must stay unreachable. PRE-FIX all three accepted and
-/// `push` installed the link; this helper then READS the destination canary and
-/// panics with the leaked bytes.
+/// the DESTINATION canary must stay unreachable. If any of the three accepted,
+/// this helper READS the destination canary and panics with the leaked bytes.
 fn source_escape_refused_by_all_views(on_disk: &str, spelled: &str) {
     let base = tempfile::tempdir().expect("tempdir");
     let root = base.path().join("R");
@@ -180,7 +177,7 @@ fn source_escape_refused_by_all_views(on_disk: &str, spelled: &str) {
 
     if local.is_ok() || remote.is_ok() || pushed.is_ok() {
         panic!(
-            "PRE-FIX ESCAPE OBSERVED for on_disk={on_disk:?} spelled={spelled:?}: local_ok={} \
+            "ESCAPE OBSERVED for on_disk={on_disk:?} spelled={spelled:?}: local_ok={} \
              wire_ok={} push_ok={} destination_canary={:?}",
             local.is_ok(),
             remote.is_ok(),
@@ -213,25 +210,25 @@ fn source_escape_refused_by_all_views(on_disk: &str, spelled: &str) {
     );
 }
 
-/// The widened fold, `ß`/`SS` through the destination preflight and `push`.
+/// The full case fold, `ß`/`SS` through the destination preflight and `push`.
 #[test]
 fn push_refuses_a_sharp_s_destination_only_fold_escape() {
     push_refuses_a_destination_only_fold_escape("stra\u{df}e", "STRASSE");
 }
 
-/// The widened fold, the `ﬁ`/`FI` ligature through the destination preflight and `push`.
+/// The full case fold, the `ﬁ`/`FI` ligature through the destination preflight and `push`.
 #[test]
 fn push_refuses_a_ligature_destination_only_fold_escape() {
     push_refuses_a_destination_only_fold_escape("\u{fb01}le", "FILE");
 }
 
-/// The widened fold, final sigma through the destination preflight and `push`.
+/// The full case fold, final sigma through the destination preflight and `push`.
 #[test]
 fn push_refuses_a_final_sigma_destination_only_fold_escape() {
     push_refuses_a_destination_only_fold_escape("\u{3c2}", "\u{3a3}");
 }
 
-/// The widened fold on the SOURCE side through the public API: when the source itself holds
+/// The full case fold on the SOURCE side through the public API: when the source itself holds
 /// the symlink component, the strict source manifest refuses and `push` returns
 /// `Err`; the destination is untouched and the canary stays unreachable.
 #[test]
@@ -258,7 +255,7 @@ fn push_refuses_a_source_contained_fold_escape() {
     assert!(std::fs::read(dst.join("dir/link/secret")).is_err());
 }
 
-/// ORDER fix, `U+1FB7` (small alpha with perispomeni and ypogegrammeni): both
+/// Fold order, `U+1FB7` (small alpha with perispomeni and ypogegrammeni): both
 /// capital witness spellings through the LOCAL walk, the WIRE assembler, and
 /// `push`.
 #[test]
@@ -268,7 +265,7 @@ fn greek_alpha_perispomeni_ypogegrammeni_escape_is_refused_by_all_views() {
     }
 }
 
-/// ORDER fix, `U+1FC7` (small eta form): both capital witness spellings.
+/// Fold order, `U+1FC7` (small eta form): both capital witness spellings.
 #[test]
 fn greek_eta_perispomeni_ypogegrammeni_escape_is_refused_by_all_views() {
     for capital in ["\u{1fcc}\u{0342}", "\u{0397}\u{0342}\u{0345}"] {
@@ -276,7 +273,7 @@ fn greek_eta_perispomeni_ypogegrammeni_escape_is_refused_by_all_views() {
     }
 }
 
-/// ORDER fix, `U+1FF7` (small omega form): both capital witness spellings.
+/// Fold order, `U+1FF7` (small omega form): both capital witness spellings.
 #[test]
 fn greek_omega_perispomeni_ypogegrammeni_escape_is_refused_by_all_views() {
     for capital in ["\u{1ffc}\u{0342}", "\u{03a9}\u{0342}\u{0345}"] {
@@ -284,7 +281,7 @@ fn greek_omega_perispomeni_ypogegrammeni_escape_is_refused_by_all_views() {
     }
 }
 
-/// ORDER fix, the destination result-view preflight for all three Greek pairs
+/// Fold order, the destination result-view preflight for all three Greek pairs
 /// in both capital witness spellings: the destination holds the small-form
 /// symlink, the source spells the capital form, and once the link is installed
 /// the kernel walks through the surviving destination symlink and leaves the

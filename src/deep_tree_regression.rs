@@ -1,26 +1,25 @@
 //! Regression: a directory tree deeper than the C stack must never abort the
 //! host process.
 //!
-//! The tree walks used to recurse one Rust frame per directory level
-//! (`atomic::unix::remove_dir_contents_fd`, the default `Remote::copy_tree`
-//! walk, and the path-based `remove_dir_all` the UNIX transport delegates
-//! to). A tree deeper than the caller's stack exhausted it, and Rust's
-//! stack-overflow handler ABORTS the whole process (SIGABRT) — a library
-//! call killing its host is never acceptable. The walks are now explicit
-//! heap `Vec` stacks; the only remaining bound is the descriptor limit,
-//! which surfaces as a clean `Err`, never an abort. (The Windows transport
-//! delegates removal to `std::fs::remove_dir_all` through
-//! `atomic::remove_dir_all_fd`, which is itself iterative on the installed
-//! toolchain; `atomic::unix::remove_dir_all_path` is the Unix walk, kept for
-//! the crate's own tests and with no production caller.)
+//! The tree walks keep an explicit heap `Vec` stack instead of one Rust frame
+//! per directory level: `atomic::unix::remove_dir_contents_fd`, the default
+//! `Remote::copy_tree` walk, `atomic::copy_dir_recursive_fd`,
+//! `atomic::fsync_tree_recursive_fd`, and `atomic::unix::remove_dir_all_path`.
+//! A stack overflow is a PROCESS abort (SIGABRT), so a recursive walk turns a
+//! deep tree into a library call that kills its host; with a heap stack the
+//! deep-tree tests below finish. (The Windows transport delegates removal to
+//! `std::fs::remove_dir_all` through `atomic::remove_dir_all_fd`, which is
+//! itself iterative on the installed toolchain;
+//! `atomic::unix::remove_dir_all_path` is the Unix walk, `#[cfg(test)]` with no
+//! production caller.)
 //!
-//! The pre-fix failure is a PROCESS abort, so an in-process assertion cannot
-//! observe it (the test process would die with the child). These tests
-//! therefore RE-EXEC this test binary as a child (behind [`MODE_ENV`]) that
-//! builds a deep tree with RELATIVE descriptors (`mkdirat`/`openat`, so
-//! `PATH_MAX` never limits the construction), runs the walk on a
-//! deliberately SMALL thread stack, and exits; the parent asserts the child
-//! exited successfully and cleans the tree up before asserting.
+//! The failure is a PROCESS abort, so an in-process assertion cannot observe it
+//! (the test process would die with the child). These tests therefore RE-EXEC
+//! this test binary as a child (behind [`MODE_ENV`]) that builds a deep tree
+//! with RELATIVE descriptors (`mkdirat`/`openat`, so `PATH_MAX` never limits
+//! the construction), runs the walk on a deliberately SMALL thread stack, and
+//! exits; the parent asserts the child exited successfully and cleans the tree
+//! up before asserting.
 #![cfg(unix)]
 // Test-only construction drives the same name-mutating primitives the funnel
 // guards; this module is exempt from the production name-mutation rule.
@@ -48,21 +47,19 @@ const DONE_MARKER: &str = "STOREKIT_DEEP_TREE_CHILD_DONE";
 /// The child's descriptor-exhaustion mode: lower `RLIMIT_NOFILE` before the
 /// removal walk so its one-descriptor-per-level frontier hits `EMFILE`.
 const EMFILE_MODE: &str = "remove_emfile";
-/// The soft `RLIMIT_NOFILE` the child lowers to. The observed threshold is
-/// `limit - 8`, so this is reached long before `DEPTH` levels.
+/// The soft `RLIMIT_NOFILE` the child lowers to, reached long before `DEPTH`
+/// removal levels are entered.
 const EMFILE_NOFILE: u64 = 64;
 /// Printed by the child once the descriptor-exhaustion case has run and its
 /// in-child assertions held; the parent requires it (non-vacuity).
 const EMFILE_MARKER: &str = "STOREKIT_DEEP_TREE_EMFILE";
 
-/// Directory levels the child nests. Calibrated against the PRE-fix
-/// one-frame-per-level walk: at [`CHILD_STACK`] it overflows between depth 96
-/// and 128, so 256 leaves a >2x margin while every intermediate spelling
-/// stays far below `PATH_MAX`.
+/// Directory levels the child nests: the calibration test below asserts that a
+/// recursive copy needs more than twice [`FD_COPY_STACK`] at this depth.
 const DEPTH: usize = 256;
-/// The stack the child runs the walk on. 16 KiB is the smallest thread stack
-/// macOS allows; it is far below the 2 MiB libtest uses, so per-level stack
-/// growth is the only thing under test.
+/// The stack the child runs the raw-syscall walks on. 16 KiB is the smallest
+/// thread stack macOS allows, and it is far below a normal thread stack, so
+/// per-level stack growth is what shows up on it.
 const CHILD_STACK: usize = 16 * 1024;
 /// Optional override of the child's stack size, so a caller can measure a
 /// walk's CONSTANT stack cost (the fd-confined copy needs more than the raw
@@ -70,26 +67,11 @@ const CHILD_STACK: usize = 16 * 1024;
 const STACK_ENV: &str = "STOREKIT_DEEP_TREE_STACK";
 /// The stack the fd-confined copy/fsync children run on.
 ///
-/// PROFILE-DEPENDENT and MEASURED per platform (all at depth 256; a stack the
-/// walk's CONSTANT cost fits is what the ITERATIVE shape needs, while the
-/// RECURSIVE reference's need grows with depth):
-///
-/// * DEBUG: the fd copy aborts at 16/24 KiB on Linux and fits from 32 KiB
-///   (macOS fits 16 KiB); the recursive reference aborts at 64 KiB on BOTH
-///   platforms and needs >256 KiB on macOS. 64 KiB therefore leaves the
-///   ITERATIVE shape a 2x margin on Linux and the RECURSIVE reference at
-///   least a 4x margin on both.
-/// * RELEASE: the fd copy and fsync fit 8 KiB on BOTH platforms, and the
-///   recursive reference aborts through 64 KiB and first SURVIVES at 96 KiB
-///   (macOS and Linux alike). 24 KiB leaves the iterative shape a 3x margin
-///   and the recursive reference a 2.7x margin.
-///
-/// The RELEASE value is deliberately NOT 64 KiB: at the old single value the
-/// release recursive reference sat only 1.5x above the stack (it survived at
-/// 96 KiB), so an optimizer change could have let the reference survive and
-/// made the calibration vacuous. 24 KiB restores a multi-x margin, and the
-/// calibration test ASSERTS a >=2x margin at runtime instead of only claiming
-/// one.
+/// PROFILE-DEPENDENT, and pinned by
+/// [`deep_tree_recursive_reference_copy_aborts_at_the_fd_stack`]: at [`DEPTH`]
+/// levels the iterative copy fits this stack while a recursive reference
+/// overflows twice this stack, so the calibration holds a >=2x margin in both
+/// profiles rather than asymptotically fitting either shape.
 const FD_COPY_STACK: usize = if cfg!(debug_assertions) {
     64 * 1024
 } else {
@@ -113,16 +95,14 @@ fn deep_tree_copy_does_not_abort_the_process() {
     assert_child_succeeds("copy");
 }
 
-/// A deep tree is copied by the re-added PUBLIC `atomic::copy_dir_recursive_fd`
-/// without overflowing the stack (subprocess). The source tool's original was
-/// RECURSIVE; the crate's replacement is iterative precisely so this cannot
-/// abort the host.
+/// A deep tree is copied by the PUBLIC `atomic::copy_dir_recursive_fd`
+/// without overflowing the stack (subprocess).
 #[test]
 fn deep_tree_fd_copy_does_not_abort_the_process() {
     assert_child_succeeds_with_stack("copy_fd", FD_COPY_STACK);
 }
 
-/// A deep tree is fsynced by the re-added PUBLIC
+/// A deep tree is fsynced by the PUBLIC
 /// `atomic::fsync_tree_recursive_fd` without overflowing the stack
 /// (subprocess).
 #[test]
@@ -130,13 +110,11 @@ fn deep_tree_fd_fsync_does_not_abort_the_process() {
     assert_child_succeeds_with_stack("fsync_fd", FD_COPY_STACK);
 }
 
-/// The CALIBRATION for the two tests above: a RECURSIVE reference copy (the
-/// shape the source tool's original used, and the shape the crate's re-added
-/// primitive replaced) ABORTS on the SAME stack and the SAME 256-level tree.
-/// This is what makes the iterative primitive's success evidence of iteration
-/// rather than evidence of a generous stack: at this stack one shape overflows
-/// and the other does not. The reference is test-only and is never part of the
-/// crate's public surface.
+/// The CALIBRATION for the two tests above: a RECURSIVE reference copy ABORTS on
+/// the SAME stack and the SAME 256-level tree. This is what makes the iterative
+/// primitive's success evidence of iteration rather than evidence of a generous
+/// stack: at this stack one shape overflows and the other does not. The
+/// reference is test-only and is never part of the crate's public surface.
 ///
 /// MARGIN: the reference must abort at BOTH [`FD_COPY_STACK`] and `2 *
 /// FD_COPY_STACK`, so the recursive cliff is provably at least 2x above the
@@ -170,10 +148,7 @@ fn assert_recursive_reference_aborts(stack: usize) {
 /// A deep removal with `RLIMIT_NOFILE` lowered surfaces a CLEAN
 /// descriptor-exhaustion `Err` (never an abort, never a panic, never a
 /// silent partial success), leaks no descriptor, and leaves the tree in a
-/// defined, retryable state. The pre-rewrite recursive form held the same
-/// one-descriptor-per-level frontier and failed the same way, so this is a
-/// COVERAGE-ONLY pin of the documented "bounded by the descriptor limit, a
-/// clean `Err`" contract rather than a regression the rewrite fixed.
+/// defined, retryable state.
 #[test]
 fn deep_tree_removal_surfaces_a_clean_descriptor_exhaustion() {
     assert_emfile_child();
@@ -235,9 +210,8 @@ fn run_walk(root: &Path, mode: &str) -> Result<(), String> {
                 .copy_tree(&src, &dest)
                 .map_err(|e| format!("copy_tree: {e}"))
         }
-        // The re-added PUBLIC fd-confined copy (the source tool's
-        // `copy_dir_recursive_fd` equivalent): it must be iterative too, or a
-        // deep tree aborts on this deliberately small stack.
+        // The fd-confined copy: it must be iterative too, or a deep tree
+        // aborts on this deliberately small stack.
         "copy_fd" => {
             let owned =
                 crate::atomic::RootDir::open(root).map_err(|e| format!("open root: {e}"))?;
@@ -245,7 +219,7 @@ fn run_walk(root: &Path, mode: &str) -> Result<(), String> {
             crate::atomic::copy_dir_recursive_fd(&owned, &root.join(TOP), &dest)
                 .map_err(|e| format!("copy_dir_recursive_fd: {e}"))
         }
-        // The re-added PUBLIC fd-confined tree fsync.
+        // The PUBLIC fd-confined tree fsync.
         "fsync_fd" => {
             let owned =
                 crate::atomic::RootDir::open(root).map_err(|e| format!("open root: {e}"))?;
@@ -253,16 +227,15 @@ fn run_walk(root: &Path, mode: &str) -> Result<(), String> {
             crate::atomic::fsync_tree_recursive_fd(&owned, &tree)
                 .map_err(|e| format!("fsync_tree_recursive_fd: {e}"))
         }
-        // The test-only RECURSIVE reference copy: the shape the source tool's
-        // original used. It exists to prove the fd-copy stack calibration.
+        // The test-only RECURSIVE reference copy. It exists to prove the
+        // fd-copy stack calibration.
         "copy_recursive" => recursive_copy_reference(&root.join(TOP), &root.join(COPY)),
         other => Err(format!("unknown mode {other:?}")),
     }
 }
 
-/// A deliberately RECURSIVE reference copy — the shape the source tool's
-/// original `copy_dir_recursive_fd` used (one Rust frame per directory level).
-/// TEST-ONLY: it exists so the deep-tree harness can prove that
+/// A deliberately RECURSIVE reference copy — one Rust frame per directory
+/// level. TEST-ONLY: it exists so the deep-tree harness can prove that
 /// [`FD_COPY_STACK`] is calibrated to distinguish recursion from iteration at
 /// 256 levels, not merely to fit.
 fn recursive_copy_reference(src: &Path, dst: &Path) -> Result<(), String> {
@@ -392,9 +365,9 @@ fn run_child(mode: &str, stack: usize) -> std::process::Output {
         .output()
         .expect("spawn the child test binary");
 
-    // Clean up BEFORE asserting, even when the child aborted: a pre-fix abort
-    // leaves a partially removed deep tree behind, and the host must not keep
-    // it. `DEPTH` is far below the parent thread's stack budget.
+    // Clean up BEFORE asserting, even when the child aborted: an abort leaves a
+    // partially removed deep tree behind, and the host must not keep it.
+    // `DEPTH` is far below the parent thread's stack budget.
     let _ = std::fs::remove_dir_all(root.join(TOP));
     let _ = std::fs::remove_dir_all(root.join(COPY));
     out

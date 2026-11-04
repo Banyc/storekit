@@ -18,9 +18,9 @@
 //! working directory, against a real filesystem. Word splitting, pathname
 //! expansion, option parsing, quoting, and the stdin payload all behave as
 //! they would far side, and an object created relative to the working
-//! directory is a genuine object OUTSIDE the destination root. The macOS run
-//! exercises a BSD userland (`stat`, `ln`, `mkdir`, ...); the Linux run
-//! exercises GNU coreutils.
+//! directory is a genuine object OUTSIDE the destination root. On macOS the
+//! far-side commands are the BSD userland (`stat`, `ln`, `mkdir`, ...); on
+//! Linux they are GNU coreutils.
 //!
 //! WHAT THE SHIM DOES NOT PROVE. It does not talk to any network and does not
 //! exercise the SSH protocol or a real remote login shell: no connection
@@ -30,12 +30,10 @@
 //! side is the SAME host and the SAME local filesystem. A defect that depends
 //! on any of those is out of scope here and is NOT covered by these tests.
 //!
-//! The tests drive [`Remote::write`] and [`Remote::symlink`] directly. The
-//! sync applier slice that normally calls them is not ported into this crate
-//! yet (`src/sync.rs` is a stub), so the "run is `Ok` / `applied` is right"
-//! assertions are expressed as `Remote::write` returning `Ok`, the literal
-//! destination path round-tripping its exact bytes and mode, and the
-//! destination root holding exactly the planned entries.
+//! The tests drive [`Remote::write`] and [`Remote::symlink`] directly: the
+//! assertions are the operation returning `Ok`, the literal destination path
+//! round-tripping its exact bytes and mode, and the destination root holding
+//! exactly the planned entries.
 #![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
@@ -278,49 +276,46 @@ fn assert_literal_upload(root_rel: &str, rel: &str, decoys: &[&str], data: &[u8]
     );
 }
 
-/// THE REPRODUCTION: a SPACE in a parent component. Pre-fix, the unquoted
-/// `$(dirname '<p>')` split at the space: `mkdir -p` created `<root>/aa` (a
-/// stray inside the root) and `bb` relative to the remote working directory
-/// (an object OUTSIDE the root), and the upload failed because the real
-/// parent `aa bb` was never created.
+/// THE REPRODUCTION: a SPACE in a parent component. The literal parent
+/// `aa bb` must be created inside the destination root, and nothing may appear
+/// in the remote working directory.
 #[test]
 fn upload_with_space_in_parent_component_is_confined() {
     assert_literal_upload("dst", "aa bb/c", &[], b"payload space parent");
 }
 
-/// A SPACE in the destination ROOT itself. Pre-fix the split happened on the
-/// root's parent, creating sibling objects under the working directory.
+/// A SPACE in the destination ROOT itself: the root's parent must not be
+/// split into sibling objects under the working directory.
 #[test]
 fn upload_with_space_in_destination_root_is_confined() {
     assert_literal_upload("dst root", "c", &[], b"payload space root");
 }
 
-/// A NEWLINE in the destination ROOT. This is the case merely QUOTING the
-/// command substitution cannot fix: `$(dirname ...)` STRIPS the trailing
-/// newline of its output, so `dst\n` is silently truncated to `dst` before
-/// `mkdir` ever sees it.
+/// A NEWLINE in the destination ROOT — the case a `$(dirname ...)` command
+/// substitution cannot handle: it STRIPS the trailing newline of its output, so
+/// `dst\n` would be silently truncated to `dst` before `mkdir` ever sees it.
 #[test]
 fn upload_with_newline_in_destination_root_is_confined() {
     assert_literal_upload("dst\nroot", "c", &[], b"payload newline root");
 }
 
-/// A TAB in a parent component: the default `IFS` splits the unquoted
+/// A TAB in a parent component: the default `IFS` splits an unquoted
 /// substitution result on it exactly as on a space.
 #[test]
 fn upload_with_tab_in_parent_component_is_confined() {
     assert_literal_upload("dst", "aa\tbb/c", &[], b"payload tab parent");
 }
 
-/// A NEWLINE in a parent component: split by `IFS`, and on a component-final
-/// newline the substitution output is also truncated.
+/// A NEWLINE in a parent component: split by `IFS`, and for a component-final
+/// newline the substitution output is truncated as well.
 #[test]
 fn upload_with_newline_in_parent_component_is_confined() {
     assert_literal_upload("dst", "aa\nbb/c", &[], b"payload newline parent");
 }
 
-/// A GLOB `*` in a parent component. A decoy sibling `aaXbb` makes the
-/// unquoted pathname expansion deterministic: pre-fix `aa*bb` expanded to the
-/// decoy, so the literal `aa*bb` parent was never created.
+/// A GLOB `*` in a parent component, with a decoy sibling `aaXbb` so a glob
+/// expansion would be observable: the literal `aa*bb` parent must be created
+/// and the decoy left alone.
 #[test]
 fn upload_with_star_in_parent_component_does_not_glob() {
     assert_literal_upload("dst", "aa*bb/c", &["aaXbb"], b"payload star parent");
@@ -338,19 +333,15 @@ fn upload_with_bracket_in_parent_component_does_not_glob() {
     assert_literal_upload("dst", "aa[xy]bb/c", &["aaxbb"], b"payload bracket parent");
 }
 
-/// A LEADING `-` in a parent component: the destination path is absolute, so
-/// this round-trips both pre-fix and post-fix; the test pins that the `--`
-/// hardening did not break it and that the split/expansion fix did not start
-/// treating it as an option.
+/// A LEADING `-` in a parent component: the far-side command must place the
+/// destination path as an operand, never as an option.
 #[test]
 fn upload_with_leading_dash_in_parent_component_is_confined() {
     assert_literal_upload("dst", "-aa/c", &[], b"payload dash parent");
 }
 
-/// A SINGLE QUOTE in a parent component. `shell_quote` already renders it as
-/// `'\''`, and command-substitution output is never re-parsed for quotes, so
-/// this round-trips both pre-fix and post-fix; the test pins that the fix
-/// preserved the existing single-quote escaping.
+/// A SINGLE QUOTE in a parent component: the far-side quoting must carry it as
+/// data, never re-parsed as a quote.
 #[test]
 fn upload_with_single_quote_in_parent_component_is_confined() {
     assert_literal_upload("dst", "aa'bb/c", &[], b"payload quote parent");
@@ -380,17 +371,10 @@ fn upload_leaf_names_with_metacharacters_round_trip() {
 
 /// A destination name at the manifest's legal MAXIMUM must still upload.
 /// The manifest accepts a name up to `NAME_MAX` (255 bytes), and the far-side
-/// upload writes through a same-directory temp whose name was derived from the
-/// destination basename as `.basename.tmp.XXXXXX` — 12 bytes MORE than the
-/// name. A 243-byte name left exactly 12 bytes of headroom and uploaded; a
-/// 244-byte name overflowed and `mktemp` failed with `File name too long`, so a
-/// legal tree was silently untransferable. The fix bounds the temp trunk while
-/// keeping it in the destination's own directory.
-///
-/// The measured boundary pre-fix: 243 bytes Ok, 244 bytes
-/// `Err(Transport("ssh upload failed: mktemp: mkstemp failed on
-/// .../<244 a's>.tmp.eWbAFI: File name too long"))`. Post-fix every length from
-/// 1 through `NAME_MAX` transfers.
+/// upload writes through a same-directory `mktemp` temp whose basename trunk is
+/// bounded by `atomic::bounded_temp_trunk`, so the temp name is never
+/// longer than a legal destination name. The sampled lengths
+/// `[1, 243, 244, 254, 255]` all transfer.
 #[test]
 fn upload_names_at_the_name_max_boundary_are_transferable() {
     for len in [1usize, 243, 244, 254, 255] {
@@ -401,9 +385,8 @@ fn upload_names_at_the_name_max_boundary_are_transferable() {
     }
 }
 
-/// A symlink LINK TARGET that starts with `-` is an operand, not an option:
-/// pre-fix `ln -sfn '-dash-target' <link>` was parsed by `ln` as the option
-/// cluster `-d` (`ln: illegal option -- d`) and the link was never created.
+/// A symlink LINK TARGET that starts with `-` is an operand, not an option: it
+/// must be created and round-trip verbatim.
 #[test]
 fn symlink_target_with_leading_dash_is_not_an_option() {
     let h = Harness::new("dst");
@@ -424,9 +407,7 @@ fn symlink_target_with_leading_dash_is_not_an_option() {
 }
 
 /// A `Remote::exec` PROGRAM NAME that starts with `-` is an operand, not an
-/// option: pre-fix `exec '-prog'` was parsed by the shell's `exec` builtin as
-/// the option cluster `-p` (`exec: -p: invalid option`) and the program never
-/// ran.
+/// option: it must run with its argv intact.
 #[test]
 fn exec_program_with_leading_dash_is_not_an_option() {
     let h = Harness::new("dst");

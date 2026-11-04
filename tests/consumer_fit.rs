@@ -1,53 +1,43 @@
 //! CONSUMER-FIT GUARD: the public call shapes a CONSUMER's interface requires.
 //!
-//! This crate exists to be consumed — by `~/code/deploy` (and then
-//! `~/code/ckpt`) — and a deletion or a signature change that is invisible to
-//! this crate's OWN suite is still a build break for a consumer. A prior pass
-//! deleted `Remote::exists` and demoted `atomic::write_atomic_replace(&Path)`,
-//! justified by "our production never did"; the population that mattered was
-//! the CONSUMER's interface, where deploy's interface requires `exists` (this
-//! crate supplies it as a DEFAULT method, so a transport may override it with a
-//! cheaper probe) and calls the path-based replace. This file is the class fix:
-//! it NAMES the required shapes and exercises them through the PUBLIC API only,
-//! so a future deletion of any of them is a loud COMPILE failure here — exactly
-//! the failure a consumer would get, and exactly the failure no unit test in
-//! this crate can produce.
+//! This crate exists to be consumed, and a deletion or a signature change that
+//! is invisible to this crate's OWN suite is still a build break for a
+//! consumer. This file IMPORTS and exercises the required shapes through the
+//! PUBLIC API only, so a future deletion of any imported one is a loud COMPILE
+//! failure here — exactly the failure a consumer would get, and exactly the
+//! failure no unit test in this crate can produce. The one exception is
+//! `id_newtype!`, which the list below only NAMES: this file neither invokes
+//! the macro nor uses a type it generates, so deleting it would not break
+//! compilation here.
 //!
 //! Each group below says WHICH KIND of evidence it has, measured at
 //! `~/code/deploy` `@` = `a76da6d4` (tip `2a2af061`):
 //!
-//! * a name a CURRENT consumer CALLS — `Remote::exists` (called in production),
-//!   the absolute-path replace and its `_fd` twin, `copy_dir_recursive_fd`,
+//! * the names a consumer's interface requires — `Remote::exists`, the
+//!   absolute-path replace and its `_fd` twin, `copy_dir_recursive_fd`,
 //!   `fsync_tree_recursive_fd`, `with_operation_lock_sidecar` with `SIDECAR_*`,
 //!   and the `id_newtype!` machinery;
 //! * a name the crate HOLDS for a consumer that does not use it YET — the `sync`
 //!   entry point with its ownership values, `SyncReport`, `copy_tree_verbatim`.
 //!   Measured at that revision: `deploy` contains ZERO occurrences of any of
-//!   them, so the pin is not an attestation of a current need; it is a promise
-//!   not to drop the surface the planned migration depends on, and it says so
-//!   here rather than borrowing the authority of a call site that does not
-//!   exist.
+//!   them, so the pin is a promise not to drop the surface the planned migration
+//!   depends on, not an attestation of a call site that does not exist
+//!   (`README.md`, "Design conflicts the `deploy` migration surfaced" (c)).
 //!
-//! Deleting any of them is a COMPILE failure here either way, which is the
-//! point. Each is cited by NAME, never by `file:line`: a consumer's line numbers
-//! move under it, and this crate's own rules forbid resting a claim on one.
+//! Deleting an imported shape is a COMPILE failure here, which is the point;
+//! the named-only `id_newtype!` is a citation, not a compile pin. Each is cited
+//! by NAME, never by `file:line`: a consumer's line numbers move under it, and
+//! this crate's own rules forbid resting a claim on one.
 //!
-//! * `Remote::exists` — `src/remote/transport/mod.rs`, the trait method the
-//!   consumer's interface requires, `fn exists(&self, rel: &RootedRelativePath)
-//!   -> bool`. Its PRODUCTION caller is `src/store/local/objects.rs`; every other
-//!   caller in that tree sits in a `#[cfg(test)]` module, so those attest the
-//!   trait method's shape but not a production need.
+//! * `Remote::exists` — the trait method the consumer's interface requires,
+//!   `fn exists(&self, rel: &RootedRelativePath) -> bool`. It is a DEFAULT
+//!   method, so a transport may override it with a cheaper probe.
 //! * the path-based atomic replace — the ABSOLUTE-PATH call shape
-//!   `write_atomic_replace(&path, bytes, &mut hook)`, which the consumer's
-//!   retention history-floor writer uses (`src/retention/reachability/
-//!   history_floor.rs`; the migration deleted `deploy`'s platform-specific store
-//!   modules, so the durable evidence is the CALL SHAPE, not a file that moves
-//!   under it) — and its confined twin `write_atomic_replace_fd`, which the
-//!   consumer's `store/local` writer drives.
+//!   `write_atomic_replace(&path, bytes, &mut hook)` — and its confined twin
+//!   `write_atomic_replace_fd`.
 //! * the tree pair — `copy_dir_recursive_fd` (out-of-root `&Path` source into a
 //!   root-confined `RootedRelativePath` staging destination) then
-//!   `fsync_tree_recursive_fd`; recorded in the README's "Design conflicts
-//!   the `deploy` migration surfaced" (c).
+//!   `fsync_tree_recursive_fd` (README, design conflicts (c)).
 //! * the ONE `sync` entry point in BOTH ownership states —
 //!   `DestinationOwnership::lock(..)` (owned) and
 //!   `DestinationOwnership::Unowned` (the explicitly weaker path). HELD FOR THE
@@ -84,8 +74,8 @@ fn local_transport(base: &Path) -> LocalTransport {
         .expect("build a local transport")
 }
 
-/// `Remote::exists` (deploy's REQUIRED trait method) plus the typed-absence
-/// alternative `Remote::metadata_opt` (`Ok(None)` versus `Err`).
+/// `Remote::exists` (the trait method a consumer's interface requires) plus the
+/// typed-absence alternative `Remote::metadata_opt` (`Ok(None)` versus `Err`).
 ///
 /// The control is the last block: an UNANSWERABLE probe (a symlinked parent,
 /// refused by the confined read) reads as `false` through `exists` and as
@@ -141,12 +131,10 @@ fn remote_existence_probe_and_typed_absence() {
     }
 }
 
-/// The path-based UNCONFINED atomic replace — the ABSOLUTE-PATH call shape the
-/// consumer's retention history-floor writer uses at the revision above (the
-/// migration deleted its platform-specific store modules, so the durable evidence
-/// is the CALL SHAPE, not a file that moves under it) — AND its confined
-/// equivalent `write_atomic_replace_fd` (deploy's `write_atomic_replace_at`
-/// resolves through it). Both must be nameable, and both must install the bytes.
+/// The path-based UNCONFINED atomic replace — the ABSOLUTE-PATH call shape
+/// `write_atomic_replace(&absolute, bytes, &mut hook)` — AND its confined
+/// equivalent `write_atomic_replace_fd`. Both must be nameable, and both must
+/// install the bytes.
 #[test]
 fn atomic_replace_path_based_and_confined() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -183,7 +171,7 @@ fn atomic_replace_path_based_and_confined() {
     );
 }
 
-/// The fd-confined tree pair with the EXACT consumer signatures: an
+/// The fd-confined tree pair with the call shapes a consumer names: an
 /// out-of-root `&Path` SOURCE copied into a root-confined `RootedRelativePath`
 /// staging destination, then `fsync_tree_recursive_fd` over that destination.
 /// The typed error branch proves the refusal is a `StoreKind`, not message
@@ -232,15 +220,13 @@ fn tree_pair_out_of_root_source_into_confined_staging() {
     }
 }
 
-/// One consumer-required name and one held for the planned consumer, both
-/// exercised through the PUBLIC API only: the operation-scoped sidecar critical
-/// section (`deploy`'s `remote::helper::recover` fallback needs a
-/// blocking-with-deadline form over the already-open, read-only record — a
-/// current CALL SITE), and the tolerant verbatim copy, which `deploy`'s
-/// retention checkpoint does NOT use (measured: its live-base clone is a
-/// test-only `std::fs::copy`) and which the crate therefore holds for the
-/// planned consumer rather than attesting. A future deletion of either is a
-/// COMPILE failure here.
+/// One name a consumer's interface requires and one held for the planned
+/// consumer, both exercised through the PUBLIC API only: the operation-scoped
+/// sidecar critical section (`with_operation_lock_sidecar`), and the tolerant
+/// verbatim copy (`copy_tree_verbatim`), which no consumer calls yet — the crate
+/// holds it for the planned migration (`README.md`, design conflicts (c)) rather
+/// than attesting it by a call site. A future deletion of either is a COMPILE
+/// failure here.
 #[test]
 fn sidecar_critical_section_and_tolerant_clone_are_public() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -7,10 +7,11 @@
 //! `serde::` path. This file therefore CANNOT catch a regression to
 //! consumer-unhygienic paths; the macro is written with `$crate::…` and
 //! hand-written serde impls (see `id_newtype!`'s consumer contract) precisely
-//! because a bare path compiles here yet fails in a real consumer. The
-//! regression guard for THAT property is a consumer crate whose only
-//! dependency is `storekit` (see the crate's `EXTRACTION.md` note); this
-//! file remains the in-repo round-trip check for the generated impls.
+//! because a bare path compiles here yet fails in a real consumer. That
+//! property is stated as the macro's CONSUMER CONTRACT and in `EXTRACTION.md`
+//! ("The `id` newtype macro names `serde` through the crate, so a call site
+//! needs no `serde` dependency of its own"); this file remains the in-repo
+//! round-trip check for the generated impls.
 
 /// The validator the macro's `$validator` slot takes: the contract is a
 /// plain `fn(&str) -> bool`.
@@ -21,7 +22,7 @@ fn valid_probe_id(s: &str) -> bool {
 storekit::id_newtype!(
     ProbeId,
     valid_probe_id,
-    "A downstream-crate identity newtype: a non-empty ASCII token."
+    "An identity newtype built at the macro's call site: a non-empty ASCII token."
 );
 
 #[test]

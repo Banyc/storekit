@@ -14,19 +14,18 @@
 //! * its OWN host key and its OWN client key (`ssh-keygen`, ed25519);
 //! * its OWN `AuthorizedKeysFile` and its OWN `known_hosts` (via `ssh-keyscan`);
 //! * a NON-DEFAULT, dynamically chosen port on `127.0.0.1`, run as the current
-//!   (non-root) user under the test's `tempfile::TempDir`;
+//!   user under the test's `tempfile::TempDir`;
 //! * nothing in `/etc/ssh`, nothing in the real `~/.ssh`, never port 22.
 //!
-//! The harness's `Drop` shuts the listener down and asks every OpenSSH
-//! `ControlMaster` under the test's own `TMPDIR` to exit, so the test leaves no
-//! processes behind. The temp dir (host key, client key, keys, config, log) is
+//! The harness's `Drop` kills the listener and asks every OpenSSH `ControlMaster`
+//! under the test's own `TMPDIR` to exit, so the masters the run created are
+//! shut down. The temp dir (host key, client key, keys, config, log) is
 //! removed with the `TempDir`.
 //!
-//! These tests are `#[cfg(unix)]`, like the crate's other ssh tests. They are
-//! gated behind `STOREKIT_FULL_TESTS` ONLY in the sense that they need `sshd`,
-//! `ssh`, `ssh-keygen`, `ssh-keyscan`, and `perl` on `PATH`; if `sshd` is
-//! genuinely absent the harness reports that clearly rather than silently
-//! passing.
+//! These tests are `#[cfg(unix)]`, like the crate's other ssh tests. They need
+//! `sshd`, `ssh`, `ssh-keygen`, `ssh-keyscan`, and `perl` on `PATH`; if `sshd`
+//! is genuinely absent, `find_sshd` panics with a message naming what to
+//! install rather than silently passing.
 #![cfg(unix)]
 // Test-only fixtures drive the same name-mutating primitives the funnel guards;
 // the production name-mutation rule does not apply to this test crate.
@@ -630,8 +629,8 @@ fn far_side_lock_exclusion_is_symmetric() {
 // ---------------------------------------------------------------------------
 
 /// Acquisition against a HELD record returns PROMPTLY with the contended
-/// outcome. The wait is bounded so a regression that waits can never hang the
-/// suite.
+/// outcome; the elapsed time is asserted so a regression that WAITS is
+/// reported instead of passing on the contention result alone.
 #[test]
 fn far_side_lock_acquisition_is_non_blocking() {
     let f = Fixture::new();
@@ -684,9 +683,10 @@ fn far_side_lock_is_released_after_a_failed_run() {
 // 4. Connection loss releases the record and is REPORTED
 // ---------------------------------------------------------------------------
 
-/// Killing the connection (the lock session's local `ssh` client) releases the
-/// far-side record, and a run handed the dead session reports a typed
-/// connection-loss failure instead of a clean success.
+/// Killing the far-side holder (the `perl` process holding the `flock`) releases
+/// the record — the lock session's local `ssh` client then exits — and a run
+/// handed the dead session reports a typed connection-loss failure instead of a
+/// clean success.
 #[test]
 fn connection_loss_releases_the_far_side_lock_and_is_reported() {
     let f = Fixture::new();
@@ -750,11 +750,9 @@ fn connection_loss_releases_the_far_side_lock_and_is_reported() {
 // 5. A transport that does not implement far-side locking fails closed
 // ---------------------------------------------------------------------------
 
-/// The `Remote::lock_far_side` DEFAULT refuses, so a transport that does not
-/// override it cannot be used to run an unowned remote destination silently.
-/// `LocalTransport` is such a transport: `lock_remote` refuses it (a local
-/// destination is refused even earlier, by the local-destination check, so this
-/// asserts the refusal is a `Preflight` naming the right remedy).
+/// `DestinationOwnership::lock_remote` refuses a LOCAL destination with the
+/// typed `LocalDestinationViaRemoteLock`: a local destination's record is on
+/// this host, so it must be owned with `DestinationOwnership::lock`.
 #[test]
 fn lock_remote_refuses_a_local_destination() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -784,7 +782,8 @@ fn lock_remote_refuses_a_local_destination() {
 
 /// The port-TOCTOU probe itself: a listener that is not our sshd must never be
 /// mistaken for it. A plain TCP listener presents no ed25519 host key, so the
-/// probe does not return `Ok(true)` AND names the cause; the harness then
+/// probe returns `Err` naming the cause (a foreign sshd would return
+/// `Ok(false)`); either way it never returns `Ok(true)`. `start_listener` then
 /// retries on a fresh port and, if every port is taken, fails naming the port
 /// race rather than surfacing an opaque authentication error from the wrong
 /// `AuthorizedKeysFile`.
@@ -819,9 +818,7 @@ const RECORD_HEADER: &[u8] = b"storekit lock record v1\n";
 /// A pre-existing FOREIGN record at the far-side path is not a record this
 /// crate wrote, so a far-side acquisition REFUSES it with the local arm's
 /// typed `LockRecordNotRecognized` and leaves the entry byte-for-byte and
-/// mode-for-mode untouched. PRE-FIX the holder unconditionally truncated the
-/// entry and wrote a bare op id, destroying the caller's data and returning
-/// success.
+/// mode-for-mode untouched.
 #[test]
 fn far_side_acquisition_refuses_a_foreign_record_without_truncating_it() {
     let f = Fixture::new();
@@ -861,8 +858,7 @@ fn far_side_acquisition_refuses_a_foreign_record_without_truncating_it() {
 /// A record the crate wrote (header + op id) is ADOPTED by the far-side holder
 /// — the header survives the acquisition — and a later LOCAL
 /// `FileLock::acquire` on the same path SUCCEEDS instead of refusing it with
-/// `LockRecordNotRecognized`. PRE-FIX the holder rewrote the entry as a bare op
-/// id, so the local arm then refused the far side's own record.
+/// `LockRecordNotRecognized`.
 #[test]
 fn a_crate_written_record_is_adopted_across_the_far_side_and_local_arms() {
     let f = Fixture::new();
@@ -877,8 +873,8 @@ fn a_crate_written_record_is_adopted_across_the_far_side_and_local_arms() {
     let after_far_side = std::fs::read(&record).expect("read the far-side record");
     drop(ownership);
 
-    // The flock is released asynchronously. Retry ONLY the typed contention;
-    // a LockRecordNotRecognized is the defect and must fail here at once.
+    // The flock is released asynchronously. Retry ONLY the typed contention; a
+    // LockRecordNotRecognized is a real failure and must fail here at once.
     let deadline = Instant::now() + Duration::from_secs(20);
     let local = loop {
         match FileLock::acquire(&record, "local after far side") {
@@ -894,9 +890,8 @@ fn a_crate_written_record_is_adopted_across_the_far_side_and_local_arms() {
     };
     drop(local);
 
-    // The far-side arm wrote a record the local arm recognises. PRE-FIX this
-    // held a BARE op id (no header), which is why the local acquire above was
-    // refused.
+    // The far-side arm wrote a record the local arm recognises (the local
+    // acquire above already proved it).
     assert!(
         after_far_side.starts_with(RECORD_HEADER),
         "the far-side acquisition must write the crate's record header, got: {:?}",
@@ -908,9 +903,8 @@ fn a_crate_written_record_is_adopted_across_the_far_side_and_local_arms() {
     );
 }
 
-/// The far-side acquisition makes the record PRIVATE (`0600`), tightening a
-/// record an earlier version left wider — the local arm's chmod, on the same
-/// record. PRE-FIX the holder never chmodded, so a `0644` record stayed `0644`.
+/// The far-side acquisition makes the record PRIVATE (`0600`) — the local
+/// arm's chmod, on the same record.
 #[test]
 fn a_far_side_acquisition_tightens_the_record_mode_to_0600() {
     let f = Fixture::new();

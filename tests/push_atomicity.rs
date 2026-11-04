@@ -1,14 +1,12 @@
-//! A PUSH into a LOCAL destination must be atomic and durable, exactly like a
-//! PULL. Before the fix the push direction wrote through `Remote::write`
-//! (`LocalTransport::write_confined`), which opened the destination
-//! `O_WRONLY|O_CREAT|O_TRUNC` and did ONE `write` with no temp, no rename and
-//! no fsync anywhere under the destination. A write that failed part-way — an
-//! ENOSPC on a small tmpfs — therefore DESTROYED the previous content and left
-//! the entry TORN: truncated to zero, then partially
-//! rewritten. The identical operation expressed as a PULL (which already used
-//! the crate's durable fd-confined primitives) left the old file intact.
+//! A PUSH into a LOCAL destination must be atomic: a destination write that
+//! fails part-way leaves the previous content intact, exactly as a PULL does.
+//! `LocalTransport::write_confined` installs the destination through the
+//! crate's atomic replace (`write_atomic_replace_fd_under_existing_parent`): a
+//! unique temp in the same directory, fsynced, renamed into place, then the
+//! parent directory fsynced. A failure before the rename leaves the previous
+//! content untouched and unlinks the temp.
 //!
-//! This suite reproduces the failure deterministically without a tmpfs, using
+//! This suite reproduces the mid-write failure without a tmpfs, using
 //! `RLIMIT_FSIZE` (an ENOSPC-like, mid-write `EFBIG` on the 8 MiB source with
 //! the per-file limit set to 4 MiB). The reproducing body must run in its OWN
 //! process because `RLIMIT_FSIZE` and the ignored `SIGXFSZ` are process-wide:
@@ -143,8 +141,7 @@ fn push_mid_write_failure_leaves_previous_content_intact_child() {
         "a failed push left the destination TORN: the old content was replaced by a partial write"
     );
 
-    // THE FIX leaves no stray temp behind (the pre-fix code had no temp; the
-    // post-fix atomic replace unlinks a failed temp).
+    // The atomic replace leaves no stray temp behind on a failed write.
     let mut temps: Vec<String> = std::fs::read_dir(&dst)
         .expect("list the destination")
         .map(|e| {
@@ -163,17 +160,10 @@ fn push_mid_write_failure_leaves_previous_content_intact_child() {
 }
 
 /// A local PUSH must transfer a destination name at the manifest's legal
-/// MAXIMUM. Change 1 routed the local push through the atomic replace, whose
-/// temp was `.{name}.tmp.{pid}.{counter}` — the embedded name made the temp
-/// 10–12 bytes longer than the destination, so the longest legal names failed
-/// `openat ...: File name too long (os error 63)` and the destination was left
-/// in `indeterminate` (fail-closed, but untransferable).
-///
-/// The measured pre-fix boundary (pid-dependent): a 240-byte name transferred
-/// and a 243-byte name failed with
-/// `Err(Transport("write <name>: store error: openat .<243 a's>.tmp.72526.2:
-/// File name too long (os error 63)"))`. Post-fix every length from 1 through
-/// `NAME_MAX` transfers.
+/// MAXIMUM. The atomic replace's temp name bounds the destination trunk to
+/// [`storekit::atomic::NAME_MAX`] (`bounded_temp_trunk`), so the temp is never
+/// longer than a legal destination name, and the sampled lengths
+/// `[1, 243, 244, 254, 255]` all transfer.
 #[test]
 fn push_names_at_the_name_max_boundary_are_transferable() {
     let tmp = tempfile::Builder::new()
