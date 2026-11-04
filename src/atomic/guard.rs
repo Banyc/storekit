@@ -2640,6 +2640,14 @@ mod tests {
             ("src/atomic/unix.rs", "libc::stat", 8),
             ("src/atomic/unix.rs", "libc::symlinkat", 1),
             ("src/atomic/unix.rs", "libc::unlinkat", 3),
+            // The far-side executable's descriptor-bound `verify-open`: an
+            // `O_NOFOLLOW | O_NONBLOCK` read-only open (neither bit can ADOPT a
+            // name; `clippy.toml` names `custom_flags` itself and the call
+            // carries the documented item-level allow), plus the C library's
+            // `strerror` for the errno TEXT the perl scripts print.
+            ("src/bin/storekit-remote.rs", "libc::O_NOFOLLOW", 1),
+            ("src/bin/storekit-remote.rs", "libc::O_NONBLOCK", 1),
+            ("src/bin/storekit-remote.rs", "libc::strerror", 1),
             ("src/lock/unix.rs", "libc::EAGAIN", 1),
             ("src/lock/unix.rs", "libc::ELOOP", 1),
             ("src/lock/unix.rs", "libc::EWOULDBLOCK", 2),
@@ -2882,6 +2890,9 @@ mod tests {
             // `FILE_FLAG_OPEN_REPARSE_POINT` only.
             ("src/atomic/guard.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
+            // The far-side executable's `verify-open`: a READ-ONLY open
+            // forwarding `O_NOFOLLOW | O_NONBLOCK` only.
+            ("src/bin/storekit-remote.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/unix.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/windows.rs", "OpenOptions::custom_flags", 1),
             ("src/lock/unix.rs", "OpenOptions::custom_flags", 1),

@@ -2228,6 +2228,12 @@ impl SshTransport {
     ///
     /// Names are printed as RAW BYTES (`binmode STDOUT`); a non-UTF-8 name is
     /// refused by the Rust decoder, never lossily decoded.
+    ///
+    /// This is the FALLBACK form: [`Self::list`] goes through
+    /// [`Self::far_command`], so a far side with a compatible
+    /// `storekit-remote` runs [`Self::list_cli_argv`] instead and this script
+    /// runs only when the CLI is absent or incompatible. Both forms emit the
+    /// same frame, the same failure messages, and the same exit status.
     fn list_script(&self, rel: &Path) -> String {
         let p = shell_quote(&self.root.join(rel).to_string_lossy());
         format!(
@@ -2238,6 +2244,18 @@ my @s = lstat(\"$dir/$n\"); die \"list: lstat $dir/$n: $!\" unless @s; \
 my $mt = $s[2] & 0170000; my $t = ($mt == 0120000) ? \"l\" : (($mt == 0040000) ? \"d\" : \"f\"); \
 printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
         )
+    }
+
+    /// The CLI form of [`Self::list_script`]: `storekit-remote list <path>`.
+    /// The path is the SAME absolute `root.join(rel)` the script is given —
+    /// through `to_string_lossy`, exactly as the script builds it — so the two
+    /// forms inspect the same directory and print the same raw entry names.
+    fn list_cli_argv(&self, rel: &Path) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "list".to_string(),
+            self.root.join(rel).to_string_lossy().into_owned(),
+        ]
     }
 
     /// Build the remote shell command implementing the atomic compare-and-
@@ -2344,6 +2362,13 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// perl is multi-line inside the single-quoted `-e` argument (shell
     /// single quotes span newlines).
     ///
+    /// This is the FALLBACK form: the call site goes through
+    /// [`Self::verify_open_command`], so a far side with a compatible
+    /// `storekit-remote` runs [`Self::verify_open_cli_argv`] instead and this
+    /// script runs only when the CLI is absent or incompatible — or when the
+    /// test-only swap seam below is installed (the CLI has no equivalent).
+    /// Both forms emit the same frame and exit 0 for every outcome.
+    ///
     /// Test-only swap injection is via a `#[cfg(test)]` Rust VALUE seam
     /// (`SshTransport::test_verify_swap` set through
     /// `SshTransport::set_test_verify_swap`): the
@@ -2428,6 +2453,53 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
              }}\n\
              printf \"N\\t%x\\n\", $s[2] & 0xffff;\n\
              ' -- {p}"
+        )
+    }
+
+    /// The CLI form of [`Self::verify_open_script`]: `storekit-remote
+    /// verify-open <path>`. Same frame, same "exit 0 for every outcome" rule,
+    /// same `O_NOFOLLOW | O_NONBLOCK` open — the near-side parser is unchanged
+    /// because both forms produce identical bytes.
+    fn verify_open_cli_argv(&self, rel: &Path) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "verify-open".to_string(),
+            self.root.join(rel).to_string_lossy().into_owned(),
+        ]
+    }
+
+    /// The command selector for the descriptor-bound verification helper.
+    ///
+    /// With no test seam installed this is [`Self::far_command`], like every
+    /// other switched operation: the CLI argv when the far side has a
+    /// compatible `storekit-remote`, the perl script otherwise.
+    ///
+    /// The helper's `#[cfg(test)]` swap seam (`test_verify_swap`, set through
+    /// [`Self::set_test_verify_swap`]) mutates the path BETWEEN the helper's
+    /// own open/fstat/read steps and lives only in the perl script; the CLI has
+    /// no equivalent. When the seam is installed the SCRIPT is therefore
+    /// returned DIRECTLY — the far side is not consulted at all, so the swap
+    /// tests keep exercising the swap (and issue no probe). This branch is
+    /// `#[cfg(test)]`: a production build contains no swap logic and always
+    /// goes through the selector.
+    fn verify_open_command(&self, rel: &Path) -> Result<String> {
+        #[cfg(test)]
+        {
+            // The guard is released AT THE END OF THIS STATEMENT, before
+            // `verify_open_script` takes it again: holding it across that call
+            // would re-lock a non-reentrant mutex and deadlock.
+            let seam_installed = self
+                .test_verify_swap
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false);
+            if seam_installed {
+                return Ok(self.verify_open_script(rel));
+            }
+        }
+        self.far_command(
+            self.verify_open_script(rel),
+            &self.verify_open_cli_argv(rel),
         )
     }
 
@@ -2925,7 +2997,17 @@ impl Remote for SshTransport {
     }
 
     fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
-        let out = self.run_remote(&self.list_script(rel.as_path()))?;
+        // The listing is the CLI when the far side carries a compatible
+        // `storekit-remote` (decided once by the transport's probe), the perl
+        // script otherwise; both emit the SAME NUL-framed raw-byte records, the
+        // same `die` message, and the same exit status, so the near-side
+        // decoder below is unchanged. Nothing is sorted here — the frame is in
+        // `readdir` order.
+        let command = self.far_command(
+            self.list_script(rel.as_path()),
+            &self.list_cli_argv(rel.as_path()),
+        )?;
+        let out = self.run_remote(&command)?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh list failed: {}",
@@ -3365,9 +3447,11 @@ impl Remote for SshTransport {
         // VERIFY the existing entry through THE ONE CENTRALIZED
         // DESCRIPTOR-BOUND verification
         // ([`crate::transport::verify_existing`]): ONE remote helper
-        // operation ([`SshTransport::verify_open_script`]) performs the
-        // open-with-O_NOFOLLOW → fstat-the-same-fd → read-through-the-same-fd
-        // sequence and emits ONE frame carrying the fd-derived mode + content
+        // operation ([`SshTransport::verify_open_command`] — the CLI when the
+        // far side has a compatible `storekit-remote`, the perl helper
+        // otherwise) performs the open-with-O_NOFOLLOW → fstat-the-same-fd →
+        // read-through-the-same-fd sequence and emits ONE frame carrying the
+        // fd-derived mode + content
         // (or the errno) — there is NO client round-trip between the metadata
         // check and the read, and a symlink is never followed — the
         // `O_NOFOLLOW` open fails it with ELOOP. A regular file with the
@@ -3380,7 +3464,7 @@ impl Remote for SshTransport {
         // unreadable entry — never an undifferentiated conflict).
         let verified = verify_existing(
             || {
-                let out = self.run_remote(&self.verify_open_script(rel.as_path()))?;
+                let out = self.run_remote(&self.verify_open_command(rel.as_path())?)?;
                 if !out.status.success() {
                     return Err(Error::transport(format!(
                         "ssh verify-open failed: {}",
