@@ -1,13 +1,15 @@
-//! The production SSH transport group: the [`SshTransport`] over `ssh`/`scp`,
+//! The production SSH transport group: the [`SshTransport`] over `ssh`,
 //! host-identity verification and pinning ([`hostkey`]), and the ONE bounded
 //! subprocess runner every ssh operation goes through ([`runner`]) — hard
 //! deadline, kill, and deterministic reap.
 //!
 //! Transport setup is split into two phases: [`Remote::prepare_identity`]
-//! (verify/pin the host key) runs before ANY remote request — including a dry
-//! run's status inspection — while [`Remote::provision_layout`] (create the
-//! deployment-directory layout) runs only behind the push engine's
-//! non-dry-run gate.
+//! (verify/pin the host key) runs ahead of every self-preparing entry point —
+//! read-only status inspection included — while [`Remote::provision_layout`]
+//! (create the deployment-directory layout) runs at the start of a push,
+//! before the destination manifest is read. [`Remote::try_write_new`] is the
+//! ONE entry point that does not prepare: its caller must run
+//! [`Remote::prepare_identity`] itself.
 //!
 //! # Submodules
 //!
@@ -92,8 +94,7 @@ const MUX_FILE_PREFIX: &str = "mux-";
 /// collision lets one transport reuse another identity's authenticated
 /// ControlMaster), so the platform budget may shorten it from 256 bits but
 /// never below this; under this floor the transport fails closed instead of
-/// emitting a path `ssh` cannot use. The macOS default `TMPDIR` retains 112
-/// bits (28 hex) after the listener reserve below.
+/// emitting a path `ssh` cannot use.
 const MIN_MUX_HASH_HEX: usize = 24;
 
 /// The bytes OpenSSH adds to the `ControlPath` when it BINDS the mux listener.
@@ -102,42 +103,72 @@ const MIN_MUX_HASH_HEX: usize = 24;
 /// socket at the configured path: it first binds
 /// `"<ControlPath>.<16 random alphanumerics>"` and then `link(2)`s that socket
 /// into place, so the `sun_path` that must actually fit is that TEMPORARY name.
-/// A `ControlPath` that passes OpenSSH's own `ssh.c` length check (`<
-/// sizeof(sun_path)`) but leaves less than this reserve still fails to bind a
-/// master — `unix_listener: path "..." too long for Unix domain socket`, with
-/// multiplexing silently disabled. The boundary sits a few bytes above the
-/// longest path that multiplexes, which is why the reserve below is part of the
-/// budget rather than a guess (no figures here: the bound is a property of the
-/// OpenSSH build, and the reserve is what the crate pins). The suffix is `.` plus
-/// the 16 characters the code generates, so the
-/// reserve is exactly 17 bytes and MUST be part of the budget — not just the
-/// final path length — or the transport works without multiplexing.
+/// The suffix is `.` plus those 16 characters, so the reserve is exactly 17
+/// bytes and MUST be part of the budget — not just the final path length — or a
+/// `ControlPath` that fits the limit outright still fails to bind a master.
 const MUX_LISTENER_RESERVE_BYTES: usize = 17;
 
-/// The reserved exit code the remote `try_write_new` script (`write_new_cmd`)
-/// exits with when the no-clobber publish (perl `link(2)`) hit an EXISTING
-/// destination — the conflict/verdict decision point. It is the ONLY nonzero
-/// exit the transport
-/// maps to a verdict; every other nonzero exit is a propagated error — a
-/// pre-install step's failure OR the final parent-directory sync, the latter
-/// reported through [`SSH_UPLOAD_POST_RENAME_EXIT`] as a visible-but-not-yet-
-/// durable replace. `17` cannot collide
-/// with the pre-install steps' own failures (each exits nonzero, but the
-/// transport distinguishes the verdict by code, never by `exists`-sniffing),
-/// and it is deliberately distinct from [`SSH_TWRITE_PREINSTALL_EXIT`].
-/// `17` is also EEXIST (POSIX, identical on Linux and macOS) — the raw
-/// `link(2)` errno the script maps directly to this code.
+/// The reserved exit code the remote create-new scripts (`write_new_cmd` and
+/// `try_write_new_sidecar_cmd`) exit with when the no-clobber publish (perl
+/// `link(2)`) found the destination ALREADY PRESENT — the conflict/verdict
+/// decision point. It is the ONLY nonzero exit [`RemotePublish::of`] maps to a
+/// verdict; every other nonzero exit is a propagated error. `17` cannot collide
+/// with the pre-install steps' own failures (they exit
+/// [`SSH_TWRITE_PREINSTALL_EXIT`]), and it is also EEXIST (POSIX, identical on
+/// Linux and macOS) — the raw `link(2)` errno the script maps directly to this
+/// code. The decision is the destination's PRESENCE, not the errno:
+/// `write_new_cmd` re-tests `[ -e ] || [ -L ]` after a FAILED `link(2)` and
+/// exits this code for a non-EEXIST failure (EACCES, EXDEV, ...) too when the
+/// destination is there, so such a failure is the SAME verified verdict, never
+/// a pre-install error.
 pub const SSH_TWRITE_CONFLICT_EXIT: i32 = 17;
 
-/// The exit code the remote `write_new_cmd` script uses for a PRE-INSTALL
-/// failure — any failure BEFORE the no-clobber publish: the parent `mkdir`,
-/// the `mktemp` allocation, the payload write, the final `chmod`, the file
-/// fsync, or a non-EEXIST `link(2)` failure. Such a failure means the
-/// operation never reached the publish
-/// decision point, so it is a propagated Error, NEVER a verdict — the
-/// transport refuses to guess the destination's state. Deliberately distinct
-/// from [`SSH_TWRITE_CONFLICT_EXIT`] so the script can tell "the install never
-/// happened" from "the destination already existed".
+/// The exit code the remote create-new scripts (`write_new_cmd` and
+/// `try_write_new_sidecar_cmd`) exit with EXPLICITLY for a failure that is not
+/// the reserved conflict verdict. For `write_new_cmd` that is its PRE-INSTALL
+/// failures: any step of its `&&`-connected chain (parent `mkdir`, `mktemp`
+/// allocation, payload write, length guard, final `chmod`, file fsync) failing,
+/// or the publish failing with the destination ABSENT afterwards. For
+/// `try_write_new_sidecar_cmd` it is those same pre-install failures PLUS one
+/// POST-install case — the parent-directory `open`/`sync` that runs after its
+/// `link(2)` succeeded — so the code covers these states of the destination:
+///
+/// * BEFORE the install (both scripts) — NOTHING was published: the parent
+///   `mkdir`, the `mktemp` allocation, the payload write, the length guard, the
+///   final `chmod`, the file fsync, or a `link(2)` failure whose destination is
+///   ABSENT afterwards. The temp this invocation created (if any) is removed
+///   and the destination is untouched.
+/// * AFTER the install (`try_write_new_sidecar_cmd` ONLY) — the `link(2)`
+///   SUCCEEDED, so the record IS in place, and only the PARENT-DIRECTORY fsync
+///   afterwards failed: the install is VISIBLE but its durability is
+///   UNCONFIRMED, the remote counterpart of
+///   [`crate::atomic::ReplaceOutcome::ReplacedDurabilityUnknown`]. Not a
+///   conflict, and not an absent entry either.
+///
+/// Both are propagated Errors, NEVER a verdict, and the code does NOT say
+/// which of the two happened. The constant is only what a script exits
+/// EXPLICITLY, so it is neither the whole pre-install class nor the whole
+/// post-install story. `write_new_cmd` ends its install-success branch
+/// `perl -e '{fsync_dir}' -- <parent>; exit $?`, so a failed parent fsync there
+/// exits the perl primitive's OWN status (perl `die` exits `$!` — EIO=5,
+/// EACCES=13, 255 when `$!` is 0, and that sysopen/fsync errno set is never
+/// [`SSH_TWRITE_CONFLICT_EXIT`]), carrying that primitive's `die` message on
+/// stderr; the record IS INSTALLED there too — visible, durability UNCONFIRMED —
+/// and it reaches [`RemotePublish::PreInstall`] through the primitive's status,
+/// NOT through this constant. `try_write_new_sidecar_cmd` is the script that
+/// exits this code EXPLICITLY for a failed parent-dir `open`/`sync` after its
+/// successful `link(2)`, and SILENTLY (no diagnostic), so for that script not
+/// even stderr names the failed step. The class that covers both scripts on
+/// both sides of the install is [`RemotePublish::PreInstall`]; this constant
+/// names only part of it. The pre-install classification is the
+/// destination's PRESENCE, not the errno: `write_new_cmd` re-tests
+/// `[ -e ] || [ -L ]` after a failed `link(2)`, so a non-EEXIST failure (EACCES,
+/// EXDEV, ...) that leaves a destination PRESENT still exits
+/// [`SSH_TWRITE_CONFLICT_EXIT`] and IS a verified verdict, exactly like EEXIST.
+/// Only `try_write_new_sidecar_cmd` reports every non-EEXIST `link(2)` failure
+/// here, because it has no post-failure presence re-check. Deliberately
+/// distinct from [`SSH_TWRITE_CONFLICT_EXIT`] so the script can tell "the
+/// destination already existed" from every other outcome.
 pub const SSH_TWRITE_PREINSTALL_EXIT: i32 = 1;
 
 /// The exit code the remote upload script (`upload_bytes`) exits with when the
@@ -155,11 +186,13 @@ pub const SSH_UPLOAD_POST_RENAME_EXIT: i32 = 74;
 
 /// The remote `try_write_new` script's exit status, classified ONCE.
 ///
-/// The exit status is the ONLY evidence the transport uses for "did the
-/// no-clobber publish reach its decision point", and the three outcomes are
-/// mutually exclusive: a durable install, a destination that already existed,
-/// or a failure BEFORE the publish. The script never reports the middle state
-/// any other way, so [`RemotePublish::of`] is the whole classification and
+/// The exit status is the ONLY evidence the transport uses for what the
+/// no-clobber publish did, and the three outcomes are
+/// mutually exclusive: exit 0 (a durable install), the reserved conflict code
+/// (a destination that already existed), and EVERY other status — a
+/// pre-install failure, a post-install parent-directory fsync failure, or no
+/// exit code at all. The script never reports the middle state any other way,
+/// so [`RemotePublish::of`] is the whole classification and
 /// [`SshTransport::try_write_new_with`] branches on it instead of re-testing
 /// `success()` and `code()` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,13 +207,37 @@ enum RemotePublish {
     /// `AlreadyPresent` or a typed `Conflict`) comes from that verification,
     /// never from this code.
     Existed,
-    /// Every other status: a PRE-INSTALL failure (the parent `mkdir`, the temp
-    /// allocation, the payload write, the final chmod, the file fsync, or a
-    /// non-EEXIST `link(2)` failure) — and equally a status with NO exit code at
-    /// all (the client or the remote command died on a signal, or `ssh` itself
-    /// failed). The operation never reached the publish decision point, so this
-    /// is a propagated error, NEVER a verdict: the transport does not guess the
-    /// destination's state.
+    /// Every other status, which covers BOTH sides of the install:
+    ///
+    /// * a PRE-INSTALL failure — the parent `mkdir`, the temp allocation, the
+    ///   payload write, the length guard, the final chmod, the file fsync, or a
+    ///   `link(2)` failure whose destination is ABSENT afterwards (`write_new_cmd`
+    ///   re-tests `[ -e ] || [ -L ]` and exits [`SSH_TWRITE_CONFLICT_EXIT`] when
+    ///   the destination is PRESENT, so a non-EEXIST link failure on a present
+    ///   destination is `Existed`, not this): NOTHING was published;
+    /// * a POST-INSTALL parent-directory fsync failure. `write_new_cmd` ends
+    ///   `if [ "$rc" -eq 0 ]; then perl -e '{fsync_dir}' -- <parent>; exit $?; fi`,
+    ///   so once the `link(2)` succeeded a failing parent fsync IS the command's
+    ///   exit status (perl's `die` status), and `try_write_new_sidecar_cmd`
+    ///   syncs the parent AFTER its successful `link(2)` and exits
+    ///   [`SSH_TWRITE_PREINSTALL_EXIT`] explicitly. Here the record IS
+    ///   INSTALLED: visible, durability UNCONFIRMED. That is not a conflict and
+    ///   not a converged `AlreadyPresent`, and it does not mean the publish
+    ///   decision point was never reached — it WAS, and it installed the entry;
+    /// * and, separately, a status carrying NO exit code at all — the LOCAL
+    ///   `ssh` client itself terminated by an external signal. Nothing else
+    ///   lands here: `ssh(1)` exits 255 both for its own failures (unreachable
+    ///   host, authentication, bad options) and when the remote command dies on
+    ///   a signal, so those DO carry a code (255) and are classified by the
+    ///   every-other-status arm above rather than by the absence of one; the
+    ///   runner's own deadline kill never reaches [`RemotePublish::of`] at all,
+    ///   it surfaces as `RunError::Timeout`.
+    ///
+    /// Because the code alone cannot tell the first case from the second, the
+    /// transport reports a propagated error carrying the remote stderr (which
+    /// in `write_new_cmd`'s post-install case is the fsync primitive's own
+    /// message) instead of guessing the destination's state; it is NEVER a
+    /// verdict.
     PreInstall,
 }
 
@@ -337,17 +394,14 @@ mod holder {
 ///   (`LOCKRECORDNOTRECOGNIZED`, exit 6) WITHOUT truncating or writing it,
 ///   byte-for-byte and mode-for-mode untouched (the local arm's typed
 ///   `LockRecordNotRecognized` rule, on the SAME record);
-/// * otherwise the record is chmodded `0600` (tightening a record an earlier
-///   version left wider) and the header followed by the holder identity is
+/// * otherwise the record is chmodded `0600` and the header followed by the
+///   holder identity is
 ///   written into it (so a refused contender can name the holder, like the
 ///   local record), `LOCKOK <pid>` is printed and flushed, and the process
 ///   BLOCKS reading stdin;
 /// * stdin EOF (the local client closed its pipe, or the connection dropped)
 ///   ends the loop; the explicit `LOCK_UN` + `close` then release the flock,
 ///   and process death releases it regardless.
-///
-/// The trailing `# STOREKIT_TEST_HOLD_LOCK` token is the stable hook a test's
-/// fake `perl` on `PATH` matches to recognise this exact program.
 fn perl_hold_lock() -> String {
     let script = PERL_HOLD_LOCK_TEMPLATE.replace(
         RECORD_HEADER_PLACEHOLDER,
@@ -461,7 +515,7 @@ const FAR_SIDE_LOCK_RELEASE_GRACE: Duration = Duration::from_secs(5);
 /// deadline accounting — then deletes the env key, so later iterations
 /// (also EWOULDBLOCKs on a retained lock) stay silent. No timing/sleep is
 /// added to the signal path. With the env unset (production) the block is
-/// skipped entirely and the emitted behavior is byte-identical to a prelude
+/// skipped entirely and the emitted behaviour is identical to a prelude
 /// without the signal.
 fn sidecar_flock_prelude(deadline_secs: f64, interval_secs: f64) -> String {
     format!(
@@ -503,8 +557,9 @@ enum HostIdentity {
     KnownHosts(PathBuf),
     /// A pre-verified host-key fingerprint: the fetched key must match
     /// `expected`, and the verified key is pinned into a managed known-hosts
-    /// file (`pinned`, set only by [`SshTransport::prepare_identity`] — never at
-    /// construction, so building the transport has no side effects).
+    /// file (`pinned`, set only through [`SshTransport::pin_known_hosts`] —
+    /// reached from [`Remote::prepare_identity`], never from construction, so
+    /// building the transport has no side effects).
     Fingerprint {
         expected: String,
         pinned: std::sync::Mutex<Option<PathBuf>>,
@@ -551,26 +606,27 @@ pub struct SshTransport {
     /// The host-identity SOURCE (a known-hosts file, or a fingerprint whose pin
     /// resolves into a managed file), classified once at construction.
     identity: HostIdentity,
-    /// The RESOLVED pin-cache directory for the managed known-hosts file
-    /// (the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`, else
-    /// `<temp_dir>/deploy-ssh-knownhosts`) — resolved ONCE at the
-    /// construction boundary, never read from the process env.
+    /// The RESOLVED pin-cache directory for the managed known-hosts file,
+    /// resolved by the caller ONCE at the construction boundary — never read
+    /// from the process env here.
     known_hosts_cache_dir: PathBuf,
     /// The directory holding the SSH connection-multiplexing (ControlMaster)
     /// sockets, one per distinct CONNECTION IDENTITY — the socket name is the
     /// LEADING hex characters of the SHA-256 of `user@host:port` PLUS the
     /// identity material (the USER's key path or the ambient marker, the
-    /// resolved known-hosts source, the configured fingerprint, and the
-    /// caller's ssh options). Keying on the identity is what makes
-    /// multiplexing SAFE: reusing a master skips both the host-key
+    /// resolved known-hosts source, the configured fingerprint, the caller's
+    /// ssh options, and the ambient authentication environment — see
+    /// [`SshTransport::mux_identity_material`]). Keying on the identity is what
+    /// makes multiplexing SAFE: reusing a master skips both the host-key
     /// verification and the `-i` key selection, so a master may only be shared
     /// with a transport whose authentication and host-key request is
     /// identical. The directory is a short path under the system temp dir
-    /// (`<temp_dir>/dmux`, created 0700 in
-    /// [`SshTransport::prepare_identity`] before any ssh op) because Unix
-    /// domain socket paths are length-limited (`sockaddr_un.sun_path`: 104
-    /// bytes on macOS, 108 on Linux) and the known-hosts cache path is too long
-    /// to host them. The hash is TRUNCATED to whatever width that limit leaves
+    /// (`<temp_dir>/dmux`, created 0700 by
+    /// [`SshTransport::prepare_identity`], which every self-preparing entry
+    /// point runs — the `try_write_new`-first caller is the one path that does
+    /// not, so it must prepare first) because Unix domain socket paths are
+    /// length-limited (`sockaddr_un.sun_path`: 104 bytes on macOS, 108 on
+    /// Linux). The hash is TRUNCATED to whatever width that limit leaves
     /// (see [`mux_hash_hex_width`]), with a 96-bit floor below which
     /// construction fails closed. Every ssh subprocess this transport spawns
     /// reuses ONE persistent master connection per remote/identity, so the
@@ -579,8 +635,8 @@ pub struct SshTransport {
     /// once per operation; the master daemonizes into its own process group, so
     /// the runner's foreground-only containment is unaffected.
     mux_socket_dir: PathBuf,
-    /// The environment snapshot (owned): the pin path's `ssh-keygen`
-    /// fingerprint-verification child receives its variables.
+    /// The environment snapshot (owned): every child this transport spawns
+    /// (ssh, ssh-keyscan, ssh-keygen) receives its variables.
     env: SysEnv,
     /// THE bounded subprocess runner every ssh operation goes through
     /// ([`SshRunner`]): hard deadline, kill, and deterministic reap, so no
@@ -599,10 +655,10 @@ pub struct SshTransport {
     identity_file: Option<PathBuf>,
     /// Caller-supplied extra `ssh -o <value>` options, appended AFTER the
     /// crate's own options. Because OpenSSH uses the FIRST obtained value for
-    /// a repeated keyword, a caller cannot override the crate's own host-key
-    /// or authentication policy with a conflicting option; a non-conflicting
-    /// option (a `ProxyJump`, a `CertificateFile`, a `HostKeyAlgorithms`) is
-    /// passed through verbatim. See [`SshTransport::with_ssh_option`].
+    /// a repeated single-value keyword, a caller cannot override the crate's
+    /// own host-key policy with a conflicting option; a non-conflicting option
+    /// (a `ProxyJump`, a `CertificateFile`, a `HostKeyAlgorithms`) is passed
+    /// through verbatim. See [`SshTransport::with_ssh_option`].
     ssh_options: Vec<String>,
     /// Test-only swap injection for the descriptor-bound verification helper:
     /// a [`VerifySwap`](crate::transport::VerifySwap) stored as a Rust VALUE
@@ -640,8 +696,8 @@ impl SshTransport {
     /// no `-i`/`IdentityFile`/`IdentitiesOnly` option is added, so ssh
     /// authenticates with the AMBIENT configuration — the running user's
     /// `~/.ssh` default identities, the `SSH_AUTH_SOCK` agent, and
-    /// `~/.ssh/config` — exactly as a bare `ssh user@host` would. A tool that
-    /// owns its own private key should not rely on that ambient state: pass it
+    /// `~/.ssh/config`. A tool that owns its own private key should not rely
+    /// on that ambient state: pass it
     /// with [`SshTransport::with_identity_file`] (`.with_identity_file(path)`),
     /// which adds `-o IdentitiesOnly=yes -i <path>`. Extra non-conflicting ssh
     /// options are available through [`SshTransport::with_ssh_option`].
@@ -723,7 +779,8 @@ impl SshTransport {
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
         // verified and pinned by `prepare_identity` (before the first remote
-        // request), not here — a dry run must never touch the network or disk.
+        // request), not here — construction must never touch the network or
+        // disk.
         Ok(t)
     }
 
@@ -812,9 +869,9 @@ impl SshTransport {
     /// Append a caller-supplied `ssh` option, passed as `-o <value>` (e.g.
     /// `with_ssh_option("ProxyJump", "bastion")`). Options are appended AFTER
     /// the crate's own, so OpenSSH's first-obtained-value rule keeps the
-    /// crate's host-key and authentication policy authoritative; a
-    /// non-conflicting option is passed through verbatim. The value is passed
-    /// to ssh as one argument, never through a shell.
+    /// crate's host-key policy authoritative; a non-conflicting option is
+    /// passed through verbatim. The value is passed to ssh as one argument,
+    /// never through a shell.
     pub fn with_ssh_option(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
         self.ssh_options
             .push(format!("{}={}", key.as_ref(), value.as_ref()));
@@ -846,20 +903,17 @@ impl SshTransport {
     /// inherit the first's authenticated session, skipping its own host-key
     /// check and key selection. That is exactly the "ambient `~/.ssh/config` /
     /// agent key" class the keying exists to close. The material therefore
-    /// carries `HOME` and `SSH_AUTH_SOCK`, the two variables OpenSSH consults
-    /// for authentication and host verification: `HOME` locates
+    /// carries `HOME` and `SSH_AUTH_SOCK`: `HOME` locates
     /// `~/.ssh/config` (which can set `IdentityFile`, `CertificateFile`,
     /// `HostKeyAlgorithms`, `ProxyCommand`, `ProxyJump`, `CanonicalDomains`,
     /// ...), `~/.ssh/known_hosts`, and the default identities, and
     /// `SSH_AUTH_SOCK` selects the agent that supplies keys.
     ///
-    /// The crate passes its WHOLE environment snapshot to `ssh`, but no other
-    /// variable in it changes authentication or host verification:
-    /// `BatchMode=yes` is fixed by the crate's own options (and the crate's
-    /// options precede any caller option, so OpenSSH's first-obtained-value
-    /// rule keeps it), hence askpass is never consulted;
-    /// `PreferredAuthentications=publickey` excludes GSSAPI; and the login
-    /// user is carried in the TARGET. An input genuinely NOT covered is the
+    /// The crate also fixes `BatchMode=yes` and
+    /// `PreferredAuthentications=publickey` in its own options, and it passes
+    /// them BEFORE any caller option, so OpenSSH's first-obtained-value rule
+    /// keeps them; the login user is carried in the TARGET. An input genuinely
+    /// NOT covered is the
     /// passwd-entry home directory `ssh` falls back to when `HOME` is unset —
     /// the crate cannot observe the OS's resolution.
     ///
@@ -913,14 +967,14 @@ impl SshTransport {
     /// socket: the leading [`mux_hash_hex_width`] hex characters of the
     /// full-strength SHA-256 of [`SshTransport::mux_identity_material`].
     ///
-    /// The truncation is forced by the platform: the `sun_path` a Unix domain
-    /// socket must fit is too short for the FULL 64 hex characters (the
-    /// pre-fix spelling, which made `ssh` refuse the option with a fatal
-    /// "ControlPath too long"), and OpenSSH additionally binds a temporary
+    /// The hash may need truncating because the `sun_path` a Unix domain socket
+    /// must fit is limited, and OpenSSH additionally binds a temporary
     /// `<ControlPath>.<16 random chars>` before linking the real socket into
-    /// place ([`MUX_LISTENER_RESERVE_BYTES`]). The width keeps a 96-bit floor
-    /// ([`MIN_MUX_HASH_HEX`]) so the collision margin stays a security
-    /// property, not a formality.
+    /// place ([`MUX_LISTENER_RESERVE_BYTES`]): the full 64 hex characters are
+    /// kept when that budget allows them, and otherwise the hash is truncated
+    /// to the leading `budget` characters [`mux_hash_hex_width`] returns. The
+    /// width keeps a 96-bit floor ([`MIN_MUX_HASH_HEX`]) so the collision margin
+    /// stays a security property, not a formality.
     fn mux_identity_hash(&self, pinned: Option<&Path>) -> Result<String> {
         let width = mux_hash_hex_width(&self.mux_socket_dir)?;
         let full = simple_hash(&self.mux_identity_material(pinned));
@@ -931,10 +985,12 @@ impl SshTransport {
     /// Build the fixed `ssh` arguments (options + target). Errors when a
     /// fingerprint identity's pin has not resolved, so the caller cannot
     /// accidentally fall back to trust-on-first-use by never preparing the
-    /// identity ([`Remote::prepare_identity`] every request entry point runs).
+    /// identity ([`Remote::prepare_identity`] is the caller's contract;
+    /// `prepare_for_request` enforces it on every entry point except
+    /// [`Self::try_write_new_with`]).
     fn ssh_args(&self) -> Result<Vec<String>> {
-        // Read the pinned path through the identity; it is set only by
-        // `prepare_identity`. It is part of BOTH the mux identity (below) and
+        // Read the pinned path through the identity; it is set only through
+        // `pin_known_hosts`. It is part of BOTH the mux identity (below) and
         // the host-key options (the match at the end), so it is read once.
         let pinned = self.identity.pinned();
         let mut args: Vec<String> = vec![
@@ -952,9 +1008,8 @@ impl SshTransport {
             // exchange, auth, session) is paid once per push instead of once
             // per operation. The socket name is the leading hex characters of
             // the connection identity's SHA-256, TRUNCATED to the width
-            // `sun_path` leaves (the full 64 overflowed the limit under the
-            // macOS default TMPDIR and made ssh refuse every operation);
-            // keying on the identity is what keeps a reused master from
+            // `sun_path` leaves; keying on the identity is what keeps a reused
+            // master from
             // bypassing a DIFFERENT transport's host-key check or `-i` key.
             // The master daemonizes into its own process group, so the
             // runner's foreground-only containment is unaffected; a stale
@@ -974,9 +1029,10 @@ impl SshTransport {
         ];
         // The host-key policy of the ONE configured source, always verified
         // strictly. For a fingerprint identity the pin must already have
-        // resolved: every request is self-preparing (see
-        // `prepare_for_request`), so an unresolved pin here means the caller
-        // built arguments without preparing, and there is no
+        // resolved: the self-preparing entry points call `prepare_for_request`
+        // first, so an unresolved pin here means the caller built arguments
+        // without preparing (`prepare_identity` is the caller's contract, and
+        // `try_write_new` does not prepare), and there is no
         // trust-on-first-use fallback.
         let known_hosts: &Path = match (&self.identity, &pinned) {
             (HostIdentity::KnownHosts(known_hosts), _) => known_hosts,
@@ -1037,14 +1093,30 @@ impl SshTransport {
         Ok(())
     }
 
-    /// Prepare this transport's host identity before a remote request, so
-    /// EVERY request entry point ([`Self::run_remote`], [`Self::upload_bytes`],
-    /// and [`Remote::exec`]) is self-preparing and no caller can forget the
-    /// separate [`Remote::prepare_identity`] step. This is the CLASS fix for
-    /// "an undocumented extra call": `prepare_identity` creates the
+    /// Prepare this transport's host identity before a remote request, so the
+    /// entry points that call it ([`Self::run_remote`], [`Self::run_remote_ok`],
+    /// [`Self::upload_bytes`], [`Remote::exec`], and
+    /// [`Self::spawn_far_side_lock`]) are self-preparing and their callers
+    /// cannot forget the separate [`Remote::prepare_identity`] step.
+    /// `prepare_identity` creates the
     /// ControlMaster socket directory that `ssh_command_argv`'s `ControlPath`
     /// requires, so a fresh transport whose mux dir does not exist otherwise
     /// fails its first request with `unix_listener: cannot bind to path ...`.
+    ///
+    /// `download_bytes` (reached from [`Remote::read`]) is self-preparing
+    /// TRANSITIVELY: it probes the entry through `metadata` →
+    /// [`Self::run_remote`] before it builds its `cat` argv, so a fresh
+    /// unprepared transport whose first request is `read` does resolve the pin
+    /// and create the mux directory.
+    ///
+    /// NOT universal: [`Self::try_write_new_with`] (reached from the public
+    /// [`Remote::try_write_new`]) is the ONE entry point that builds ssh args
+    /// and runs the runner WITHOUT first calling `prepare_for_request`, so a
+    /// caller whose FIRST request is `try_write_new` must run
+    /// [`Remote::prepare_identity`] itself: a fingerprint-only transport
+    /// otherwise fails in `ssh_args` ("ssh host identity is not
+    /// configured"), and a known-hosts transport never creates the mux
+    /// directory on that path.
     ///
     /// IDEMPOTENT and cheap: the sync entry points still call
     /// [`Remote::prepare_identity`] FIRST (deliberately, before the
@@ -1072,9 +1144,7 @@ impl SshTransport {
     /// WHO is killed is the LOCAL `ssh` client (its whole process group). The
     /// far-side command is NOT killed by this: the remote has no obligation to
     /// terminate when the connection drops, and baseline OpenSSH does not ask
-    /// it to. Measured on both GNU/Linux and macOS far sides, a remote
-    /// `sleep 303` started through `exec(["sleep", "303"], 2s)` is reparented to
-    /// init and KEEPS RUNNING after the local client is killed. The deadline
+    /// it to. The deadline
     /// therefore bounds the CALLER, never the remote work; a far-side command
     /// whose effects must stop needs its own bound.
     pub(crate) fn run_remote(&self, command: &str) -> Result<std::process::Output> {
@@ -1116,11 +1186,10 @@ impl SshTransport {
 
     /// Build the `ssh <args> -- <command>` argv, forcing the remote command to
     /// run under `bash` regardless of the deployment account's login shell.
-    /// The remote scripts (globs, the `[ -e ] || [ -L ] || continue`
-    /// existence guard, ...) are
-    /// written for POSIX sh/bash semantics; a login shell like zsh aborts on
-    /// an unmatched glob (`no matches found`) instead of passing the pattern
-    /// through, which breaks e.g. the first `list` of an empty object store.
+    /// The remote scripts are shell scripts written for POSIX sh/bash
+    /// semantics; a login shell like zsh differs (it aborts on
+    /// an unmatched glob with `no matches found` instead of passing the pattern
+    /// through), and a script must not depend on the account's login shell.
     /// Wrapping the command in `bash -c '<quoted>'` means the outer login
     /// shell only parses the trivial `bash -c '...'` invocation (single-
     /// quoted, no globs to expand), and the inner script runs under bash.
@@ -1151,11 +1220,9 @@ impl SshTransport {
     ///   kind-changing replacement that the applier did not stage is an error
     ///   rather than a surprise.
     ///
-    /// GNU `mv -T` provided the first two points on GNU only. It is an
-    /// ILLEGAL option on BSD/macOS (`mv: illegal option -- T`, exit 64), so on
-    /// a supported macOS/BSD remote EVERY kind-changing replacement — the
-    /// symlink-to-directory `current` swap, a symlink retarget, dir-over-nondir
-    /// — failed with a transport error. `rename(2)` is portable and has no
+    /// GNU `mv -T` provided the first two points on GNU only, and it is an
+    /// ILLEGAL option on BSD/macOS (`mv: illegal option -- T`, exit 64).
+    /// `rename(2)` is portable and has no
     /// option parsing at all: both operands are shell-quoted and passed after
     /// `--`, so a leading `-` is an operand, never an option.
     fn rename_cmd(root: &Path, from: &Path, to: &Path) -> String {
@@ -1187,9 +1254,8 @@ impl SshTransport {
     /// symlink is therefore not a failure, and a fifo is never opened.
     ///
     /// `-exec … {} +`, NOT `-exec … {} ;`, is what makes a failed fsync an
-    /// error: `find` IGNORES the invoked command's exit status for `;` (proved
-    /// on GNU and BSD: a tree whose every fsync exited 9 still made `find` exit
-    /// 0), while for `+` POSIX `find` exits nonzero if ANY invocation does.
+    /// error: `find` IGNORES the invoked command's exit status for `;`, while
+    /// for `+` POSIX `find` exits nonzero if ANY invocation does.
     /// The `sh -c` wrapper stops at the first failed entry (`|| exit 1`), so
     /// the single nonzero invocation survives as `find`'s nonzero exit and
     /// [`Remote::fsync_tree`] surfaces an `Err` instead of a durability claim
@@ -1246,8 +1312,8 @@ impl SshTransport {
     /// Upload raw bytes to a remote path (creating parent dirs). Runs through
     /// the shared bounded runner: the stdin payload is written as part of the
     /// bounded wait, so an upload to a remote that stops reading (hung remote
-    /// mid-`cat`) times out after `SSH_COMMAND_TIMEOUT_SECS` instead of
-    /// blocking the push indefinitely.
+    /// mid-`cat`) is killed at its size-aware transfer deadline
+    /// ([`upload_deadline`]) instead of blocking the push indefinitely.
     ///
     /// When the transport was built with `verbose` (the CLI's `--verbose`),
     /// each upload emits `[trace] upload.start` / `[trace] upload.done` lines
@@ -1278,8 +1344,8 @@ impl SshTransport {
         // is fsynced. This is the far-side realization of the same
         // compare-free atomic replace the local path uses: a failure at ANY
         // step before the rename leaves the PREVIOUS content visible and
-        // removes the temp, so a failed upload can no longer destroy or
-        // truncate the entry it was replacing. The rename is perl's raw
+        // removes the temp, so a failed upload never destroys or
+        // truncates the entry it was replacing. The rename is perl's raw
         // `rename(2)` (ships with every reasonable remote; GNU and BSD agree)
         // so it OVERWRITES the final entry atomically — a destination that is
         // a DIRECTORY makes it fail loudly rather than being linked into or
@@ -1307,8 +1373,7 @@ impl SshTransport {
             .unwrap_or_else(|| "object".to_string());
         // The temp name is BOUNDED regardless of the destination basename's
         // length: the manifest permits a name up to `NAME_MAX`, and a fixed
-        // `.{basename}.tmp.XXXXXX` adds 12 bytes and made a 244-byte name
-        // overflow (`mktemp: ... File name too long`).
+        // `.{basename}.tmp.XXXXXX` would add 12 bytes to it.
         // [`crate::atomic::bounded_temp_trunk`] keeps the basename verbatim
         // while it fits and falls back to a truncated prefix plus a hash for
         // long names; `mktemp`'s `XXXXXX` still allocates a UNIQUE name, so
@@ -1323,8 +1388,8 @@ impl SshTransport {
         );
         // The final mode is applied to the TEMP before the rename (the same
         // ordering `write_new_cmd` uses), so the published inode carries the
-        // caller's mode, never the remote umask. A `mode` of 0 keeps the
-        // historical "no chmod" meaning; the mktemp temp is private (0o600).
+        // caller's mode, never the remote umask. A `mode` of 0 means no chmod
+        // at all; the mktemp temp is private (0o600).
         let chmod_step = if mode != 0 {
             format!("chmod {:o} \"$tmp\" && ", mode & 0o7777)
         } else {
@@ -1406,13 +1471,11 @@ impl SshTransport {
     /// Read a file's bytes from the remote. The deadline is SIZE-AWARE,
     /// exactly as an upload's ([`transfer_deadline`]): the entry's size comes
     /// from the same framed `lstat` helper the rest of the transport uses,
-    /// and the bound is `max(command deadline, size / min_rate)`. The fixed
-    /// command deadline ALONE killed a large read mid-transfer (the local
-    /// `ssh` client is killed at the deadline and the truncated stdout was
-    /// then reported by the caller as a content failure), the read-path
-    /// counterpart of the reason uploads already scale. The extra `lstat`
-    /// runs over the persistent `ControlMaster` session (one round trip on an
-    /// already-open connection, never a new handshake); a read whose size
+    /// and the bound is `max(command deadline, size / min_rate)`, so a
+    /// large read is not killed by the fixed command deadline and its stdout
+    /// reported by the caller as a content failure — the read-path
+    /// counterpart of why uploads scale. The extra `lstat` reuses the
+    /// transport's multiplexed connection; a read whose size
     /// cannot be learned — a vanished or unreadable entry — falls back to the
     /// command deadline, and the following `cat` then reports the real
     /// failure rather than a size-derived one.
@@ -1591,7 +1654,8 @@ fn read_timeout_error(
 /// The final socket path is `<mux_dir>/mux-<hash>`, but the path OpenSSH
 /// actually BINDS is `<mux_dir>/mux-<hash>.<16>` — its temporary listener name
 /// (see [`MUX_LISTENER_RESERVE_BYTES`]). Both must fit `sockaddr_un.sun_path`
-/// (`SUN_PATH_BYTES - 1` bytes, the array including its terminating NUL). The
+/// (`SUN_PATH_BYTES - 1` bytes; the array itself includes its terminating
+/// NUL). The
 /// budget is therefore `SUN_PATH_BYTES - 1 - MUX_LISTENER_RESERVE_BYTES` minus
 /// `len(mux_dir)` and `len("/mux-")`. The FULL SHA-256 (64 hex characters) is
 /// used when it fits; otherwise the LEADING `budget` hex characters are kept.
@@ -1803,16 +1867,18 @@ impl SshTransport {
     /// 6. Remove only the temporary file THIS invocation created (the
     ///    cleanup runs on the conflict path too — the `rc` capture keeps it
     ///    outside the `&&` chain).
-    /// 7. A perl `fsync(2)` of the PARENT directory — the rename that publishes
-    ///    the record is durable, and its failure PROPAGATES (a failed fsync is a
-    ///    failed install, never a silent success).
-    ///    PROPAGATES (the old script swallowed it with `2>/dev/null`): a
-    ///    failed sync is a failed install, never a silent success.
+    /// 7. A perl `fsync(2)` of the PARENT directory — the `link(2)` that
+    ///    publishes the record is durable, and its failure PROPAGATES as the
+    ///    command's exit status (never a silent success). The record is
+    ///    already INSTALLED at that point, and the propagated status is the
+    ///    failing perl primitive's own (`die` exits `$!`, never
+    ///    [`SSH_TWRITE_CONFLICT_EXIT`]), so [`RemotePublish::of`] classifies
+    ///    this POST-install durability failure as [`RemotePublish::PreInstall`]
+    ///    with the entry visible.
     ///
-    /// The parent directory is created first (the remote layout is not
-    /// provisioned by SSH the way LocalTransport does it), so a fresh remote
+    /// The parent directory is created first, so a fresh remote
     /// root still allows the first lock acquisition. The PRE-INSTALL chain
-    /// (`mkdir` .. `sync "$tmp"`) is `&&`-connected and its exit status is
+    /// (`mkdir` .. `PERL_FSYNC_FILE`) is `&&`-connected and its exit status is
     /// captured separately: if ANY pre-install step fails, the command exits
     /// [`SSH_TWRITE_PREINSTALL_EXIT`] WITHOUT installing anything (fail
     /// closed) — a pre-install failure is a propagated ERROR, never the
@@ -1822,14 +1888,12 @@ impl SshTransport {
     /// — which a shell `ln` would silently link INSIDE — or a symlink) is
     /// EEXIST, never dereferenced and never linked-into; EEXIST (17, the
     /// same value as [`SSH_TWRITE_CONFLICT_EXIT`]) exits the reserved
-    /// conflict code directly, any other link failure is the pre-install
-    /// exit. Only a nonzero publish exit whose destination is then PRESENT
-    /// (`[ -e ]`/`[ -L ]`) is the confirmed-EEXIST verdict
-    /// [`SSH_TWRITE_CONFLICT_EXIT`] (the winner is never replaced; the
-    /// transport verifies it and decides AlreadyPresent vs Conflict); a
-    /// nonzero publish exit with the destination ABSENT is a real publish
-    /// failure, again the pre-install exit (an error). The final `sync
-    /// <parent>` runs ONLY on the install-success path, and its exit status
+    /// conflict code directly. Any OTHER link failure is a real publish
+    /// error, reported as the conflict verdict when the destination is then
+    /// PRESENT (`[ -e ]`/`[ -L ]`) and as the pre-install exit when it is
+    /// ABSENT. The winner is never replaced; the transport verifies it and
+    /// decides AlreadyPresent vs Conflict. The final `fsync(2)` of the
+    /// parent runs ONLY on the install-success path, and its exit status
     /// is the command's exit status — a real `fsync(2)` (perl `IO::Handle::sync`),
     /// never a best-effort swallow. (The
     /// AlreadyPresent retry's parent sync runs in the TRANSPORT — see
@@ -1899,8 +1963,12 @@ impl SshTransport {
         // ANY form — a regular file, a directory, a symlink — so the
         // immutable-record destination can never be silently created over a
         // non-file entry. EEXIST is 17 on both Linux and macOS (POSIX),
-        // identical to the reserved [`SSH_TWRITE_CONFLICT_EXIT`]; any other
-        // link failure is the pre-install exit (a real publish error).
+        // identical to the reserved [`SSH_TWRITE_CONFLICT_EXIT`], so perl maps
+        // it straight to that code; any OTHER link failure is decided by the
+        // destination's PRESENCE afterwards — the shell re-tests
+        // `[ -e ] || [ -L ]`, exiting the conflict code when the destination is
+        // there (the decision point WAS reached; the transport then verifies
+        // the winner) and the pre-install code only when it is absent.
         format!(
             "mkdir -p {p} && tmp=$(mktemp {tpl}) && cat > \"$tmp\" && perl -e '{verify_len}' -- \"$tmp\" {len} && chmod {mode} \"$tmp\" && perl -e '{fsync_file}' -- \"$tmp\"; pre=$?; if [ \"$pre\" -ne 0 ]; then rm -f \"$tmp\"; exit {preinst}; fi; perl -e 'exit 0 if link($ARGV[0], $ARGV[1]); exit(($! + 0) == 17 ? {conflict} : {preinst})' \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; if [ \"$rc\" -eq 0 ]; then perl -e '{fsync_dir}' -- {parent}; exit $?; fi; if [ -e {d} ] || [ -L {d} ]; then exit {conflict}; fi; exit {preinst}",
             p = shell_quote(&parent),
@@ -1919,7 +1987,7 @@ impl SshTransport {
 
     /// Build the perl-native command for the operation-lock `try_write_new`:
     /// the ENTIRE seven-step durable create is performed inside the SAME Perl
-    /// process that owns the sidecar `flock`. The sidecar is created durably
+    /// process that owns the sidecar `flock`. The sidecar is created
     /// (`mkdir -p`, `touch`, `chmod 644`) and never removed; the perl helper
     /// acquires an exclusive `LOCK_EX|LOCK_NB` with a 2-second monotonic deadline
     /// and 5ms retry interval (mirroring `SIDECAR_WAIT_TIMEOUT` /
@@ -1929,14 +1997,18 @@ impl SshTransport {
     /// `sidecar contended`. The lock is held via the open file description until
     /// the perl process exits — no `exec` is ever performed, so the descriptor is
     /// never closed with `FD_CLOEXEC` before the mutation, and the flock stays
-    /// held through file fsync and parent-directory sync. Perl is used because it
-    /// ships on every Linux/macOS remote and provides portable `flock`.
+    /// held through file fsync and parent-directory sync. Perl supplies the
+    /// portable `flock` the far side already needs for the sidecars.
     ///
     /// The parent-directory fsync (step 7) is performed INSIDE the Perl process
     /// before exit by opening the directory and calling `IO::Handle->sync` on
     /// the descriptor, so the flock is still held (the `sync` is durability,
     /// not mutual exclusion, but keeping it inside avoids releasing the lock
-    /// before the directory entry is durable).
+    /// before the directory entry is durable). A failed parent-dir `open` or
+    /// `sync` there exits [`SSH_TWRITE_PREINSTALL_EXIT`] with the record
+    /// ALREADY linked into place and therefore installed-but-unsynced — the
+    /// same code as this script's pre-install failures, with no diagnostic, so
+    /// the status alone cannot say whether anything was published.
     /// `expected_len` is the client's exact payload length; the perl helper
     /// verifies `length($data)` against it BEFORE creating the temp, so a
     /// mid-transfer connection loss (a clean, short EOF on stdin) can never
@@ -1977,9 +2049,8 @@ impl SshTransport {
     /// `verify_open`, and the sidecars — that `opendir`s the directory,
     /// `lstat`s each entry, and prints the frame. The mode comes from
     /// `lstat`'s `st_mode` (`$s[2] & 0xffff`, the same raw-mode value the
-    /// `lstat` protocol uses), NOT from `stat -c '%f'`: BSD/macOS `stat`
-    /// rejects `-c`, so the old script produced an EMPTY mode on a supported
-    /// macOS remote and the parser silently defaulted every entry to mode 0.
+    /// `lstat` protocol uses), NOT from `stat -c '%f'`, which BSD/macOS `stat`
+    /// rejects.
     ///
     /// The FRAME is one NUL-terminated record per entry,
     /// `type<TAB>mode<TAB>size<TAB>name`. NUL is the only byte a POSIX file
@@ -1994,18 +2065,12 @@ impl SshTransport {
     /// the LOCAL listing reports, so the two views of one tree compare equal:
     /// the RAW `st_mode` (type bits INCLUDED, not masked to `0o7777`) and the
     /// REAL `st_size` (for a symlink, the length of its target — `lstat` never
-    /// follows it). The previous mask + literal `size: 0` made the SSH view
-    /// report `600:0` where the local view reported `100600:1`, so a
-    /// field-by-field comparison of the two views could never agree.
+    /// follows it).
     ///
     /// The classification is `lstat`-based (not `-e`/`-d`, which FOLLOW a
     /// symlink), so a DANGLING symlink is INCLUDED — an entry the far-side
-    /// manifest walk (also `lstat`) includes. The two views of one directory
-    /// must agree: the old omission made `sync` report a legitimately installed
-    /// dangling link as a `NameNotFaithful` conflict, refuse to replace an
-    /// existing one, and (with `delete_extraneous`) hide a reserved dangling
-    /// child from the residue gate so the sanctioned recursive removal
-    /// destroyed the caller's copy. `.`/`..` are skipped explicitly.
+    /// manifest walk (also `lstat`) includes, so the two views of one directory
+    /// agree. `.`/`..` are skipped explicitly.
     ///
     /// The errno of an `opendir`/`lstat` failure is handled the way
     /// `LocalTransport::list` handles it, so the two views agree on FAILURE
@@ -2013,16 +2078,11 @@ impl SshTransport {
     ///
     /// * `opendir` ENOENT ⇒ empty output, exit 0. `LocalTransport::list`
     ///   deliberately treats a `NotFound` directory as an empty listing (an
-    ///   unprovisioned remote root is not an error), and the pre-rewrite glob
-    ///   also produced empty output; the rewrite's bare `die` made the SSH view
-    ///   diverge for an absent directory.
+    ///   unprovisioned remote root is not an error).
     /// * any OTHER `opendir` failure (EACCES, ENOTDIR, ...) ⇒ `die` loudly.
     /// * ANY `lstat` failure ⇒ `die` loudly. An entry that cannot be stat'd
-    ///   must fail the listing, never vanish: the old `next unless @s` silently
-    ///   dropped every entry of a `chmod 400` directory (opendir succeeds on
-    ///   the read bit, each `lstat` then fails EACCES), so the SSH view
-    ///   returned an empty list for a NON-EMPTY directory while the local view
-    ///   returned `Permission denied`.
+    ///   must fail the listing, never vanish, so a `chmod 400` directory is
+    ///   a listing FAILURE rather than an empty list.
     ///
     /// Names are printed as RAW BYTES (`binmode STDOUT`); a non-UTF-8 name is
     /// refused by the Rust decoder, never lossily decoded.
@@ -2086,8 +2146,7 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// Build the remote framed `lstat` helper for `rel`: ONE remote exec
     /// whose single stdout frame reports the OUTCOME WITH THE ERRNO (see the
     /// [`LSTAT_ERRNO_ENOENT`] protocol doc on this module). The helper is a
-    /// `perl -e` one-liner (perl ships with every reasonable Linux/macOS
-    /// remote — the same interpreter the test fixtures already use) that
+    /// `perl -e` one-liner (the interpreter the test fixtures also use) that
     /// performs a REAL `lstat` and prints `P`/`A`/`E` frames, exiting 0 for
     /// all three outcomes — the FRAME is the signal, an exit code carries no
     /// errno. The path is passed as a positional argument after `--` (already
@@ -2105,8 +2164,7 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// → ELOOP, NEVER followed — even one pointing at a matching regular
     /// file; `O_NONBLOCK` so a fifo/device open cannot block the helper),
     /// `stat` on the SAME handle (fstat), and `sysread` THROUGH the same
-    /// handle — closing the client-side TOCTOU the old
-    /// lstat-then-separate-read left open (there is NO client round-trip
+    /// handle — so there is NO client round-trip
     /// between the steps: one frame carries the fd-derived mode AND content,
     /// or the errno). The remote-side race between the helper's OWN steps is
     /// out of scope — the guarantee is that metadata and content come from
@@ -2119,8 +2177,12 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     ///   mode bits classify dir/symlink/other);
     /// * `E\t<errno>` — the open/fstat/read failed (ELOOP → symlink,
     ///   ENOENT/ENOTDIR → absent, EISDIR → directory, EACCES/... →
-    ///   unreadable; the errno numbers are POSIX, identical on Linux and
-    ///   macOS).
+    ///   unreadable). The number is the REMOTE platform's errno and the two
+    ///   platforms do NOT agree on every one of them: ELOOP is 40 on Linux
+    ///   and 62 on macOS and the parser matches the PAIR, while ENOENT=2,
+    ///   ENOTDIR=20 and EISDIR=21 are the errnos this mapping distinguishes
+    ///   BY NUMBER (those three agree across the two platforms). The
+    ///   mapping — never the raw identity — is the contract.
     ///
     /// The path is a positional argument after `--` (single-quoted); the
     /// perl is multi-line inside the single-quoted `-e` argument (shell
@@ -2222,14 +2284,12 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// `LocalTransport::metadata` reports through `meta_to_remote` (which uses
     /// `metadata_mode`), so the two views of one entry compare equal. Every
     /// consumer of the field masks it with `& 0o7777` itself (see
-    /// `verify_existing`), so the raw value changes no decision; the old
-    /// `& 0o7777` here made the field silently different from the local view.
+    /// `verify_existing`), so the raw value changes no decision.
     fn meta_from_raw_mode(raw: u32) -> RemoteMeta {
         // Classify from `S_IFMT` exactly as the local view does
         // (`LocalTransport::metadata` reports `std::fs::Metadata::is_file()`, a
-        // strict `S_IFREG` test). The old `!is_symlink && !is_dir` made the two
-        // transports DISAGREE for a fifo/socket/device: the SSH view called
-        // such an entry a FILE, the local view did not. `RemoteMeta` is public
+        // strict `S_IFREG` test), so a fifo/socket/device is NOT a file on
+        // either transport. `RemoteMeta` is public
         // API, so the two views of one entry must agree.
         let kind = raw & 0o170000;
         let is_symlink = kind == 0o120000;
@@ -2488,18 +2548,13 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
     /// defensively. The parse is STRICT on every field: a structurally
     /// malformed record (fewer than four TAB fields) is refused, a mode field
     /// that is not hex is an ERROR rather than a silent 0, and a size field
-    /// that is not decimal is an error rather than a silent 0. The old
-    /// `unwrap_or(0)` default was exactly how a BSD/macOS `stat -c` failure
-    /// turned every entry's mode into 0 without a single error — a public field
-    /// that was silently wrong on a supported platform. The producer is now
-    /// portable, so an unparseable mode means a mangled frame, never a
-    /// userland we do not support.
+    /// that is not decimal is an error rather than a silent 0: an unparseable
+    /// mode means a mangled frame.
     ///
     /// The `mode` is carried RAW — the full `st_mode`, type bits INCLUDED —
     /// and the `size` is the real `st_size`, so an entry parsed here is
     /// field-by-field identical to the entry `LocalTransport::list` builds from
-    /// `symlink_metadata`. The old `& 0o7777` mask and literal `size: 0` were a
-    /// silent divergence between the two views of one tree. The `type` field is
+    /// `symlink_metadata`. The `type` field is
     /// the script's own classification and must AGREE with the mode's type bits
     /// (both come from the same `lstat`), so a frame cannot carry a type that
     /// contradicts its mode.
@@ -2620,9 +2675,10 @@ impl Remote for SshTransport {
         // Create the local ControlMaster socket directory (0700) before any
         // ssh op: the multiplexing sockets live here, keyed by the CONNECTION
         // IDENTITY (`user@host:port` plus the user key, the resolved
-        // known-hosts source, and the caller's ssh options — see
+        // known-hosts source, the caller's ssh options, and the ambient
+        // authentication environment — see
         // `mux_identity_material`). Local-only, like the known-hosts pin
-        // below — a dry run's status inspection still connects over ssh and
+        // below — read-only status inspection still connects over ssh and
         // therefore needs the mux dir to exist.
         std::fs::create_dir_all(&self.mux_socket_dir).map_err(|e| {
             Error::transport(format!(
@@ -2637,7 +2693,7 @@ impl Remote for SshTransport {
             ))
         })?;
         // Verify the host key against the configured source and pin it in a
-        // managed file BEFORE any remote request — including a dry run's status
+        // managed file BEFORE any remote request — including read-only status
         // inspection, which still connects over ssh and therefore needs the
         // identity ready. `pin_known_hosts` is the ONE authority on whether
         // there is anything to pin: a known-hosts identity already has its
@@ -2649,18 +2705,12 @@ impl Remote for SshTransport {
     fn provision_layout(&self) -> Result<()> {
         // Create the ROOT ITSELF, then the caller-supplied bootstrap
         // directories, in ONE `mkdir -p`. Every path is single-quoted by
-        // `argv_cmd`/`shell_quote` so it reaches `mkdir` verbatim. This runs
-        // only after the push engine's non-dry-run gate.
+        // `argv_cmd`/`shell_quote` so it reaches `mkdir` verbatim.
         //
         // The ROOT is an operand on purpose, mirroring
-        // `LocalTransport::provision_layout`'s `create_dir_all(self.base)`.
-        // The pre-fix argv omitted it, so with `Layout::empty()` (no bootstrap
-        // directories) the command was `mkdir -p` with NO OPERAND and the
-        // remote `mkdir` failed with its usage error (`missing operand` on
-        // GNU, `usage: mkdir [-pv] [-m mode] directory_name ...` on macOS);
-        // and even when bootstrap directories were supplied, the root itself
-        // was still left absent, so the first destination manifest read failed
-        // with `not a directory: <root>`. A fresh destination is now usable
+        // `LocalTransport::provision_layout`'s `create_dir_all(self.base)`:
+        // an empty layout is then `mkdir -p <root>` rather than a `mkdir -p`
+        // with NO OPERAND (a usage error), and a fresh destination is usable
         // through the same call on either transport.
         let cmd = Self::provision_layout_cmd(&self.root, &self.layout);
         self.run_remote_ok(&cmd).map_err(|error| {
@@ -2759,8 +2809,7 @@ impl Remote for SshTransport {
         // parents), so each entry is fsynced before its parent — the whole
         // staged bundle is durable before the atomic install rename. The fsync
         // itself is the portable perl primitive (see [`PERL_FSYNC_DIR`]);
-        // `sync <path>` is GNU-only and a NO-OP on BSD/macOS, so the old
-        // command silently made this method a no-op on a supported remote.
+        // `sync <path>` is GNU-only and a NO-OP on BSD/macOS.
         let cmd = Self::fsync_tree_cmd(&self.root, rel.as_path());
         self.run_remote_ok(&cmd)
     }
@@ -2768,8 +2817,7 @@ impl Remote for SshTransport {
     fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
         // FAIL-CLOSED: the parent-directory fsync is the portable perl
         // primitive (see [`PERL_FSYNC_DIR`]) and a failed fsync is a propagated
-        // error (the mutation's durability is unconfirmed). `sync <dir>` would
-        // have been a silent no-op here on BSD/macOS.
+        // error (the mutation's durability is unconfirmed).
         let cmd = Self::fsync_parent_cmd(&self.root, rel.as_path());
         self.run_remote_ok(&cmd)
     }
@@ -2906,9 +2954,7 @@ impl Remote for SshTransport {
         // symlink targets, and timestamps, and on both GNU and current
         // macOS/BSD userlands it also preserves extended attributes and
         // POSIX ACLs (GNU `-a` is `-dR --preserve=all`; BSD/macOS `-a` is
-        // `-R -P -p`). Both userlands copy a read-only source directory by
-        // creating the destination directory writable and chmodding it at
-        // the end.
+        // `-R -P -p`).
         //
         // It does NOT preserve OWNERSHIP for a NON-ROOT caller. `cp -a`
         // tries to reproduce the source uid/gid, but a non-root caller may
@@ -3128,13 +3174,17 @@ impl Remote for SshTransport {
             // directory: the record is installed with the final mode and a
             // durable entry.
             RemotePublish::InstalledDurably => return Ok(CreateNewVerdict::Created),
-            // A pre-install failure (the temp allocation, the payload write, the
-            // final chmod, or the file fsync) or the final parent-dir sync
-            // failure — and equally a status carrying NO exit code — exits with
-            // a code other than the reserved conflict code: the operation never
-            // reached (or never finished) the publish decision point, so this is
-            // a propagated ERROR, never a verdict. The transport never guesses
-            // the destination's state from a failed pre-install.
+            // No durable install was confirmed, and the status does not say on
+            // which side of the publish the script failed. PRE-INSTALL (the
+            // temp allocation, the payload write, the final chmod, the file
+            // fsync, or a `link(2)` failure with the destination ABSENT
+            // afterwards): NOTHING was published. POST-INSTALL (the
+            // parent-directory fsync both create-new scripts run AFTER a
+            // SUCCESSFUL `link(2)`): the record IS installed and only its
+            // durability is unconfirmed — not a conflict, not a converged
+            // install, and the entry is NOT absent. A status carrying NO exit
+            // code lands here too. Every case is a propagated ERROR carrying
+            // the remote stderr, never a verdict from this status alone.
             RemotePublish::PreInstall => {
                 return Err(Error::transport(format!(
                     "ssh try_write_new failed: {}",
@@ -3155,9 +3205,8 @@ impl Remote for SshTransport {
         // open-with-O_NOFOLLOW → fstat-the-same-fd → read-through-the-same-fd
         // sequence and emits ONE frame carrying the fd-derived mode + content
         // (or the errno) — there is NO client round-trip between the metadata
-        // check and the read (the old lstat-then-separate-read left a
-        // client-side TOCTOU window open; a symlink is never followed — the
-        // `O_NOFOLLOW` open fails it with ELOOP). A regular file with the
+        // check and the read, and a symlink is never followed — the
+        // `O_NOFOLLOW` open fails it with ELOOP. A regular file with the
         // EXACT required mode and the caller's accepted content equivalence →
         // AlreadyPresent (and the PARENT DIRECTORY is synced here, so the
         // convergent retry returns with a durable entry — the same
@@ -3370,10 +3419,13 @@ impl FarSideLockSession for SshFarSideLock {
         // client is reaped, because the holder process has exited.
         child.stdin.take();
         if reap_bounded(child, FAR_SIDE_LOCK_RELEASE_GRACE).is_none() {
-            // The child refused to exit within the grace (a hung connection):
-            // kill it and reap, which drops the connection and lets the far
-            // side notice EOF and release. The `reap_bounded` fallback already
-            // attempted the kill; this is the belt-and-braces wait.
+            // `None` does NOT mean "the child outlived the grace": a child that
+            // refuses to exit is killed and reaped inside `reap_bounded` and
+            // reports `Some(status)`. `None` means reaping failed — a failed
+            // `try_wait` before the grace, or a failed `wait` after the grace
+            // kill — so the child's liveness is unanswerable and it may well
+            // still be running: kill and reap it, which drops the connection
+            // and lets the far side notice EOF and release.
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -3388,7 +3440,9 @@ impl Drop for SshFarSideLock {
 }
 
 /// Wait up to `grace` for `child` to exit, then kill and reap it. Returns the
-/// exit status it was reaped with, or `None` when it had to be killed.
+/// exit status the child was reaped with, or `None` when reaping failed: a
+/// failed `try_wait` before the grace, or a failed `wait` after the grace
+/// kill.
 fn reap_bounded(
     child: &mut std::process::Child,
     grace: Duration,
@@ -3418,8 +3472,9 @@ impl SshTransport {
     /// [`SshFarSideLock`] for the lifetime.
     fn spawn_far_side_lock(&self, record: &Path, op_id: &str) -> Result<SshFarSideLock> {
         // The mux dir must exist before the `ControlPath` option is used, and a
-        // fingerprint-only identity must be pinned first — the same self-
-        // preparing step every other request takes.
+        // fingerprint-only identity must be pinned first — the self-preparing
+        // step `prepare_for_request` performs (not every request takes it;
+        // `try_write_new` is the only one that does not).
         self.prepare_for_request()?;
         let inner = Self::argv_cmd(&[
             "perl".into(),
@@ -3543,14 +3598,21 @@ fn drain_stderr(stderr: Option<std::process::ChildStderr>) -> String {
 }
 
 /// Map a far-side lock holder's failure to the typed refusal a caller branches
-/// on. The layers are separated by EVIDENCE (the anchored far-side diagnostic
-/// and the exit status), never by a guess from one number: `LOCKCONTENDED` /
-/// exit 3 is the typed contention, `LOCKRECORDNOTRECOGNIZED` / exit 6 is the
-/// record-recognition refusal (the SAME typed condition the local
-/// `FileLock::acquire` raises), `LOCKERR` / exit 4/5 is a far-side refusal
-/// (no perl, an uncreatable/read-only parent, a real `flock` failure), 126/127
-/// and the `perl: not found` markers are the missing interpreter, and an `ssh`
-/// exit 255 is the transport failing before the far-side command ran.
+/// on. The layers are separated by EVIDENCE (the anchored far-side diagnostic,
+/// the exit status, and whether the readiness `read_line` itself succeeded),
+/// never by a guess from one number: `LOCKCONTENDED` / exit 3 is the typed
+/// contention, `LOCKRECORDNOTRECOGNIZED` / exit 6 is the record-recognition
+/// refusal (the SAME typed condition the local `FileLock::acquire` raises),
+/// `LOCKERR` / exit 4/5 / a FAILED readiness read is a far-side refusal (an
+/// uncreatable or read-only parent, a failed `chmod`, a real `flock` failure,
+/// or a first line `read_line` could not decode — a non-UTF-8 line is
+/// `InvalidData`), 126/127 and the `perl: not found` markers are the missing
+/// interpreter, and the transport-level fallback claims the statuses the arms
+/// above do not recognise — an `ssh` exit 255 among them — but only in a case
+/// whose readiness read SUCCEEDED: the call site passes `read_result.err()`
+/// here, so a reaped 255 or any other unrecognised status WITH a failed
+/// readiness read is `FarSideScript` from the `LOCKERR` arm, never
+/// `BeforeCommand`.
 fn far_side_lock_refusal(
     record: &Path,
     status: Option<std::process::ExitStatus>,
@@ -3843,7 +3905,7 @@ mod tests_ssh {
         );
         assert!(
             fingerprint.identity.pinned().is_none(),
-            "construction must not pin (a dry run never touches disk)"
+            "construction must never touch the network or disk"
         );
     }
 
@@ -4041,8 +4103,7 @@ mod tests_ssh {
 
     /// The framed-lstat `RemoteMeta` must carry the RAW `st_mode` (type bits
     /// INCLUDED) and the REAL size, so it matches `LocalTransport::metadata`
-    /// (`meta_to_remote`). The old `& 0o7777` mask made the field silently
-    /// different from the local view; every consumer masks it itself, so the
+    /// (`meta_to_remote`); every consumer masks the mode itself, so the
     /// raw value is safe. Frame: `P\t<size>\t<rawmode_hex>`.
     #[test]
     fn lstat_frame_carries_the_raw_mode_and_the_real_size() {
@@ -4062,11 +4123,8 @@ mod tests_ssh {
     }
 
     /// `RemoteMeta.is_file` must agree between the two transports for a
-    /// fifo/socket/device. Pre-fix the SSH classification was
-    /// `is_file = !is_symlink && !is_dir`, so an `S_IFIFO` entry reported
-    /// `is_file == true` over SSH while `LocalTransport::metadata` reported
-    /// false (an inconsistency between the two transports, reachable against a
-    /// real sshd). Both now use a strict `S_IFREG` test.
+    /// fifo/socket/device: both classify from a strict `S_IFREG` test, so an
+    /// `S_IFIFO` entry is NOT a file on either side.
     #[cfg(unix)]
     #[test]
     fn fifo_is_not_a_file_on_either_transport() {
@@ -4130,14 +4188,10 @@ mod tests_ssh {
     }
 
     /// The LITERAL `list_script` must report the REAL mode on a BSD
-    /// userland. Pre-fix it ran `stat -c '%f'`, which BSD/macOS `stat` rejects;
-    /// the mode column came out empty and the parser silently defaulted every
-    /// entry to 0, so this test FAILED on macOS with `left: 0` for each entry.
-    /// The script is now one perl `lstat` one-liner (perl is already required
-    /// far side), and the mode is `st_mode & 0xffff` in hex — POSIX on GNU and
-    /// BSD alike. It also pins that hidden entries are covered and `.`/`..` are
-    /// never emitted, which the previous shape-only test asserted by string
-    /// matching.
+    /// userland. The script is one perl `lstat` one-liner (perl is already
+    /// required far side), and the mode is `st_mode & 0xffff` in hex — POSIX
+    /// on GNU and BSD alike. It also pins that hidden entries are covered and
+    /// `.`/`..` are never emitted.
     // unix-only: sets a mode with PermissionsExt::from_mode.
     #[cfg(unix)]
     #[test]
@@ -4210,10 +4264,8 @@ mod tests_ssh {
     }
 
     /// Run the LITERAL `list_script` for `rel` under `/bin/sh` and return the
-    /// parsed entries. The mode is now obtained through the portable perl
-    /// `lstat` path (NOT GNU-only `stat -c`), so these tests assert on the mode
-    /// too; the old "callers must never assert on the mode" caveat is gone
-    /// because the underlying defect is fixed.
+    /// parsed entries. The mode comes from the portable perl `lstat` path (NOT
+    /// GNU-only `stat -c`), so these tests assert on the mode too.
     fn run_list_script(t: &SshTransport, rel: &Path) -> Vec<RemoteEntry> {
         let script = t.list_script(rel);
         let out = run_sh_stdin(&script, &[]);
@@ -4234,8 +4286,7 @@ mod tests_ssh {
     }
 
     /// An ABSENT directory must list EMPTY, matching
-    /// `LocalTransport::list`'s deliberate `NotFound` ⇒ empty rule. Pre-fix
-    /// `opendir … or die` exited 2 for a missing directory.
+    /// `LocalTransport::list`'s deliberate `NotFound` ⇒ empty rule.
     #[test]
     fn list_script_absent_directory_is_empty() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4247,12 +4298,10 @@ mod tests_ssh {
     }
 
     /// A `chmod 400` directory has the READ bit (so `opendir`
-    /// succeeds) but no SEARCH bit, so every `lstat` fails EACCES. The old
-    /// `next unless @s` silently dropped every entry, printing ZERO bytes and
-    /// exiting 0 for a NON-EMPTY directory — `Ok(vec![])` where the local view
-    /// returned `Permission denied`. The listing must now FAIL. A `chmod 111`
+    /// succeeds) but no SEARCH bit, so every `lstat` fails EACCES and the
+    /// listing must FAIL rather than return an empty `Ok`. A `chmod 111`
     /// directory has no read bit, so `opendir` itself must fail loudly.
-    // unix-only: sets mode 0o000 with PermissionsExt::from_mode.
+    // unix-only: sets directory modes with PermissionsExt::from_mode.
     #[cfg(unix)]
     #[test]
     fn list_script_unreadable_directory_is_an_error_not_an_empty_listing() {
@@ -4288,10 +4337,9 @@ mod tests_ssh {
         }
     }
 
-    /// The fsync primitives must TERMINATE on a FIFO. The old
-    /// `open my $fh, "<", $ARGV[0]` blocks forever on a fifo with no writer
-    /// (proved on GNU and BSD with `timeout 3` → rc 124); `sysopen` with
-    /// `O_NONBLOCK` returns immediately and the non-regular entry is refused.
+    /// The fsync primitives must TERMINATE on a FIFO: `sysopen` with
+    /// `O_NONBLOCK` returns immediately and the non-regular entry is refused,
+    /// where a plain read `open` on a fifo with no writer would block forever.
     /// Both primitives share the pattern, so both are pinned.
     // unix-only: needs a FIFO (the mkfifo(1) utility).
     #[cfg(unix)]
@@ -4494,10 +4542,10 @@ mod tests_ssh {
     }
 
     /// The `fsync_tree` command must exit NONZERO when a
-    /// far-side fsync fails. Pre-fix `find … -exec … {} ;` ignored the invoked
-    /// command's exit status, so a fake perl that failed EVERY call still made
-    /// the whole command exit 0. This runs the LITERAL command under `/bin/sh`
-    /// with such a fake on `PATH`.
+    /// far-side fsync fails: `-exec … {} +` plus the `|| exit 1` wrapper make a
+    /// failing invocation the command's exit status. This runs the LITERAL
+    /// command under `/bin/sh` with a fake perl that fails every fsync on
+    /// `PATH`.
     #[test]
     fn fsync_tree_cmd_propagates_a_failed_fsync() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4518,8 +4566,8 @@ mod tests_ssh {
         );
         assert!(
             !out.status.success(),
-            "a failed far-side fsync ANYWHERE in the tree must make the command exit nonzero \
-             (pre-fix find exited 0); stdout {:?} stderr {:?}",
+            "a failed far-side fsync ANYWHERE in the tree must make the command exit nonzero; \
+             stdout {:?} stderr {:?}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -4548,16 +4596,11 @@ mod tests_ssh {
         );
     }
 
-    /// A DANGLING symlink must be LISTED. The old guard `[ -e "$e" ] ||
-    /// continue` FOLLOWS the symlink, so such an entry vanished from `list`
-    /// while the far-side manifest walk (which uses `lstat`) still included it
-    /// — the two views of one directory disagreed. `sync` then reported a
-    /// legitimately installed dangling link as a `NameNotFaithful` conflict,
-    /// refused to replace an existing one, and (with `delete_extraneous`) could
-    /// no longer see a reserved dangling child, so the sanctioned recursive
-    /// removal destroyed the caller's only copy. This runs the LITERAL script
-    /// under `/bin/sh`; pre-fix the dangling entry is absent, so the assertion
-    /// FAILS.
+    /// A DANGLING symlink must be LISTED: the `lstat` classification does not
+    /// follow the link, so such an entry is present, exactly as the
+    /// far-side manifest walk (which also uses `lstat`) reports it. This runs
+    /// the LITERAL script under `/bin/sh`, and the listing view must agree with
+    /// the manifest's.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4572,7 +4615,7 @@ mod tests_ssh {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(
             names.contains(&"dangling"),
-            "a dangling symlink must be listed (POSIX `-e` follows the link); got {names:?}"
+            "a dangling symlink must be listed (lstat does not follow the link); got {names:?}"
         );
         assert!(
             names.contains(&"live"),
@@ -4586,12 +4629,7 @@ mod tests_ssh {
         assert!(!dangling.is_dir);
     }
 
-    /// Non-regression: the `-e`/`-L` guard still filters the UNMATCHED globs.
-    /// When a directory is empty every pattern expands to its own literal text
-    /// (`<dir>/*`, `<dir>/.[!.]*`, `<dir>/..?*`), which is not an entry; a bare
-    /// `|| continue` cannot be dropped, or those literals would be listed as
-    /// bogus names. This pins that the dangling-symlink fix did not open that
-    /// hole.
+    /// An EMPTY directory must list nothing (there is no entry to report).
     #[test]
     fn list_script_filters_unmatched_globs_in_an_empty_directory() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4606,12 +4644,10 @@ mod tests_ssh {
     }
 
     /// The wire frame must carry a name
-    /// containing a TAB or a NEWLINE verbatim. Pre-fix the frame was
-    /// tab/LF-delimited, so `a\tb` parsed as `a` (the tab split the fields)
-    /// and `line1\nline2` split into TWO bogus entries — the listing view used
-    /// by the byte-exact comparison silently disagreed with the directory.
-    /// The frame is now NUL-terminated (`type<TAB>mode<TAB>size<TAB>name`), and
-    /// NUL is the one byte a POSIX name cannot contain. Runs on any POSIX host (these
+    /// containing a TAB or a NEWLINE verbatim. The frame is NUL-terminated
+    /// (`type<TAB>mode<TAB>size<TAB>name`), and NUL is the one byte a POSIX
+    /// name cannot contain, so a tab or newline inside a name is data rather
+    /// than a delimiter. Runs on any POSIX host (these
     /// names are legal on APFS too).
     #[test]
     fn list_script_carries_a_tab_and_a_newline_in_a_name() {
@@ -4640,10 +4676,8 @@ mod tests_ssh {
     }
 
     /// A name ending in a newline is legal and
-    /// must survive the frame. Pre-fix the script derived the name with
-    /// `$(basename ...)`, and command substitution strips EVERY trailing
-    /// newline, so `n\n` became `n` — a byte-exact comparison would then match
-    /// the wrong entry (or miss the intended one entirely).
+    /// must survive the frame: the script prints the `readdir` entry verbatim,
+    /// with no command substitution that would strip a trailing newline.
     #[test]
     fn list_script_carries_a_trailing_newline_in_a_name() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4661,10 +4695,9 @@ mod tests_ssh {
     }
 
     /// The listing payload is decoded from
-    /// RAW bytes and a non-UTF-8 name is REFUSED. Pre-fix
-    /// `String::from_utf8_lossy(&out.stdout)` mapped every such name to U+FFFD,
-    /// so two DISTINCT on-disk names became one compared spelling. This is the
-    /// byte-level reproduction of the U+FFFD conflation and needs no
+    /// RAW bytes and a non-UTF-8 name is REFUSED: a lossy decode would map
+    /// two DISTINCT on-disk names to one U+FFFD spelling. This is the
+    /// byte-level reproduction of that conflation and needs no
     /// filesystem that can actually hold such a name.
     #[test]
     fn decode_list_output_refuses_two_distinct_non_utf8_names() {
@@ -4699,10 +4732,9 @@ mod tests_ssh {
     }
 
     /// `readlink` prints the RAW target plus ONE newline. The frame
-    /// must strip exactly that one byte — the pre-fix `.trim()` also deleted a
-    /// leading/trailing whitespace byte that is PART OF THE TARGET, so the SSH
-    /// read differed from the raw local `read_link` and a concurrent `"x"` ->
-    /// `"x "` change kept the same target hash.
+    /// must strip exactly that one byte: any leading/trailing whitespace is
+    /// PART OF THE TARGET, so the SSH read must equal the raw local
+    /// `read_link`.
     #[test]
     fn parse_readlink_output_strips_exactly_one_newline() {
         let rel = Path::new("link");
@@ -4729,9 +4761,9 @@ mod tests_ssh {
         );
     }
 
-    /// Pre-fix `String::from_utf8_lossy` turned a non-UTF-8 target into U+FFFD;
-    /// the manifest refuses a non-UTF-8 target, so the read must fail closed
-    /// rather than misreport one.
+    /// A non-UTF-8 target must fail closed rather than be read lossily: the
+    /// manifest refuses a non-UTF-8 target, so a `from_utf8_lossy` read could
+    /// only misreport one.
     #[test]
     fn parse_readlink_output_refuses_a_non_utf8_target() {
         let err = SshTransport::parse_readlink_output(b"\xff\n", Path::new("link"))
@@ -4740,11 +4772,14 @@ mod tests_ssh {
     }
 
     /// The two read mechanisms must AGREE on the exact bytes of a target: the
-    /// LOCAL path is raw (`std::fs::read_link`, the mechanism
-    /// `LocalTransport::read_link` uses), and the SSH frame must return the
-    /// same bytes for the same link. Pre-fix `.trim()` returned `"x"` for a
-    /// local `"x "`, so an SSH destination/source failed post-transfer
-    /// verification on a legitimate link.
+    /// LOCAL reference here is the path-based `std::fs::read_link`, which
+    /// returns the stored bytes verbatim, and `LocalTransport::read_link`
+    /// agrees with it on both platforms — on Unix it goes through
+    /// `crate::atomic::read_link_fd`, which reads the link with `readlinkat`,
+    /// and on Windows it IS `std::fs::read_link`. Neither trims nor unescapes a
+    /// target, so the SSH frame must return the same bytes for the same link,
+    /// or an SSH destination/source fails post-transfer verification on a
+    /// legitimate link.
     // unix-only: builds symlink fixtures with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4768,9 +4803,7 @@ mod tests_ssh {
 
     /// The two views of one directory must AGREE on a dangling symlink:
     /// `Remote::list` (the address-fidelity and residue view) and the far-side
-    /// manifest walk (which uses `lstat` and therefore includes it). This is
-    /// the cross-view pin for the defect: pre-fix `list` omitted the entry
-    /// while the manifest kept it, so the assertion on `list` FAILS.
+    /// manifest walk (which uses `lstat` and therefore includes it).
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4840,10 +4873,7 @@ mod tests_ssh {
     /// gate sees a RESERVED entry inside it. The gate reads the SAME `list`
     /// view. A RESERVED DANGLING symlink left in the claimed directory must be
     /// VISIBLE (and typed as a symlink, so the gate treats it as residue, not
-    /// as a removable file); pre-fix the walk saw an ordinary directory, ran
-    /// the recursive `rm -rf`, and destroyed the caller's only copy with
-    /// `residue` empty. This asserts the precondition the gate consumes and
-    /// FAILS pre-fix (the reserved child is absent from the listing).
+    /// as a removable file). This asserts the precondition the gate consumes.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4853,8 +4883,8 @@ mod tests_ssh {
         std::fs::create_dir_all(&claimed).unwrap();
         std::fs::write(claimed.join("ordinary"), b"x").unwrap();
         // The reserved entry is a DANGLING symlink: its target was removed (the
-        // object it points at is gone), which is exactly why the naive
-        // existence test dropped it.
+        // object it points at is gone), so an existence test that follows the
+        // link would drop it.
         std::os::unix::fs::symlink("../../objects/gone", claimed.join(".reserved")).unwrap();
         assert!(
             !claimed.join(".reserved").exists()
@@ -4910,16 +4940,11 @@ mod tests_ssh {
     }
 
     /// `provision_layout` must create the destination ROOT, not
-    /// only the caller's bootstrap directories.
-    ///
-    /// Pre-fix the argv listed ONLY `layout.bootstrap_dirs`, so with
-    /// `Layout::empty()` the command was `mkdir -p` with NO OPERAND and the
-    /// remote `mkdir` failed with its usage error (`mkdir: missing operand` on
-    /// GNU, `usage: mkdir [-pv] [-m mode] directory_name ...` on macOS); with
-    /// bootstrap directories present the ROOT was still left absent, so the
-    /// first destination manifest read failed with `not a directory: <root>`.
-    /// `LocalTransport::provision_layout` already created its base, so the
-    /// same consumer call worked locally and failed only on the remote path.
+    /// only the caller's bootstrap directories: an empty layout is still
+    /// `mkdir -p <root>` rather than a `mkdir -p` with NO OPERAND (a usage
+    /// error), and with bootstrap directories present the root is created
+    /// alongside them, so the destination manifest read finds a directory.
+    /// `LocalTransport::provision_layout` creates its base the same way.
     /// This pins the ROOT as the FIRST operand.
     #[test]
     fn provision_layout_creates_the_destination_root() {
@@ -4996,11 +5021,10 @@ mod tests_ssh {
     /// selection do NOT run for the reuser. A socket keyed only on
     /// `user@host:port` therefore lets a second `SshTransport` (or any ssh
     /// client) bypass its OWN configured host key and user key by landing on a
-    /// master another identity established. This test pins the fix: transports
+    /// master another identity established. This test pins it: transports
     /// whose identity material differs must derive DIFFERENT sockets, and two
     /// transports with identical material must derive the SAME socket so
-    /// multiplexing still helps. Pre-fix every path below was equal (the hash
-    /// covered only `target:port`), so the `assert_ne!`s fail.
+    /// multiplexing still helps.
     #[test]
     fn the_control_socket_is_keyed_on_the_connection_identity() {
         fn control_path(args: &[String]) -> String {
@@ -5107,14 +5131,11 @@ mod tests_ssh {
     }
 
     /// The ControlMaster socket is keyed on the AMBIENT AUTHENTICATION
-    /// ENVIRONMENT. With `identity_file = None` the material used to write the
-    /// single marker `identity=<ambient>`, which collapsed EVERY ambient
-    /// environment to one key: two transports differing only in `HOME` (hence
+    /// ENVIRONMENT: two transports differing only in `HOME` (hence
     /// `~/.ssh/config`, `~/.ssh/known_hosts`, default identities) or
-    /// `SSH_AUTH_SOCK` (the agent) derived the SAME `ControlPath`, so the second
-    /// reused the first's authenticated master and skipped its own host-key
-    /// check and key selection. Pre-fix every `assert_ne!` below failed because
-    /// all four paths were equal.
+    /// `SSH_AUTH_SOCK` (the agent) must derive DIFFERENT `ControlPath`s, or
+    /// the second would reuse the first's authenticated master and skip its
+    /// own host-key check and key selection.
     #[test]
     fn the_control_socket_is_keyed_on_the_ambient_environment() {
         use std::collections::BTreeMap;
@@ -5177,21 +5198,16 @@ mod tests_ssh {
     }
 
     /// The mux socket path must FIT the platform's
-    /// `sockaddr_un.sun_path` under the REAL process environment.
-    ///
-    /// Pre-fix the socket name was the FULL 64-hex SHA-256, so with the macOS
-    /// default `TMPDIR` (`/var/folders/.../T/`) the derived `ControlPath` was
-    /// 122 bytes — over the 103-byte macOS limit (the `sun_path` array is 104
-    /// bytes including its NUL). OpenSSH treats an over-long `ControlPath` as a
+    /// `sockaddr_un.sun_path` under the REAL process environment: OpenSSH
+    /// treats an over-long `ControlPath` as a
     /// FATAL configuration error with NO fallback ("ControlPath too long", exit
-    /// 255), so EVERY remote operation of EVERY `SshTransport` failed on macOS.
-    /// The gate was blind because the other ControlPath tests build
-    /// `SysEnv::from_map` with no `TMPDIR`, so `temp_dir()` fell back to `/tmp`
-    /// and the path happened to fit.
+    /// 255), so an unfitting path fails EVERY remote operation. This test pins
+    /// the budget against the INHERITED environment (`SysEnv::from_process`,
+    /// hence the process's own `TMPDIR`).
     #[test]
     fn the_control_path_fits_the_platform_sun_path_under_the_real_environment() {
-        // The REAL process environment, not a hermetic map: this is the one
-        // test that must see the platform's actual TMPDIR.
+        // The REAL process environment: this test must see the platform's
+        // actual TMPDIR.
         let env = SysEnv::from_process();
         let t = SshTransport::new(
             "deploy",
@@ -5246,8 +5262,9 @@ mod tests_ssh {
         );
     }
 
-    /// The socket path is `len(mux_dir) + len("mux-") + width`, and
-    /// the width is `min(64, SUN_PATH_BYTES - 1 - len(mux_dir) - len("/mux-"))`.
+    /// The socket path is `len(mux_dir) + len("/mux-") + width`, and the width
+    /// is the smaller of 64 and `SUN_PATH_BYTES - 1 - MUX_LISTENER_RESERVE_BYTES`
+    /// minus `len(mux_dir)` and `len("/mux-")`.
     /// This pins the arithmetic for a SHORT temp dir (full 256-bit hash), a LONG
     /// one (truncated to the budget, path EXACTLY at the limit), and a temp dir
     /// so long that a safe hash no longer fits (FAIL CLOSED, naming the limit
@@ -5360,15 +5377,9 @@ mod tests_ssh {
     }
 
     /// The LITERAL `rename_cmd` runs under `sh` against a real
-    /// root, and a symlink-to-directory destination is REPLACED IN PLACE. This
-    /// replaces the old `rename_uses_no_target_directory_flag`, which asserted
-    /// `cmd.contains("mv -T")` — a shape assertion that could not tell whether
-    /// the command RUNS.
-    ///
-    /// Pre-fix `rename_cmd` emitted `mv -T`; on this host (macOS/BSD userland)
-    /// `mv` rejects it and the command exits 64, so this test FAILED with
-    /// `mv: illegal option -- T` + usage. On Linux/GNU it passed, which is
-    /// exactly the silent platform divergence this pins.
+    /// root, and a symlink-to-directory destination is REPLACED IN PLACE: the
+    /// primitive is perl `rename(2)`, so the command must actually RUN, not
+    /// merely have the right shape.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5400,13 +5411,11 @@ mod tests_ssh {
         );
     }
 
-    /// The property `-T` existed to provide — a regular file must
-    /// not be moved INTO a directory target — must survive the portable
-    /// primitive. The `rename(2)` refusal (`EISDIR`/`ENOTDIR`) is loud (nonzero)
-    /// and leaves both operands untouched. This pins the guard; it passes
-    /// pre-fix too (pre-fix `mv -T` also refused, just for the wrong reason on
-    /// BSD), but without it a "fix" that dropped the guard would regress
-    /// silently.
+    /// A regular file must
+    /// not be moved INTO a directory target. The `rename(2)` refusal
+    /// (`EISDIR`/`ENOTDIR`) is loud (nonzero)
+    /// and leaves both operands untouched, so a change that dropped the guard
+    /// would regress silently.
     #[test]
     fn rename_refuses_a_file_onto_a_directory_target() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -5445,9 +5454,7 @@ mod tests_ssh {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let root = dir.path().join("remote");
         let rel = Path::new("state/operation.lock");
-        // The mutation-lock record: operation_id + unique acquisition id (no
-        // time anywhere in the protocol — create-once ownership with no
-        // lease/expiry).
+        // The mutation-lock record payload the compare reads.
         let payload = "{\"operation_id\":\"a\",\"acquisition_id\":\"acq-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6\"}";
 
         // Genuinely absent: the Absent frame.
@@ -5519,9 +5526,9 @@ mod tests_ssh {
         );
     }
 
-    // Regression: when the destination sits directly in the deployment root,
-    // the old sibling naming (`{root}.{basename}.tmp...`) placed the temp OUTSIDE
-    // the managed root entirely.
+    // A destination sitting directly in the deployment root must still keep its
+    // temp INSIDE the root (a `{root}.{basename}.tmp...` sibling name would
+    // escape it).
     #[test]
     fn try_write_new_temp_stays_inside_root_for_root_level_dest() {
         let t = transport();
@@ -5594,7 +5601,7 @@ mod tests_ssh {
             ordinary.contains("mktemp"),
             "ordinary writes retain mktemp-based shell implementation, got: {ordinary}"
         );
-        // New deadline policy: shared prelude uses monotonic deadline, EINTR retry,
+        // The shared prelude uses a monotonic deadline, EINTR retry,
         // and distinguishes contention from other errno.
         assert!(
             cmd.contains("while (!flock($fh"),
@@ -5727,9 +5734,9 @@ mod tests_ssh {
                 "{name} missing contended"
             );
             assert!(cmd.contains("usleep"), "{name} missing usleep");
-            // the old bounded-retry loop is gone (flock part); the create-new tmp-name
-            // allocation loop is a different O_EXCL concern and is intentionally kept.
-            // So we don't assert absence of "for (1..32)" globally.
+            // The flock policy is the prelude's; the create-new tmp-name
+            // allocation loop is a different O_EXCL concern, so absence of
+            // "for (1..32)" is not asserted globally.
         }
         // The tmp-name O_EXCL allocation loop in create-new is still present.
         let tr2 = transport();
@@ -5751,16 +5758,13 @@ mod tests_ssh {
     // ------------------------------------------------------------------
     // Synchronized flock-contention tests: process scheduling is exercised
     // with DETERMINISTIC synchronization — a real OS pipe handshake — never
-    // elapsed-time guesses. The old `sidecar_flock_prelude_runtime_with_
-    // short_deadline` proptest slept a holder thread and compared wall
-    // clocks against a 50 ms deadline, which flaked under parallel load.
-    // The input space here is three discrete concurrency states, so these
-    // are plain deterministic `#[test]`s: the sidecar reports its FIRST
-    // confirmed EWOULDBLOCK through the prelude's env-gated
-    // `DEPLOY_TEST_CONTENDED_FD` signal, the parent is signal-driven off
-    // that pipe, and every assertion checks a STATE TRANSITION (deadline
-    // error vs success) — never an elapsed-millisecond comparison. The pure
-    // prelude-generation proptests stay.
+    // elapsed-time guesses. The input space here is three discrete
+    // concurrency states, so these are plain deterministic `#[test]`s: the
+    // sidecar reports its FIRST confirmed EWOULDBLOCK through the prelude's
+    // env-gated `DEPLOY_TEST_CONTENDED_FD` signal, the parent is
+    // signal-driven off that pipe, and every assertion checks a STATE
+    // TRANSITION (deadline error vs success) — never an elapsed-millisecond
+    // comparison.
     // ------------------------------------------------------------------
 
     /// The flock contention window the synchronized tests exercise (passed as
@@ -5827,8 +5831,8 @@ mod tests_ssh {
 
     /// Equality by variant only: the tests compare an outcome against
     /// `Ok(SidecarErrorCode::…)`, never the payloads of two errors, and
-    /// `std::io::Error` no longer carries a `PartialEq` impl on this
-    /// toolchain. `std::mem::discriminant` keeps the comparison meaningful
+    /// `std::io::Error` has no `PartialEq`, so
+    /// `std::mem::discriminant` keeps the comparison meaningful
     /// exactly where it is used.
     // unix-only: part of the flock/pipe/poll sidecar contract.
     #[cfg(unix)]
@@ -5853,7 +5857,7 @@ mod tests_ssh {
     /// A Rust-side exclusive flock holder: opens the lock path read-write
     /// (creating it like the real sidecar's mutex file) and takes `LOCK_EX`;
     /// the `Drop` releases the lock deterministically — including on a test
-    /// panic — instead of a `sleep`-timed release.
+    /// panic.
     // unix-only: flock(2) + AsRawFd.
     #[cfg(unix)]
     struct HolderGuard {
@@ -6287,13 +6291,9 @@ mod tests_ssh {
         crate::test_support::write_executable(&p, fake_perl_body(needle, code).as_bytes());
     }
 
-    // The old temp name derived from the LOCAL pid + a per-process counter, so
-    // two controllers on different hosts could share a pid and collide on the
-    // same remote temp name; `printf ... > tmp` then truncated the collided
-    // path, and the no-clobber publish could install the WRONG payload. With
-    // remote `mktemp` allocation, concurrent controllers can never be handed
-    // the same name: exactly one install wins, every loser reports failure,
-    // and no reader ever observes torn/mixed content.
+    // With remote `mktemp` allocation, concurrent controllers are never handed
+    // the same temp name: exactly one install wins, every loser reports
+    // failure, and no reader ever observes torn/mixed content.
     #[test]
     fn try_write_new_concurrent_controllers_never_collide() {
         use std::sync::Arc;
@@ -6518,12 +6518,11 @@ mod tests_ssh {
     /// sequence — the FINAL MODE is chmod'd onto the temp BEFORE the portable
     /// FILE fsync, which is before the no-clobber install, and the
     /// PARENT-DIRECTORY fsync (also the portable perl primitive) runs after the
-    /// install and is never swallowed (`2>/dev/null` is gone).
+    /// install and is never swallowed.
     ///
-    /// Pre-fix the script used `sync "$tmp"` / `sync <dir>`; the fix uses the
-    /// perl `fsync(2)` the [`PERL_FSYNC_FILE`]/[`PERL_FSYNC_DIR`] hooks are
-    /// named for. This test therefore FAILED pre-fix at
-    /// "the file fsync step must be present".
+    /// The fsync steps are the perl `fsync(2)` the
+    /// [`PERL_FSYNC_FILE`]/[`PERL_FSYNC_DIR`] hooks are
+    /// named for.
     #[test]
     fn try_write_new_cmd_final_chmod_and_portable_fsyncs() {
         let t = transport();
@@ -6604,10 +6603,6 @@ mod tests_ssh {
     /// still run (the fake delegates them to the real perl), so the record is
     /// fully installed and the command's exit status is EXACTLY the failed
     /// durability step.
-    ///
-    /// Pre-fix there was no perl dir-fsync hook: the parent durability step was
-    /// the operand-taking `sync <dir>`, which the fake perl never saw, so the
-    /// command exited 0 and this test FAILED with `Some(0)` instead of `Some(9)`.
     #[test]
     fn try_write_new_dir_fsync_failure_propagates() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -6694,7 +6689,7 @@ mod tests_ssh {
             msg.contains("the entry is visible but its durability is unconfirmed"),
             "a post-rename fsync failure must report visible-but-unconfirmed durability, got: {msg}"
         );
-        // Constraint #4: visible-but-unconfirmed durability is its OWN typed
+        // Visible-but-unconfirmed durability is its OWN typed
         // condition, so a caller can distinguish "retrying may be wrong" from
         // "the write failed" without matching the message.
         assert_eq!(
@@ -6717,11 +6712,9 @@ mod tests_ssh {
     ///
     /// The short read is SIMULATED here with a fake `cat` that consumes only 3
     /// of the payload's bytes and exits 0 — exactly the clean, short EOF a lost
-    /// connection produces. The REAL-connection case reproduces over live
-    /// sshds: killing the ControlMaster mid-128-MiB-write left a strict prefix
-    /// (36,110,336 bytes on macOS/BSD, 196,608 on GNU/Linux) with the OLD
-    /// content gone. Pre-fix this test FAILED: the script renamed the
-    /// 3-byte temp over `state/f` and exited 0, so `OLD-CONTENT` was replaced.
+    /// connection produces. Without the length check the script would rename the
+    /// 3-byte temp over `state/f` and exit 0, so `OLD-CONTENT` would be
+    /// replaced.
     #[test]
     fn upload_refuses_to_publish_a_truncated_payload() {
         // A SHORT hermetic TMPDIR (see the sibling upload test).
@@ -6786,9 +6779,7 @@ mod tests_ssh {
 
     /// The `try_write_new` case: the SAME truncation on a FRESH immutable record.
     /// The far side must refuse to publish and leave the slot FREE, so a re-run
-    /// still succeeds. Pre-fix the truncated record was `link(2)`-published and
-    /// the re-run returned `Conflict(ContentMismatch)` — the slot was
-    /// permanently poisoned.
+    /// still succeeds rather than hitting a permanently poisoned slot.
     #[test]
     fn try_write_new_refuses_a_truncated_payload_and_leaves_the_slot_replaceable() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -6849,7 +6840,7 @@ mod tests_ssh {
     /// lock-record spelling is refused BEFORE any remote command is built (so
     /// no ssh is attempted), and the substrate methods (`write`, `remove_file`,
     /// `remove_dir_all`, `rename`, `symlink`, `set_mode`, `create_dir*`) are
-    /// guarded too. Pre-fix these all built and ran a remote command.
+    /// guarded too, so no remote command is built for a refused spelling.
     #[test]
     fn ssh_mutations_refuse_a_lock_record_they_do_not_own() {
         let t = transport();
@@ -6933,10 +6924,6 @@ mod tests_ssh {
     /// A failure of the FILE fsync (step 4) aborts BEFORE the
     /// publish — the command exits [`SSH_TWRITE_PREINSTALL_EXIT`] and NOTHING is
     /// installed, because the record's bytes were never made durable.
-    ///
-    /// Pre-fix there was no perl file-fsync hook: the GNU-only `sync "$tmp"`
-    /// succeeded (or silently no-opped), the publish ran, and this test FAILED
-    /// with `Some(0)` instead of `Some(1)`.
     #[test]
     fn try_write_new_file_fsync_failure_aborts_before_publish() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -7165,7 +7152,7 @@ mod fingerprint_ssh_tests {
     // carrying the fake bin dir first in `PATH` plus the fake-ssh variables
     // (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`) and the per-test pin
     // cache (`STOREKIT_TEST_SSH_KNOWNHOSTS_DIR`). The transport spawns its children
-    // (ssh / ssh-keyscan / ssh-keygen / stat) with that snapshot's variables
+    // (ssh / ssh-keyscan / ssh-keygen / perl) with that snapshot's variables
     // (`SysEnv::apply_to_command`: env_clear + the snapshot's vars), so the
     // fake binaries resolve and their
     // inputs ride the same child env — the process-global environment is
@@ -7296,14 +7283,12 @@ printf '%s %s\n' "$host" '{pubkey}'
                 .as_bytes(),
             );
 
-            // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it):
-            // the transport's list script uses `stat -c '%f'` (raw mode in
-            // hex). The metadata path no longer calls `stat` at all — it runs
-            // the framed perl `lstat` helper directly — so the shim's `%s %f`
-            // branch implements the SAME framed protocol (P/A/E frames from a
-            // REAL lstat errno; a missing path reports `A\t2`), keeping the
-            // fixture faithful for any caller that still formats through
-            // `stat`. `/usr/bin/perl` (absolute) is used so an injected fake
+            // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it),
+            // with a `%s %f` branch that emits the transport's framed
+            // `P`/`A`/`E` lstat protocol itself (from a REAL lstat errno; a
+            // missing path reports `A\t2`), so any caller that formats through
+            // `stat` sees the metadata protocol rather than a bare mode.
+            // `/usr/bin/perl` (absolute) is used so an injected fake
             // `perl` in the test bin dir never shadows the shim's interpreter.
             crate::test_support::write_executable(
                 &bin.join("stat"),
@@ -7331,12 +7316,12 @@ esac
 "#.as_bytes(),
             );
 
-            // Fake `mv` emulating GNU coreutils `mv -T` (no-target-directory):
-            // macOS BSD mv lacks `-T` and, like GNU mv without `-T`, treats a
-            // destination that is a symlink to a directory as the directory
-            // itself and moves the source INTO it. The deploy tool's `current`
-            // swap depends on GNU `-T` semantics, so strip the flag and remove
-            // any existing destination first.
+            // Fake `mv`: if a caller passes `-T` (no-target-directory), strip
+            // the flag and remove any existing destination first, so a caller
+            // relying on GNU `-T` semantics gets them on BSD/macOS too (where
+            // `mv` treats a destination that is a symlink to a directory as
+            // the directory itself); other invocations delegate to the system
+            // `mv`.
             crate::test_support::write_executable(
                 &bin.join("mv"),
                 r#"#!/bin/sh
@@ -7467,9 +7452,7 @@ exec /bin/mv "$@"
     /// snippets ([`PERL_FSYNC_FILE`] / [`PERL_FSYNC_DIR`]) record the path they
     /// fsync into `log` (`file:<path>` / `dir:<path>`) and then delegate every
     /// other invocation to the REAL perl, so the rest of the remote script is
-    /// unaffected. The pre-fix GNU-only `sync <operand>` no longer exists far
-    /// side, so a probe of `sync` would prove nothing about the durability
-    /// branch.
+    /// unaffected.
     fn write_fake_perl_fsync_log(bin: &Path, log: &Path) {
         let real = real_perl();
         write_fake_bin(
@@ -7527,7 +7510,7 @@ exec /bin/mv "$@"
 
     // Scenario (a): a fingerprint-only configuration can make a STATUS request
     // once the identity has been prepared. Before preparation it cannot even
-    // build its ssh arguments — the exact regression this feature fixes.
+    // build its ssh arguments.
     #[test]
     fn status_succeeds_with_fingerprint_only_config() {
         let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -7692,9 +7675,8 @@ exec /bin/mv "$@"
 
     /// THE absence-vs-permission regression: a remote `lstat` that fails with
     /// EACCES (permission denied) is an `E` frame with errno 13 — an ERROR,
-    /// never absence. The old shell-boolean guard (`[ ! -e ]` succeeds on
-    /// EACCES just like on ENOENT) reported permission failures as absent;
-    /// the frame carries the errno so the parser cannot confuse them.
+    /// never absence, because the frame carries the errno rather than a shell
+    /// boolean that succeeds on both EACCES and ENOENT.
     #[test]
     fn metadata_opt_eacces_is_an_error_never_absence() {
         let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -7904,9 +7886,7 @@ exec /bin/mv "$@"
         // fake `ssh` (signal-killed command / spawn failure) and driven
         // through the REAL transport + parser. ONLY the absence errnos
         // (ENOENT/ENOTDIR) return `Ok(None)`; every other outcome returns
-        // `Err`, and for the error cases the caller-level gate
-        // (`swap_current`) also errors and leaves the `current` link
-        // byte-identical — a failed lstat is never absence, so it can never
+        // `Err` — a failed lstat is never absence, so it can never
         // drive a swap/removal (the same fail-closed rule retention relies
         // on: zero deletions on a failed read).
         #![proptest_config(ProptestConfig {
@@ -8054,13 +8034,13 @@ exec /bin/mv "$@"
     }
 
     /// The transport-level verdict matrix over the fake ssh remote: the TYPED
-    /// verdict survives the ssh transport boundary. A fake `sync` logger in
-    /// the fake bin dir records every sync the remote script (and the
+    /// verdict survives the ssh transport boundary. A fake `perl` fsync logger
+    /// in
+    /// the fake bin dir records every fsync the remote script (and the
     /// transport's AlreadyPresent retry) performs, so the parent-durability
     /// property is OBSERVABLE: the parent sync runs for `Created` AND for
     /// `AlreadyPresent` (an identical retry establishes the parent's
-    /// durability — the fix for the old script, which only synced on the
-    /// fresh-install path), and NOT for `Conflict` (a different winner is not
+    /// durability), and NOT for `Conflict` (a different winner is not
     /// ours to bless). A mode mismatch over identical bytes stays `Conflict`.
     #[derive(Clone, Copy, Debug)]
     enum SshVerdictState {
@@ -8122,8 +8102,7 @@ exec /bin/mv "$@"
             // `PERL_FSYNC_DIR`, carrying the crate's test tokens) and
             // delegates every other invocation to the REAL perl, so the test
             // can prove WHICH branch established the parent-directory
-            // durability. (The pre-fix GNU-only `sync <operand>` no longer
-            // exists far side, so probing `sync` would prove nothing.)
+            // durability.
             let sync_log = tmp.path().join("sync.log");
             write_fake_perl_fsync_log(&fake.bin, &sync_log);
 
@@ -8268,9 +8247,9 @@ exec /bin/mv "$@"
         }
     }
 
-    /// Arbitrary bytes for the byte-preservation property: EVERY byte class
-    /// the old lossy stringification mangled — NULs, non-UTF8, control
-    /// chars, quotes, backslashes, shell metacharacters — plus long payloads
+    /// Arbitrary bytes for the byte-preservation property: NULs, non-UTF8,
+    /// control chars, quotes, backslashes, shell metacharacters, plus long
+    /// payloads
     /// that straddle the pipe buffer (the stdin payload is written by the
     /// runner's wait closure, so a payload larger than the pipe must still
     /// flow through the remote `cat` exactly).
@@ -8285,7 +8264,7 @@ exec /bin/mv "$@"
     }
 
     proptest! {
-        // THE BYTE-PRESERVATION PROPERTY (the create-new fix): `try_write_new`
+        // THE BYTE-PRESERVATION PROPERTY: `try_write_new`
         // is a BYTE API, so ARBITRARY `Vec<u8>` must round-trip EXACTLY —
         // `try_write_new(rel, data)` then `read(rel)` == `data` byte-for-byte
         // — through the ssh transport (over the fake remote) AND the local
@@ -8419,9 +8398,7 @@ exec /bin/mv "$@"
     // symlink points at a matching regular file, so a following stat would
     // wrongly accept it), an unreadable file → Unreadable, a wrong mode →
     // ModeMismatch, different content → ContentMismatch. The `Other` (fifo)
-    // kind is generated only for the LOCAL leg: the ssh perl-lstat's
-    // THREE-way classification (dir/symlink/file) cannot express a fifo — it
-    // reports as a file, and reading it with `cat` would block the transport.
+    // kind is generated only for the LOCAL leg (see `x_entry_strategy`).
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum XTransport {
         Local,
@@ -8475,10 +8452,7 @@ exec /bin/mv "$@"
         .boxed();
         match transport {
             XTransport::Local => all,
-            // The ssh perl-lstat classifies dir/symlink/file only: a fifo
-            // reports as a file and its `cat` read would block, so the Ssh
-            // leg filters the inexpressible fifo kind out of the same
-            // strategy.
+            // The Ssh leg filters the fifo kind out of the same strategy.
             XTransport::Ssh => all
                 .prop_filter("fifo is not expressible over the ssh lstat", |e| {
                     *e != XEntry::Other
@@ -8780,8 +8754,8 @@ exec /bin/mv "$@"
     ///
     /// Structural TOCTOU closure: the verification is ONE remote exec — the
     /// recorded ssh invocation log contains EXACTLY ONE `sysopen` helper
-    /// invocation (write + verify-open [+ parent sync on AlreadyPresent]),
-    /// never the old lstat-then-separate-read pair. Bounded cases, fixed
+    /// invocation (write + verify-open [+ parent sync on AlreadyPresent]).
+    /// Bounded cases, fixed
     /// seed 0x5EED_5EED (house style), no persistence.
     fn ssh_swap_case() -> impl Strategy<Value = (VerifySwapBoundary, VerifySwapKind)> {
         prop_oneof![
@@ -8904,8 +8878,7 @@ exec /bin/mv "$@"
             // with `O_NOFOLLOW`; the create-new path's portable perl fsync
             // snippets also call `sysopen`, but WITHOUT `O_NOFOLLOW`, so the
             // anchor isolates the verification), and the total is write +
-            // verify-open (+ the parent fsync only for AlreadyPresent), never
-            // the old lstat-then-separate-read pair.
+            // verify-open (+ the parent fsync only for AlreadyPresent).
             let invocations = read_ssh_argv_log(&fake.argv_log);
             let verify_invs = invocations
                 .iter()
@@ -8935,19 +8908,16 @@ exec /bin/mv "$@"
     /// and returns the same verdict regardless of arbitrary ambient
     /// environment variables. The production `verify_open_script` contains
     /// ZERO swap/hook/env logic, so even when the child env carries
-    /// `DEPLOY_VERIFY_SWAP`/`DEPLOY_VERIFY_SWAP_BOUNDARY` (the variables the
-    /// old hook read), the verification must behave identically to a baseline
+    /// `DEPLOY_VERIFY_SWAP`/`DEPLOY_VERIFY_SWAP_BOUNDARY`, the verification
+    /// must behave identically to a baseline
     /// run with no extra vars and must not litter `.swap-orig`/`swap-target`
     /// or mutate any entry. This property generates arbitrary env maps
-    /// (0..=20 random names/values) deliberately mixed with the old hook's
-    /// trigger pairs, drives the production `try_write_new` → verify path
-    /// through the fake-ssh transport, and asserts both invariants. It would
-    /// fail against the pre-fix code where the env reached the perl helper
-    /// and fired the swap.
+    /// (0..=20 random names/values) deliberately mixed with those trigger
+    /// pairs, drives the production `try_write_new` → verify path
+    /// through the fake-ssh transport, and asserts both invariants.
     fn arb_env_name() -> impl Strategy<Value = String> {
-        // Valid env names: [A-Za-z_][A-Za-z0-9_]{0,39} but the spec says
-        // [A-Za-z0-9_]{1,40} — we use the looser set with first char not
-        // digit to keep names shell-safe; length 1..12 keeps the map small.
+        // Env names kept shell-safe (first char not a digit) and short; length
+        // 1..12 keeps the map small.
         prop::string::string_regex("[A-Za-z_][A-Za-z0-9_]{0,11}").unwrap()
     }
 
@@ -9039,26 +9009,16 @@ exec /bin/mv "$@"
             let before = snapshot_remote_recursive(&fake.remote_root);
 
             // Build the enriched ambient env: arbitrary vars + deliberate
-            // old-hook trigger pairs (every kind × boundary combo that would
-            // fire the pre-fix hook). Guard reserved vars so the harness stays
-            // authoritative (skip or override LAST).
+            // `DEPLOY_VERIFY_SWAP` trigger pairs. Guard reserved vars so the
+            // harness stays authoritative (skip or override LAST).
             let reserved = ["PATH", "FAKE_SSH_ROOT", "FAKE_SSH_REMOTE_PREFIX", "STOREKIT_TEST_SSH_KNOWNHOSTS_DIR"];
             let mut enriched: Vec<(String, String)> = base_vars.into_iter().filter(|(k, _)| !reserved.contains(&k.as_str())).collect();
-            // Deliberately include hook triggers — at least one per case, and
-            // cover all kind/boundary combos across the property's cases via
-            // the arbitrary base plus these fixed triggers. The last occurrence
+            // Deliberately include the trigger pair, so the property exercises
+            // the case an env-reading helper would act on. The last occurrence
             // of each key wins in the BTreeMap, so these authoritative triggers
-            // are last and will fire pre-fix.
+            // are last.
             enriched.push(("DEPLOY_VERIFY_SWAP".to_string(), "symlink".to_string()));
             enriched.push(("DEPLOY_VERIFY_SWAP_BOUNDARY".to_string(), "before_open".to_string()));
-            // Also include other combos to ensure the property would catch any
-            // hook variant; the map's last value wins, but we add them as
-            // separate keys would not work — instead we push a second trigger
-            // pair with different values under alternative env names that the
-            // old hook would not read, but the arbitrary base already covers
-            // random names. The key point is at least one valid trigger is
-            // present; we keep the property deterministic by always pushing the
-            // before_open/symlink combo.
             let extra_refs: Vec<(&str, &str)> = enriched.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             let env = fake_env_with(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/ambient-ssh", &extra_refs);
             let t = fake.transport(&cache, &env);

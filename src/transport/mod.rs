@@ -7,9 +7,12 @@
 //! operation goes through live in the `ssh` submodule group.
 //!
 //! Transport setup is split into two phases: [`Remote::prepare_identity`]
-//! (verify/pin the host key) runs before the run's first remote request, while
-//! [`Remote::provision_layout`] (create the deployment-directory layout) runs
-//! only from the sync engine's push path, on the remote destination.
+//! (verify/pin the host key) runs ahead of every self-preparing entry point,
+//! read-only status inspection included; [`Remote::try_write_new`] is the ONE
+//! entry point that does not prepare, so its caller must run
+//! [`Remote::prepare_identity`] itself. [`Remote::provision_layout`] (create
+//! the deployment-directory layout) runs at the start of a push, before the
+//! destination manifest is read.
 //!
 //! # Submodules
 //!
@@ -880,11 +883,13 @@ pub trait Remote {
         Ok(None)
     }
 
-    /// Prepare the host identity (verify/pin the host key) before the run's
-    /// first remote request: construction is side-effect-free, and identity
-    /// preparation happens before the first request that needs to connect.
-    /// Default: no-op (transports without a host-identity concept, like
-    /// `LocalTransport`).
+    /// Prepare the host identity (verify/pin the host key) ahead of every
+    /// self-preparing entry point, read-only status inspection included; the
+    /// ONE entry point that does not prepare is [`Remote::try_write_new`],
+    /// whose caller must call this itself. Construction is side-effect-free;
+    /// identity preparation happens before the first request that needs to
+    /// connect. Default: no-op (transports without a host-identity concept,
+    /// like `LocalTransport`).
     fn prepare_identity(&self) -> Result<()> {
         let _ = self;
         Ok(())
@@ -2448,7 +2453,8 @@ impl LocalTransport {
     /// ENTIRE environment. Construction
     /// is side-effect-free: no directories are created and nothing is
     /// touched on disk. Call [`Remote::provision_layout`] to create the
-    /// deployment layout before the first mutation.
+    /// deployment layout before the first mutation (the push entry points do
+    /// this at the start of a push, before the destination manifest is read).
     ///
     /// The FILESYSTEM ROOT is refused (defense in depth): a transport rooted
     /// at `/` would make a confined operation (and any recursive removal)

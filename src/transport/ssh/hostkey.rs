@@ -12,10 +12,9 @@ use super::runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner, lefto
 /// Build the `ssh-keyscan` argument vector (port, connect timeout, key
 /// types, bare host). The bare address is used (not `user@address`) because
 /// `ssh-keyscan` expects a hostname/address, and the configured port is
-/// passed via `-p`. `-T N` is the canonical ssh-keyscan connection timeout:
-/// it is supported by both OpenSSH (Linux) and the LibreSSL/macOS build
-/// (which REJECTS the nonexistent `-O timeout=` variant — `-O` only
-/// carries `hashalg=`). [`pin_known_hosts`] additionally
+/// passed via `-p`. `-T N` is the ssh-keyscan connection timeout; the
+/// LibreSSL build ships no `-O timeout=` variant (`ssh-keyscan` answers
+/// `Unsupported -O option`). [`pin_known_hosts`] additionally
 /// enforces the same N-second bound at the process level, so a keyscan
 /// implementation that ignores `-T` still cannot hang the pin step.
 pub(crate) fn keyscan_args(port: u16, address: &str) -> Vec<String> {
@@ -38,8 +37,8 @@ pub(crate) fn keyscan_args(port: u16, address: &str) -> Vec<String> {
 /// use as `UserKnownHostsFile` in later ssh invocations.
 ///
 /// `cache_dir` is the RESOLVED pin-cache directory (resolved once at the
-/// transport-construction boundary from the environment snapshot — never
-/// read from the process env here), and `env` is the snapshot whose
+/// transport-construction boundary — never read from the process env here),
+/// and `env` is the snapshot whose
 /// variables ride the `ssh-keygen` fingerprint-verification child.
 // KNOWN RESIDUE, NOT THE GUARDED FUNNEL: this one cache-file mutation drops a
 // stale/unreadable pinned key before re-pinning. The path is derived from the
@@ -62,8 +61,7 @@ pub(crate) fn pin_known_hosts(
     // Pinned keys live in a private (0700) cache directory owned by this
     // user, rather than a predictable world-readable temp file name, so a
     // locally pre-created file cannot be trusted blindly. The cache root is
-    // resolved at the boundary (the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`,
-    // else `<temp_dir>/deploy-ssh-knownhosts`) and passed in — each test
+    // resolved at the construction boundary and passed in — each test
     // points it at its own isolated cache.
     let cache_dir = cache_dir.to_path_buf();
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
@@ -150,8 +148,9 @@ pub(crate) fn pin_known_hosts(
         )));
     }
 
-    // Exclusive (O_EXCL) creation with 0600 permissions so a concurrent or
-    // pre-existing file cannot be silently overwritten or read by others.
+    // Exclusive (O_EXCL) creation (so a concurrent or pre-existing file is
+    // never silently overwritten), then `chmod 0600` so the pinned file is
+    // private to this user.
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -216,11 +215,10 @@ pub(crate) fn key_matches_fingerprint(line: &str, expected: &str, env: &SysEnv) 
 /// The key is the PAIR `(target, port)`, never `target` alone. The pinned
 /// content is the key `ssh-keyscan -p <port>` returned, so two sshd instances
 /// reached at DIFFERENT ports on one host can serve DIFFERENT host keys (and
-/// different fingerprints). Keying on `user@host` alone made both ports share
-/// ONE pin file: each transport's fingerprint check would then discard and
-/// re-pin the other's file, and a pinned key could momentarily clash between
-/// ports. Including the port keeps each pinned content under its own key; the
-/// target stays in the key so two accounts never share a pin either.
+/// different fingerprints); keying on the pair keeps each pinned content under
+/// its own entry instead of letting each transport's fingerprint check discard
+/// and re-pin the other's file. The target stays in the key so two accounts
+/// never share a pin either.
 pub(crate) fn pin_file_path(cache_dir: &Path, target: &str, port: u16) -> PathBuf {
     cache_dir.join(format!(
         "knownhosts-{}.txt",
@@ -239,7 +237,7 @@ pub(crate) fn fingerprints_match(text: &str, expected: &str, env: &SysEnv) -> bo
 /// Stable, filesystem-safe hash of a string for building temp-file names and
 /// identity cache keys.
 ///
-/// This is full-strength SHA-256, not a 64-bit FNV-1a. The hash is a SECURITY
+/// This is full-strength SHA-256. The hash is a SECURITY
 /// boundary here: a collision between two distinct connection identities would
 /// make them derive the SAME `ControlPath`, and a reused ControlMaster skips
 /// the second connection's host-key check and key selection. At 64 bits a
@@ -285,8 +283,8 @@ mod tests_hostkey {
         );
     }
 
-    /// The identity hash is full-strength SHA-256 (256 bits), not a 64-bit
-    /// FNV-1a: a ControlPath collision between two distinct identities would
+    /// The identity hash is full-strength SHA-256 (256 bits): a ControlPath
+    /// collision between two distinct identities would
     /// let one reuse the other's authenticated master. Pinned against the
     /// SHA-256 `abc` vector so a future "simplification" cannot quietly
     /// weaken it.
@@ -311,8 +309,8 @@ mod tests_hostkey {
         // The connection target (`user@host`) must NOT be passed to ssh-keyscan.
         assert!(!args.iter().any(|a| a.contains('@')));
         // The keyscan carries the same connect timeout as ssh. `-T N` is the
-        // canonical ssh-keyscan connection timeout (OpenSSH and the
-        // LibreSSL/macOS build both support it; `-O timeout=` does not exist).
+        // ssh-keyscan connection timeout (the LibreSSL/macOS build supports it;
+        // `-O timeout=` does not exist).
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-T" && w[1] == SSH_CONNECT_TIMEOUT_SECS.to_string()),

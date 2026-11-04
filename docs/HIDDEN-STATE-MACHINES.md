@@ -1110,9 +1110,10 @@ the pin's RESOLUTION is `HostIdentity::Fingerprint`'s
 `pinned: Mutex<Option<PathBuf>>`, set only by `prepare_identity`. The mux
 directory and the pin cache file are filesystem state.
 
-**Transitions.** Every request self-prepares (`prepare_for_request` →
-`prepare_identity`). Preparation creates/chmods the mux directory and calls
-`pin_known_hosts`, which validates or re-pins the cache; `ssh_args` refuses an
+**Transitions.** Every self-preparing entry point self-prepares
+(`prepare_for_request` → `prepare_identity`); `try_write_new` is the ONE
+exception, its caller must prepare first. Preparation creates/chmods the mux
+directory and calls `pin_known_hosts`, which validates or re-pins the cache; `ssh_args` refuses an
 unresolved pin rather than falling back to trust-on-first-use. `pin_known_hosts`
 removes a stale cache, runs `ssh-keyscan`, filters by fingerprint, and creates
 the pin with `create_new`.
