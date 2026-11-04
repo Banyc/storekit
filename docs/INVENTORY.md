@@ -5,7 +5,7 @@ every acceptance test is present, and the gate is green; then this file is delet
 
 | Item | Status |
 |---|---|
-| `sync-exclusions` | OPEN |
+| `sync-exclusions` | DONE — change `vustlsuzoxtl` (`16e46de1`) |
 | `tolerant-staging-docs` | OPEN |
 
 **Out of scope, recorded so they are not re-proposed.** Transactional apply (an
