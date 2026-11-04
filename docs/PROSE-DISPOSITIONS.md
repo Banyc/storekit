@@ -235,3 +235,14 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/reserved.rs | reserved predicates; containment fold order (NFD → case_fold → NFC → strip) | kept-corrected | `is_reserved_*`, `is_unaddressable_*`, `manifest::fold_component` |
 | src/error.rs, src/id.rs, src/relpath.rs, src/root.rs | typed kinds, id rules, path boundary, owned-root registry | kept-corrected | `*_kind` constructors, `valid_name`, `RootedRelativePath`, `OwnedRoot` |
 | src/platform.rs, src/casefold.rs, src/digest.rs, src/env.rs, src/trace.rs, src/test_support.rs | port helpers, fold provenance, digest, env snapshot, tracer, test support | kept-corrected | `chmod`/`file_mode`, `case_fold`, `sha256_bytes`, `SysEnv`, `Tracer`, fixtures |
+
+## Slice 11 — `src/atomic/unix.rs` (change `yqsvvynv`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/atomic/unix.rs | module docs + temp typestates (`PathTemp`, `Temp`, `Published`, `discard`) | kept-corrected | `Temp::{create,write,make_private,sync,publish}`, `Drop`, `discard_temp` |
+| src/atomic/unix.rs | replace/CAS/compare (`replace_core`, `write_atomic_cas_fd`, `CompareReplace`) | kept-corrected | stage order, `live_matches`, `ReplaceStage`, `linkat` |
+| src/atomic/unix.rs | chain commit (`PathChain`, `UnixChain`, `ensure_private_dir_durable[_fd]`) | kept-corrected | `commit_created_entries`, `sync_parent_dir`, dirs gate |
+| src/atomic/unix.rs | overlap/copy identity (`refuse_overlapping_copy`, `copy_dir_recursive_fd`) | kept-corrected | `open_destination_anchor` (`openat`), `fd_entry_identity` (`st_dev`,`st_ino`), `dir_chain_contains`; no reliance on `realpath` case behaviour |
+| src/atomic/unix.rs | heap cost (`dir_entry_names`), removal walks, reads | kept-corrected | open-frame name lists, `remove_dir_contents_fd` |
+| src/atomic/unix.rs | test docs (fault stages) + inline comments | kept-corrected | the fault point's actual position in `replace_core` |
