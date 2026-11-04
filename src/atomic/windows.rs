@@ -313,8 +313,7 @@ fn ensure_private_dir_durable_chain(path: &Path) -> Result<DirChain> {
     }
     // Create the chain TOP-DOWN (parents before their children). A racing
     // creation of an ancestor is tolerated. Every missing component is passed
-    // to the chain (the old `bool` reported "the chain was non-empty", not
-    // which `create_dir` won a race), preserving that answer exactly.
+    // to the chain — a racing `AlreadyExists` is still safe to fsync.
     for component in missing.iter().rev() {
         match std::fs::create_dir(component) {
             Ok(()) => {}
@@ -545,7 +544,7 @@ fn refuse_unlandable_name<'a>(name: &'a std::ffi::OsStr, parent: &Path) -> Resul
 /// FOLLOWING reparse points: a junction or directory-symlink alias must report
 /// its TARGET's identity, which is the whole point of an identity-based overlap
 /// decision. Unix reaches the same pair through
-/// `atomic::guard::fd_entry_identity`; Windows has no directory descriptor, so
+/// `atomic::unix::fd_entry_identity`; Windows has no directory descriptor, so
 /// this opens the path with `FILE_FLAG_BACKUP_SEMANTICS` (required to open a
 /// directory) and WITHOUT `FILE_FLAG_OPEN_REPARSE_POINT`.
 fn directory_identity(path: &Path) -> Result<(u64, u64)> {
@@ -708,9 +707,9 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 /// and a symlink source is refused, exactly as on Unix.
 ///
 /// SYMLINKS: the crate's OWN target rules are reused
-/// ([`crate::manifest::validate_symlink_target`] and
-/// [`crate::manifest::check_relative_symlink_target`]), and a link is copied
-/// as a link, never followed.
+/// ([`crate::manifest::validate_symlink_target`] and the indexed
+/// [`crate::manifest::check_relative_symlink_target_indexed`]), and a link is
+/// copied as a link, never followed.
 ///
 /// ALL-OR-NOTHING LANDING: a copied entry never replaces a pre-existing
 /// destination entry. A copied file uses `create_new` (`O_EXCL` semantics), a
@@ -739,9 +738,10 @@ fn refuse_overlapping_copy(root: &RootDir, src: &Path, dst_rel: &Path) -> Result
 ///
 /// DOCUMENTED WEAKER GUARANTEE: there is no directory descriptor and no
 /// `O_NOFOLLOW`, so a symlink injected into a destination component IS
-/// followed (`rel_join` only refuses absolute/`..`/`.` spellings).
+/// followed ([`rel_join`] only joins it: the [`RootedRelativePath`] boundary
+/// refuses an absolute, a `..`, a `.`, and the empty spelling beforehand).
 /// Modes are a no-op on this port (`crate::platform::chmod`), so the Unix
-/// port's undo journal has nothing to undo here and the source cannot be
+/// port's mode journal has nothing to undo here and the source cannot be
 /// mutated through a mode.
 pub fn copy_dir_recursive_fd(
     root: &RootDir,
@@ -1396,7 +1396,7 @@ fn renameat_paths_guarded(root: &RootDir, from: GuardedRel<'_>, to: GuardedRel<'
 
 /// Path-based recursive removal of a directory tree. On Windows this
 /// delegates to `std::fs::remove_dir_all`, which is ITERATIVE on the
-/// installed toolchain: `library/std/src/sys/fs/windows.rs:1382` opens the
+/// installed toolchain: `library/std/src/sys/fs/windows.rs:1418` opens the
 /// directory and calls `remove_dir_all_iterative`
 /// (`library/std/src/sys/fs/windows/remove_dir_all.rs:173`), so a deep tree
 /// fails cleanly rather than aborting the host — the same guarantee the Unix
@@ -1552,8 +1552,9 @@ pub fn path_state_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
 ///   reported as [`PathKind::Symlink`] whatever its target's kind — a
 ///   symlink TO A DIRECTORY is never [`PathKind::Dir`]. A missing entry is
 ///   ABSENCE (`Ok(None)`); every other filesystem error is [`Error::store`].
-///   `rel` is validated as ROOT-RELATIVE first ([`rel_join`]), so an
-///   absolute path, a `..`, a `.`, and the empty path are refused.
+///   `rel` is a validated ROOT-RELATIVE spelling ([`rel_join`] only joins
+///   it), so an absolute path, a `..`, a `.`, and the empty path never
+///   reach this function.
 /// * NOT GUARANTEED: a symlink injected at a PARENT component IS followed
 ///   (`Path::join` has no component-wise `O_NOFOLLOW`), and a non-symlink
 ///   reparse point is reported by its resolved kind (the classification

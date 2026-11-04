@@ -41,31 +41,30 @@
 //! compare-and-replace twin, the tree-object directory copy (`copy_dir_recursive_fd`
 //! for a root-confined landing, and the deliberately-named, tolerant
 //! `copy_tree_verbatim` for a clone that is NOT landing into a store root), the JSON
-//! readers (`read_json`, `read_json_fd`), and the crate-internal durable helpers
-//! (`sync_parent_dir` — `pub(crate)`, deliberately not public). Two
-//! more are the consumer-facing recovery hooks: [`read_root_dir_fd`] enumerates the
-//! OWNED ROOT itself (the empty and `.` child spellings are refused, so residue at the
-//! root was otherwise unreachable) and [`is_crate_temp_name`] recognises the crate's
-//! own crash residue.
+//! readers (`read_json_fd`, plus the `#[cfg(test)]`-only `read_json`), and the
+//! crate-internal durable helpers (`sync_parent_dir` — `pub(crate)`, deliberately
+//! not public). Two more are the consumer-facing recovery hooks: [`read_root_dir_fd`]
+//! enumerates the OWNED ROOT itself (the empty and `.` child spellings are refused,
+//! so residue at the root is otherwise unreachable) and [`is_crate_temp_name`]
+//! recognises the crate's own crash residue.
 //!
 //! # The reserved-spelling guard is STRUCTURAL, not a list of call sites
 //!
 //! The single-holder guarantee rests on the lock record's inode never
-//! changing. Enumeration is the wrong shape — the call sites found by hand each
-//! missed one — so the guard is no longer applied by enumeration. The SAME
-//! shape now also protects a stranded ORIGINAL (destination residue): a
-//! primitive that carried the lock authority and skipped the residue authority
-//! destroyed a strand file, so BOTH authorities live behind ONE gate
+//! changing. Enumeration is the wrong shape — a hand-found list of call sites
+//! is exactly the population a new call site escapes — so the guard lives in
+//! the primitives, not in their callers. The SAME gate protects a stranded
+//! ORIGINAL (destination residue): BOTH authorities live behind ONE call
 //! ([`guard::refuse_reserved_mutation`]) that every name-mutating primitive
 //! consults, with an explicit [`guard::Sanction`] naming the ONE reserved
 //! spelling that may be broken.
 //!
 //! * the private [`guard`] module owns the ONE reserved-spelling gate (the
 //!   lock-record authority AND the residue authority) and the
-//!   unforgeable [`GuardedRel`] capability (private fields; `new` and
-//!   `new_for_owned_lock_record` are the only constructors and the only
-//!   callers of the guard); every rel-path mutator mints one, and the rename
-//!   worker demands one;
+//!   unforgeable [`GuardedRel`] capability (private fields; `new`,
+//!   `new_for_owned_lock_record` and `new_for_residue` are the only
+//!   constructors, so they are the only ways to MINT one); the rename worker
+//!   demands one, and the primitives below run the gate themselves as well;
 //! * the low-level single-NAME syscall wrappers in [`unix`] (`unlinkat`,
 //!   `renameat`, `symlinkat`, `linkat`, `mkdirat`) and the mutating branch of
 //!   [`openat_no_follow_io`] run the guard at the PRIMITIVE, so a new caller
@@ -126,15 +125,16 @@
 //!
 //! # How the funnel rule is enforced in this module
 //!
-//! The platform-independent path-based replace here
-//! ([`write_atomic_replace`]'s failed-temp cleanup) is one of the funnel's own
-//! mutation sites; it consults the reserved-spelling guard through
-//! [`guard::refuse_reserved_mutation`]. The module-level
-//! `#![allow(clippy::disallowed_methods)]` below lets that call compile while
+//! The denied mutation sites in this module are [`remove_temp`]'s
+//! `std::fs::remove_file` (the ONE path-based temp unlink) and the
+//! `custom_flags` open in [`RootDir::open`]. The module-level
+//! `#![allow(clippy::disallowed_methods)]` below lets those calls compile while
 //! the crate-root `#![deny(clippy::disallowed_methods)]` rejects the same
-//! RESOLVED symbols everywhere else. The count PIN in [`guard`]'s tests is a
-//! different device: it watches the funnel's own call counts change, inside the
-//! allow where the lint is blind. Neither device covers the other.
+//! RESOLVED symbols everywhere else; the reserved-spelling guard itself runs in
+//! the primitives ([`refuse_reserved_mutation`] and each port's own entry
+//! points). The count PIN in [`guard`]'s tests is a different device: it watches
+//! the funnel's own call counts change, inside the allow where the lint is
+//! blind. Neither device covers the other.
 #![allow(clippy::disallowed_methods)]
 
 use crate::error::{Error, ReservedKind, Result, StoreKind};
@@ -162,7 +162,6 @@ pub(crate) use dirchain::{ChainCommit, CreatedChain, DirChain};
 // `GuardedRel` without running the guard; the rel-path mutators demand one.
 // `OwnedLockRecord` is the unforgeable OWNERSHIP authority the guard consults;
 // it can only be built from the transport's own `Layout`.
-// The alias keeps the historical spelling used throughout the primitives.
 pub(crate) use guard::{GuardedRel, OwnedLockRecord, Sanction};
 
 /// THE one reserved-spelling gate, re-exported from the private
@@ -294,13 +293,8 @@ pub use windows::*;
 /// whether THIS platform's primitives refuse a swapped component.
 pub const COMPONENT_CONFINED: bool = cfg!(unix);
 
-/// The path-based JSON reader — TEST-ONLY (the crash-consistency assertions
-/// read a REOPENED store's files directly to verify the on-disk state). The
-/// store's OWN record reads route through [`read_json_fd`]
-/// (descriptor-relative: a symlink in any component, final included, is
-/// refused); no production caller uses the
-/// raw-path reader, so it is `#[cfg(test)]`-gated (no `#[allow(dead_code)]`
-/// band-aid).
+/// The path-based JSON reader — `#[cfg(test)]`-gated (no `#[allow(dead_code)]`
+/// band-aid); the root-relative reader is [`read_json_fd`].
 #[cfg(test)]
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes =
@@ -321,10 +315,6 @@ pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 /// write-path CAS `write_atomic_cas_fd`) are deliberately NOT converted:
 /// there a swallowed `exists()` error lands in the subsequent open/create
 /// call, which fails and propagates anyway — no silent absence is possible.
-///
-/// Under `#[cfg(test)]` the check routes through the injectable
-/// `MarkerIoOps` seam when a test installed one, so the tri-state
-/// property can force each outcome on the marker path.
 pub fn path_state(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -387,10 +377,7 @@ const BOUNDED_TRUNK_BRANCH_SLACK: usize = 4;
 /// restricted to trunks of at most `NAME_MAX - overhead - SLACK` bytes, while
 /// the truncated branch always emits at least `NAME_MAX - overhead - 3`
 /// bytes, so a name returned verbatim can never be the truncation of a
-/// different name (the pre-fix bound returned the name verbatim whenever it
-/// merely fit, so a 240-byte name's 239-byte hash-truncated trunk was itself
-/// returned verbatim by the next call — two distinct destinations shared one
-/// lock record). Within the truncated branch two distinct names collide only
+/// different name. Within the truncated branch two distinct names collide only
 /// if their SHA-256 digests collide, and the digest is taken over the FULL
 /// name, so the branch stays injective.
 pub(crate) fn bounded_temp_trunk(name: &str, suffix: &str) -> String {
@@ -476,14 +463,14 @@ pub(crate) fn is_mktemp_tail(tail: &str) -> bool {
 /// * `TEMP_SUFFIX_MARKER` + `<pid>.<counter>` — the local atomic replace
 ///   ([`temp_name_string`]);
 /// * `TEMP_SUFFIX_MARKER` + `<pid>.<time>.<rand>` — the far-side sidecar
-///   replace (`SshTransport::write_sidecar_cmd`);
+///   replace (`SshTransport::try_write_new_sidecar_cmd`);
 /// * `TEMP_SUFFIX_MARKER` + `<pid>` when the trunk IS the application lock
 ///   record — the far-side sidecar recover
 ///   (`SshTransport::recover_sidecar_cmd`, whose temp is
 ///   `.operation.lock.tmp.<pid>`);
 /// * either marker + one [`MKTEMP_PLACEHOLDER`]-wide alphanumeric token — the
-///   far-side `mktemp` write/claim templates (`SshTransport::write_cmd` /
-///   `SshTransport::remove_file_if_cmd`);
+///   far-side `mktemp` templates (`SshTransport::upload_bytes`,
+///   `SshTransport::write_new_cmd` and `SshTransport::remove_file_if_cmd`);
 /// * `CLAIM_SUFFIX_MARKER` + `<pid>.<counter>` — the local compare-and-delete
 ///   claim (`LocalTransport::remove_file_if`).
 ///
@@ -561,7 +548,7 @@ pub(crate) fn is_crate_temp_shape(name: &str) -> bool {
 /// claim-ASIDE (no authority marker) HOLDS a stranded original and must NOT be
 /// removed by this predicate: recover it with [`crate::sync::Residue::recover_to`]
 /// or remove it deliberately with [`crate::sync::Residue::discard`], never by a
-/// blanket `remove_dir_all` (the crate's own recursive-removal primitives now
+/// blanket `remove_dir_all` (the crate's own recursive-removal primitives
 /// REFUSE it).
 pub fn is_crate_temp_name(name: &str) -> bool {
     is_crate_temp_shape(name)
@@ -618,10 +605,10 @@ pub(crate) fn remove_temp(tmp: &Path) -> std::io::Result<()> {
 /// post-rename parent-fsync failure ([`ReplaceOutcome::ReplacedDurabilityUnknown`])
 /// is therefore NOT a cleanup point.
 ///
-/// The PATH-BASED replace's explicit cleanup, used in PRODUCTION on every port
-/// now that [`write_atomic_replace`] is public and production on Unix too. The
-/// descriptor-relative twin is `atomic::unix::discard_temp_fd`; the linear
-/// temp's `Drop` is the same unlink through [`remove_temp`].
+/// The PATH-BASED replace's explicit cleanup, reached on every port by the
+/// public [`write_atomic_replace`]. The descriptor-relative twin is
+/// `atomic::unix::discard_temp_fd`; the linear temp's `Drop` is the same unlink
+/// through [`remove_temp`].
 fn discard_temp(original: Error, tmp: &Path) -> Error {
     match remove_temp(tmp) {
         Ok(()) => original,
@@ -656,10 +643,8 @@ pub enum ReplaceOutcome {
 }
 
 /// The [`write_atomic_replace`] stage a test-injected fault fires at. The
-/// hook is [`write_atomic_replace`]'s own `fault` parameter, so a
-/// per-fixture registry can fault each atomic-replacement stage exactly as
-/// the append path's `FaultKind::AppendWrite` family does; production
-/// passes a no-op hook.
+/// hook is [`write_atomic_replace`]'s own `fault` parameter, so a test can
+/// fault each atomic-replacement stage; production passes a no-op hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplaceStage {
     /// The temp-file CREATE/WRITE stage (before any I/O on the temp): the
@@ -684,9 +669,10 @@ pub enum ReplaceStage {
 pub struct DirEntry {
     /// The entry's file name (never `.` or `..`).
     pub name: std::ffi::OsString,
-    /// Whether the entry is a directory (classified with
-    /// `fstatat(AT_SYMLINK_NOFOLLOW)` — a symlink entry is reported as a
-    /// non-directory, never followed).
+    /// Whether the entry is a directory, classified WITHOUT following a
+    /// symlink entry (Unix `fstatat(AT_SYMLINK_NOFOLLOW)`, Windows
+    /// `std::fs::DirEntry::file_type`) — a symlink entry is reported as a
+    /// non-directory, never followed.
     pub is_dir: bool,
 }
 
@@ -817,13 +803,10 @@ pub(crate) fn refuse_verbatim_overlap(src: &Path, dst: &Path) -> Result<()> {
     ))
 }
 
-// THE ROOT-RELATIVE SPELLING RULE now lives in ONE place: the validated
+// THE ROOT-RELATIVE SPELLING RULE lives in ONE place: the validated
 // [`RootedRelativePath`] type ([`crate::relpath`]), which every `_fd`
-// primitive takes and every boundary parses. The former `validate_rel` helper
-// enforced a LOOSER version of the rule at each primitive that called it (it
-// accepted a non-leading `.` segment, which [`Path::components`] erases); with
-// the type at the boundary the helper has no caller and is gone — see
-// `docs/API-CONSTRAINTS.md` constraint #1.
+// primitive takes and every boundary parses — see `docs/API-CONSTRAINTS.md`
+// constraint #1.
 
 impl RootDir {
     /// Open the owned root.
@@ -950,16 +933,9 @@ mod tests {
     /// the local two-part `<pid>.<counter>` tail, the far-side `mktemp`
     /// six-alphanumeric tail, the sidecar three-part `<pid>.<time>.<rand>`
     /// tail, and the operation-lock sidecar recover one-part `<pid>` tail —
-    /// and nothing else.
-    ///
-    /// CHANGED DELIBERATELY: the pre-fix predicate was BOTH over- and
-    /// under-broad — it matched `notes.tmp.1.0` (no leading dot: a name the id
-    /// rule ACCEPTS, so the documented recovery sweep could delete live
-    /// content) and MISSED the far-side `mktemp` tail `.tmp.aB3xY9` and the
-    /// sidecar three-part tail, so a crashed far-side temp was misreported as a
-    /// held-aside and never removed. The former "near-miss"
-    /// `.sync-aside.foo.tmp.1.2.3` is a genuine sidecar temp and is asserted
-    /// TRUE now; the dotless spellings moved to the "not a temp" list.
+    /// and nothing else. `.sync-aside.foo.tmp.1.2.3` is a genuine sidecar temp
+    /// and is asserted TRUE; the dotless spellings are in the "not a temp"
+    /// list.
     #[test]
     fn temp_names_are_exactly_the_authoritys_suffixes() {
         let generated = temp_name_for(std::path::Path::new("sync-aside.foo"));
@@ -1014,7 +990,6 @@ mod tests {
 
         // NEAR-MISS: the crate's temps ALWAYS begin with `.`, so a dotless
         // name the id rule ACCEPTS must NOT be offered to the recovery sweep.
-        // Pre-fix the suffix-only match made every one of these `true`.
         for near_miss in [
             "notes.tmp.1.0",
             "report.tmp.123.4",
@@ -1135,21 +1110,16 @@ mod tests {
         }
     }
 
-    /// `bounded_temp_trunk` must be INJECTIVE. Pre-fix it returned the
-    /// name VERBATIM whenever it merely fit, so `trunk(trunk(B)) == trunk(B)`
-    /// for a long `B`: a 240-byte name forces the hash branch and its 239-byte
-    /// trunk then fit verbatim, so two DISTINCT sibling destinations shared one
-    /// lock record. The fix reserves branch slack so no verbatim trunk can
-    /// equal a truncated one, and the hash keeps same-prefix long names
-    /// distinct.
+    /// `bounded_temp_trunk` must be INJECTIVE: no verbatim trunk may equal a
+    /// truncated one, and the hash keeps same-prefix long names distinct.
     ///
     /// LOAD-BEARING BY MUTATION: removing the hash from the truncation (keeping
     /// only the prefix) makes the same-prefix pair collide and fails this test.
     #[test]
     fn bounded_temp_trunk_is_injective() {
         let suffix = ".operation.lock"; // 15 bytes; `.` + suffix = overhead 16
-        // The injectivity collision: a 240-byte name forces the hash branch; its trunk
-        // is then tested again and must not be returned verbatim.
+        // A 240-byte name forces the hash branch; its trunk is then tested again
+        // and must not be returned verbatim.
         let long = "b".repeat(240);
         let trunk_long = bounded_temp_trunk(&long, suffix);
         assert!(
@@ -1291,16 +1261,11 @@ mod tests {
         assert_eq!(normalize_root(Path::new("//")), PathBuf::from("/"));
     }
 
-    /// The root-relative spelling rule is the validated type's rule.
-    ///
-    /// This test replaces `validate_rel_accepts_normal_spellings_and_refuses_escapes`,
-    /// which pinned the LOOSER private helper. The helper accepted a
-    /// non-leading `.` segment (`a/./b`) because [`std::path::Path::components`]
-    /// erases it; [`RootedRelativePath::parse`] scans the literal spelling too
-    /// and REFUSES it. That is the ONE deliberate tightening of constraint #1:
-    /// the public boundary is STRICTER than the private check it replaces.
-    /// Every other spelling in the old test is unchanged (trailing and repeated
-    /// separators accepted; empty, absolute, `..`, and `.` refused).
+    /// The root-relative spelling rule is the validated type's rule:
+    /// [`RootedRelativePath::parse`] scans the LITERAL spelling, so a
+    /// non-leading `.` segment (`a/./b`) is refused even though
+    /// [`std::path::Path::components`] erases it. Trailing and repeated
+    /// separators are accepted; empty, absolute, `..`, and `.` are refused.
     #[test]
     fn rooted_relative_path_is_the_only_spelling_authority() {
         use crate::error::Error;

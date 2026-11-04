@@ -4,8 +4,8 @@
 //! carries an OBLIGATION: every directory this call created must be committed
 //! durably (fsynced into its parent, deepest first, plus the parent-of-parent
 //! entry) before the caller may report that it created anything. A bare `bool`
-//! made that obligation implicit: a future edit could return `true` before the
-//! fsync loop ran, and the created-but-not-yet-durable state was representable.
+//! makes that obligation implicit, and the created-but-not-yet-durable state
+//! representable.
 //!
 //! [`CreatedChain`] is that state, and [`CreatedChain::commit`] is the only
 //! function that can produce [`DirChain::Created`] — the `Created` arm's
