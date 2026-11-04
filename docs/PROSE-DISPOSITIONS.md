@@ -160,3 +160,24 @@ derived from, so a later reader can re-check it.
 | API-CONSTRAINTS.md | 7 — strict source walk | kept-corrected | `UnsupportedSink`, `RefuseUnsupported` |
 | API-CONSTRAINTS.md | Mode-spelling paragraph | kept-corrected | `mode_octal`, `compute_tree_digest` |
 | API-CONSTRAINTS.md | Rules for adding a constraint | not-a-claim | — |
+
+## Slice 4 — `src/sync/apply.rs` (change `uotuqmxp`)
+
+Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previously deferred claims fixed here (`prepare`'s "no residue" scoped to lock records/entries, with the SSH preparation residue named; `lock_with_in_root_lock`'s parent directory now a `ResidueBelow` conflict).
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/sync/apply.rs | module doc: intro, destruction invariant, mode-record invariant, failure accounting | kept-corrected | `transfer`, `remove_extraneous`, `forbids_destruction`, `is_prohibited`, `ModeJournal`, `ModeRecord`, `widen_dir_verified`, `begin_mutation`, `derive_report` |
+| src/sync/apply.rs | module doc: kind replacement / reserved namespace / residue; unsupported destinations; refusal vs destruction; ordering | kept-corrected | `claim_aside`, `apply_manifests`, `is_residue_path`, `reconcile_residue`, `may_delete`, `Sanction`, `run_steps`, `verify` |
+| src/sync/apply.rs | module doc: two roots disjoint; lock discipline; non-cooperating writer; far-side session | kept-corrected | `refuse_overlapping_roots`, `DestinationOwnership`, `prepare`, `prepare_identity`, `FileLock`, `SourcePlan::confirm`, `spawn_far_side_lock`, `PERL_HOLD_LOCK_TEMPLATE` |
+| src/sync/apply.rs | module doc: sibling lock record + write-footprint parts (a)(b)(c) | kept-corrected | `destination_lock_path`, `is_residue_path`, `delete_verdict`, `create_lock_parent`, `provision_layout`, `Layout`, `require_existing_root`, `MUX_DIR_NAME` |
+| src/sync/apply.rs | module doc: root pinning; component confinement; root mode not journalled; missing ancestors; path ancestry; manifest addresses; folding | kept-corrected | `LocalSide::{open,manifest,confirm_pinned_root,root_for_mutation}`, `guard_destination`, `COMPONENT_CONFINED`, `ancestor_paths`, `rooted`, `manifest_spelling`, `verify_names`, `case_sensitivity` |
+| src/sync/apply.rs | module doc: fold-test pins; `AppendTail`; closing `Policy` | kept-corrected (2 unverifiable claims deleted) | `filesystem_is_case_insensitive` call sites, `append_attempt`, `append_write`, `Policy`, `ReplaceAll` |
+| src/sync/apply.rs | types/consts/enums: `Mode`, `ASIDE_PREFIX`, `OPERATION_LOCK_SUFFIX`, owner bits, `Direction`, `Extraneous`, `EntryPolicy`, `Policy`, `ReplaceAll`, `ConflictReason`, `Conflict`, `SyncReport`, `SyncResult`, `SyncError` | kept-corrected | their uses in `transfer`/`remove_extraneous`/`derive_report`/`Reconciled::report` |
+| src/sync/apply.rs | lock path: `destination_lock_path`, `RetireOutcome`, `retire_destination_lock`, `create_lock_parent`, `destination_op_id`, `destination_lock_record`, `lock_destination`, `require_existing_root`, `acquire_in_root_lock` | kept-corrected | bodies, `OwnedLockRecord`, `FileLock::acquire`, `ensure_private_dir_durable` |
+| src/sync/apply.rs | `sync`, `DestinationOwnership`, `Prepared`, `prepare`, `require_endpoint_identity`, `dest_root_for`, `dest_is_local_for` | kept-corrected | bodies, `Prepared::matches`, `LocalSide::open`, `prepare_identity`, `source.manifest()` |
+| src/sync/apply.rs | mode journal + pending mutations + claims/sanctions: every `ModeRecord`, `ModeJournal`, `MutationKind`, `MutationAttempt`, `PendingMutations`, `Outcome`, `Claim`, `ClaimDisposition`, `Sanction`, `Removal`, `RenamedEntryLocation` | kept-corrected | their method bodies and call sites |
+| src/sync/apply.rs | `run`, `SourcePlan`, `fail_run`, `source_changed_error`, `Applier` fields, `VerifyPass`, `PreSettleVerified`, `PassReport`, `DeleteRefusal`, `DeleteVerdict`, `StepsRan`→`Settled`→`Reconciled` | kept-corrected | bodies, `provision_layout`, `destination_manifest`, `reserved_entries`, `Reconciled::report` |
+| src/sync/apply.rs | `Applier` methods (report, mutation accounting, conflicts, deletion verdict, widen/guard, removal walk, claim/rollback/reconcile, transfer, append, finalize/restore, verify, listings, case probe) | kept-corrected | each method body and its callees; `CaseProbe`, `CaseSensitivity`, `delete_verdict`, `append_attempt`, `install_file` |
+| src/sync/apply.rs | free helpers (`aside_name`, manifest path helpers, error builders, `ReportClass`/`ReportClaims`/`ReportPartition`, `reserved_roots`, `is_guarded`, `ancestor_paths`, `normalize_root`, `refuse_overlapping_roots`, `Side`, `LocalSide`, `set_local_mode`, `symlink_local`) | kept-corrected | bodies and the `crate::atomic`/`platform` primitives they call |
+| src/sync/apply.rs | all inline comments | kept-corrected / deleted (historical and unverifiable clauses) | the enclosing function body |
