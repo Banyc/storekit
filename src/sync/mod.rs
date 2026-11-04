@@ -5,8 +5,8 @@
 //! from the mutation:
 //!
 //! * [`diff`] — describe each side as a manifest
-//!   ([`crate::manifest::TreeMetadata`]) and classify every path. It mutates
-//!   nothing.
+//!   ([`crate::manifest::TreeMetadata`]) and classify every path. Neither tree
+//!   is mutated.
 //! * [`apply`] — move the eligible entries in the caller's
 //!   [`apply::Direction`], under a caller-supplied [`apply::Policy`], and
 //!   verify what was written.
@@ -24,9 +24,9 @@
 //!
 //! [`apply`] states how each clause is realized: the prohibition is the conflict
 //! record read through the exhaustive [`apply::ConflictReason`] decision (there
-//! is no parallel blocked set), deletion requires the `Sanction` the caller
-//! holds, and a residue path is a state of its own — distinct from a removed
-//! path, so it is reported, never deleted, and still restored.
+//! is no parallel blocked set), deletion requires an explicit `Sanction`, and a
+//! residue path is a state of its own — distinct from a removed path, so it is
+//! reported, never deleted, and still restored.
 //!
 //! # The mode-record invariant
 //!

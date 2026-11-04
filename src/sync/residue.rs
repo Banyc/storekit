@@ -9,11 +9,6 @@
 //! removal of a destination-only directory holding residue is refused as
 //! [`ConflictReason::ResidueBelow`](crate::sync::ConflictReason::ResidueBelow)).
 //!
-//! What was MISSING was a way to put the original back. The old documentation
-//! told the caller to remove each reported path — which DESTROYS the caller's
-//! only copy. This module is the pair of deliberate operations the recovery
-//! recipe actually needs:
-//!
 //! * [`Residue::recover_to`] RENAMES the stranded aside back to the path it
 //!   belongs at;
 //! * [`Residue::discard`] REMOVES it, explicitly, for the case where the caller
@@ -22,8 +17,7 @@
 //! # Why a handle, and why `recover_to` takes a target
 //!
 //! The pair shares ONE precondition (the path really is a stranded residue) and
-//! ONE subject (the aside), and the two operations are exactly the two
-//! decisions a caller can make about it; exposing them as methods on a
+//! ONE subject (the aside); exposing the two operations as methods on a
 //! [`Residue`] makes "I have identified a strand" a state the caller cannot
 //! forget to re-establish before acting. The construction is fallible
 //! ([`Residue::detect`]), so a caller cannot recover or discard a path that is
@@ -34,9 +28,9 @@
 //! (`.sync-aside.<pid>.<n>`) — it never encodes the name it was claimed from.
 //! That is not an oversight: embedding the original name would push the aside
 //! over `NAME_MAX` for an original at the manifest's legal maximum. The caller
-//! knows the original name from [`SyncError::restore_failures`](crate::sync::SyncError)
-//! (whose message names both spellings) or from the source tree it was
-//! restoring.
+//! knows the original name from the `restore_failures` of an UNCONFIRMED move
+//! ([`SyncError::restore_failures`](crate::sync::SyncError), which names both
+//! spellings) or from the source tree it was restoring.
 //!
 //! # Fail closed
 //!
@@ -58,7 +52,8 @@
 //! refusal. A NON-cooperating writer is outside the crate's exclusion, exactly
 //! as it is for every other sync mutation (see [`crate::sync`]'s lock
 //! discipline). The rename is made DURABLE by fsyncing the parent directory
-//! after it lands.
+//! after it lands on a platform whose [`crate::atomic::sync_parent_dir_fd`]
+//! performs the fsync (it is a no-op on Windows).
 
 use crate::atomic::{self, PathKind, RootDir};
 use crate::error::{Error, ReservedKind, Result, StoreKind};
@@ -70,10 +65,9 @@ use std::path::{Path, PathBuf};
 /// component is a claim-aside spelling ([`crate::reserved::is_residue_name`]).
 ///
 /// The proof is the TYPE, not an assertion re-run at every use:
-/// `ResidueAside::parse` is the ONLY constructor and carries the ONE
-/// `NotResidue` refusal, so a [`Residue`] cannot hold a spelling that is not a
-/// strand and no operation has a second spelling gate of its own to disagree
-/// with `detect`.
+/// `ResidueAside::parse` is the ONLY constructor of the handle, so a [`Residue`]
+/// cannot hold a spelling that is not a strand and no operation has a second
+/// spelling gate of its own to disagree with `detect`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResidueAside(RootedRelativePath);
 
@@ -222,11 +216,9 @@ impl Residue {
             )));
         }
         // A target that EXISTS as anything — a regular file, a directory, or a
-        // SYMLINK — is OCCUPIED. Using the live KIND (not the tri-state presence
-        // probe, which REFUSES a symlink with a raw `ELOOP` store error) makes
-        // the symlink-occupant case a TYPED conflict, exactly like a regular
-        // occupant, instead of a `Store("openat ... ELOOP")` a consumer cannot
-        // classify.
+        // SYMLINK — is OCCUPIED. Using the live KIND makes the symlink-occupant
+        // case a TYPED conflict, exactly like a regular occupant, instead of a
+        // `Store("openat ... ELOOP")` a consumer cannot classify.
         if atomic::path_kind_fd(&dir, &target)?.is_some() {
             return Err(Error::reserved(
                 ReservedKind::RecoverTargetOccupied,
@@ -275,11 +267,12 @@ impl Residue {
     /// DISCARD: deliberately remove the stranded aside.
     ///
     /// This is IRREVERSIBLE and is the caller's explicit decision that the
-    /// strand is disposable. It is the only sanctioned break of the crate's
-    /// implicit-removal residue guard: the aside's own spelling is permitted,
-    /// but the LOCK authority still runs and a NESTED residue is still refused
-    /// (a residue inside the strand is a SEPARATE stranded original the caller
-    /// must discard first). A missing aside is an idempotent success.
+    /// strand is disposable. It is the caller-facing sanctioned break of the
+    /// crate's implicit-removal residue guard: the aside's own spelling is
+    /// permitted, but the LOCK authority still runs and a NESTED residue is
+    /// still refused (a residue inside the strand is a SEPARATE stranded
+    /// original the caller must discard first). A missing aside is an
+    /// idempotent success.
     pub fn discard(&self) -> Result<()> {
         // SERIALIZE against a cooperating writer, EXACTLY as `recover_to` does:
         // a sync run holds the destination's operation lock for its whole
@@ -429,9 +422,8 @@ mod tests {
         );
     }
 
-    /// Discard removes a directory strand RECURSIVELY and a file strand with a
-    /// single unlink, and is an idempotent success when the strand is already
-    /// gone.
+    /// Discard removes a directory strand RECURSIVELY and a file strand, and is
+    /// an idempotent success when the strand is already gone.
     #[test]
     fn discard_removes_directory_and_file_strands() {
         let dir = tmpdir();
@@ -451,8 +443,7 @@ mod tests {
     }
 
     /// A discard REFUSES a NESTED residue: the strand holds a second stranded
-    /// original, and the caller must discard that one first. This is the strict
-    /// half of the explicit-discard design — one decision discards one strand.
+    /// original, and that one has to be discarded first.
     #[test]
     fn discard_refuses_a_nested_residue() {
         let dir = tmpdir();
@@ -480,10 +471,9 @@ mod tests {
     }
 
     /// The SPELLING PROOF is the type: a non-residue spelling is refused where
-    /// the aside is NAMED (`ResidueAside::parse`, the only constructor), so no
-    /// handle can carry one and `discard` carries no spelling gate of its own
-    /// to disagree with `detect`. This is the single place the `NotResidue`
-    /// verdict can be produced.
+    /// the aside is NAMED (`ResidueAside::parse`, the only constructor of the
+    /// handle), so no handle can carry one and `discard` carries no spelling
+    /// gate of its own to disagree with `detect`.
     #[test]
     fn the_spelling_proof_refuses_ordinary_content() {
         let dir = tmpdir();
@@ -527,9 +517,7 @@ mod tests {
     }
 
     /// `recover_to` HOLDS the destination operation lock (the SAME
-    /// `FileLock` authority a sync run holds) for its duration. PRE-FIX it took
-    /// no lock at all, so a cooperating writer could install the target inside
-    /// the check-then-rename window and be silently replaced by the rename.
+    /// `FileLock` authority a sync run holds) for its duration.
     #[test]
     fn recover_to_is_serialized_by_the_destination_operation_lock() {
         use crate::lock::FileLock;
@@ -558,11 +546,7 @@ mod tests {
 
     /// `discard` HOLDS the destination operation lock (the SAME
     /// `FileLock` authority a sync run holds) for its duration, exactly like
-    /// `recover_to`. PRE-FIX it opened the root and unlinked the aside with NO
-    /// lock, so a cooperating second process could remove the claim-aside a
-    /// LIVE run created between its claim-aside rename and its
-    /// install/rollback — the run's rollback would then have nothing to
-    /// restore, i.e. the caller's only copy destroyed.
+    /// `recover_to`.
     #[test]
     fn discard_is_serialized_by_the_destination_operation_lock() {
         use crate::lock::FileLock;
@@ -585,10 +569,10 @@ mod tests {
         assert!(fs::symlink_metadata(root.join(".sync-aside.999.0")).is_err());
     }
 
-    /// A consumer can tell DESTROYING A STRAND (`ResidueBelow`) from an
-    /// OCCUPIED recovery target (`RecoverTargetOccupied`) via the TYPED reason,
-    /// without string-matching; and a SYMLINK occupant is that same typed
-    /// conflict, not a raw `Store("openat ... ELOOP")`.
+    /// An OCCUPIED recovery target is the typed
+    /// `ReservedKind::RecoverTargetOccupied` for BOTH a regular occupant and a
+    /// SYMLINK occupant, not a raw `Store("openat ... ELOOP")`; a path that is
+    /// not a residue is refused at detection.
     #[test]
     #[cfg(unix)]
     fn the_reserved_kind_distinguishes_strand_from_occupied_target() {

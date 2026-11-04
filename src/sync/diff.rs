@@ -19,8 +19,8 @@
 //! the perl verification script
 //! ([`crate::manifest::remote_tree_verify_script`]) run through
 //! [`Remote::exec`], and the printed per-entry hashes are assembled with
-//! [`crate::manifest::canonicalize_remote_entries`], so only hashes cross the
-//! link — never the tree bytes.
+//! [`crate::manifest::canonicalize_remote_entries_checked`], so only hashes
+//! cross the link — never the tree bytes.
 //!
 //! [`diff_trees`] classifies every path in the union of the two manifests as
 //! [`EntryDiff::Missing`], [`EntryDiff::Changed`], [`EntryDiff::Extraneous`],
@@ -52,10 +52,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-/// The exec deadline for the far-side tree hashing script. It bounds one perl
-/// process walking the whole tree; 120 s mirrors the source crate's
-/// verification timeout and is long enough for a large tree on a slow host
-/// while still bounding a hung remote.
+/// The exec deadline for the far-side tree hashing script: it bounds one perl
+/// process walking the whole tree, so a hung remote cannot hold the caller
+/// past it.
 pub const REMOTE_MANIFEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The entry kind.
@@ -65,8 +64,7 @@ pub const REMOTE_MANIFEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// ([`TreeEntry::entry_type`]) is what removes the "project the `type` string
 /// into a kind" re-read at every consumer (API constraint #7). A policy keyed
 /// on this kind sees the value the canonicalizer wrote without re-parsing it,
-/// and the wire strings the two producers emit still agree by construction
-/// (the `manifest` suite pins both the bytes and the accepted spellings).
+/// and the wire strings the two producers emit still agree by construction.
 pub use crate::manifest::EntryKind;
 
 /// The classification of one path present in either manifest.
@@ -74,20 +72,23 @@ pub use crate::manifest::EntryKind;
 pub enum EntryDiff {
     /// In the source, not in the destination: the entry must be created.
     Missing,
-    /// Present on both sides, but kind, mode, or content hash differs.
+    /// Present on both sides, but kind, mode, content hash, or symlink target
+    /// differs.
     Changed,
     /// In the destination only. Reported; never deleted unless the caller
     /// explicitly asks.
     Extraneous,
-    /// Present on both sides with identical metadata. Skipped with NO I/O.
+    /// Present on both sides with identical metadata. No content is
+    /// transferred.
     Same,
 }
 
 /// The typed, path-ordered diff between a source and a destination manifest.
 ///
-/// `entries` is sorted by path, so the consuming walk creates each directory
-/// before its children (a parent path is always a proper prefix, hence sorts
-/// first) and the report is deterministic.
+/// `entries` is sorted by path, as is each manifest's own `entries` list, so
+/// a directory path precedes its children (a parent path is a proper prefix,
+/// hence sorts first) and both the consuming walk and the report are
+/// deterministic.
 #[derive(Clone, Debug)]
 pub struct TreeDiff {
     /// The source manifest (the side the content comes from).
@@ -157,9 +158,8 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 ///
 /// This is the STRICT form and it describes the SOURCE side: an entry the
 /// address-fidelity rules cannot represent makes the whole manifest an ERROR.
-/// Use it for
-/// the tree
-/// the content comes FROM. For the DESTINATION a caller must use
+/// Use it for the tree the content comes FROM. For the DESTINATION a caller
+/// must use
 /// [`remote_destination_manifest`], which returns those entries in
 /// [`DestinationTree::unsupported`] instead of refusing the tree; that is
 /// exactly how the engine describes a destination, so a consumer that builds a
@@ -183,25 +183,24 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// remote command is `ssh … exec -- perl -e <script> <root>`. `ssh` reserves
 /// exit status 255 for its OWN failures, but a far-side `perl` `die` ALSO
 /// exits 255: perl exits 255 when `$!` is 0, and the crate's own script
-/// measures exactly that for a NON-NFC entry name and for a name (or symlink
-/// target) whose diagnostic is hex-encoded (measured on macOS perl 5.34.1 and
-/// Linux perl 5.40.1, invoked exactly as the crate invokes it). An ABSENT root
+/// reaches that arm for a NON-NFC entry name and for a name (or symlink
+/// target) whose diagnostic is hex-encoded. An ABSENT root
 /// and a root that is not a directory both exit 2 instead: `perl -e`'s module
 /// loading leaves `$!` = ENOENT, so the script's `absent:` / `not a
 /// directory:` `die` propagates 2. They are told apart by the DIAGNOSTIC, not
 /// the status: `absent:` maps to [`Error::NotFound`] and `not a directory:`
 /// stays a script failure. Exit 255 alone therefore establishes nothing. The
-/// layer is
-/// attributed only from a POSITIVE diagnostic at the START of a stderr line
-/// ([`transport_failed_before_the_command`], [`far_side_script_failed`]);
-/// when neither the transport's markers nor the script's own closed `die`
-/// vocabulary is present, the exit status and preserved stderr are reported
-/// as an UNDETERMINED failure rather than being blamed on any layer. Only the
-/// shell's "could not start perl" statuses (126/127) suggest that `perl` may
-/// be absent, and even those are VETOED by a positive script `die` diagnostic:
-/// on Linux 126/127 are real errno values (ENOKEY / EKEYEXPIRED) that a
-/// far-side `die` propagates, so the script's own anchored words outrank the
-/// bare status.
+/// layer is attributed only from evidence the classifier reads — the typed
+/// [`TimeoutCause`], a POSITIVE diagnostic at the START of a stderr line
+/// ([`transport_failed_before_the_command`], [`far_side_script_failed`]), or
+/// the shell's 126/127 "could not start" status ([`perl_could_not_start`]) —
+/// and when none of those matches, the exit status and preserved stderr are
+/// reported as an UNDETERMINED failure rather than being blamed on any layer.
+/// Only the shell's "could not start perl" statuses (126/127) suggest that
+/// `perl` may be absent, and even those are VETOED by a positive script `die`
+/// diagnostic: on Linux 126/127 are real errno values (ENOKEY / EKEYEXPIRED)
+/// that a far-side `die` propagates, so the script's own anchored words
+/// outrank the bare status.
 pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
     // SELF-PREPARE: the public primitive a consumer calls must not depend on an
     // undocumented extra caller step. The sync entry points already call
@@ -215,7 +214,7 @@ pub fn remote_manifest(remote: &dyn Remote) -> Result<TreeMetadata> {
         // The transport declares the root LOCAL: canonicalize it in process,
         // but refuse an absent or non-directory root rather than synthesizing
         // an empty manifest from it. The synthesised-empty shortcut is what
-        // would let a `delete_extraneous` sync read unreadable far-side state
+        // would let an `Extraneous::Delete` sync read unreadable far-side state
         // as "nothing is there" and destroy it.
         return match std::fs::symlink_metadata(root) {
             Ok(meta) if meta.is_dir() => canonicalize_tree(root),
@@ -423,21 +422,7 @@ pub(crate) fn strip_reserved(mut meta: TreeMetadata, reserved: fn(&str) -> bool)
 /// * NONE of the above is established — the exit status and preserved stderr
 ///   are reported as UNDETERMINED, naming no layer. This is the honest
 ///   outcome for a status no rule covers (200, a signal-killed `137` with
-///   empty stderr, a locally-generated outlier): an earlier version asserted
-///   the far-side script here, which is a layer it cannot establish.
-///
-/// Pre-fix every non-zero exit appended "(is perl installed on the remote
-/// host?)", so an `ssh` exit 255 — including the `unix_listener:` control-
-/// socket bind failure — was mislabeled as a missing interpreter; the fix
-/// after that made every exit 255 transport, which mislabeled the script's
-/// own `die`-at-255 refusals; the fix after that DELETED `Permission denied`
-/// from the transport markers on the stated grounds that the script prints it,
-/// which mislabeled a real ssh authentication failure at 255 (the script's
-/// own `Permission denied` path exits 13, so inside the 255 gate the phrase is
-/// NOT the script). This version restores authentication recognition inside
-/// the 255 gate and attributes the layer from EVIDENCE in stderr — anchored at
-/// a line start — reporting an undetermined failure rather than asserting ssh,
-/// connection, authentication, or the script.
+///   empty stderr, a locally-generated outlier).
 fn remote_manifest_failure(root: &Path, out: &ExecOutcome) -> Error {
     let stderr = out.stderr.trim();
     let stderr = if stderr.is_empty() {
@@ -560,7 +545,7 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
     if far_side_script_failed(out) {
         return false;
     }
-    // EVIDENCE-BACKED (POSIX shells; measured on macOS and Linux): 126 = found
+    // EVIDENCE-BACKED (POSIX shells): 126 = found
     // but not executable, 127 = not found. The remote command is
     // `exec -- perl -e …`, so both statuses name the `perl` program. The
     // STATUS is the primary signal — a real shell that cannot find `perl`
@@ -614,9 +599,6 @@ fn perl_could_not_start(out: &ExecOutcome) -> bool {
 /// `x\nssh: connect to host evil port 1: Connection refused\ny` holding any
 /// non-NFC entry exits 255 and puts `ssh: connect to host evil port 1:
 /// Connection refused` at the start of a line, which classifies as transport.
-/// (The earlier documented example — `not a directory: $root` echoing the root
-/// raw — was WRONG: measured, that spelling exits 2 and correctly lands in the
-/// script branch, because `perl -e`'s module loading leaves `$!` = ENOENT.)
 /// The root is chosen by the CALLER, never by the tree being described, and
 /// [`crate::transport::SshTransport::new`] validates only ABSOLUTENESS and the
 /// presence of a normal component below the filesystem root — it does not
@@ -665,7 +647,7 @@ fn stderr_line_starts_with(stderr: &str, marker: &str) -> bool {
 /// Whether `stderr` carries an OpenSSH authentication failure at the start of
 /// a line.
 ///
-/// EVIDENCE-BACKED (OpenSSH 10.2p1, macOS and Linux): a rejected public-key
+/// EVIDENCE-BACKED (OpenSSH): a rejected public-key
 /// authentication prints `<user>@<host>: Permission denied (publickey).`,
 /// whose line START is the `user@host` shape, so it cannot be matched by the
 /// bare marker `Permission denied` at line start. The pattern is anchored
@@ -689,9 +671,8 @@ fn stderr_is_auth_failure(stderr: &str) -> bool {
 }
 
 /// EVIDENCE-BACKED OpenSSH diagnostics for a failure BEFORE the far-side
-/// command ran, each at the START of a stderr line. Observed from real
-/// OpenSSH 10.2p1 on macOS and Linux; the authentication shape is handled
-/// separately by [`stderr_is_auth_failure`]. `unix_listener:` is the
+/// command ran, each at the START of a stderr line. The authentication shape
+/// is handled separately by [`stderr_is_auth_failure`]. `unix_listener:` is the
 /// `ControlMaster` control-socket bind failure; `kex_exchange_identification`
 /// is a pre-auth key-exchange failure.
 ///
@@ -720,11 +701,6 @@ fn transport_marker_at_line_start(stderr: &str) -> bool {
         .any(|marker| stderr_line_starts_with(stderr, marker))
 }
 
-/// The far-side manifest script's own closed `die` vocabulary. Every entry is
-/// the literal start of a stderr line the script writes before exiting
-/// non-zero (see [`crate::manifest::remote_tree_verify_script`]); the
-/// vocabulary is closed because the script has exactly one `die` per
-/// condition and nothing else writes its stderr.
 /// The far-side script's ABSENT-ROOT diagnostic, at the START of a stderr line
 /// (see [`crate::manifest::remote_tree_verify_script`]). Distinct from
 /// [`SCRIPT_DIE_PREFIXES`]'s `not a directory: ` on purpose: the first is the
@@ -732,6 +708,11 @@ fn transport_marker_at_line_start(stderr: &str) -> bool {
 /// exists but cannot be described.
 const ABSENT_ROOT_PREFIX: &str = "absent: ";
 
+/// The far-side manifest script's own closed `die` vocabulary. Every entry is
+/// the literal start of a stderr line the script writes before exiting
+/// non-zero (see [`crate::manifest::remote_tree_verify_script`]); the
+/// vocabulary is closed because the script has exactly one `die` per
+/// condition and nothing else writes its stderr.
 const SCRIPT_DIE_PREFIXES: &[&str] = &[
     "absent: ",
     "not a directory: ",
@@ -948,7 +929,7 @@ mod tests {
         }
     }
 
-    /// Gap 4: the RAW diff of the public primitives is NOT `apply`'s decision
+    /// The RAW diff of the public primitives is NOT `apply`'s decision
     /// surface. A stranded SOURCE `.sync-aside` reads as `Missing` (the engine
     /// refuses it with a `ReservedName` conflict) and a stranded DESTINATION
     /// `.sync-aside` reads as `Extraneous` — i.e. DELETABLE — while the engine
@@ -1085,11 +1066,9 @@ mod tests {
 
     /// `remote_manifest` and `remote_destination_manifest` PREPARE the
     /// transport's host identity before their first remote request, exactly as
-    /// the sync entry points do. Pre-fix they did not, so a fresh
-    /// `SshTransport` failed a status-only read with
-    /// `unix_listener: cannot bind to path .../dmux/...`. The probe refuses any
-    /// `exec` before preparation, so the primitive's OWN call is the only thing
-    /// that can make this pass.
+    /// the sync entry points do. The probe refuses any `exec` before
+    /// preparation, so the primitive's OWN call is the only thing that can make
+    /// this pass.
     #[test]
     fn manifest_primitives_prepare_the_transport_identity() {
         let dir = fixture_tmpdir(&SysEnv::from_process()).unwrap();
@@ -1147,9 +1126,8 @@ mod tests {
         );
     }
 
-    /// A manifest entry kind outside the canonical set is refused, and the
-    /// refusal now lives at the WIRE boundary (`Deserialize`) rather than in a
-    /// per-consumer projection: a JSON record naming an unknown kind cannot
+    /// A manifest entry kind outside the canonical set is refused at the WIRE
+    /// boundary (`Deserialize`): a JSON record naming an unknown kind cannot
     /// become a [`crate::manifest::TreeEntry`] at all.
     #[test]
     fn unknown_entry_type_is_refused_at_deserialization() {
@@ -1255,7 +1233,7 @@ mod tests {
 
         // An ABSENT root is an ERROR, never a synthesized empty manifest: an
         // absent far side must not read as "the far side described an empty
-        // tree", which is what lets a `delete_extraneous` sync destroy data.
+        // tree", which is what lets an `Extraneous::Delete` sync destroy data.
         // It is the TYPED absence condition (`Error::NotFound`), distinct from
         // an unreachable host or a transport failure.
         let absent = dir.path().join("absent");
@@ -1290,12 +1268,10 @@ mod tests {
         );
     }
 
-    /// Gap 5: the far side DISTINGUISHES an absent root from a root that is not
-    /// a directory, and the classifier turns the absent diagnostic into the
+    /// The far side DISTINGUISHES an absent root from a root that is not a
+    /// directory, and the classifier turns the absent diagnostic into the
     /// typed [`Error::NotFound`] instead of an undifferentiated transport
-    /// error. The REAL script is run on an absent root; before the fix both
-    /// cases printed `not a directory:` and a consumer had to string-match (or
-    /// probe with `exec`) to tell an absent far side from an unreachable host.
+    /// error. The REAL script is run on an absent root.
     #[test]
     fn an_absent_remote_root_is_the_typed_not_found_condition() {
         if !perl_on_path() {
@@ -1344,8 +1320,7 @@ mod tests {
     }
 
     /// F3: an `ssh`-level failure (exit 255, no far-side command) is reported
-    /// as a TRANSPORT failure and is NOT blamed on a missing `perl`. Pre-fix
-    /// every non-zero exit appended "(is perl installed on the remote host?)".
+    /// as a TRANSPORT failure and is NOT blamed on a missing `perl`.
     #[test]
     fn an_ssh_level_failure_is_not_blamed_on_perl() {
         let out = ExecOutcome {
@@ -1372,8 +1347,9 @@ mod tests {
         );
     }
 
-    /// F3: the perl-missing suggestion is reserved for the shell's "could not
-    /// start perl" status (126/127).
+    /// F3: the perl-missing suggestion is emitted for the shell's 126/127
+    /// "could not start perl" statuses and for an anchored not-found
+    /// diagnostic.
     #[test]
     fn a_missing_perl_is_reported_as_the_perl_stage() {
         let out = ExecOutcome {
@@ -1396,8 +1372,7 @@ mod tests {
     /// stay a far-side script failure, naming the exit status and preserved
     /// stderr.
     ///
-    /// The three inputs are REAL script output, measured identically on macOS
-    /// perl 5.34.1 and Linux perl 5.40.1 (see
+    /// The three inputs are REAL script output (see
     /// `real_script_statuses_classify_as_the_far_side_script`, which produces
     /// them from the script itself):
     /// * the non-NFC and LF/TAB inputs are the script's NFC and
@@ -1411,11 +1386,6 @@ mod tests {
     ///   exits 255, exactly as the non-NFC input does), and the real 2 is
     ///   pinned by `a_script_level_failure_is_reported_as_the_far_side_script`
     ///   and by the real-script test.
-    ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the inputs returned
-    /// "the transport failed before the far-side command started (exit 255): …
-    /// (this is a transport-level failure — connection, authentication, host
-    /// key, or the ssh control socket)".
     #[test]
     fn a_far_side_perl_die_at_255_is_not_a_transport_failure() {
         for stderr in [
@@ -1459,12 +1429,6 @@ mod tests {
     /// transport evidence (it is ambiguous — ssh authentication failures say it
     /// too, but those still exit 255). Exit 13 with this stderr is a far-side
     /// script failure.
-    ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the input returned
-    /// "the transport failed before the far-side command started (exit 13):
-    /// opendir /srv/store/sub: Permission denied (this is a transport-level
-    /// failure — connection, authentication, host key, or the ssh control
-    /// socket)".
     #[test]
     fn a_script_eacces_with_permission_denied_is_not_a_transport_failure() {
         let out = ExecOutcome {
@@ -1489,10 +1453,8 @@ mod tests {
     }
 
     /// F1: the transport branch is retained for exit 255 that DOES carry a
-    /// strong, unambiguous transport diagnostic. This guards against
-    /// overcorrecting the "255 alone is not transport" rule into "255 is never
-    /// transport". (This assertion also holds pre-fix, which is the point: the
-    /// fix must not lose the genuine case.)
+    /// strong, unambiguous transport diagnostic: the "255 alone is not
+    /// transport" rule must not become "255 is never transport".
     #[test]
     fn an_exit_255_with_a_strong_transport_marker_is_transport() {
         for stderr in [
@@ -1523,10 +1485,6 @@ mod tests {
     /// F1: the only branch that is a statement about `perl` itself is the
     /// remote shell's 126/127 ("found but not executable" / "not found"), with
     /// or without the wrapper's not-found diagnostic.
-    ///
-    /// PRE-FIX BEHAVIOUR: this already classified correctly (the pre-fix
-    /// classifier reached the `perl` stage for 126/127 and for the diagnostic
-    /// spellings); the test pins that the fix did not move it.
     #[test]
     fn perl_could_not_start_is_the_perl_stage() {
         for (code, stderr) in [
@@ -1582,18 +1540,12 @@ mod tests {
     /// TRANSPORT — not to the far-side script (the regression this change
     /// fixes) and not to `perl`.
     ///
-    /// EVIDENCE: OpenSSH 10.2p1 on macOS and Linux (`ssh -o BatchMode=yes …
+    /// EVIDENCE: OpenSSH (`ssh -o BatchMode=yes …
     /// nonexistentuser@localhost true`) prints the first shape; the others are
     /// OpenSSH's spellings for a disconnect, an unresponsive server, and too
     /// many authentication attempts. The leading `Warning:` line in the second
     /// case proves the auth match is LINE-ANCHORED rather than a substring of
     /// the first line.
-    ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the first shape
-    /// returned "remote tree verification at /srv/store failed inside the
-    /// far-side manifest script (exit 255): nonexistentuser@localhost:
-    /// Permission denied (publickey)." — a transport failure blamed on the
-    /// script.
     #[test]
     fn real_ssh_auth_failure_shapes_are_transport() {
         for stderr in [
@@ -1665,13 +1617,7 @@ mod tests {
 
     /// F1: a status no rule classifies must NOT be blamed on any layer — the
     /// message reports the KNOWN exit status and stderr and says the layer is
-    /// undetermined. The previous fallback asserted "failed inside the
-    /// far-side manifest script" for exactly these inputs, which is a layer it
-    /// cannot establish.
-    ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): every input returned
-    /// "… failed inside the far-side manifest script (exit N): …" — a
-    /// confident wrong layer.
+    /// undetermined.
     #[test]
     fn an_unclassified_exit_names_no_layer() {
         for (code, stderr) in [
@@ -1727,12 +1673,10 @@ mod tests {
 
     /// F2: marker and `perl`-not-found matches are LINE-ANCHORED, so a raw
     /// non-NFC entry name cannot spoof a layer. Each name below is exactly the
-    /// text the script would echo raw after its own `die` prefix; before
-    /// anchoring, every one of them routed the failure to the transport (or
-    /// the perl) branch.
+    /// text the script would echo raw after its own `die` prefix.
     ///
     /// EVIDENCE: the script's `entry name under $dir is not NFC-normalized:
-    /// $n` line, with `$n` measured echoed raw on both platforms (see
+    /// $n` line, with `$n` echoed raw (see
     /// `real_script_raw_non_nfc_name_does_not_spoof_transport`, which feeds
     /// the script's OWN output).
     #[test]
@@ -1905,8 +1849,8 @@ mod tests {
     }
 
     /// The classifier is pinned to the [status, stderr] the REAL far-side
-    /// script emits, measured identically on macOS perl 5.34.1 and Linux perl
-    /// 5.40.1 under the crate's own `perl -e <script> <root>` invocation:
+    /// script emits under the crate's own `perl -e <script> <root>`
+    /// invocation:
     ///
     /// * root EXISTS but is not a directory -> 2 (`not a directory: …`);
     /// * root is ABSENT                    -> 2 (`absent: …`, a DISTINCT
@@ -1916,12 +1860,6 @@ mod tests {
     /// * a non-NFC entry name              -> 255 (name echoed RAW);
     /// * an entry name with LF             -> 255 (name HEX-encoded);
     /// * an empty directory                -> 0   (the empty manifest).
-    ///
-    /// This corrects the module's earlier claim that the script's
-    /// non-directory-root refusal "exits 255": under the invocation the crate
-    /// actually uses it exits 2 (`perl -e`'s module loading leaves `$!` =
-    /// ENOENT). Only a `perl <file>` invocation (never used here) exits 255 for
-    /// that refusal — the source of the original mistake.
     #[test]
     fn real_script_statuses_classify_as_the_far_side_script() {
         if !perl_on_path() {
@@ -2062,13 +2000,8 @@ mod tests {
     /// EKEYEXPIRED and 126 = ENOKEY are REAL errno values that keyring-backed
     /// trees (fscrypt, AFS) return, and the script's `die` propagates `$!`, so
     /// the bare status proves nothing about starting `perl`. The decisive
-    /// cross-check is that the SAME stderr at exit 5 already classified as the
-    /// script — the STATUS ALONE was the misrouting signal.
-    ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the 127/126 inputs
-    /// returned "remote tree verification at /srv/store could not start the
-    /// far-side `perl` (exit 127): open /srv/store/x: Key has expired (is perl
-    /// installed on the remote host?)".
+    /// cross-check is that the SAME stderr at exit 5 also classifies as the
+    /// script, so the STATUS ALONE was the only differing input.
     #[test]
     fn f1_a_script_die_that_propagates_126_or_127_is_the_far_side_script() {
         for (code, stderr) in [
@@ -2116,10 +2049,8 @@ mod tests {
 
     /// F1 ground truth from the REAL interpreter, not from reasoning: perl's
     /// `die` propagates `$!` as the exit status, so `$! = 127` exits 127 with
-    /// the script's own `open …` diagnostic on stderr. Measured on macOS perl
-    /// 5.34.1 (`open /srv/store/x: 127`, no errno string) and Linux perl
-    /// 5.40.1 (`open /srv/store/x: Key has expired`); BOTH start with the
-    /// script's `open ` die prefix, so both must classify as the script.
+    /// the script's own `open …` diagnostic on stderr, which starts with the
+    /// script's `open ` die prefix and therefore classifies as the script.
     #[test]
     fn f1_a_real_interpreter_die_at_127_is_the_far_side_script() {
         if !perl_on_path() {
@@ -2155,8 +2086,7 @@ mod tests {
     /// F1: the veto is safe only because the script's closed `die` vocabulary
     /// and the perl-not-found markers are DISJOINT. Every die prefix is a bare
     /// word (`open `, `lstat `, …); every not-found marker begins `perl:`, so
-    /// neither appears at the start of the other's line. The enumeration is
-    /// the verification of the reordering claim, not a hand-wave.
+    /// neither appears at the start of the other's line.
     #[test]
     fn the_script_die_vocabulary_and_the_perl_not_found_markers_do_not_collide() {
         const PERL_NOT_FOUND: &[&str] = &[
@@ -2189,13 +2119,6 @@ mod tests {
     /// F2: the classifier must read the typed [`TimeoutCause`], never the bare
     /// `exit_code == -1` (which a signal-killed child also produces). The drain
     /// case must NOT be blamed on the transport-before-command layer.
-    ///
-    /// PRE-FIX MISCLASSIFICATION (probe, before the fix): the drain input
-    /// returned "remote tree verification at /srv/store could not run: the
-    /// transport failed before the far-side command started (exit -1): … left
-    /// processes holding its output pipes open (this is a transport-level
-    /// failure — connection, …)"; the bare `-1` input returned the same
-    /// transport-before-command message.
     #[test]
     fn f2_the_typed_cause_not_the_status_alone_classifies_the_deadline() {
         // (a) The deadline killed a RUNNING command: transport-before-command.
@@ -2382,7 +2305,7 @@ mod tests {
             );
         }
         // An ABSENT root is not a transport failure at all, so it carries no
-        // transport kind — the distinction the migration needed.
+        // transport kind.
         let absent = ExecOutcome {
             exit_code: 2,
             stdout: String::new(),
@@ -2397,8 +2320,7 @@ mod tests {
     /// THE MUTATION CONTROL. The layer kinds must be PAIRWISE DISTINCT and none
     /// may be `Unclassified`: collapsing two layers onto one kind (the
     /// mutation this control detects) fails here while every message-substring
-    /// test above would still pass. The first case is the exact doctrine
-    /// defect — an unreachable host reported as a far-side script failure.
+    /// test above would still pass.
     #[test]
     fn manifest_failure_layer_kinds_are_pairwise_distinct() {
         let outcomes = [
