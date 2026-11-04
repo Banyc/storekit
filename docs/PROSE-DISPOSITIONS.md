@@ -102,3 +102,61 @@ derived from, so a later reader can re-check it.
 | MIGRATION.md | `ckpt` intro | not-a-claim | — |
 | MIGRATION.md | `ckpt` adopts table | corrected (hard-link sentence scoped to the adopted primitives) | `atomic::{path_kind_fd,read_fd,write_atomic_cas_fd,...}`, `ensure_private_dir_durable_fd`, `RootedRelativePath` |
 | MIGRATION.md | `ckpt` does not adopt / Validation | kept / not-a-claim | `EntryPolicy::AppendTail`, `id_newtype!`, `LockFileEx`/`flock` |
+
+## Slice 2 — `docs/CONSISTENCY.md`, `docs/API-CONSTRAINTS.md` (change `wlxrtmms`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| CONSISTENCY.md | Title + defect definition | not-a-claim | — |
+| CONSISTENCY.md | Out of scope (races/TOCTOU) | not-a-claim | — |
+| CONSISTENCY.md | The axes (A–M) | kept-corrected ("what it has caught" column deleted) | the 13 axes' named symbols |
+| CONSISTENCY.md | Rules preamble | kept-corrected ("learned by finding the opposite" deleted) | — |
+| CONSISTENCY.md | Rule: claim is a measurement | not-a-claim | — |
+| CONSISTENCY.md | Rule: one authority | kept-corrected | `crate::atomic`, `platform::chmod`, `from_manifest` |
+| CONSISTENCY.md | Remaining rules (denial, removal-test, derivation, deletion, no-decoration, unforgeable, residual, every-copy) | not-a-claim | — |
+| CONSISTENCY.md | Stated residuals intro | kept-corrected | policy kept; drift-devices sentence deleted |
+| CONSISTENCY.md | Funnel completeness | kept-corrected | `lib.rs` deny, `every_production_libc_reference_is_pinned`, `std_fs_name_mutation_counts_are_pinned`, `clippy.toml` |
+| CONSISTENCY.md | Far-side root unresolvable | kept-corrected | `refuse_overlapping_roots`, its test, module docs |
+| CONSISTENCY.md | Count pins pin call counts | kept-corrected | pin mechanism; unearned parenthetical deleted |
+| CONSISTENCY.md | Deny list resolved symbols | kept-corrected | `clippy.toml`, `GetFileInformationByHandle`/`LockFileEx` |
+| CONSISTENCY.md | Funnel-side pin syntactic | kept-corrected | `std_fs` pin, builder test, README (c) |
+| CONSISTENCY.md | `libc` pin token scan | kept-corrected | `libc_alias_routes…`, `every_mutation_symbol…` |
+| CONSISTENCY.md | Windows compare-and-replace / symlink | kept-corrected | `write_atomic_if_match_fd`, `replace_core` |
+| CONSISTENCY.md | Far-side holder parent checks | kept-corrected | `FileLock::acquire`, `PERL_HOLD_LOCK_TEMPLATE` |
+| CONSISTENCY.md | `FileLock::acquire` immediate parent | kept-corrected | `lock/mod.rs` |
+| CONSISTENCY.md | No deny entry checked for resolution | kept-corrected | `pathname_socket_binds…`, `libc_alias_routes…` |
+| CONSISTENCY.md | Wire reader validates shapes | kept-corrected | `mode_octal`, `schema_version_wire`, `verify_tree_metadata` |
+| CONSISTENCY.md | `std::fs` audit parses sources | kept-corrected | `std_fs_audit` |
+| CONSISTENCY.md | Identity injectivity on folding hosts | kept-corrected | `is_unaddressable_name`, `fold_lock_record_component` |
+| CONSISTENCY.md | Races/interleavings/TOCTOU | not-a-claim | — |
+| CONSISTENCY.md | Windows port compiles/lints | kept-corrected | `atomic/windows.rs`, windows gate |
+| CONSISTENCY.md | Unforgeability is type-level | kept-corrected | private-field proofs, `compile_fail` doctests |
+| API-CONSTRAINTS.md | Title + intro | kept-corrected | measure-by-deletion kept; earned-by-defect deleted |
+| API-CONSTRAINTS.md | "Removes from the impl" column | deleted (8 retrospective cells; stale `validate_rel`, `EntryKind::of`, `parse_mode`) | — |
+| API-CONSTRAINTS.md | Row 1 pair / pair-less | kept-corrected | `RootDir`, `RootedRelativePath`, `PAIR-LESS-MUTATIONS`, its tests |
+| API-CONSTRAINTS.md | Row 2 ownership one axis | kept-corrected | `DestinationOwnership`, `Prepared`, four `PreflightKind`s, per-direction tests |
+| API-CONSTRAINTS.md | Row 3 containment one authority | kept-corrected | `SymlinkContainmentIndex`, `live_entry_kinds` |
+| API-CONSTRAINTS.md | Row 4 typed kinds | kept-corrected | `ReservedKind`, `MaterializationKind`, `StoreKind`, `TransportKind`, `PreflightKind` |
+| API-CONSTRAINTS.md | Row 5 reserved spellings value | kept-corrected | `Sanction`, `GuardedRel` |
+| API-CONSTRAINTS.md | Row 6 bounds constants | kept-corrected | `NAME_MAX`, `MAX_ANCESTRY`, `BOUNDED_TRUNK_BRANCH_SLACK`, `SIDECAR_WAIT_TIMEOUT` |
+| API-CONSTRAINTS.md | Row 7 one direction per type | kept-corrected | `DestinationTree`, two `compile_fail` doctests |
+| API-CONSTRAINTS.md | Row 8 weak path named | kept-corrected | the five R items |
+| API-CONSTRAINTS.md | Pair-less mutations block | kept-corrected | pair-less test, `PERL_HOLD_LOCK_TEMPLATE` |
+| API-CONSTRAINTS.md | Constraint 8 intro | not-a-claim | — |
+| API-CONSTRAINTS.md | C — wire assembler completeness | kept-corrected | `CompleteListing::new`, `canonicalize_remote_entries_*_checked` |
+| API-CONSTRAINTS.md | N — unconfined atomic replace | kept-corrected | `write_atomic_replace(_fd)` |
+| API-CONSTRAINTS.md | N — `Remote::exists` | kept-corrected | `exists` default, `metadata_opt` |
+| API-CONSTRAINTS.md | N — `Remote::lock_far_side` | kept-corrected | `FarSideLockUnsupported`, `lock_remote`, `Unowned` |
+| API-CONSTRAINTS.md | N — enumerated path-based mutators | kept-corrected | pair-less block |
+| API-CONSTRAINTS.md | R — `Remote::exec` | kept-corrected | `exec` residual docs |
+| API-CONSTRAINTS.md | R — `fsync_tree`/`fsync_parent` defaults | kept-corrected | trait defaults + overrides |
+| API-CONSTRAINTS.md | R — `remove_file_if` default | kept-corrected | trait default, `OwnedLockRecord` |
+| API-CONSTRAINTS.md | R — weaker paths named at the item | kept-corrected | `*_destination`, `COMPONENT_CONFINED`, `cp -a`, `AppendTail` |
+| API-CONSTRAINTS.md | R — `is_reserved_*` narrower | kept-corrected | `is_reserved_*`, `is_unaddressable_*`, diff strip |
+| API-CONSTRAINTS.md | Out of scope — `Tracer::new(bool)` | kept-corrected | `trace.rs` |
+| API-CONSTRAINTS.md | What constraint 7 closed — intro | kept-corrected | historical sentence deleted |
+| API-CONSTRAINTS.md | 7 — entry kind/mode validated | kept-corrected | `TreeEntry`, `mode_octal`, `verify_tree_metadata` |
+| API-CONSTRAINTS.md | 7 — destination observation distinct | kept-corrected | `DestinationTree`, two `compile_fail` doctests |
+| API-CONSTRAINTS.md | 7 — strict source walk | kept-corrected | `UnsupportedSink`, `RefuseUnsupported` |
+| API-CONSTRAINTS.md | Mode-spelling paragraph | kept-corrected | `mode_octal`, `compute_tree_digest` |
+| API-CONSTRAINTS.md | Rules for adding a constraint | not-a-claim | — |
