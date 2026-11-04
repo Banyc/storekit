@@ -83,7 +83,9 @@ the symbols it was derived from, so a later reader can see what was opted in
 and what was removed rather than assumed.
 
 **Slices** — each is a declared, committed scope; a slice touches only its own
-files and appends its own ledger rows.
+files and RETURNS its own disposition rows (file, section, disposition,
+symbols). The master appends those rows to `docs/PROSE-DISPOSITIONS.md` when it
+lands the slice, so slices never edit the ledger and cannot conflict on it.
 
 1. `docs/HIDDEN-STATE-MACHINES.md`.
 2. `docs/CONSISTENCY.md`, `docs/API-CONSTRAINTS.md`.
