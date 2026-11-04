@@ -98,14 +98,6 @@ A slice is done when every comment/doc site in its files is dispositioned and
 the diff matches the ledger. Reviewers check the ledger and the re-derivation,
 not the prose's style.
 
-**Pending dispositions.** `src/sync/apply.rs`, `prepare`'s doc paragraph: "so a
-refusal leaves no residue" is false on the SSH path (`prepare_identity` creates
-the mux directory and possibly the known-hosts pin before the strict source
-read). `lock_with_in_root_lock`'s doc and its module-docs twin: a destination
-parent directory that holds the in-root record is refused by `delete_verdict`
-as a `ResidueBelow` CONFLICT, not "reported as residue". Both are corrected or
-deleted by the slice that covers that file; neither is re-opened here.
-
 ## Store substrate
 
 ### Lock-record lifecycle
@@ -382,8 +374,8 @@ as failed.
 
 ### Run phase pipeline
 
-**Where.** `sync::{sync, run}`; `sync::apply::{Applier::run, run_steps,
-settle, VerifyPass, PreSettleVerified, derive_report}`.
+**Where.** `sync::sync`; `sync::apply::{run, Applier::run, run_steps, settle,
+VerifyPass, PreSettleVerified, derive_report}`.
 
 **States.** Preflight → lock → provision remote destination → destination
 manifest → reserved strip and diff → unsupported-destination preflight →
@@ -547,7 +539,7 @@ is not; an unconfirmable probe records a candidate consumed by
 the live destination and routes an unconfirmable one to `indeterminate` plus a
 restore failure naming both possible spellings.
 
-**Watch.** The report's lists assert existence and contain only confirmed
+**Watch.** The `residue` list asserts existence and contains only confirmed
 paths. The possibility channel asserts no location. A claim carries no kind, so
 the removal primitive reads the live kind at its own entry.
 
@@ -731,7 +723,7 @@ one path's own name and kind.
 
 ### Source-quiescence two-sample check
 
-**Where.** `sync::run`; `sync::apply::{SourcePlan, SourcePlan::confirm,
+**Where.** `sync::apply::run`; `sync::apply::{SourcePlan, SourcePlan::confirm,
 source_changed_error, fail_run}`.
 
 **States.** Plan read before locking; source stable at the post-run re-read;
@@ -776,10 +768,10 @@ kind and the fields an entry carries cannot disagree and the symlink's fixed
 `0o777` exists in one place (one variant per kind, not a kind plus a field set
 computed beside it). BOTH walks build this value and push it. `EntryAssembler`:
 the growing entry vector and the `seen` set, finished with the `ShownPath` the
-refusal names the link by. `CompleteListing` carries the listing text and the
-root it describes TOGETHER with the producing walk's exit status. The walk has
-no state type ACROSS entries: each classification is built, pushed and dropped
-inside one loop iteration.
+refusal names the link by. `CompleteListing` ties the listing text and the root
+it describes to a producing walk that exited zero. The walk has no state type
+ACROSS entries: each classification is built, pushed and dropped inside one
+loop iteration.
 
 **Transitions.** `EntryAssembler::push` validates the spelling, refuses a
 duplicate, and appends; `EntryAssembler::finish` CONSUMES the assembler, runs
