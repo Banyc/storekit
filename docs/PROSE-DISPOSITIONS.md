@@ -190,3 +190,12 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/sync/residue.rs | module doc, `Residue`, `ResidueAside::parse`, `detect`, `operation_lock`, `recover_to`, `discard` | kept-corrected | bodies, lock acquisition, `ReservedKind::{RecoverTargetOccupied,ResidueNotAnEntry}` |
 | src/sync/diff.rs | module doc, `diff_source_and_destination`, `apply_manifests`, `strip_reserved`, remote-manifest status parsing | kept-corrected (glued doc comment repaired) | `manifest_entry_equal`, `build_metadata`, `canonicalize_remote_entries_checked`, `ABSENT_ROOT_PREFIX`, `SCRIPT_DIE_PREFIXES`, `perl_could_not_start`, `TransportKind` |
 | src/sync/apply/tests.rs | test doc comments + assertion message strings | kept-corrected (report-lists comment scoped: four lists exclusive, `transient_dirs` holds widened `Same` dirs) | the tests' own assertions, `derive_report`, `ReportClass`, `journal.is_widened` |
+
+## Slice 6 — `src/atomic/guard.rs` (change `lqkoqxmy`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/atomic/guard.rs | module docs; `PAIR-LESS-MUTATIONS` block; the derived-surface test | kept-corrected | `audited_fns`, `resolve_audited_name`, `type_is_raw_path`, `sig_takes_raw_path`, `pair_less_mutation_enumeration_is_the_derived_public_surface` |
+| src/atomic/guard.rs | funnel/allow/deny prose and pins | kept-corrected | `clippy.toml`, `every_production_libc_reference_is_pinned`, `std_fs_name_mutation_counts_are_pinned`, `reconciled_denied_symbols`, `funnel_region_modules` |
+| src/atomic/guard.rs | AST-walk prose (`syn`, macro bodies, `#[path]`/`include!`) | kept-corrected | `parse_crate`, `macro_body_public_path_fns`, `is_test_only` |
+| src/atomic/guard.rs | reserved-spelling and `OwnedRoot::parse` claims; inline comments | kept-corrected | `refuse_reserved_mutation`, three minting constructors, `symlink_metadata`/`canonicalize` |
