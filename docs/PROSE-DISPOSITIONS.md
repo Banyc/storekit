@@ -267,3 +267,14 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | tests/{composed_lock,confinement,id_macro,operation_lock_sidecar_reserved,ownership_endpoint,platform_symlink_reserved,remote_lock}.rs | module docs + test docs | kept-corrected | the symbols each test names |
 | src/deep_tree_regression.rs | module doc + probe docs | kept-corrected | heap-stack walks, calibration |
 | src/fifo_regression.rs | `PROBE_LIMIT`/`CHILD_LIMIT` docs | kept-corrected (`4 × PROBE_LIMIT = CHILD_LIMIT`; blocking open caught by the hard cap) | `probe`, `fifo_child`, the limits |
+
+## Slice 14 — `src/transport/ssh/{mod,hostkey}.rs`, `src/transport/mod.rs` (cross-file copies), `docs/HIDDEN-STATE-MACHINES.md` (change `yozwqrsp`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/transport/ssh/mod.rs | module docs; far-side scripts; errno mapping; `RemotePublish`/preinstall; lock-refusal arms; identity/pin/keyscan; self-preparation; socket-path budget; readlink; test docs | kept-corrected | `write_new_cmd`/`try_write_new_sidecar_cmd`/`hold` scripts, `parse_verify_open_frame`, `RemotePublish::of`, `far_side_lock_refusal`, `prepare_for_request` call sites, `mux_hash_hex_width`, `read_link_fd` |
+| src/transport/ssh/hostkey.rs | keyscan args, pin path/keying, hashes, fingerprints | kept-corrected | `keyscan_args`, `pin_known_hosts`, `pin_file_path`, `sha256` |
+| src/transport/mod.rs | module docs + `prepare_identity`/`provision_layout` trait docs (cross-file copies) | kept-corrected | `try_write_new`/`try_write_new_with` call sites, `prepare_for_request` |
+| docs/HIDDEN-STATE-MACHINES.md | Host-identity preparation and pin cache | kept-corrected | `prepare_for_request`, `try_write_new` |
+
+Overruled finding (naming nit): "the ONE entry point" names the public `try_write_new` while the inner `try_write_new_with` is also public; the claim that exactly one path runs the runner without preparing was verified by the reviewer pair and the fix agent's call-site audit.
