@@ -135,7 +135,7 @@ fn probe_commit_ancestor(prefix: &str) {
 #[cfg(not(test))]
 fn probe_commit_ancestor(_prefix: &str) {}
 
-/// Record the atomic replace's `renameat` for the ordering probe.
+/// Record the atomic replace's rename for the ordering probe.
 #[cfg(test)]
 fn probe_rename() {
     replace_order_probe::record("rename".to_string());
@@ -161,7 +161,7 @@ struct Published;
 ///
 /// The temp exists from [`create`](Self::create) until one of the stage
 /// methods consumes it. Every pre-publish failure calls
-/// [`discard`](Self::discard), which preserves the old
+/// [`discard`](Self::discard), which preserves the
 /// [`discard_temp`](super::discard_temp) error contract (original failure plus
 /// the cleanup failure). A `?`/plain drop of a live temp is the best-effort
 /// `Drop` unlink, so a pre-publish exit can never silently leak the name; a
@@ -244,8 +244,8 @@ impl PathTemp {
         let path = self.path.take().expect("a live temp owns its path");
         // The rename is a NAME operation (the create handle cannot rename),
         // and the handle is closed first: the temp's open descriptor is not
-        // needed past the fsync, and closing it before the name moves keeps
-        // the descriptor lifetime identical to the pre-typestate replace.
+        // needed past the fsync, so closing it before the name moves keeps the
+        // descriptor lifetime minimal.
         drop(self.file.take());
         match std::fs::rename(&path, target) {
             Ok(()) => Ok(Published),
@@ -290,7 +290,8 @@ impl Drop for PathTemp {
 /// other pair-less mutations API constraint #1 enumerates;
 /// [`crate::atomic::COMPONENT_CONFINED`] describes the platform split.
 /// It is PUBLIC because it is part of the interface this crate was
-/// extracted from — a consumer's port calls the path-based replace (see
+/// extracted from — a consumer's call shape is the path-based replace (see
+/// `docs/API-CONSTRAINTS.md`, constraint 8, verdict `N`, and
 /// `docs/CONSISTENCY.md`, axis M) — and a public-API name is justified by a
 /// consumer's need, never by this crate's own tests. A path-based port keeps
 /// the same PUBLIC name because its fd surface is path-based throughout.
@@ -316,8 +317,7 @@ pub fn write_atomic_replace(
     if let Some(parent) = path.parent() {
         // DURABLE creation of the parent chain: every directory created here
         // has its own entry fsynced into its parent BEFORE the temp write and
-        // the rename, so the replace's durability claim covers the WHOLE chain
-        // `create_dir_all` left the created directories' entries unsynced.
+        // the rename, so the replace's durability claim covers the WHOLE chain.
         // The commit runs inside the chain; its verdict is not needed here.
         ensure_private_dir_durable_chain(parent)?;
     }
@@ -331,8 +331,8 @@ pub fn write_atomic_replace(
     let temp = PathTemp::create(tmp)?;
     let temp = temp.write(bytes)?;
     // Private BEFORE visible and BEFORE the fsync: the temp carries 0o600
-    // before the rename — no reader ever observes the marker with the wider
-    // create-time mode — and this corrective chmod PRECEDES the `sync_all()`
+    // before the rename — no reader ever observes the published entry at the
+    // wider create-time mode — and this corrective chmod PRECEDES the `sync_all()`
     // below, so that fsync covers the mode change rather than leaving it
     // unflushed. Both run on the CREATE HANDLE, not a reopened name.
     let temp = temp.make_private()?;
@@ -396,52 +396,68 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
 
 /// DURABLE private directory creation: create `path` (and every missing
 /// ancestor) at the private 0o700 chmod, then make
-/// EVERY newly created directory entry durable BEFORE the call returns — fsync
-/// the parent directory of each component this call created (deepest first), and
-/// then the parent of the new path's own parent (the entry that names the
-/// directory HOLDING the new path). The store case this exists for is the FIRST
-/// ledger append on a NEW target: the walk creates `targets/<target>/` while
-/// `targets/` itself was already created (UNSYNCED) by the store open, so
-/// the append must fsync BOTH the `targets/<target>/`
-/// entry (inside `targets/`) AND the `targets/` entry (inside the base) before
-/// it reports success — otherwise a power loss (on Linux — see the README's
-/// durability assumption) could lose the directories while the reported ledger
-/// survives.
+/// EVERY newly created directory entry durable BEFORE the call returns:
+///
+/// 1. fsync the parent directory of EACH component this call created, DEEPEST
+///    FIRST — the entry naming the new path is committed first, then each
+///    entry naming a shallower created component, and the entry naming the
+///    shallowest created component (which lives in the deepest PRE-EXISTING
+///    ancestor) last;
+/// 2. then, whenever this call created something and `path.parent()` is
+///    non-empty, fsync that parent's own parent — the entry naming the
+///    directory HOLDING the new path. This step is NOT conditional on the
+///    created chain's depth: the holding directory may pre-date this call from
+///    an UNSYNCED creation, so its entry is committed even when this call
+///    created only `path` itself. When the created chain is deeper than one
+///    component the loop in step 1 has already fsynced that same directory, so
+///    the step repeats one fsync instead of adding one.
+///
+/// A power loss between the creation and those syncs (on Linux — see the
+/// README's durability assumption) could lose the directories while a reported
+/// write inside them survives.
 ///
 /// The helper knows what it created by creating COMPONENT-BY-COMPONENT (walk
 /// up from `path` to the deepest existing ancestor, create the missing chain
 /// top-down, chmod each) instead of `create_dir_all`, which cannot report what
-/// it created. Syncing an already-existing ancestor is always safe (the fsync
-/// only forces the entries created below it), so the extra parent-of-parent
-/// sync is the harmless, conservative "sync the ancestor chain" choice.
+/// it created. Fsyncing a directory this call did not create is always safe (it
+/// forces that directory's OWN entries, of which the call may have created
+/// none), so the extra parent-of-parent sync is the harmless, conservative
+/// "sync the ancestor chain" choice.
 ///
 /// Returns `true` when this call created at least one directory (and therefore
-/// ran the syncs), `false` when everything already existed (the fast path of
-/// every later append: nothing created, nothing to sync). The verdict itself
-/// is [`DirChain`] inside [`ensure_private_dir_durable_chain`]; this public
-/// signature keeps the historical `bool` for the callers that only branch on
-/// "did anything get created".
+/// ran the syncs), `false` when everything already existed (nothing created,
+/// nothing to sync). The verdict itself is [`DirChain`] inside
+/// [`ensure_private_dir_durable_chain`]; this crate-internal signature keeps the
+/// `bool` for the callers that only branch on "did anything get created".
 pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
     ensure_private_dir_durable_chain(path).map(|chain| chain.is_created())
 }
 
 /// The PATH-BASED durable-commit body for [`CreatedChain`]: it owns the
-/// created components (shallowest first) and the parent whose entry is the
-/// parent-of-parent commit.
+/// created components (shallowest first) and the new path's own parent, whose
+/// entry in ITS parent is the parent-of-parent commit.
 pub(super) struct PathChain {
     /// The components this call created, shallowest first (creation order).
     components: Vec<PathBuf>,
-    /// The created path's own parent: the entry naming the directory HOLDING
-    /// the new path, which an earlier UNSYNCED creation (the store open) may
-    /// have made.
+    /// The created path's own parent, i.e. the directory HOLDING the new path;
+    /// its own entry (in that parent's parent) is the parent-of-parent commit,
+    /// and an earlier UNSYNCED creation (the store open) may have made the
+    /// directory itself.
     parent: Option<PathBuf>,
 }
 
 impl ChainCommit for PathChain {
     fn commit_created_entries(&self, created: &[usize]) -> Result<()> {
-        // Durable commit of every NEW directory entry, DEEPEST FIRST: the new
-        // directory's own entry, then up the created chain, then the
-        // parent-of-parent entry.
+        // Durable commit of every NEW directory entry, DEEPEST FIRST: each
+        // created component's own entry into its parent, starting with the new
+        // directory's own entry and ending with the shallowest created
+        // component's entry (in the deepest PRE-EXISTING ancestor). `parent`
+        // is then committed UNCONDITIONALLY (whenever it is non-empty): it is
+        // the directory HOLDING the new path, and its own entry in the
+        // grandparent is what may be missing because an earlier, unsynced call
+        // made that directory. The step is therefore not gated on the created
+        // chain's depth — a chain deeper than one component has already had
+        // the same directory fsynced by the loop above.
         for &i in created.iter().rev() {
             probe_commit_entry(&self.components[i].to_string_lossy());
             sync_parent_dir(&self.components[i])?;
@@ -600,10 +616,9 @@ fn ensure_private_dir_durable_chain(path: &Path) -> Result<DirChain> {
 /// The walk holds no source lock and re-enumerates nothing, so a source that
 /// changes shape mid-copy can be copied inconsistently. A caller that cannot
 /// guarantee a quiescent source must serialize it itself. The traversal
-/// descends into a subdirectory the moment it encounters one, so a
-/// mid-walk failure leaves the same depth-first pre-order partial state the
-/// historical recursion left; `copy_tree_verbatim_visits_in_recursive_preorder`
-/// pins that order.
+/// descends into a subdirectory the moment it encounters one, so a mid-walk
+/// failure leaves a depth-first pre-order partial state;
+/// `copy_tree_verbatim_visits_in_recursive_preorder` pins that order.
 ///
 /// # Windows (the path-based port)
 ///
@@ -830,9 +845,11 @@ pub fn copy_tree_verbatim(src: &Path, dst: &Path) -> Result<()> {
 // [`write_atomic_replace_fd`]). Either way a symlink injected into a path
 // component can never redirect a mutation outside the owned root — the
 // descriptor pins the root, and no component is ever followed. The
-// path-based free functions above stay for tests and for `path_state`
-// (`read_json` is `#[cfg(test)]`: no production caller uses the raw-path
-// reader); the store's OWN mutations route through the `_fd` variants below.
+// path-based free functions above are the deliberately-named pair-less
+// surface (`write_atomic_replace`, `copy_tree_verbatim`, and the two durable
+// helpers `sync_parent_dir` / `ensure_private_dir_durable`, which the lock path
+// calls with a path it holds no descriptor for); the store's OWN `_fd`
+// mutations route through the variants below.
 // =====================================================================
 
 /// Split a ROOT-RELATIVE path into its components as raw bytes for the
@@ -854,10 +871,10 @@ fn rel_components(rel: &Path) -> Vec<&[u8]> {
 /// | O_NOFOLLOW | O_CLOEXEC`), and the final component is opened with
 /// `flags` plus `O_NOFOLLOW | O_CLOEXEC`. Every component, INCLUDING the
 /// final one, is therefore refused (ELOOP) if it is a symlink — a mutation
-/// can never be redirected outside the root the descriptor pins. `rel` is
-/// validated as ROOT-RELATIVE first ([`rel_components`]): an absolute path,
-/// a `..`, a `.`, or the empty path is refused before any `openat`, so the
-/// spelling can never move the resolution off the root. `mode` is
+/// can never be redirected outside the root the descriptor pins. `rel` is a
+/// [`RootedRelativePath`], so the spelling was validated at the boundary — an
+/// absolute path, a `..`, a `.`, and the empty path were refused there — and
+/// cannot move the resolution off the root. `mode` is
 /// used only when `flags` includes `O_CREAT`. The raw `_io` variant returns
 /// the underlying io error (so a caller can distinguish a genuine NotFound
 /// from a symlink refusal); [`openat_no_follow`] wraps it with the path
@@ -915,7 +932,7 @@ fn openat_no_follow_io_path(
 /// Whether an `openat` flag set can CREATE, REPLACE, or TRUNCATE a directory
 /// entry. `O_RDONLY` is 0, so a pure read is `false`; every write/append/
 /// create/truncate flag is `true`. This is the predicate the chokepoint in
-/// [`openat_no_follow_io`] uses, and it is deliberately conservative.
+/// [`openat_no_follow_io_path`] uses, and it is deliberately conservative.
 fn open_flags_mutate(flags: i32) -> bool {
     const MUTATING: i32 =
         libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND;
@@ -1017,11 +1034,9 @@ fn refuse_mutation_name(name: &OsStr, sanction: Sanction<'_>) -> Result<()> {
 
 /// renameat between two names in (possibly different) directory fds.
 ///
-/// Closed at the PRIMITIVE: the guard used to sit only in
-/// [`renameat_paths`], so calling this raw primitive (which was `pub`)
-/// renamed the lock record straight through it. The name checks live HERE
-/// now, and the function is PRIVATE: there is no public rename primitive
-/// left to bypass.
+/// Closed at the PRIMITIVE: the name checks live HERE, and the function is
+/// PRIVATE, so no unguarded rename primitive is reachable from outside this
+/// module.
 fn renameat_fd(
     dir_fd: &OwnedFd,
     from: &OsStr,
@@ -1291,20 +1306,23 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
 }
 
 /// Read every entry name of the directory `dir_fd` (excluding `.`/`..`) into
-/// an owned `Vec`, in `readdir` order. The tree walks below used to descend
-/// from inside [`for_each_dir_entry`]'s callback, holding a live `DIR*`
-/// across a recursive call; collecting the names first preserves the order
-/// but lets the walk own its iteration explicitly, on the heap.
+/// an owned `Vec`, in `readdir` order. Collecting the names first lets the walk
+/// own its iteration explicitly, on the heap, instead of descending from inside
+/// [`for_each_dir_entry`]'s callback with a live `DIR*` across a recursive call.
 ///
-/// COST: O(entries) heap for the WIDEST directory of the walk — one buffered name
-/// per entry, freed when the frame drops. The per-name and total figures this
-/// bullet used to carry were a measurement of one host, are not reproducible from
-/// this repository, and did not even agree with each other; the SHAPE is the claim. This is a stated cost, not a leak:
-/// the alternative (a live `DIR*` per level) holds a descriptor AND a `DIR`
-/// buffer per level and cannot be resumed after an error part-way through one
-/// directory's iteration. No cap is imposed; a caller with a directory of
-/// millions of entries should stream it through its own walk rather than the
-/// tree copy.
+/// COST: the returned list owns one name per entry, so it is O(entries of THAT
+/// directory). Both walks ([`copy_dir_recursive_fd`], [`remove_dir_contents_fd`])
+/// keep the list inside the frame they push and pop that frame only once the
+/// directory's subtree is done, and the frames open at one time are exactly the
+/// ancestor chain from the walk root to the directory being visited. Their peak
+/// is therefore the SUM of the buffered lists along that open chain (a frame's
+/// slot array stays allocated for the whole directory and the names it has not
+/// yet yielded are still owned), not the widest single directory. This is a
+/// stated cost, not a leak: the alternative (a live `DIR*` per level) holds a
+/// descriptor AND a `DIR` buffer per level and cannot be resumed after an error
+/// part-way through one directory's iteration. No cap is imposed; a caller with
+/// a directory of millions of entries should stream it through its own walk
+/// rather than the tree copy.
 fn dir_entry_names(dir_fd: &OwnedFd) -> Result<Vec<Vec<u8>>> {
     let mut names = Vec::new();
     for_each_dir_entry(dir_fd, |name| {
@@ -1358,7 +1376,7 @@ fn discard_temp_fd(original: Error, parent_fd: &OwnedFd, tmp_name: &OsStr) -> Er
 ///
 /// The temp exists from [`create`](Self::create) until one of the stage
 /// methods consumes it. Every pre-publish failure calls
-/// [`discard`](Self::discard), preserving the old [`discard_temp_fd`] error
+/// [`discard`](Self::discard), preserving the [`discard_temp_fd`] error
 /// contract; a `?`/plain drop of a live temp is the best-effort `Drop`
 /// unlink, so a pre-publish exit can never silently leak the name. A
 /// successful [`publish`](Self::publish) / [`publish_no_replace`](Self::publish_no_replace)
@@ -1447,7 +1465,7 @@ impl<'a> Temp<'a> {
         let name = self.name.take().expect("a live temp owns its name");
         // The rename is a NAME operation (a descriptor cannot be renamed) and
         // the temp's open handle is not needed past the fsync; close it first
-        // so the descriptor lifetime is identical to the pre-typestate replace.
+        // so the descriptor lifetime stays minimal.
         drop(self.file.take());
         match renameat_fd(self.parent, &name, self.parent, target, Sanction::None) {
             Ok(()) => Ok(Published),
@@ -1458,8 +1476,7 @@ impl<'a> Temp<'a> {
     fn publish_no_replace(mut self, target: &OsStr, shown: &Path) -> Result<NoReplacePublish> {
         let name = self.name.take().expect("a live temp owns its name");
         // As in `publish`: the linkat addresses the NAME, and the fsynced
-        // create handle is closed first (the pre-typestate CAS did the same
-        // before linking).
+        // create handle is closed first.
         drop(self.file.take());
         let installed = match linkat_fd(self.parent, &name, self.parent, target) {
             Ok(()) => true,
@@ -1511,9 +1528,9 @@ impl Drop for Temp<'_> {
 /// REFUSE a foreign final entry instead of overwriting it uses one of the
 /// open/create-new primitives — [`openat_no_follow`], [`write_file_fd`],
 /// [`write_atomic_cas_fd`], [`read_fd`], or [`path_state_fd`]. The parent
-/// directory is created via [`ensure_private_dir_durable_fd`] if missing (so
-/// every created directory's own entry is fsynced into its parent before the
-/// rename). A failure
+/// directory is created via [`ensure_private_dir_durable_fd_chain`] if missing
+/// (so every created directory's own entry is fsynced into its parent before
+/// the rename). A failure
 /// BEFORE the rename UNLINKS the temp before the `Err` returns (best-effort,
 /// the cleanup failure carried with the original one), so a failed replace
 /// leaves no stray temp; the post-rename parent-fsync failure is NOT a
@@ -1558,22 +1575,22 @@ pub fn write_atomic_replace_fd_under_existing_parent(
 /// The verdict of [`write_atomic_if_match_fd`].
 #[derive(Debug)]
 pub enum CompareReplace {
-    /// The live entry still held the expected bytes (or was absent when the
-    /// caller expected absence) and `bytes` were installed by the atomic
-    /// replace; the wrapped [`ReplaceOutcome`] carries the replace's own
-    /// two-commit-point durability verdict.
+    /// The live entry still held the expected bytes and `bytes` were installed
+    /// by the atomic replace; the wrapped [`ReplaceOutcome`] carries the
+    /// replace's own two-commit-point durability verdict. `expected` is a byte
+    /// slice, so absence is never "expected": a missing live entry is
+    /// [`CompareReplace::Mismatch`], never a `Replaced`.
     Replaced(ReplaceOutcome),
     /// The live entry did NOT hold the expected bytes at the moment of the
-    /// check (it was changed by another writer, or is absent, or a symlink
-    /// that was refused). NOTHING was written: the visible entry is exactly
+    /// check (it was changed by another writer, or is absent). NOTHING was
+    /// written: the visible entry is exactly
     /// what the other writer left. The caller must re-read and re-decide.
     Mismatch,
 }
 
 /// Should the caller treat the live entry at `file_name` (relative to
-/// `parent_fd`) as equal to `expected`? `Ok(false)` covers a genuine
-/// [`std::io::ErrorKind::NotFound`] AND any entry that is not a readable
-/// regular file the `O_NOFOLLOW` open can hand back: a symlink is refused
+/// `parent_fd`) as equal to `expected`? `Ok(false)` is a genuine
+/// [`std::io::ErrorKind::NotFound`] and nothing else: a symlink is refused
 /// (`ELOOP`, propagated as an `Err` — never followed, never compared against
 /// its target), a directory fails the read, and every other failure is a real
 /// error. Fail closed: only a byte-identical regular file compares equal.
@@ -1635,10 +1652,9 @@ fn replace_core(
     if ensure_parent && !parent_rel.as_os_str().is_empty() {
         // DURABLE creation of the parent chain: every directory this call
         // creates has its OWN entry fsynced into its parent BEFORE the temp
-        // write and the rename, so the [
-        // `ReplaceOutcome::ReplacedDurable`] claim is true for the WHOLE chain,
-        // not only for the final entry's parent. The non-durable helper used
-        // to leave the created directories' entries unsynced.
+        // write and the rename, so the
+        // [`ReplaceOutcome::ReplacedDurable`] claim is true for the WHOLE chain,
+        // not only for the final entry's parent.
         ensure_private_dir_durable_fd_chain(root, parent_rel)?;
     }
     let (parent_fd, file_name) = parent_fd_of(root.as_fd(), rel)?;
@@ -1659,8 +1675,8 @@ fn replace_core(
     let temp = Temp::create(&parent_fd, tmp_name)?;
     let temp = temp.write(bytes, rel)?;
     // Private BEFORE visible and BEFORE the fsync: the temp carries 0o600
-    // before the rename — no reader ever observes the marker with the wider
-    // create-time mode — and this corrective chmod PRECEDES the `sync_all()`
+    // before the rename — no reader ever observes the published entry at the
+    // wider create-time mode — and this corrective chmod PRECEDES the `sync_all()`
     // below, so that fsync covers the mode change rather than leaving it
     // unflushed. Both run on the CREATE HANDLE, not on a reopened name: the
     // chmod and the fsync address the inode `O_EXCL` created.
@@ -1686,9 +1702,7 @@ fn replace_core(
             Ok(false) => return Ok(CoreReplace::Mismatch),
             // An OBSERVATION failure (a symlink appeared at the live entry, it
             // became unreadable, ...) also abandons the temp, and the linear
-            // temp makes that cleanup structural. The pre-typestate core
-            // propagated this error with `?` and LEAKED the temp name; see the
-            // commit body's stated delta.
+            // temp makes that cleanup structural.
             Err(e) => return Err(temp.discard(e)),
         }
     }
@@ -1725,9 +1739,10 @@ fn replace_core(
 ///
 /// The comparison is byte-exact and descriptor-bound: the live entry is
 /// opened `O_NOFOLLOW` (a symlink is REFUSED, never followed or compared
-/// against its target) and read through the SAME descriptor the compare and
-/// the install use. See [`replace_core`] for the two check points and for the
-/// residual window between the second check and the `renameat`.
+/// against its target) and read through that descriptor, in the same parent
+/// directory descriptor the install renames into. See [`replace_core`] for the
+/// two check points and for the residual window between the second check and
+/// the `renameat`.
 pub fn write_atomic_if_match_fd(
     root: &RootDir,
     rel: &RootedRelativePath,
@@ -1743,10 +1758,11 @@ pub fn write_atomic_if_match_fd(
 }
 
 /// The descriptor-relative create-or-compare CAS: the same protocol as
-/// [`write_atomic_cas_fd`], but every path resolves COMPONENT-WISE relative to
-/// `root` with `openat(O_NOFOLLOW)`. A symlink injected at the final
-/// component is REFUSED (ELOOP) — never followed, never compared against
-/// its target.
+/// [`write_atomic_replace_fd`], but a new entry is installed WITHOUT
+/// replacement (`linkat` fails on `EEXIST`), and every path resolves
+/// COMPONENT-WISE relative to `root` with `openat(O_NOFOLLOW)`. A symlink
+/// injected at the final component is REFUSED (ELOOP) — never followed, never
+/// compared against its target.
 pub fn write_atomic_cas_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> Result<()> {
     let rel = rel.as_path();
     // A CAS that would CREATE the record (or rewrite it) is a mutation of the
@@ -1795,9 +1811,9 @@ pub fn write_atomic_cas_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8
             return Ok(());
         }
     }
-    // Private BEFORE visible: chmod the installed file, then fsync the
-    // parent directory (THE DURABILITY COMMIT POINT — fail closed, see
-    // [`write_atomic_cas_fd`]).
+    // The installed entry was created 0o600; chmod it explicitly, then fsync
+    // the parent directory (THE DURABILITY COMMIT POINT — fail closed, see
+    // [`ReplaceOutcome`]).
     {
         let f = std::fs::File::from(openat_readable_regular(
             &parent_fd,
@@ -1842,9 +1858,15 @@ pub fn ensure_private_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result
 
 /// The descriptor-relative DURABLE private-directory creation: the same
 /// component-by-component creation + per-component 0o700 chmod as
-/// [`ensure_private_dir_durable`], then the same durable commit — fsync the
-/// parent of each created component (deepest first), then the parent of the
-/// new path's own parent — all through directory fds. Returns `true` when
+/// [`ensure_private_dir_durable`], then the same commit SHAPE through directory
+/// fds — fsync the parent of each created component (deepest first), then the
+/// new path's parent-of-parent. The last step differs from the path-based port
+/// in its GATE, not in its target: it runs when the relative path has at least
+/// TWO components (the new path's own parent is then itself inside the root, so
+/// the target is the descriptor of component `len - 3`, or the root descriptor
+/// for a two-component path) and is SKIPPED for a one-component path, whose
+/// parent-of-parent is the root's own parent and so outside the tree this port
+/// walks. Returns `true` when
 /// this call created at least one directory.
 pub fn ensure_private_dir_durable_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<bool> {
     ensure_private_dir_durable_fd_chain(root, rel.as_path()).map(|chain| chain.is_created())
@@ -1876,9 +1898,11 @@ impl<'a> UnixChain<'a> {
 impl ChainCommit for UnixChain<'_> {
     fn commit_created_entries(&self, created: &[usize]) -> Result<()> {
         // Durable commit of every NEW directory entry, DEEPEST FIRST: fsync
-        // the parent of each created component (the new dir's own entry), then
-        // the parent of the new path's own parent (the entry that names the
-        // directory HOLDING the new path).
+        // the parent of each created component (the new dir's own entry first,
+        // then up the created chain), then, when the path has at least two
+        // components, the new path's parent-of-parent — the entry that names the
+        // directory HOLDING the new path, i.e. `dirs[len - 3]`, or the root
+        // descriptor for a two-component path.
         for &i in created.iter().rev() {
             probe_commit_entry(&self.prefixes[i]);
             if i == 0 {
@@ -2104,9 +2128,9 @@ pub fn remove_file_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
 /// under the root (both parents resolved component-wise with O_NOFOLLOW).
 ///
 /// This is the ONLY public rename authority, and the rename WORKER below
-/// demands a [`GuardedRel`] for each end — unforgeable tokens that only
-/// [`GuardedRel::new`] can mint — so no new primitive can name a rename
-/// without running the guard.
+/// demands a [`GuardedRel`] for each end — unforgeable tokens that only the
+/// guard module's constructors can mint — so no new primitive can name a
+/// rename without running the guard.
 pub fn renameat_paths(
     root: &RootDir,
     from: &RootedRelativePath,
@@ -2139,7 +2163,7 @@ pub(crate) fn rename_residue_paths(
     // would REPLACE: refuse it, exactly as the public rename does. An ABSENT
     // residue `to` is a fresh claim-aside (the engine's own), and a residue
     // `from` is a MOVE (the strand survives), so both remain permitted. This
-    // keeps the SANCTIONED route from becoming the old hole for a caller that
+    // keeps the SANCTIONED route from becoming a hole for a caller that
     // names an existing strand as the destination.
     if to
         .file_name()
@@ -2214,9 +2238,9 @@ fn remove_dir_all_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -
 /// strand is disposable — but the LOCK authority still runs on the whole path,
 /// the walk still refuses any NESTED residue (a residue inside the strand is a
 /// SEPARATE stranded original the caller must discard first), and every entry's
-/// lock-record spelling is still refused. This is the only sanctioned break of
-/// the implicit-removal residue guard, and it is reachable only through the
-/// caller's explicit discard.
+/// lock-record spelling is still refused. This is the sanctioned break of
+/// the implicit-removal residue guard for a RECURSIVE removal, and it is
+/// reachable only through the caller's explicit discard.
 pub(crate) fn remove_residue_dir_all_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
     let rel = rel.as_path();
     // The FINAL-residue sanction lets the walk root through; the gate still
@@ -2269,9 +2293,7 @@ pub(crate) fn remove_claim_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> R
 /// The copy primitive refuses every destination residue for the same reason,
 /// so the two creation paths agree on ONE sanction: a residue spelling is
 /// never created, because a copy must not occupy a strand that may hold a
-/// stranded original. The previous `Sanction::Residue` here was dead (the
-/// chokepoint refused) and its comment claimed a create the copy must never
-/// make.
+/// stranded original.
 pub fn create_dir_fd(root: &RootDir, rel: &RootedRelativePath) -> Result<()> {
     create_dir_fd_path(root, rel.as_path())
 }
@@ -2333,9 +2355,11 @@ fn remove_dir_fd_inner(root: &RootDir, rel: &Path, sanction: Sanction<'_>) -> Re
 /// entry at `rel` is unlinked first (never followed); the link is created
 /// with `symlinkat`; the parent directory is fsynced.
 ///
-/// This is the ONE symlink authority. The lock-record guard runs on the full
-/// path AND the `unlinkat`/`symlinkat` chokepoints guard the final name, so a
-/// call that names the record cannot destroy it and install a link.
+/// This is the ONE REPLACE-semantics symlink authority (the copy lands a link
+/// through [`symlink_new_fd`], which must not replace). The lock-record guard
+/// runs on the full path AND the `unlinkat`/`symlinkat` chokepoints guard the
+/// final name, so a call that names the record cannot destroy it and install a
+/// link.
 pub fn symlink_fd(root: &RootDir, target: &Path, rel: &RootedRelativePath) -> Result<()> {
     let rel = rel.as_path();
     refuse_reserved_mutation(rel, Sanction::None)?;
@@ -2385,13 +2409,11 @@ fn symlink_new_fd(root: &RootDir, target: &Path, rel: &Path) -> Result<()> {
     fsync_dir_fd(&parent_fd)
 }
 
-/// The canonical filesystem path pinned by an owned-root DESCRIPTOR.
+/// The filesystem path pinned by an owned-root DESCRIPTOR.
 ///
-/// The Unix [`RootDir`] stores only a descriptor, so the copy's overlap check
-/// needs the descriptor's own resolved path. Linux exposes it as
-/// `/proc/self/fd/N`; macOS via `fcntl(F_GETPATH)`. Either answer is already
-/// canonical (the kernel tracks the resolved path), which is exactly what the
-/// overlap comparison needs.
+/// The Unix [`RootDir`] stores only a descriptor, so naming the destination in
+/// the copy's overlap refusal needs the descriptor's own resolved path. Linux
+/// exposes it as `/proc/self/fd/N`; macOS via `fcntl(F_GETPATH)`.
 fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
     let fd = root.as_fd().as_raw_fd();
     #[cfg(target_os = "linux")]
@@ -2424,15 +2446,17 @@ fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
 /// Refuse a copy whose SOURCE and DESTINATION overlap, deciding OVERLAP BY
 /// IDENTITY rather than by spelling.
 ///
-/// The old check compared `canonicalize(src)` against a lexical join of the
-/// owned root's resolved self-path and `dst_rel`. Two spellings of ONE
-/// directory that `realpath(3)` does not unify evade that comparison — a Linux
-/// `mount --bind` alias of the root, or a macOS firmlink spelling — and the
-/// destination is then created INSIDE the source, whose `read_dir` re-yields it
-/// and the walk recurses without bound (reproduced: 57 `sub/.../sub` levels to
-/// `EMFILE` on Linux, `ENAMETOOLONG` on macOS). A case-fold-equal `dst_rel` on
-/// a case-insensitive filesystem (macOS APFS) evades it too, and the copy then
-/// MUTATES ITS OWN SOURCE.
+/// A spelling-based comparison misses two spellings of ONE directory that
+/// `realpath(3)` cannot collapse — a Linux `mount --bind` alias of the root, or a
+/// macOS firmlink spelling (`/Users` and `/System/Volumes/Data/Users` report one
+/// identity under two strings). A case-fold-equal `dst_rel` on a case-insensitive
+/// filesystem (macOS APFS) is another alias the IDENTITY comparison closes: the
+/// two spellings differ only by case, and the decision reads no string — the
+/// anchor is opened with `openat(2)` from the owned root descriptor and compared
+/// by `(st_dev, st_ino)` — so `realpath(3)`'s case behaviour is not relied on
+/// either way. The alias destination is then created INSIDE the source, whose
+/// `read_dir` re-yields it and the walk recurses without bound; an alias that is
+/// the source tree ITSELF can instead MUTATE ITS OWN SOURCE.
 ///
 /// THE RULE: open the source directory and the DESTINATION ANCHOR — the deepest
 /// existing directory on `dst_rel`, resolved component-wise from the owned root
@@ -2453,15 +2477,11 @@ fn owned_root_self_path(root: &RootDir) -> Result<PathBuf> {
 /// guessing: an overlap that cannot be ruled out is not allowed through.
 ///
 /// WHAT IT STILL CANNOT CATCH: two distinct paths onto the SAME tree that
-/// report DIFFERENT `(st_dev, st_ino)` pairs. On Linux a bind mount of a
-/// directory reports the SAME device and inode as the original (bind mounts do
-/// not change `st_dev`), and on macOS a firmlink likewise resolves to the same
-/// inode, so both are caught. It would NOT catch an alias that presents a
-/// different device number for the same underlying directory (some overlay or
-/// network filesystems report a per-mount device); such an alias would have to
-/// be reproduced on that filesystem to be seen, and this primitive documents
-/// the limit rather than pretending to close it. A `btrfs` subvolume or a
-/// `mount --bind` across a bind of a bind still report one inode.
+/// report DIFFERENT `(st_dev, st_ino)` pairs. It would NOT catch an alias that
+/// presents a different device number for the same underlying directory (some
+/// overlay or network filesystems report a per-mount device); such an alias
+/// would have to be reproduced on that filesystem to be seen, and this
+/// primitive documents the limit rather than pretending to close it.
 fn refuse_overlapping_copy(
     root: &RootDir,
     src: &Path,
@@ -2728,17 +2748,14 @@ struct PlannedMode {
 
 /// The copy's SINGLE mode journal for destination directories: every mode the
 /// walk widened or created, and every mode the successful finalize must
-/// install. Owning both records in one entry is what removes the old parallel
-/// `modes`/`dirs` vectors and the `armed` flag that only code shape kept in
-/// sync.
+/// install.
 ///
 /// `Drop` restores the planned modes deepest-first if [`commit`](Self::commit)
 /// did not complete; `commit` applies the intended final modes deepest-first
 /// (the copy root is the shallowest, so it lands last) and then clears the
 /// obligations. This is what makes a FAILED copy leave a destination the crate
-/// can remove itself ([`remove_dir_all_fd`]) instead of a `0o200` directory
-/// nothing can open, and what keeps a fold-equal source's own mode
-/// byte-identical after a failed copy.
+/// can remove itself ([`remove_dir_all_fd`]), and what keeps a fold-equal
+/// source's own mode byte-identical after a failed copy.
 struct CopyModes<'a> {
     root: &'a RootDir,
     modes: Vec<PlannedMode>,
@@ -2928,32 +2945,25 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// REFUSED rather than opened.
 ///
 /// ITERATIVE, NEVER RECURSIVE. The walk keeps an explicit heap `Vec` of open
-/// frames instead of one Rust frame per directory level (the source tool's
-/// original recursed); a deep tree therefore cannot exhaust the C stack and
-/// ABORT the host process. The descriptor bound is ~ONE PER LEVEL of source
-/// depth, plus O(1) transient descriptors per destination mutation:
-/// `parent_fd_of`/`openat_no_follow` re-resolve the whole ancestor chain, but
-/// they do it ONE COMPONENT AT A TIME and drop each intermediate descriptor
-/// before the next `openat`, so a mutation holds ONE destination descriptor at
-/// the instant of the syscall, never `depth` of them. MEASURED (Linux, depth
-/// 256): the copy succeeds at `RLIMIT_NOFILE=262` and fails at 260, i.e. peak
-/// ~= depth + 6 — NOT the ~`2 * depth` a first reading of the re-opening might
-/// suggest. The bound surfaces as a clean `Err`, never an abort. The COST that
+/// frames instead of one Rust frame per directory level; a deep tree therefore
+/// cannot exhaust the C stack and ABORT the host process. The descriptor bound
+/// is ~ONE PER LEVEL of source depth, plus O(1) transient descriptors per
+/// destination mutation: `parent_fd_of`/`openat_no_follow` re-resolve the whole
+/// ancestor chain, but they do it ONE COMPONENT AT A TIME and drop each
+/// intermediate descriptor before the next `openat`, so a mutation holds ONE
+/// destination descriptor at the instant of the syscall, never `depth` of them.
+/// The bound surfaces as a clean `Err`, never an abort. The COST that
 /// does grow with depth is TIME: each destination entry re-resolves its parent
 /// chain from the root, so it costs O(depth) `openat` calls (a directory also
 /// pays one O(depth) pass in the deepest-first finalize); the source side stays
-/// O(1) per entry. This is a deliberate, stated cost, not a hidden one. This is
-/// why the re-added form is the iterative one.
+/// O(1) per entry. This is a deliberate, stated cost, not a hidden one.
 ///
 /// MODE FIDELITY: directory and file modes are copied EXACTLY from the source
 /// (including the setuid/setgid/sticky bits — a mode-shifted copy would fail
 /// the staged-object digest verification). The walk is TWO-PHASE: every
 /// destination directory is created owner-writable and widened during the
 /// walk, and every final mode is applied DEEPEST-FIRST at the end, so a
-/// READ-ONLY source tree copies cleanly. (The source tool's original created
-/// each directory at its final mode before copying into it, so a read-only
-/// source directory failed with `EACCES`; keeping the exact final modes while
-/// fixing that is a deliberate, documented difference.)
+/// READ-ONLY source tree copies cleanly.
 ///
 /// A FAILED COPY RESTORES EVERY MODE IT CHANGED ([`CopyModes`], an RAII
 /// journal): the widened walk modes are for the walk only, so an error return
@@ -3004,12 +3014,12 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// recovery sweep ([`crate::atomic::is_crate_temp_name`]) and the WHOLE tree
 /// under it is swept. A copied ENTRY name is the opposite: a temp-shaped entry
 /// name would be a live file the sweep destroys, so [`refuse_unlandable_name`]
-/// REFUSES it. Memory: [`dir_entry_names`] buffers EVERY entry name of a
-/// directory into a `Vec` before iterating (O(entries), like the figure-free note
-/// above), so the walk's peak heap is
-/// O(entries) in the widest directory, not O(depth). No cap is imposed: a cap
-/// would be an arbitrary refusal of a legal tree, and the cost is linear and
-/// freed as each frame drops.
+/// REFUSES it. Memory: [`dir_entry_names`] buffers every entry name of a
+/// directory into a `Vec` before iterating, and a frame keeps that list until it
+/// is popped, so the frames open at one time hold the ancestor chain's lists at
+/// once (see [`dir_entry_names`]'s COST note): the peak is that sum, not the
+/// widest directory. No cap is imposed: a cap would be an arbitrary refusal of a
+/// legal tree.
 ///
 /// HARD LINKS are REFUSED (a regular file with `st_nlink > 1`): the crate's
 /// own `canonicalize_tree` refuses them, so silently duplicating one into an
@@ -3023,19 +3033,16 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// on `dst_rel`, resolved component-wise from the owned root descriptor) are
 /// compared by `(st_dev, st_ino)`, and the call refuses when the anchor is AT OR
 /// INSIDE the source (the same directory counts — one term covers it) or when an
-/// EXISTING destination is at or above the source. A spelling-based comparison is bypassable
-/// by any two spellings `realpath` does not unify — a Linux `mount --bind`
-/// alias, a macOS firmlink, a case-fold-equal `dst_rel` on a folding
-/// filesystem — and each of those made the destination be created INSIDE the
-/// source, whose `read_dir` re-yielded it and ran the walk without bound
-/// (reproduced: 57 `sub/.../sub` levels to `EMFILE` at `RLIMIT_NOFILE=64` on
-/// Linux, `ENAMETOOLONG` on macOS). Identity also closes the fold-equal case
-/// that MUTATED THE SOURCE's mode. What identity still cannot catch: two
-/// spellings that report DIFFERENT `(st_dev, st_ino)` pairs for one underlying
-/// directory (some overlay/network filesystems); a bind mount and a firmlink
-/// both report the SAME pair, so they are caught. A component that cannot be
-/// opened as a directory, or any identity-probe failure, refuses (fail
-/// closed).
+/// EXISTING destination is at or above the source. The identity comparison
+/// closes the aliases a spelling comparison cannot see (a `mount --bind`
+/// alias, a firmlink), and it closes a case-fold-equal `dst_rel` too: that one
+/// is refused as the SAME-directory case, for the reason
+/// [`refuse_overlapping_copy`] gives — the decision reads no string, opening the
+/// anchor and comparing `(st_dev, st_ino)`, so `realpath(3)`'s case behaviour is
+/// not relied on either way. What identity still cannot catch: two spellings
+/// that report DIFFERENT `(st_dev, st_ino)` pairs for one underlying directory
+/// (some overlay/network filesystems). A component that cannot be opened as a
+/// directory, or any identity-probe failure, refuses (fail closed).
 ///
 /// NOT ATOMIC, NOT DURABLE, PARTIAL ON FAILURE: there is no temp directory and
 /// no final rename, so entries appear at their destination in `read_dir`
@@ -3106,13 +3113,11 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 /// itself (a lock, or copying from a snapshot) — the crate does not lock an
 /// arbitrary source path.
 ///
-/// ERROR CLASSES: the old live `symlink_metadata` probe collapsed EVERY
-/// error — ENOENT, ENOTDIR, ELOOP, EACCES, ENAMETOOLONG — into `Absent` ("no
-/// symlink here", i.e. ACCEPT), a fail-OPEN arm. The containment index has no
+/// ERROR CLASSES: the containment index has no
 /// error arm: it answers `Absent`/`NotSymlink`/`Symlink` from enumerated
-/// entries, so none of those classes can arise INSIDE the rule. They surface
-/// in the ENUMERATION and fail CLOSED — the copy refuses rather than guessing
-/// a component is absent:
+/// entries, so none of the filesystem error classes can arise INSIDE the rule.
+/// They surface in the ENUMERATION and fail CLOSED — the copy refuses rather
+/// than guessing a component is absent:
 ///
 /// * `ENOENT`: an entry that vanished between enumeration and the copy is a
 ///   tree that moved; refused (and the end-of-run source re-check reports a
@@ -3125,7 +3130,8 @@ fn readlinkat_name(dir_fd: &OwnedFd, name: &[u8], shown: &Path) -> Result<PathBu
 ///   bound).
 ///
 /// `dst_rel` must not name the destination ROOT itself (an empty path is
-/// refused): use [`copy_dir_recursive_fd`] on a non-empty relative path.
+/// refused by the validated boundary): call this primitive with a non-empty
+/// relative path.
 /// Ancestors created for `dst_rel` use the store-private `0o700` mode (the
 /// shared directory-creation authority); only the FINAL directory gets the
 /// source's mode, and an intermediate staging directory's mode is outside the
@@ -3204,14 +3210,7 @@ pub fn copy_dir_recursive_fd(
     // run the indexed rule over it; this copy builds the SAME index from a
     // filesystem ENUMERATION of the source subtree (at `dst_rel`) and the
     // destination entries the run leaves in place, so all three views apply
-    // exactly one rule over one fold and cannot disagree. Before this the copy
-    // passed a LIVE `symlink_metadata` probe closure, which erred in BOTH
-    // directions: its exact-string probe missed a fold-equal symlink the index
-    // refuses (an accepted escape on a case-sensitive source copied to a
-    // folding destination), it had NO destination result-view (a destination-
-    // only symlink under `dst_rel` was invisible because the probe answered
-    // from the source), and it collapsed EVERY `symlink_metadata` error to
-    // `Absent` (fail-open).
+    // exactly one rule over one fold and cannot disagree.
     //
     // The source is enumerated with `WalkDir` (no follow) and the destination
     // root likewise; a source-relative path is relocated under `dst_rel`. A
@@ -3270,8 +3269,7 @@ pub fn copy_dir_recursive_fd(
     // PRE-EXISTING final directory is recorded with its ORIGINAL restore mode
     // before it is widened, so a failed copy puts it back exactly; a directory
     // this call CREATED is recorded with the removable 0o700. The journal also
-    // carries the intended FINAL mode, so the old parallel `dirs` vector and
-    // the separate root-final line are gone.
+    // carries the intended FINAL mode.
     let (final_preexisting_mode, _created_ancestors) = create_destination_chain(root, dst_rel)?;
     let mut modes = CopyModes::new(root);
     modes.plan(dst_rel, final_preexisting_mode.unwrap_or(0o700), root_mode);
@@ -3372,7 +3370,7 @@ pub fn copy_dir_recursive_fd(
                         ),
                     ));
                 }
-                // ALL-OR-NOTHING symlink landing: the ONE symlink authority
+                // ALL-OR-NOTHING symlink landing: the symlink authority
                 // without its replace half, so a copied symlink refuses a
                 // pre-existing destination entry exactly as the file and
                 // directory rules do (a source symlink must not silently
@@ -3547,12 +3545,7 @@ fn set_dir_mode_fd(root: &RootDir, rel: &Path, mode: u32) -> Result<()> {
 /// here): the walk reopens the whole root-relative path COMPONENT-WISE for
 /// every directory it enumerates, every file it fsyncs, and every directory it
 /// finally fsyncs, because it keeps only the path in its heap stack, never a
-/// directory descriptor. Measured `openat` counts (Linux, one `open` per
-/// component): 1202 at depth 32, 17042 at depth 128, 264722 at depth 512 —
-/// i.e. ~depth^2. The fix (hold one directory descriptor per level and reach
-/// each child relative to its parent) is understood but not taken here: it
-/// trades the open count for one descriptor per level, so its failure mode at
-/// the descriptor limit changes shape, and the current form is already
+/// directory descriptor. The current form is already
 /// fail-closed, error-propagating, deepest-first, and ITERATIVE (a deep tree
 /// surfaces a clean `Err`, never an abort). A caller fsyncing trees deeper than
 /// a few hundred levels should prefer a streaming walk.
@@ -3593,15 +3586,13 @@ pub fn fsync_tree_recursive_fd(root: &RootDir, rel: &RootedRelativePath) -> Resu
 /// itself in place.
 ///
 /// The walk is a POST-ORDER over an explicit heap `Vec` of open directory
-/// frames instead of one recursive call per level. The recursive form used
-/// one C stack frame per directory level, so a tree deeper than the stack
-/// overflowed it and Rust's stack-overflow handler ABORTED the whole host
-/// process — never an acceptable outcome for a library call. Each frame
+/// frames instead of one recursive call per level, so a tree deeper than the C
+/// stack cannot overflow it. Each frame
 /// holds the directory's descriptor and the entry names read from it (in
 /// `readdir` order); a subdirectory's frame is pushed when its entry is
 /// reached and popped — its entry removed from its parent — only after the
-/// subdirectory's own contents are gone, which is exactly the recursion's
-/// deepest-first order.
+/// subdirectory's own contents are gone, which is the deepest-first order a
+/// recursion would produce.
 fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
     struct Frame {
         fd: OwnedFd,
@@ -3682,8 +3673,6 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
                 // symlink is removed, never its target). The guard runs on
                 // EVERY entry the walk unlinks, so removing an ANCESTOR can
                 // never take the record with it.
-                // record, not on the full `child_rel` (which includes a
-                // deliberately permitted discard root).
                 refuse_reserved_mutation(&child_rel, Sanction::Residue)?;
                 unlinkat_fd(&top.fd, child_name, Sanction::None)?;
                 None
@@ -3700,23 +3689,17 @@ fn remove_dir_contents_fd(dir_fd: &OwnedFd, rel: &Path) -> Result<()> {
 /// a root-relative spelling), kept for the crate's own tests: no production
 /// caller exists, and the transport routes to [`crate::atomic::remove_dir_all_fd`]
 /// (via `remove_dir_all_confined`). On Windows `remove_dir_all_fd` delegates to
-/// `std::fs::remove_dir_all`, whose WINDOWS
-/// implementation is itself iterative on the installed toolchain
-/// (`library/std/src/sys/fs/windows.rs:1382` opens the directory and calls
-/// `remove_dir_all_iterative`,
-/// `library/std/src/sys/fs/windows/remove_dir_all.rs:173`), so the
-/// deep-tree-abort guarantee holds on BOTH platforms — this walk is the
-/// Unix realization of it, not the only one. This walk reuses
+/// `std::fs::remove_dir_all`; this walk is the Unix realization of the
+/// deep-tree-abort guarantee. This walk reuses
 /// [`remove_dir_contents_fd`]'s explicit heap frame stack and is bounded by
 /// the descriptor limit — a clean `Err` (or success), never an abort.
-/// Semantics follow the Unix `std::fs::remove_dir_all` the transport relied
-/// on: a MISSING `path` is a successful no-op (idempotent removal), and a
-/// symlink at `path` is unlinked as the entry itself, never followed.
+/// Semantics follow the Unix `std::fs::remove_dir_all`: a MISSING `path` is a
+/// successful no-op (idempotent removal), and a symlink at `path` is unlinked
+/// as the entry itself, never followed.
 #[cfg(test)]
 pub(crate) fn remove_dir_all_path(path: &Path) -> Result<()> {
     // The ONE gate covers both authorities: the lock-record spelling AND the
-    // residue spelling (this path-based primitive walked straight over a
-    // stranded aside before).
+    // residue spelling.
     refuse_reserved_mutation(path, Sanction::None)?;
     let md = match std::fs::symlink_metadata(path) {
         Ok(md) => md,
@@ -3796,11 +3779,10 @@ pub fn write_file_fd(root: &RootDir, rel: &RootedRelativePath, bytes: &[u8]) -> 
 // FINAL component is opened with `O_NOFOLLOW` and so is refused too: a
 // symlink injected into ANY path component of a read is refused (ELOOP),
 // never followed, so a read can never be redirected outside the owned
-// root. The path-based free function `path_state` (defined in
-// `atomic/mod.rs`) stays for the retention machinery (which operates on paths
-// under a store base it does not hold a descriptor for); `read_json` is
-// `#[cfg(test)]` and has no production caller, so it is not part of that
-// surface. The store's OWN reads route through the `_fd` variants below.
+// root. `read_json` is
+// `#[cfg(test)]` and has no production caller; the path-based `path_state`
+// (defined in `atomic/mod.rs`) is the unconfined spelling, and the store's OWN
+// reads route through the `_fd` variants below.
 // =====================================================================
 
 /// Read the whole file at `rel` relative to `dir_fd`, resolved
@@ -3971,12 +3953,11 @@ fn read_dir_fd_path(root: &RootDir, rel: &Path) -> Result<Vec<DirEntry>> {
 ///
 /// `read_dir_fd(root, "")` and `read_dir_fd(root, ".")` are refused by the
 /// validated [`RootedRelativePath`] boundary — those spellings name the root,
-/// not an entry UNDER it —
-/// so before this function a consumer had NO public way to enumerate the root
-/// and could not reach residue sitting directly at the store root (a crashed
-/// temp, a stray file). The root descriptor is already pinned by the
-/// [`RootDir`], so no path spelling is involved; each entry is classified
-/// exactly as [`read_dir_fd`] classifies a child.
+/// not an entry UNDER it — so residue sitting directly at the store root (a
+/// crashed temp, a stray file) is reachable only through this function. The
+/// root descriptor is already pinned by the [`RootDir`], so no path spelling is
+/// involved; each entry is classified exactly as [`read_dir_fd`] classifies a
+/// child.
 pub fn read_root_dir_fd(root: &RootDir) -> Result<Vec<DirEntry>> {
     let dir_fd = root
         .as_fd()
@@ -4248,7 +4229,7 @@ mod tests {
     /// An absolute path, a `..` walk, a `.`, and the empty path are refused
     /// by the VALIDATED BOUNDARY ([`RootedRelativePath::parse`]) — the ONE
     /// place a root-relative spelling is checked now that the primitives take
-    /// the type. The primitive can no longer be handed such a spelling at all,
+    /// the type. The primitive cannot be handed such a spelling at all,
     /// so the refusal is asserted where it happens.
     #[test]
     fn path_kind_fd_refuses_escaping_spellings() {
@@ -4347,11 +4328,9 @@ mod tests {
                 "{spelling:?} must name the same entry as a/b"
             );
         }
-        // THE DELIBERATE TIGHTENING (constraint #1): `a/./b` used to resolve
-        // to `a/b` through the looser `validate_rel` guard (which inherited
-        // `Path::components`' erasure of a non-leading `.`). The validated
-        // boundary scans the literal spelling and REFUSES it, so it is no
-        // longer an accepted spelling.
+        // `a/./b` is refused too: the validated boundary scans the literal
+        // spelling, so a non-leading `.` is REFUSED rather than erased by
+        // `Path::components`.
         assert!(
             RootedRelativePath::parse(Path::new("a/./b")).is_err(),
             "a literal `.` segment must be refused by the validated boundary"
@@ -4512,8 +4491,6 @@ mod tests {
     /// WITHOUT publishing unlinks the temp name for BOTH forms (the
     /// path-based temp and the descriptor-relative temp); the replace stage
     /// sweeps above exercise the same `Drop` through real replace failures.
-    /// Before the linear type the obligation lived in each exit path, so there
-    /// was no value whose drop could be witnessed here.
     #[test]
     fn an_unpublished_linear_temp_unlinks_its_name_on_drop() {
         let (dir, root) = owned_root();
@@ -4725,16 +4702,17 @@ mod tests {
     }
 
     /// The SECOND COMPARE's OBSERVATION failure is a pre-rename exit that must
-    /// clean up the temp. The first compare passed and the temp was written,
-    /// chmodded, and fsynced; then the live entry becomes a SYMLINK, so the
+    /// clean up the temp. The first compare passed and the temp was written
+    /// and chmodded but NOT yet fsynced — the [`ReplaceStage::Sync`] hook fires
+    /// before `temp.sync` — and then the live entry becomes a SYMLINK, so the
     /// second `live_matches` errors (ELOOP) instead of answering mismatch.
     ///
-    /// BEHAVIOUR DELTA, pinned here: the pre-typestate core propagated that
-    /// error with `?` and LEAKED the temp name; the linear `Temp` discards it on
-    /// every pre-publish exit. The destination is never touched. The seam is
+    /// The linear `Temp` discards that error on every pre-publish exit, so the
+    /// temp is unlinked. The destination is never touched. The seam is
     /// the existing per-stage fault hook: the mutation runs at
-    /// [`ReplaceStage::Sync`], which is AFTER the temp was written and BEFORE
-    /// the second compare, so no extra test hook is needed.
+    /// [`ReplaceStage::Sync`], which is AFTER the temp was written and chmodded
+    /// and BEFORE both the temp fsync and the second compare, so no extra test
+    /// hook is needed.
     #[test]
     fn a_second_compare_error_unlinks_the_temp_and_leaves_the_destination() {
         let (dir, root) = owned_root();
@@ -4782,12 +4760,11 @@ mod tests {
         );
     }
 
-    /// The iterative path-based copy must visit entries in the SAME order as
-    /// the recursion it replaced: depth-first pre-order, descending into a
-    /// subdirectory the moment it is encountered — NOT "every file first,
-    /// then every subdirectory". The final tree is identical either way, so
-    /// this pins the observable consequence: on a mid-copy failure the
-    /// partial state follows the recursive order. The subdirectory/file names
+    /// The iterative path-based copy visits entries depth-first pre-order,
+    /// descending into a subdirectory the moment it is encountered — NOT
+    /// "every file first, then every subdirectory". The final tree is identical
+    /// either way, so this pins the observable consequence: on a mid-copy
+    /// failure the partial state follows that order. The subdirectory/file names
     /// are CHOSEN from a probe of this filesystem's own enumeration order, and
     /// BOTH creation orders are tried, so the subdirectory precedes the
     /// failing file on a name-hash filesystem (APFS), a creation-order
@@ -4824,8 +4801,9 @@ mod tests {
                 .is_some_and(|(s, f)| s < f);
             any_non_vacuous |= sub_before_file;
 
-            // Make the file's copy fail: a regular file cannot overwrite a
-            // directory, so `std::fs::copy` fails once the walk reaches it.
+            // Make the file's copy fail: the destination name is pre-created
+            // as a DIRECTORY, so the walk's create-new open for the file fails
+            // once it reaches it.
             std::fs::create_dir_all(dst.join(&file_name)).unwrap();
 
             let res = super::copy_tree_verbatim(&src, &dst);
@@ -4876,9 +4854,6 @@ mod tests {
     /// The ORDERING PROOF: replacing a path whose parent chain is
     /// MISSING commits every CREATED directory's own entry into its parent
     /// BEFORE the rename, so `ReplacedDurable` is true for the whole chain.
-    /// The pre-fix code created the chain with the non-durable helper and
-    /// fsynced only the file's parent, so this test failed with "the created
-    /// directory entry ... was never fsynced into its parent".
     #[test]
     fn a_missing_parent_chain_is_committed_durably_before_the_rename() {
         let (_dir, root) = owned_root();
@@ -4945,8 +4920,7 @@ mod tests {
     }
 
     /// The same ordering for the PATH-BASED replace (the Windows local path,
-    /// also reachable on Unix): `create_dir_all` used to leave the new
-    /// directories' entries unsynced.
+    /// also reachable on Unix).
     #[test]
     fn the_path_based_replace_commits_new_parent_entries_before_the_rename() {
         let dir = tempfile::tempdir().unwrap();
@@ -5010,10 +4984,9 @@ mod tests {
     // The owned root is enumerable
     // -----------------------------------------------------------------
 
-    /// Residue sitting DIRECTLY at the store root used to be unreachable: the
-    /// empty and `.` spellings are refused by the validated boundary. The
-    /// dedicated root enumerator reaches it, while those child spellings stay
-    /// refused.
+    /// Residue sitting DIRECTLY at the store root is reachable only through the
+    /// dedicated root enumerator: the empty and `.` spellings are refused by the
+    /// validated boundary, while the enumerator reaches it.
     #[test]
     fn the_owned_root_is_enumerable_and_root_child_spellings_stay_refused() {
         let (dir, root) = owned_root();
@@ -5041,7 +5014,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A crashed atomic replace (SIGKILL mid-protocol) leaves its temp behind;
-    /// the now-public recognizer is the recovery hook, and it must NOT confuse
+    /// the public recognizer is the recovery hook, and it must NOT confuse
     /// a genuine claim-ASIDE (which HOLDS a stranded original) for a temp.
     #[test]
     fn the_crate_temp_recognizer_is_public_and_distinguishes_a_held_aside() {
@@ -5075,9 +5048,9 @@ mod tests {
     // The stable-inode guarantee is structural
     // -----------------------------------------------------------------
 
-    /// The two-holder reproduction: while A holds the record, B used to UNLINK
-    /// it through the substrate and C then created a fresh inode and acquired
-    /// it — two simultaneous holders. The removal primitive now refuses a
+    /// The two-holder reproduction: while A holds the record, a removal through
+    /// the substrate must not unlink it (a fresh inode could then be created and
+    /// acquired — two simultaneous holders). The removal primitive refuses a
     /// lock-record spelling, so the record keeps A's inode and C is refused.
     #[test]
     fn removing_the_lock_record_is_refused_so_no_second_holder_can_appear() {
@@ -5113,11 +5086,10 @@ mod tests {
         assert!(matches!(alias_err, Error::Conflict(_)), "{alias_err:?}");
     }
 
-    /// The atomic REPLACE must consult the same guard as removal. Pre-fix
-    /// `replace_core` renamed a fresh inode over the record: A held
-    /// `operation.lock`, a replace swapped the inode, and C then acquired the
-    /// NEW inode while A still held the old one — two simultaneous holders.
-    /// The replace is now refused, the inode is A's, and C is contended.
+    /// The atomic REPLACE must consult the same guard as removal: a replace
+    /// that swapped the record's inode would let C acquire the NEW inode while
+    /// A still held the old one — two simultaneous holders. The replace is
+    /// refused, the inode is A's, and C is contended.
     #[test]
     fn replacing_the_lock_record_is_refused_so_no_second_holder_can_appear() {
         use std::os::unix::fs::MetadataExt;
@@ -5155,11 +5127,11 @@ mod tests {
         drop(holder);
     }
 
-    /// Removing an ANCESTOR of the record must not unlink it. Pre-fix the
-    /// guard checked only the ENTRY path's final component, so
-    /// `remove_dir_all_fd(root, "state")` walked into `state` and unlinked
-    /// `state/operation.lock`; a second acquisition then succeeded. The walk
-    /// now consults the guard at every unlink, so the ancestor removal is
+    /// Removing an ANCESTOR of the record must not unlink it: a guard that
+    /// checked only the ENTRY path's final component would let
+    /// `remove_dir_all_fd(root, "state")` walk into `state` and unlink
+    /// `state/operation.lock`, and a second acquisition would then succeed. The
+    /// walk consults the guard at every unlink, so the ancestor removal is
     /// refused and the record keeps its inode.
     #[test]
     fn removing_an_ancestor_of_the_lock_record_is_refused() {
@@ -5195,11 +5167,10 @@ mod tests {
         drop(holder);
     }
 
-    /// The PATH-BASED `write_atomic_replace` had NO lock-record guard.
-    /// Pre-fix it renamed a fresh inode over the record: A held
-    /// `operation.lock`, a path-based replace swapped the inode, and C then
-    /// acquired the NEW inode while A still held the old one — two simultaneous
-    /// holders. The replace is now refused, the inode is A's, and C is
+    /// The PATH-BASED `write_atomic_replace` consults the lock-record guard:
+    /// without it a path-based replace would swap the record's inode and C
+    /// could acquire the NEW inode while A still held the old one — two
+    /// simultaneous holders. The replace is refused, the inode is A's, and C is
     /// contended.
     #[test]
     fn path_based_replace_of_the_lock_record_is_refused() {
@@ -5231,11 +5202,11 @@ mod tests {
     }
 
     /// Renaming an ANCESTOR of the lock record MOVES the record with its
-    /// directory (the inode follows), freeing the old path. Pre-fix the guard
-    /// checked only the endpoints' final components, so
-    /// `renameat_paths(root, "state", "state2")` succeeded and a second
-    /// acquisition at `state/operation.lock` created a NEW inode — two
-    /// simultaneous holders. The source SUBTREE is now walked and the rename is
+    /// directory (the inode follows), freeing the old path: a guard that checked
+    /// only the endpoints' final components would let
+    /// `renameat_paths(root, "state", "state2")` succeed and a second
+    /// acquisition at `state/operation.lock` create a NEW inode — two
+    /// simultaneous holders. The source SUBTREE is walked and the rename is
     /// refused; the record keeps its inode and C is contended.
     #[test]
     fn renaming_an_ancestor_of_the_lock_record_is_refused() {
@@ -5287,10 +5258,9 @@ mod tests {
         assert!(!dir.path().join("state").exists());
     }
 
-    /// `set_private_fd` used to admit a DIRECTORY (`O_RDONLY` on a
-    /// directory succeeds) and chmod it to 0o600, stripping its execute bit.
-    /// The opened inode is classified now, so a directory is refused and its
-    /// mode is untouched, while a regular file is still chmodded.
+    /// A directory is refused by `set_private_fd` (`O_RDONLY` on a directory
+    /// succeeds, so the opened inode is classified before the chmod): its mode
+    /// is untouched, while a regular file is still chmodded.
     #[test]
     fn set_private_refuses_a_directory_and_chmods_a_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -5328,10 +5298,7 @@ mod tests {
     /// The PATH-BASED `ensure_private_dir_durable` runs the guard with
     /// [`Sanction::Residue`], which skips the RESIDUE authority but still runs
     /// the LOCK authority — so a residue spelling is permitted here while a
-    /// lock-record spelling is refused, with the TYPED `Error::Conflict`. Its
-    /// Unix callers all passed an already-guarded full path, so deleting this
-    /// line left the suite green; this test is what notices it. Pre-fix the
-    /// call created the directory and returned `Ok(true)`.
+    /// lock-record spelling is refused, with the TYPED `Error::Conflict`.
     #[test]
     fn ensure_private_dir_durable_refuses_the_lock_record() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5419,8 +5386,7 @@ mod tests {
     /// The descriptor-relative `set_private_fd` consults the ONE lock-record
     /// guard. A chmod preserves the inode, so this is not a holder split, but
     /// the chmod primitive must not disagree with every other mutation about
-    /// the record. Pre-fix `set_private_fd` chmodded the record and returned
-    /// `Ok(())`.
+    /// the record.
     #[test]
     fn set_private_fd_refuses_the_lock_record() {
         let (dir, root) = owned_root();
@@ -5439,10 +5405,9 @@ mod tests {
     }
 
     /// The RAW rename primitive is guarded at the PRIMITIVE, not at the
-    /// higher-level `renameat_paths`. Pre-fix `renameat_fd` was `pub` and
-    /// unguarded: calling it directly renamed the record and freed the path a
-    /// successor lock acquires (two holders, different inodes). PRE-FIX
-    /// MESSAGE: the call returned `Ok(())` and `operation.lock` was gone.
+    /// higher-level `renameat_paths`: calling it directly must not rename the
+    /// record and free the path a
+    /// successor lock acquires (two holders, different inodes).
     #[test]
     fn the_raw_rename_primitive_refuses_the_lock_record() {
         let (dir, root) = owned_root();
@@ -5482,12 +5447,9 @@ mod tests {
         assert!(format!("{err}").contains("lock record"), "got: {err}");
     }
 
-    /// A raw open with a MUTATING flag set is refused at the primitive.
-    /// Pre-fix `openat_no_follow` was `pub` and unguarded, so
-    /// `O_WRONLY|O_TRUNC` truncated the record (the inode survived, but the
-    /// holder-identity bytes the contention diagnostic reads were destroyed).
-    /// PRE-FIX MESSAGE: the open returned a writable fd and the content
-    /// became empty.
+    /// A raw open with a MUTATING flag set is refused at the primitive: an
+    /// `O_WRONLY|O_TRUNC` open of the record would destroy the holder-identity
+    /// bytes the contention diagnostic reads (the inode survives).
     #[test]
     fn the_raw_truncating_open_refuses_the_lock_record() {
         let (dir, root) = owned_root();
@@ -5514,15 +5476,12 @@ mod tests {
         drop(fd);
     }
 
-    /// DATA LOSS: the recursive-removal walk consulted only the
-    /// lock-record authority, so `remove_dir_all_path`/`remove_dir_all_fd`
-    /// walked straight over a stranded `.sync-aside.` and destroyed the
-    /// caller's only copy of the original. The walk and the entry points now
-    /// consult the RESIDUE authority at the same chokepoint, and the refusal
-    /// names the sync's own `ResidueBelow` vocabulary.
-    ///
-    /// PRE-FIX MESSAGE: `remove_dir_all_path(victim)` returned `Ok`, and
-    /// `victim/.sync-aside.1234.0` no longer existed.
+    /// DATA LOSS: the recursive-removal walk must consult the RESIDUE
+    /// authority as well as the lock-record one, or `remove_dir_all_path` /
+    /// `remove_dir_all_fd` would walk straight over a stranded `.sync-aside.`
+    /// and destroy the caller's only copy of the original. The walk and the
+    /// entry points consult the residue authority at the same chokepoint, and
+    /// the refusal names the sync's own `ResidueBelow` vocabulary.
     #[test]
     fn recursive_removal_never_destroys_a_stranded_aside() {
         let (dir, root) = owned_root();
@@ -5530,7 +5489,8 @@ mod tests {
         std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
         std::fs::write(&stranded, b"precious").unwrap();
 
-        // (a) Removing the ANCESTOR walks over the aside without the guard.
+        // (a) Removing the ANCESTOR is refused: the walk reaches the nested
+        // aside.
         let err = remove_dir_all_fd(&root, &rp("victim"))
             .expect_err("removing an ancestor of a stranded aside must be refused");
         assert!(
@@ -5550,7 +5510,7 @@ mod tests {
         assert_eq!(std::fs::read(&stranded).unwrap(), b"precious".to_vec());
 
         // (b) The PATH-BASED primitive the recovery recipe named is refused
-        // for the aside itself. PRE-FIX: returned `Ok` and removed it.
+        // for the aside itself.
         let aside_abs = dir.path().join("victim/.sync-aside.1234.0");
         let err = remove_dir_all_path(&aside_abs)
             .expect_err("removing the stranded aside itself must be refused");
@@ -5591,7 +5551,7 @@ mod tests {
     }
 
     /// The exact primitive this pins: `remove_dir_all_path` over the aside path
-    /// itself. PRE-FIX: returned `Ok(())` and destroyed it.
+    /// itself.
     #[test]
     fn path_based_removal_never_destroys_a_stranded_aside() {
         let (dir, _root) = owned_root();
@@ -5650,8 +5610,9 @@ mod tests {
         assert!(dir.path().join("ordinary").exists());
     }
 
-    /// The EXPLICIT discard is the only sanctioned break of the implicit
-    /// residue guard. It removes the ONE strand, still refuses the lock
+    /// The EXPLICIT dir discard is the sanctioned break of the implicit
+    /// residue guard for a recursive removal. It removes the ONE strand, still
+    /// refuses the lock
     /// authority, and still refuses a NESTED residue (a second stranded
     /// original inside the strand).
     #[test]
@@ -5701,8 +5662,7 @@ mod tests {
 
     /// EVERY name-mutating primitive that could touch a strand FILE refuses
     /// it with the TYPED `ResidueBelow` reason, and the strand's bytes AND mode
-    /// are intact. PRE-FIX: each of these returned `Ok` (or clobbered/replaced)
-    /// and destroyed the caller's only copy.
+    /// are intact.
     #[test]
     fn every_mutating_primitive_refuses_an_existing_strand_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -5794,7 +5754,7 @@ mod tests {
         assert!(!dir.path().join(strand).exists());
 
         // The SANCTIONED residue-movement rename still REFUSES to replace an
-        // EXISTING strand (it must not become the old hole), while a FRESH
+        // EXISTING strand, while a FRESH
         // (absent) aside destination is permitted — that is the engine's own
         // claim-aside rename.
         let (dir, root) = seed();
@@ -5823,20 +5783,17 @@ mod tests {
         std::fs::write(src.join("ro").join("inner"), b"deep").unwrap();
         std::fs::write(src.join("bin"), b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(src.join("bin"), std::fs::Permissions::from_mode(0o4755)).unwrap();
-        // A READ-ONLY source directory: the two-phase walk must widen it,
-        // copy the child, then restore 0o555 (the source tool's one-phase
-        // original failed here with EACCES).
+        // A READ-ONLY source directory: the two-phase walk must widen it and
+        // copy the child.
         std::fs::set_permissions(src.join("ro"), std::fs::Permissions::from_mode(0o555)).unwrap();
         std::os::unix::fs::symlink("file.txt", src.join("link")).unwrap();
         (base, root, src)
     }
 
-    /// The re-added public tree copy carries content, symlink targets, and
+    /// The public tree copy carries content, symlink targets, and
     /// EXACT modes (including a read-only directory and the setuid bit) into
-    /// the root-confined destination, and the re-added tree fsync accepts the
-    /// result. PRE-FIX: these two public primitives did not exist, so this
-    /// test did not COMPILE (the failure was a missing primitive); there is no
-    /// runtime assertion that could have failed first.
+    /// the root-confined destination, and the tree fsync accepts the
+    /// result.
     #[test]
     fn copy_dir_recursive_fd_carries_content_modes_and_symlinks() {
         use std::os::unix::fs::PermissionsExt;
@@ -6103,7 +6060,7 @@ mod tests {
         );
     }
 
-    /// The re-added tree fsync is fd-confined: a symlink injected into a
+    /// The tree fsync is fd-confined: a symlink injected into a
     /// component of the tree path is refused rather than followed out of the
     /// root (the path-based `Remote::fsync_tree` would follow it).
     #[test]
@@ -6135,12 +6092,10 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A FIFO in the source tree must be refused PROMPTLY, never opened
-    /// blocking. `open(2)` of a FIFO read-only blocks until a writer appears,
-    /// and the primitive used to `File::open` every non-dir/non-symlink entry.
+    /// blocking: `open(2)` of a FIFO read-only blocks until a writer appears.
     /// The call runs on a worker thread so the WAIT IS BOUNDED: the test
-    /// returns (failing) after the timeout even if the fix regresses, and the
-    /// suite can never hang. PRE-FIX: the worker blocks in `open` and never
-    /// answers, so the timeout fires.
+    /// returns (failing) after the timeout even if the classified open
+    /// regresses, and the suite can never hang.
     #[test]
     fn copy_dir_recursive_fd_refuses_a_fifo_source_without_blocking() {
         let (base, _root, src) = out_of_root_fixture();
@@ -6299,9 +6254,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A source entry whose name is a crate TEMP shape is refused instead
-    /// of landed. `is_crate_temp_name` recognises the landed entry, so the
-    /// documented recovery sweep would DELETE a live file. PRE-FIX: the name
-    /// was written verbatim and the copy returned `Ok`.
+    /// of landed: `is_crate_temp_name` would recognise the landed entry, so the
+    /// documented recovery sweep would DELETE a live file.
     #[test]
     fn copy_dir_recursive_fd_refuses_a_crate_temp_name() {
         let (base, root, src) = out_of_root_fixture();
@@ -6644,9 +6598,8 @@ mod tests {
 
     /// The overlapping reproduction — `src = <root>/tree`, `dst_rel =
     /// "tree/sub"` — must be refused BEFORE anything is created, so no partial
-    /// tree is left. PRE-FIX: `ensure_private_dir_fd` created `<root>/tree/sub`,
-    /// the source `read_dir` re-yielded it, and the walk recursed to
-    /// `ENAMETOOLONG` (macOS depth 236, Linux 1017).
+    /// tree is left (a created `dst_rel` would be re-yielded by the source's own
+    /// `read_dir`).
     #[test]
     fn copy_dir_recursive_fd_refuses_a_destination_inside_the_source() {
         let (base, root, _src) = out_of_root_fixture();
@@ -6721,8 +6674,6 @@ mod tests {
     /// An ESCAPING relative symlink target is refused (both platforms), and
     /// once it is removed the ordinary tree plus the legitimate in-root
     /// relative link copy and the destination `canonicalize_tree`s cleanly.
-    /// PRE-FIX: the escaping target was copied verbatim and the result failed
-    /// `canonicalize_tree`.
     #[test]
     fn copy_dir_recursive_fd_refuses_an_escaping_symlink_and_keeps_the_tree_canonicalizable() {
         let (base, root, src) = out_of_root_fixture();
@@ -6890,13 +6841,10 @@ mod tests {
         }
     }
 
-    /// On a CASE-SENSITIVE source the old live `symlink_metadata` probe
-    /// missed a component the crate's full case fold matches, so the copy
-    /// LANDED an escaping link that `canonicalize_tree(dst)` then refused. The
-    /// copy now uses the manifest's index and refuses before landing it.
-    /// PRE-FIX this test FAILED on a case-sensitive source: the copy returned
-    /// `Ok`, `root/dst/dir/link/secret` reached the canary, and
-    /// `canonicalize_tree(dst)` refused the tree the copy produced.
+    /// On a CASE-SENSITIVE source a probe that compared spellings only would
+    /// miss a component the crate's full case fold matches, so the copy could
+    /// LAND an escaping link that `canonicalize_tree(dst)` then refuses. The
+    /// copy uses the manifest's index and refuses before landing it.
     #[test]
     fn copy_dir_recursive_fd_refuses_a_fold_escape_from_a_case_sensitive_source() {
         let Some(cs) = case_sensitive_source() else {
@@ -6934,12 +6882,10 @@ mod tests {
     }
 
     /// A destination-only symlink INSIDE `dst_rel` is part of the
-    /// post-copy view. The old probe answered from the SOURCE, so it was
-    /// invisible and `src/link -> evil/secret` landed on top of a pre-existing
-    /// `dst/evil -> ../../outside` and escaped. The copy now consults the
-    /// destination's surviving entries, so it refuses.
-    /// PRE-FIX this test FAILED: the copy returned `Ok`, `root/dst/esc` reached
-    /// the canary, and `canonicalize_tree(dst)` refused the result.
+    /// post-copy view: `src/link -> evil/secret` would land on top of a
+    /// pre-existing `dst/evil -> ../../outside` and escape if only the source
+    /// were consulted. The copy consults the destination's surviving entries,
+    /// so it refuses.
     #[test]
     fn copy_dir_recursive_fd_refuses_a_destination_only_symlink_component() {
         let (base, root, src) = out_of_root_fixture();
@@ -6964,11 +6910,8 @@ mod tests {
     }
 
     /// With NO host folding, the copy and `canonicalize_tree` must reach
-    /// the SAME verdict on a fold-equal symlink component. The old live probe
-    /// (case-sensitive source) missed `Sub`, accepted the tree, and
-    /// contradicted the manifest. The copy now uses the manifest's index, so
-    /// both refuse. PRE-FIX this test FAILED on a case-sensitive source: the
-    /// manifest refused while the copy returned `Ok`.
+    /// the SAME verdict on a fold-equal symlink component: the copy uses the
+    /// manifest's index, so both refuse.
     #[test]
     fn copy_dir_recursive_fd_agrees_with_canonicalize_tree_on_a_fold_equal_component() {
         let Some(cs) = case_sensitive_source() else {
@@ -7000,10 +6943,8 @@ mod tests {
         assert!(!base.path().join("root/dst/dir/link").exists());
     }
 
-    /// On a host that folds `STRASSE` onto `straße`, the old copy's LIVE
-    /// probe REFUSED a tree the manifest (narrow fold) ACCEPTED. After both fixes
-    /// both views refuse, so they AGREE. PRE-FIX this test FAILED: the manifest
-    /// accepted the tree (the narrow fold missed the pair).
+    /// On a host that folds `STRASSE` onto `straße`, the copy and the manifest
+    /// must AGREE: both views use the same fold, and both refuse.
     #[test]
     fn copy_dir_recursive_fd_and_manifest_agree_on_a_host_folded_component() {
         let (base, root, src) = out_of_root_fixture();
@@ -7029,11 +6970,9 @@ mod tests {
         assert!(!base.path().join("root/dst/dir/link").exists());
     }
 
-    /// ORDER fix, the FOURTH caller (the tree copy): the pre-fix order bug was
-    /// in the ONE fold authority, so the copy had the SAME under-fold as the
-    /// manifest. Both must refuse the Greek escape. PRE-FIX this is the
-    /// tree-copy half of the observed escape: the manifest ACCEPTED (checked by
-    /// the integration `greek_*` tests) and the copy returned `Ok`.
+    /// The FOURTH caller (the tree copy) uses the ONE fold authority, so the
+    /// copy and the manifest must refuse the Greek escape together (the
+    /// integration `greek_*` tests check the manifest half).
     #[test]
     fn copy_dir_recursive_fd_and_manifest_agree_on_a_greek_order_fold() {
         for (on_disk, capital) in [
@@ -7071,14 +7010,11 @@ mod tests {
         }
     }
 
-    /// The copy no longer collapses a filesystem error to "no symlink
-    /// here". An unreadable destination subtree makes the enumeration fail, and
-    /// the copy fails CLOSED rather than guessing the escaped component is
+    /// The copy fails CLOSED on an enumeration error: an unreadable
+    /// destination subtree makes the enumeration fail, and
+    /// the copy refuses rather than guessing the escaped component is
     /// absent. (Reproducible only where a mode-0000 directory really refuses
     /// reads; the premise is probed with a REAL `read_dir`.)
-    /// PRE-FIX this test FAILED: the live probe only `symlink_metadata`d the
-    /// specific target components, which did not touch the unreadable sibling,
-    /// so the copy returned `Ok`.
     #[test]
     fn copy_dir_recursive_fd_fails_closed_when_the_destination_cannot_be_enumerated() {
         use std::os::unix::fs::PermissionsExt;
@@ -7111,10 +7047,7 @@ mod tests {
 
     /// A residue-spelled DESTINATION component is refused BEFORE anything
     /// is created, with the CREATE/COPY vocabulary (not the removal
-    /// `recover_to` wording), and no partial directory is left. PRE-FIX:
-    /// `ensure_private_dir_fd` created `<root>/.sync-aside.probe`, then the
-    /// NEXT call refused with a REMOVAL-worded message and left the directory
-    /// behind.
+    /// `recover_to` wording), and no partial directory is left.
     #[test]
     fn copy_dir_recursive_fd_refuses_a_residue_destination_with_no_partial_state() {
         let (base, root, src) = out_of_root_fixture();
