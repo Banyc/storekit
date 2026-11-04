@@ -1,14 +1,9 @@
 //! Canonical tree metadata: the manifest.
 //!
-//! The canonical tree objects ([`canonicalize_tree`], [`compute_tree_digest`],
-//! [`entry_paths`]) lead this module; they define the one canonical format for
-//! a tree of bytes.
-//!
-//! The canonical format is a cross-module contract: the store verifies objects
-//! against it, recovery re-hashes with it, and the SSH transport must preserve
-//! exactly these bytes on upload. Any module that serializes or transfers tree
-//! bytes diverging from this format silently breaks digest equality for every
-//! other verifier.
+//! [`canonicalize_tree`], [`compute_tree_digest`], and [`entry_paths`] define
+//! the one canonical format for a tree of bytes, and [`verify_tree_metadata`]
+//! re-canonicalizes a tree and compares EVERY field of a stored record against
+//! it, so a record that diverges from the bytes is refused rather than trusted.
 //!
 //! # Names are on-disk names: NFC UTF-8, or the tree is refused
 //!
@@ -16,14 +11,10 @@
 //! stored exactly as the filesystem spells it (joined with `/`): valid UTF-8
 //! and already NFC. Canonicalization therefore REFUSES a tree containing a
 //! name that is not valid UTF-8 or not already NFC, with an error that names
-//! the offending entry, instead of converting or normalizing it. This is
-//! deliberate: the stored path is used to ADDRESS the file downstream, and
-//! storing a normalized spelling names a path that does not exist on a
-//! normalization-sensitive filesystem (Linux/ext4) — the sync would either
-//! fail to find the file or, worse, report success while leaving the
-//! destination holding both spellings. The two canonicalizers (the local walk
-//! and the remote wire assembler) apply the same rule, so they accept exactly
-//! the same trees.
+//! the offending entry, instead of converting or normalizing it: the stored
+//! path is what ADDRESSES the file downstream. Both canonicalizers (the local
+//! walk and the remote wire assembler) apply that name rule through the one
+//! validator [`validate_entry_path`].
 //!
 //! # Symlink targets are link data: UTF-8, wire-clean, and non-escaping
 //!
@@ -69,21 +60,16 @@
 //! guess where a follow ends.
 //!
 //! The walk is over root-RELATIVE paths and never builds an absolute base, so
-//! it does not depend on the root's spelling. Both manifest call sites now
-//! answer "does this component resolve to a symlink?" from the SAME
-//! [`SymlinkContainmentIndex`] they build from their own entry list — the local
-//! walk from the entries its `WalkDir` produced, the assembler from the entries
-//! the far side's listing produced — and both apply the crate's ONE
-//! containment fold (full Unicode case fold, Unicode NFC around it, trailing
-//! `.`/space; see [`fold_component`]). Neither canonicalizes the root, so a root reached
-//! through a symlink can no longer make the two verdicts differ, and because
-//! the fold is platform-independent the two views cannot disagree about the
-//! same tree on any host. (Before this the local walk asked `symlink_metadata`
-//! of the live tree while the assembler compared the listing's spellings
-//! byte-exactly, so on a case- or normalization-folding filesystem the local
-//! view refused a target the wire view accepted: an exact-string lookup is not
-//! the kernel's resolution, and the divergence was an under-refusal by the
-//! wire view.)
+//! it does not depend on the root's spelling or on the root's canonical form.
+//! Both manifest views reach it through the ONE shared post-pass
+//! ([`EntryAssembler::finish`]), which builds ONE [`SymlinkContainmentIndex`]
+//! from the entries that view assembled — the local walk from the entries its
+//! `WalkDir` produced, the assembler from the entries the far side's listing
+//! produced — and applies the crate's ONE containment fold (full Unicode case
+//! fold, Unicode NFC around it, trailing `.`/space; see [`fold_component`]). A
+//! root reached through a symlink therefore cannot make the two verdicts
+//! differ, and because the fold is platform-independent the two views cannot
+//! disagree about the same tree on any host.
 //!
 //! # The fold, and the residual it costs
 //!
@@ -102,79 +88,64 @@
 //! fail-closed over-refusal, and it is the residual this rule accepts rather
 //! than letting the two views — or two hosts — disagree about the same tree.
 //!
-//! A `str::to_lowercase` fold would be WRONG here, and the reason is worth stating
-//! because it is the trap this rule exists to avoid: the claim that a fold's only
-//! cost is a fail-closed over-refusal is false of that one. `to_lowercase` UNDER-folds
-//! a case-insensitive host (`ß` stays `ß` instead of `ss`, `ﬁ` stays `ﬁ`
-//! instead of `fi`, FINAL SIGMA stays itself instead of `σ`, long s stays `ſ`
-//! instead of `s`), so a target component the kernel resolved onto a symlink
-//! was answered `Absent` and ACCEPTED — an under-refusal, i.e. an escape, not
-//! an over-refusal. The fold is now the FULL Unicode case fold
-//! ([`crate::casefold`]), applied to the NFD-DECOMPOSED component
-//! (`NFC(case_fold(NFD(name)))`; see [`fold_component`]) — the Unicode default
-//! caseless match the host filesystems implement. The macOS APFS half of that
-//! claim is DEMONSTRATED, not asserted:
-//! `the_fold_agrees_with_the_host_on_the_measured_families` probes the live
-//! filesystem with a real write and a cross-spelling lookup for the measured
-//! families, and the three Greek precomposed perispomeni+ypogegrammeni pairs
-//! are covered end to end by the `greek_*` tests in
-//! `tests/casefold_confinement.rs`. The Linux `ext4 -O casefold` half was NOT
-//! re-run on a casefold host, so the claim for that
-//! host rests only on the fold being the Unicode C+F caseless match and is
-//! left UNVERIFIED here rather than asserted. The over-refusal residual above
-//! is now true, and the added over-refusal is exactly the extra spellings those
-//! hosts fold together and a case-sensitive host would leave dangling
-//! (`straße`/`SS`, `ﬁle`/`FILE`, `ς`/`σ`, ...): refused on every host, which is
-//! the safe direction for a decision that otherwise GRANTS acceptance.
+//! The fold is the Unicode default caseless match — the full `C`+`F` case fold
+//! ([`crate::casefold`]) applied to the NFD-DECOMPOSED component
+//! (`NFC(case_fold(NFD(name)))`; see [`fold_component`]) — not
+//! `str::to_lowercase`, which UNDER-folds a case-insensitive host (`ß` stays
+//! `ß` instead of `ss`, `ﬁ` stays `ﬁ` instead of `fi`, FINAL SIGMA stays itself
+//! instead of `σ`, long s stays `ſ` instead of `s`). An under-folding here is
+//! an under-refusal — an escape: a target component the kernel resolved onto a
+//! symlink would be answered `Absent` and ACCEPTED. The macOS APFS half of "the
+//! fold is not narrower than the host's" is measured by the test
+//! `the_fold_agrees_with_the_host_on_the_measured_families` (a real write and a
+//! cross-spelling lookup per measured family), and the three Greek precomposed
+//! perispomeni+ypogegrammeni pairs are covered end to end by the `greek_*`
+//! tests in `tests/casefold_confinement.rs`. The Linux `ext4 -O casefold` half
+//! is left UNVERIFIED here: it rests on the fold being the Unicode C+F caseless
+//! match. The over-refusal added by the wider fold is exactly the extra
+//! spellings those hosts fold together and a case-sensitive host would leave
+//! dangling (`straße`/`SS`, `ﬁle`/`FILE`, `ς`/`σ`, ...): refused on every host,
+//! which is the safe direction for a decision that otherwise GRANTS acceptance.
 //!
-//! CORRECTION (this revision) to the fold's ORDER: the previous revision
-//! folded `NFC(name)` first, then case-folded. Unicode caseless matching is
-//! NFD-based, so that order is not canonical-equivalence-safe: it diverges for
-//! exactly three code points — U+1FB7, U+1FC7, and U+1FF7 (the Greek
-//! precomposed perispomeni+ypogegrammeni forms). Their canonically-related
-//! capital spellings (`U+1FBC U+0342`, `U+1FCC U+0342`, `U+1FFC U+0342`, and the
-//! fully decomposed `U+0391 U+0342 U+0345` family) fold to a DIFFERENT string,
-//! so the index answered `Absent` for a component the kernel resolves to a
-//! symlink and the escape was ACCEPTED. Taking the NFD first makes both
-//! spellings fold to the same key (`NFC(case_fold(NFD(·)))`).
+//! The NFD-first ORDER is load-bearing: Unicode caseless matching is NFD-based,
+//! and an NFC-first fold diverges for exactly three code points — U+1FB7,
+//! U+1FC7, and U+1FF7 (the Greek precomposed perispomeni+ypogegrammeni forms).
+//! Their canonically-related capital spellings (`U+1FBC U+0342`, `U+1FCC
+//! U+0342`, `U+1FFC U+0342`, and the fully decomposed `U+0391 U+0342 U+0345`
+//! family) fold to a DIFFERENT string under it, so the index would answer
+//! `Absent` for a component the kernel resolves to a symlink and the escape
+//! would be ACCEPTED. Taking the NFD first makes both spellings fold to the
+//! same key (`NFC(case_fold(NFD(·)))`).
 //!
-//! This section is also the corrected RESIDUAL LIST for the physical-walk
-//! change. The previous revision claimed no legitimate tree was newly refused
-//! except the target that ends at a symlink and the target that reaches an
-//! exactly-spelled symlink component; that list was INCOMPLETE. The complete
-//! list of what this rule refuses is:
+//! The relative-target rule refuses a target that its spelled walk cannot keep
+//! inside the root, or that the walk's view of the tree cannot settle. The rule
+//! is DEFINED by that walk (`walk_relative_symlink_target`) and by the resolver
+//! it is handed, so it is not restated here as a closed list. The walk answers
+//! either `Ok` or its FIRST refusal, and that refusal has one of two shapes: a
+//! `..` that pops above the tree root, or a component the resolver refuses.
+//! What a component refusal MEANS is the resolver's. The single-view
+//! canonicalizers refuse a component that resolves to a symlink (by exact
+//! spelling, or by the fold residual above). The two-view plan-free rule
+//! ([`ContainmentViews`], via `ContainmentViews::refuses`) refuses a component
+//! the two static observations cannot agree on: a redirector in either view, a
+//! component only the destination supplies, or a source/destination kind
+//! disagreement. The refusal SHAPES a caller matches on are
+//! [`SymlinkTargetRefusal`]'s variants, and that enum,
+//! `walk_relative_symlink_target`, and `ContainmentViews::refuses` are the
+//! authority for the set. A target refused by a rule outside this walk — an
+//! EMPTY target, refused by [`validate_symlink_target`] and by the wire
+//! assembler's `missing symlink target` check — is a separate refusal, not a
+//! member of it. A spelling the walk cannot read at all — an absolute target,
+//! or a link path with an absolute or `..` component — takes the fail-closed
+//! root-escape answer.
 //!
-//! 1. A relative target that ends at a symlink, or that reaches a symlink
-//!    component with an exact spelling.
-//! 2. A relative target whose spelled walk reaches a component with NO exact
-//!    entry that FOLD-MATCHES a symlink entry (the fold residual above): refused
-//!    on EVERY host, including a case-sensitive one where the link would dangle.
-//! 3. An EMPTY symlink target, refused by BOTH views
-//!    ([`validate_symlink_target`]). Before this the local walk accepted `""`
-//!    (an empty path has no components) while the wire assembler refused it, so
-//!    a macOS source (APFS stores an empty-target link) was accepted by one
-//!    view and refused by the other.
-//! 4. A SOURCE link whose target walks through a component that a DESTINATION
-//!    symlink occupies under `Extraneous::Keep`: the RUN refuses, because
-//!    containment is a property of the RESULT, not of the source alone (see
-//!    `crate::sync`). The destination entry is never silently removed — removal
-//!    is the caller's `Extraneous` decision — so a `Keep` run refuses and the
-//!    caller must clear the component (or the source link) first.
-//!
-//! The root-relative walk is also the only rule that keeps containment
+//! The root-relative walk is also what keeps containment
 //! PORTABLE, which is the property a manifest must have: a target that stays in
 //! the root only because the root happens to be NAMED a particular name (e.g.
 //! `dir/link -> ../../real/other` when the root is `.../real`) leaves the root
 //! as soon as the tree is materialized under any other name. Checking it
 //! against the resolved real root would accept a tree whose containment is a
 //! coincidence of the root's spelling, so such a target is refused.
-//!
-//! The earlier version of this section got the argument wrong in a way worth
-//! recording: it argued only about the LINK'S PARENT components (which the walk
-//! had already verified as real directories) and never about the TARGET's
-//! components — the half whose treatment the resolution base had just changed.
-//! A safety argument must cover the part of the input whose treatment can
-//! change, not the part that was already correct.
 //!
 //! NFC is deliberately NOT required of a target. A name is an index into the
 //! tree, but a target is DATA: the kernel resolves it verbatim, it may contain
@@ -190,15 +161,11 @@
 //!
 //! A sync transports THIS manifest plus the file bytes, and the manifest
 //! model is exactly the fields of [`TreeEntry`] — so fidelity is bounded by
-//! them. This section is the crate's authoritative statement of scope: every
-//! item under "carried" was verified end to end, and every item under "not
-//! carried" is a deliberate, currently-unimplemented limitation rather than
-//! a guarantee. A caller must be able to read this and predict the result
-//! without experimenting.
+//! them.
 //!
 //! **CARRIED faithfully:** the entry's path name (NFC UTF-8, `/`-separated;
 //! see above), its kind (file, directory, or symlink), its mode INCLUDING
-//! the setuid/setgid/sticky bits (stored as the full octal mode and applied
+//! the setuid/setgid/sticky bits (the full octal mode up to `0o7777`, applied
 //! with an explicit `chmod`, so a permissive umask cannot narrow it), the
 //! file's content (the SHA-256-bound bytes), and a symlink's target (the raw
 //! target bytes).
@@ -219,10 +186,7 @@
 //!   ([`canonicalize_tree`]'s `std::fs::read`) and the far-side perl
 //!   manifest script both slurp the entire file in one allocation, so peak
 //!   resident memory is proportional to the LARGEST SINGLE FILE, not to the
-//!   tree's total size. This is a PER-FILE bound, not a total-tree bound,
-//!   and no streaming path exists. Peak memory tracks the LARGEST single entry, so
-//!   what matters is that entry's size against the process's budget, not the tree's
-//!   total.
+//!   tree's total size, and no streaming path exists.
 //!
 //! The loss of xattrs, `security.capability`, and ACLs is INVISIBLE TO THE
 //! DIFFER: a second sync compares only the manifest model, sees the entry as
@@ -233,31 +197,21 @@
 //! `nlink > 1`) is refused with an error naming the entry — see
 //! [`canonicalize_tree`] for the platform split. The DESTINATION pair TOLERATES
 //! one instead, keeping it as an unsupported entry rather than materializing it
-//! as two independent copies. Refusal is the crate's
-//! doctrine for anything it cannot reproduce faithfully (the name and
-//! symlink-target rules above follow the same principle): a silent
-//! transformation that changes what the tree means is worse than a loud
-//! failure.
+//! as two independent copies.
 //!
-//! **Push and pull now mutate a destination the SAME way.** Both publish a
+//! **Push and pull mutate a destination the SAME way.** Both publish a
 //! written file by ATOMIC RENAME into place (a NEW inode), so the replaced
 //! file's pre-existing xattrs and owner are destroyed with the old inode in
-//! BOTH directions. (Before a push was made atomic, a push overwrote the
-//! bytes IN PLACE — the SSH transport's `cat >`, the local transport's
-//! `O_TRUNC` create — and kept the old inode; that asymmetry, and the torn
-//! destination a failed in-place push could leave, are gone.)
+//! BOTH directions.
 //!
 //! **The manifest carries no TIMESTAMPS.** `TreeEntry` has no `mtime`/`atime`
-//! field, so a caller that wants "the newest N snapshots" MUST derive the
-//! order from the snapshot id's LEXICAL order (or keep its own timestamp
-//! record): the manifest (and therefore the differ) cannot rank two entries
-//! by time, and two snapshots whose only difference is a modification time
+//! field: the manifest (and therefore the differ) cannot rank two entries by
+//! time, and two snapshots whose only difference is a modification time
 //! compare `Same`.
 //!
 //! # Durability and atomicity of a written entry
 //!
-//! The write discipline is chosen by the DESTINATION, never by the direction.
-//! This is the statement a caller should read before relying on either:
+//! The write discipline is chosen by the DESTINATION, never by the direction:
 //!
 //! * **LOCAL destination** — a PULL's local root, OR a PUSH whose transport
 //!   declares `is_local() == true` ([`crate::transport::LocalTransport`]):
@@ -274,15 +228,16 @@
 //!   content is VISIBLE but its durability is unconfirmed — NEVER a bare
 //!   `Err` (a bare `Err` would falsely claim the rename never happened).
 //! * **REMOTE destination** ([`crate::transport::SshTransport`]): the SAME
-//!   protocol on the far side, in one POSIX shell command: a `mktemp` temp in
+//!   protocol on the far side, in one remote shell command: a `mktemp` temp in
 //!   the destination's own directory, the payload on STDIN into it, the final
 //!   mode, a portable perl `fsync(2)` of the temp, a perl `rename(2)` INTO
 //!   PLACE (overwriting the final entry atomically, never following a symlink),
 //!   then a perl `fsync(2)` of the parent directory. Every operand is
 //!   single-quoted, `--` precedes a value that may start with `-`, the parent
 //!   is computed on this host (never by a far-side `dirname`), and the payload
-//!   is never embedded in the command string. GNU and BSD userlands are both
-//!   exercised by the far-side suites. A failure before the rename leaves the
+//!   is never embedded in the command string. The far-side suites re-parse and
+//!   run this command under a real POSIX shell, so a GNU-only spelling fails on
+//!   a BSD host. A failure before the rename leaves the
 //!   PREVIOUS content in place and removes the temp.
 //! * **WINDOWS local destination**: the PATH-BASED replace
 //!   ([`crate::atomic::write_atomic_replace`], the public UNCONFINED form as
@@ -294,9 +249,10 @@
 //!   type-checks but is NOT exercised, so treat it as unverified.
 //!
 //! `EntryPolicy::AppendTail` adds a COMPARE before an append's write: the write
-//! happens only if the destination still holds the bytes the append read, so a
-//! concurrent modification becomes a REPORTED conflict rather than a silent
-//! overwrite (see [`crate::sync`] for what the compare can and cannot cover).
+//! goes through a compare-and-replace that expects the bytes the append read, so
+//! a concurrent modification is DETECTED and the rule re-decided (an exhausted
+//! retry loop is a `Diverged` conflict), never silently overwritten. See
+//! [`crate::sync`] for what the compare can and cannot cover.
 //!
 //! A caller that needs `security.capability`, ACLs, ownership, or timestamps
 //! preserved must apply them out of band after the sync.
@@ -314,12 +270,9 @@ use walkdir::WalkDir;
 /// The wire form is the three canonical strings `"file"`, `"dir"`, and
 /// `"symlink"`; only the serde boundary translates between that form and this
 /// type, so a reader of the manifest never RE-PARSES a kind string into the
-/// value a decision needs. Before this type the field was a `String` and every
-/// consumer projected it with a fallible `EntryKind::of` — the mode/kind
-/// re-reads API constraint #7 removes. A wire value outside the canonical set
-/// is refused by `Deserialize` (fail closed), exactly as the old projection
-/// refused it, and the emitted bytes are unchanged (see
-/// `manifest_entries_serialize_to_the_same_wire_strings`).
+/// value a decision needs. A wire value outside the canonical set is refused by
+/// `Deserialize` (fail closed), and the emitted bytes are pinned by
+/// `manifest_entries_serialize_to_the_same_wire_strings`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntryKind {
     File,
@@ -412,7 +365,9 @@ pub struct TreeEntry {
     /// For files: SHA-256 of contents. For symlinks: SHA-256 of the target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
-    /// For symlinks: the (relative, in-root) link target.
+    /// For symlinks: the link target. A SOURCE entry's target is relative and
+    /// in-root; a destination observation may carry an absolute one, recorded
+    /// in [`DestinationTree::unsupported`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
 }
@@ -455,9 +410,7 @@ fn mode_bits(m: u32) -> u32 {
 /// empty string — is refused at deserialization. The accepted set therefore
 /// equals the emitted set (`format!("{:04o}", mode & 0o7777)`), so the wire
 /// parse is injective: no two wire byte strings name one mode. This is the ONE
-/// place a mode spelling is parsed; before this the field was a `String` and
-/// every consumer re-parsed it with a fallible `parse_mode`, the mode re-reads
-/// API constraint #7 removes.
+/// place a mode spelling is parsed.
 mod mode_octal {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -475,10 +428,10 @@ mod mode_octal {
         let bytes = spelling.as_bytes();
         // Accept EXACTLY the spelling `serialize` emits: four octal digits,
         // nothing else. `from_str_radix` would also accept a leading `+` and
-        // over-long strings, and the old `& 0o7777` then folded those onto a
+        // over-long strings, which a `& 0o7777` mask then folds onto a
         // different spelling's value (`"10644"` -> `0o644`), so the wire parse
-        // was non-injective. Four octal digits are at most `0o7777`, so no mask
-        // is needed or possible here.
+        // would not be injective. Four octal digits are at most `0o7777`, so no
+        // mask is needed or possible here.
         if bytes.len() == 4 && bytes.iter().all(|b| (b'0'..=b'7').contains(b)) {
             Ok(bytes
                 .iter()
@@ -600,8 +553,8 @@ pub(crate) enum SymlinkTargetRefusal {
     /// derived from the two static observations and the run refuses instead of
     /// guessing. Produced ONLY by
     /// [`check_relative_symlink_target_two_views`]; the canonicalizers use
-    /// [`SymlinkTargetRefusal::ThroughSymlink`], whose component really is a
-    /// symlink in their single view.
+    /// [`SymlinkTargetRefusal::ThroughSymlink`], whose component the single
+    /// view resolves to a symlink (by exact spelling, or under the fold).
     PlanDependent(PathBuf),
 }
 
@@ -611,7 +564,8 @@ pub(crate) enum SymlinkTargetRefusal {
 /// `str::to_lowercase` is the Unicode *lowercase* mapping, which UNDER-matches
 /// a case-insensitive host: it maps `ß` to `ß` (not `ss`), the `ﬁ`/`ﬂ`/`ﬃ`
 /// ligatures to themselves, and U+03C2 FINAL SIGMA to itself, while macOS APFS
-/// and Linux `ext4 -O casefold` resolve all of those onto each other. This
+/// (measured) resolves all of those onto each other; the Linux
+/// `ext4 -O casefold` case is unverified here. This
 /// fold feeds a decision that GRANTS acceptance ("this component is not a
 /// symlink"), so it must not be narrower than the fold the host applies; a
 /// narrower fold lets the kernel resolve a spelled component onto a symlink
@@ -620,14 +574,12 @@ pub(crate) enum SymlinkTargetRefusal {
 /// applied to the NFD-DECOMPOSED component — and the macOS APFS half of "not
 /// narrower than the host" is DEMONSTRATED, not asserted, by the test
 /// `the_fold_agrees_with_the_host_on_the_measured_families` (a real write and a
-/// cross-spelling lookup for each measured family). The Linux `ext4 -O casefold`
-/// half was NOT re-run in this environment and is left UNVERIFIED here rather
-/// than claimed. Over-refusal (a spelling with no exact entry that fold-equals a
-/// symlink entry) is the safe direction.
+/// cross-spelling lookup for each measured family). Over-refusal (a spelling
+/// with no exact entry that fold-equals a symlink entry) is the safe direction.
 ///
 /// The component is taken to its NFD (canonical DECOMPOSITION), full-case-folded
 /// with [`crate::casefold`], taken to NFC again, and then stripped of any
-/// trailing `.`/space (the Win32 name fold [`crate::reserved`] already models
+/// trailing `.`/space (the Win32 name fold [`crate::reserved`] models
 /// for the lock record). The NFD-first order is load-bearing: Unicode caseless
 /// matching is NFD-based, so `NFD → fold → NFC` merges every pair a caseless
 /// host merges, while `NFC → fold → NFC` does not — it under-folds exactly the
@@ -644,11 +596,13 @@ pub(crate) enum SymlinkTargetRefusal {
 /// what it folds without making the manifest's verdict depend on which
 /// filesystem happened to describe it. The reserved-name, lock-record, and
 /// crate-temp DENIAL rules ([`crate::reserved`]) share the same
-/// [`crate::casefold`] primitive. They differ in the STEPS they apply — this fold is
-/// NFD, then case fold, then NFC; the denial fold is case fold only — and every
-/// reserved pattern is ASCII, so no key a denial matches is affected by the fold
-/// steps. A denial pattern that could match a non-ASCII folded key would have to
-/// apply them, exactly as this fold does.
+/// [`crate::casefold`] primitive. They differ in the STEPS they apply — this fold
+/// is NFD, then case fold, then NFC, then the trailing strip; the denial folds
+/// are the case fold alone or the case fold plus that strip, with no
+/// normalization step — and every reserved pattern is ASCII, so no key a denial
+/// matches is affected by the normalization step. A denial pattern that could
+/// match a non-ASCII folded key would have to apply it, exactly as this fold
+/// does.
 fn fold_component(name: &str) -> String {
     let nfd: String = name.nfd().collect();
     let folded: String = crate::casefold::case_fold(&nfd).nfc().collect();
@@ -672,8 +626,8 @@ fn fold_path(path: &str) -> String {
 /// What a SPELLED root-relative path resolves to in one view of a tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ComponentResolution {
-    /// Neither an exact entry nor a fold-equal symlink exists: the kernel's
-    /// `lstat` of the spelled path would fail.
+    /// Neither an exact entry nor a fold-equal symlink exists: the view holds
+    /// nothing at this spelling the kernel could follow as a symlink.
     Absent,
     /// An EXACT entry that is not a symlink.
     NotSymlink,
@@ -687,9 +641,9 @@ pub(crate) enum ComponentResolution {
 /// name a symlink.
 ///
 /// Both the local walk and the wire assembler build this from their entry
-/// list and run [`check_relative_symlink_target`] over it, so the two views
-/// apply ONE rule over ONE view and cannot disagree. See the module docs for
-/// the fold and the erring direction it costs.
+/// list and run [`check_relative_symlink_target_indexed`] over it, so the two
+/// views apply ONE rule over ONE view and cannot disagree. See the module docs
+/// for the fold and the erring direction it costs.
 pub(crate) struct SymlinkContainmentIndex<'a> {
     /// Exact manifest path -> is-symlink. Borrowed from the entry list.
     exact: BTreeMap<&'a str, bool>,
@@ -764,13 +718,9 @@ impl<'a> SymlinkContainmentIndex<'a> {
 /// the tree holds there (see [`SymlinkContainmentIndex::resolve`]). The two
 /// manifest views work in root-RELATIVE paths over the SAME
 /// [`SymlinkContainmentIndex`], so neither depends on the root's spelling and
-/// the two cannot disagree; the atomic tree copy passes a live-filesystem
-/// resolver (the source subtree it is copying, and the destination root
-/// outside it) through the same signature. (The previous
-/// rule built an ABSOLUTE base from the root and collapsed the target
-/// lexically; that made the local walk canonicalize the root while the
-/// assembler could not, so a symlinked root made the two disagree, and the
-/// collapse itself never followed a symlink component.)
+/// the two cannot disagree; the atomic tree copy builds an index from its live
+/// source and destination kinds ([`live_entry_kinds`]) and calls
+/// [`check_relative_symlink_target_indexed`] with it.
 pub(crate) fn check_relative_symlink_target(
     link_rel: &Path,
     target: &Path,
@@ -858,9 +808,9 @@ fn walk_relative_symlink_target(
 }
 
 /// Run [`check_relative_symlink_target`] for `target` against a prebuilt
-/// [`SymlinkContainmentIndex`]. The ONE entry point both canonicalizers (and
-/// the applier's destination-aware re-check) use, so every caller applies the
-/// same rule with the same fold.
+/// [`SymlinkContainmentIndex`]. The ONE entry point both canonicalizers and
+/// the [`crate::atomic`] tree copy use, so every caller applies the same rule
+/// with the same fold.
 pub(crate) fn check_relative_symlink_target_indexed(
     link_rel: &Path,
     target: &Path,
@@ -923,34 +873,20 @@ impl<'a> KindIndex<'a> {
 /// * both views hold a non-symlink kind, but DIFFERENT kinds — refuse (which
 ///   kind survives is decided by whether the replacement lands, which is the
 ///   plan);
-/// * only the destination supplies `C` — refuse. The rule is
-///   POLICY-INDEPENDENT BY CONSTRUCTION: it consults neither
-///   [`crate::sync::Extraneous`] nor any per-entry [`crate::sync::EntryPolicy`],
-///   because the applier's actual post-run set is not a FUNCTION of the
-///   `Extraneous` value. The same value yields different sets depending on
-///   conflicts, alias guards and residue guards, and an install can be refused,
-///   so consulting the policy here would trade this sound refusal for a second,
-///   weaker authority on what the run does. COST, made explicit: the same
-///   destination-only component is refused under BOTH of the crate's
-///   `Extraneous` values (2 of 2), so a `Keep` (default) run refuses a component
-///   `remove_extraneous` would never have touched; the suite records 3 such
-///   `Keep` refusals the previous rule permitted (the two residue components and
-///   the real destination directory). That over-refusal
-///   is the SANCTIONED direction: the fold is a denial tool, never a permission
-///   tool. The caller's remedies are to remove that destination component
-///   first, change the source link, or use a destination that does not supply
-///   it.
+/// * only the destination supplies `C` — refuse. The applier's actual post-run
+///   set is not a FUNCTION of the `Extraneous` value: the same value yields
+///   different sets depending on conflicts, alias guards and residue guards, and
+///   an install can be refused. COST, made explicit: the same destination-only
+///   component is refused under BOTH of the crate's `Extraneous` values (2 of
+///   2), so a `Keep` (default) run refuses a component `remove_extraneous`
+///   would never have touched. That over-refusal is the SANCTIONED direction:
+///   the fold is a denial tool, never a permission tool. The caller's remedies
+///   are to remove that destination component first, change the source link, or
+///   use a destination that does not supply it.
 /// * only the source supplies `C` — permit (it is installed; if the install is
 ///   refused it stays absent, and a dangling link does not escape);
 /// * neither supplies `C` — permit (the unchanged dangling-link behaviour);
 /// * both supply the same non-symlink kind — permit.
-///
-/// The plan-dependence the previous "result view" tried to precompute is
-/// exactly what the previous rule got wrong: it assumed the source's entry is
-/// installed wherever the source holds the path, and that `Extraneous::Delete`
-/// removes every destination-only entry. A refused replacement and a removal a
-/// conflict, an alias, or the residue guard stops both leave the destination
-/// entry in place, so the walk escaped through it.
 pub(crate) struct ContainmentViews<'a> {
     source: KindIndex<'a>,
     destination: KindIndex<'a>,
@@ -1065,8 +1001,9 @@ pub(crate) fn live_entry_kinds(root: &Path) -> Result<Vec<(String, bool)>> {
 
 /// The refusal message for [`SymlinkTargetRefusal`], naming the offending
 /// entry and the component the walk reached (when there is one: for
-/// [`SymlinkTargetRefusal::ThroughSymlink`] it is a symlink in the single
-/// view, and for [`SymlinkTargetRefusal::PlanDependent`] it is a component the
+/// [`SymlinkTargetRefusal::ThroughSymlink`] it is a component the single view
+/// resolves to a symlink, and for [`SymlinkTargetRefusal::PlanDependent`] it
+/// is a component the
 /// two static observations do not describe with the same non-symlink kind).
 /// The `escaping symlink` prefix is the crate's single classification for a
 /// relative target that cannot be shown to stay inside the root.
@@ -1089,8 +1026,8 @@ pub(crate) fn symlink_target_refusal_message(
 }
 
 /// Join a root-relative path of `Component::Normal` names with `/`, the
-/// manifest's canonical spelling. Used to look a candidate component up in the
-/// wire assembler's set of `symlink` entries.
+/// manifest's canonical spelling. Used to look a candidate component up in a
+/// containment view's exact and folded key sets.
 fn rel_path_string(rel: &Path) -> String {
     let mut out = String::new();
     for comp in rel.components() {
@@ -1272,11 +1209,7 @@ pub(crate) fn validate_entry_path(path: &str) -> Result<String> {
 /// An EMPTY target is refused by BOTH canonicalizers: it is degenerate link
 /// data that cannot be a faithful address (the kernel refuses it on Linux and
 /// APFS stores it as a dangling link), and the two views must accept exactly
-/// the same trees. Before this check the local walk accepted `""` (its
-/// component walk over an empty path reaches nothing) while the wire assembler
-/// refused it (`missing symlink target`), so a macOS source was accepted by
-/// one view and refused by the other — a third violation of the two-views
-/// contract. Refusing on both is the fail-closed choice.
+/// the same trees. Refusing on both is the fail-closed choice.
 ///
 /// NFC is NOT required: a target is not an addressable NAME but the link's
 /// DATA — the kernel dereferences it verbatim, it may legitimately contain `..`,
@@ -1326,12 +1259,11 @@ pub(crate) fn validate_symlink_target(entry_path: &str, target: &str) -> Result<
 /// `nlink`.
 ///
 /// COST: this READS AND HASHES EVERY FILE IN THE TREE, so a snapshot's cost is
-/// O(bytes scanned), NOT O(bytes changed). Content addressing makes the STORE
-/// deduplicated, but there is no dirty tracking and no reuse of a previously
-/// computed manifest, so a periodic checkpoint that changes ONE byte still pays the
-/// full scan of the whole tree. That is a design cost of the manifest-and-hash
-/// model, not a bug; reusing a caller-supplied previous manifest would
-/// remove it but is not implemented.
+/// O(bytes scanned), NOT O(bytes changed): there is no dirty tracking and no
+/// reuse of a previously computed manifest, so a periodic checkpoint that
+/// changes ONE byte still pays the full scan of the whole tree. That is a
+/// design cost of the manifest-and-hash model, not a bug; reusing a
+/// caller-supplied previous manifest would remove it but is not implemented.
 pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
     canonicalize_tree_with(root, RefuseUnsupported)
 }
@@ -1473,9 +1405,8 @@ pub fn canonicalize_tree_destination(root: &Path) -> Result<DestinationTree> {
 /// The SOURCE walk ([`RefuseUnsupported`]) refuses; the DESTINATION walk
 /// ([`RecordUnsupported`]) records the refusal and keeps the entry. Because the
 /// policy is a type, the strict path has NO `unsupported` list and NO per-entry
-/// "was this tolerated" state: the mode/enum re-read and the deferred
-/// `Option` push that the shared `match policy` used to need are gone, and the
-/// strict constructor cannot return the destination type by construction.
+/// "was this tolerated" state, and the strict constructor cannot return the
+/// destination type by construction.
 ///
 /// [`canonicalize_tree`] returns [`TreeMetadata`];
 /// [`canonicalize_tree_destination`] returns [`DestinationTree`].
@@ -1552,7 +1483,7 @@ fn build_metadata(mut entries: Vec<TreeEntry>) -> TreeMetadata {
 /// `seen` set, the per-path validation and duplicate refusal, and the shared
 /// containment post-pass. Both views of a tree fill this and then
 /// [`EntryAssembler::finish`] it, so the post-pass and the duplicate rule have
-/// a single implementation instead of one copy per view.
+/// one implementation.
 struct EntryAssembler {
     /// The entries collected so far, in walk order (`build_metadata` sorts).
     entries: Vec<TreeEntry>,
@@ -1633,8 +1564,6 @@ impl EntryAssembler {
     /// relative symlink target can be refused by it (an absolute target was
     /// already classified at its own field), so the skip is
     /// behavior-equivalent to running the loop over an empty candidate set.
-    /// The wire arm used to build the index unconditionally; it now takes the
-    /// same skip, which only avoids constructing an index nothing would read.
     fn finish<S: UnsupportedSink>(self, mut sink: S, shown: ShownPath<'_>) -> Result<S::Output> {
         let EntryAssembler { entries, .. } = self;
         let needs_containment = entries.iter().any(|e| {
@@ -1676,11 +1605,7 @@ impl EntryAssembler {
                 {
                     // The link is DISPLAYED by the path the view walked: the
                     // local walk's `root.join(rel)`, the wire view's manifest
-                    // spelling. The target is the stored link DATA either way
-                    // (the wire view's `to_string_lossy` of a UTF-8 `str` is
-                    // that same string), so the message is byte-identical to
-                    // the one each view produced before the post-pass was
-                    // shared.
+                    // spelling.
                     let link_display = match shown {
                         ShownPath::Local(root) => {
                             root.join(link_rel.as_path()).display().to_string()
@@ -1702,7 +1627,7 @@ impl EntryAssembler {
 /// carry a content hash and a `File` never a link target.
 ///
 /// A symlink carries no mode: its mode is the fixed [`SYMLINK_MODE`], which
-/// exists in ONE place — [`Classified::push_into`] — instead of in each view.
+/// exists in ONE place — [`Classified::push_into`].
 enum Classified {
     Dir {
         mode: u32,
@@ -1718,7 +1643,8 @@ enum Classified {
 }
 
 /// The canonical mode of a symlink entry: never read through the
-/// (link-following) platform helper, which would fail on a dangling link.
+/// (link-following) platform helper [`crate::platform::file_mode`], which would
+/// fail on a dangling link.
 const SYMLINK_MODE: u32 = 0o777;
 
 impl Classified {
@@ -1871,15 +1797,14 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
 /// `type` is `f`/`d`/`l`/`o` (`o` = a non-regular file: FIFO, socket, or
 /// device — classified separately so the assembler REJECTS it, mirroring
 /// the local canonicalizer's rejection of special files, and so the script
-/// never `open`s a FIFO, which would block), `mode_hex` is the raw st_mode
-/// in hex, and `content_sha256` is the sha256 of the file bytes (or of the
+/// never `open`s a FIFO, which would block), `mode_hex` is the
+/// permission bits of `st_mode` (`st_mode & 07777`) in hex, and
+/// `content_sha256` is the sha256 of the file bytes (or of the
 /// symlink target). The tool assembles the canonical metadata from this
 /// output and computes the digest ([`canonicalize_remote_entries`]), so
 /// verification never transfers the tree CONTENT — only the per-file hashes
 /// — which on a slow link costs a small round trip instead of a full tree
-/// download. Runs via `Remote::exec` as `perl -e <script> <root>`;
-/// `Digest::SHA` and `Unicode::Normalize` are core perl modules on every
-/// supported host.
+/// download. Runs via `Remote::exec` as `perl -e <script> <root>`.
 ///
 /// A walk that did not actually enumerate the WHOLE tree must never exit 0
 /// with a short or empty listing: an ABSENT root, a root that is not a
@@ -1894,8 +1819,8 @@ fn canonicalize_tree_with<S: UnsupportedSink>(root: &Path, mut sink: S) -> Resul
 /// stdout with exit 0 — assembling to the EMPTY manifest it really is.
 ///
 /// The script also VALIDATES the raw bytes before printing, because the
-/// client decodes stdout lossily ([`String::from_utf8_lossy`] in the
-/// runner) and so can never recover a byte the script mangled. It `die`s
+/// client decodes stdout lossily ([`String::from_utf8_lossy`]) and so can
+/// never recover a byte the script mangled. It `die`s
 /// (non-zero exit) — never truncates or lossily converts — for any entry
 /// NAME that is not valid UTF-8, is not already NFC, or contains any
 /// NUL/LF/CR/TAB, and for any symlink TARGET that is not valid UTF-8 or
@@ -1954,17 +1879,11 @@ fn validate_wire_hash(hash: &str, entry_path: &str) -> Result<()> {
 /// a `dir`. Refuse, naming the offending entry, otherwise.
 ///
 /// The wire walk emits a child only after its parent (`$walk` recurses after
-/// emitting), but nothing in the manifest FORMAT requires that: a hand-built
-/// or proxied line `d/x ...` with no `d` line used to be accepted. The apply
-/// layer verifies only the FINAL component of a path, so a parent component's
-/// spelling was never checked unless the parent happened to be a source
-/// manifest entry: on a case-insensitive destination a crafted `d/x` could be
-/// reported as `applied` while the destination held `D/x` (one on-disk entry
-/// named under two spellings), and on a case-sensitive one the write's
-/// `ensure_private_dir_fd` would IMPLICITLY create `d` — an on-disk entry named
-/// by NO report list (and, with `delete_extraneous`, the just-installed entry
-/// destroyed by the sanctioned removal of the pre-existing `D`). Requiring
-/// closure at assembly makes both consequences unreachable.
+/// emitting), but nothing in the manifest FORMAT requires that. Without this
+/// gate a hand-built or proxied line `d/x ...` with no `d` line would be
+/// accepted, and the parent's spelling would be neither verified nor reported:
+/// the write creates the missing parent implicitly. Requiring closure at
+/// assembly makes that unreachable.
 ///
 /// The LOCAL walk is closed by construction: `WalkDir` yields a directory
 /// before the entries inside it, so every nested path's parent is already an
@@ -2075,7 +1994,7 @@ impl<'a> CompleteListing<'a> {
 /// over the RAW target bytes; the assembler validates its shape and REQUIRES
 /// it to equal the hash of the target that crossed the wire, so a wire split
 /// or fold can never be hidden by recomputing the hash after decoding. The
-/// per-file content hashes come from the remote (sha256sum); the digest is
+/// per-file content hashes come from the remote (`Digest::SHA`); the digest is
 /// computed from the assembled metadata, so a corrupted or divergent remote
 /// tree produces a digest mismatch without any content transfer. A SYMLINK's
 /// RELATIVE target is checked with the SAME root-relative walk the local
@@ -2083,9 +2002,7 @@ impl<'a> CompleteListing<'a> {
 /// component whose EXACT entry the listing marks `symlink`, or that the crate's
 /// component fold resolves to a `symlink` entry when no exact entry exists, is
 /// refused — exactly as the local walk refuses the same component from its own
-/// entry list. (Before this the assembler compared the listing's spellings
-/// byte-exactly, so a case- or normalization-folding far side accepted a target
-/// the local walk refused.) The listing's `root` is carried for provenance but
+/// entry list. The listing's `root` is carried for provenance but
 /// the symlink check does NOT consult it: the far side's root cannot be
 /// canonicalized from here, and because the walk is root-relative it does not
 /// need to be, so the local and wire verdicts agree even when the root is
@@ -2117,18 +2034,11 @@ impl<'a> CompleteListing<'a> {
 /// so a source-only entry is not transferred and a destination-only one is not
 /// classified — but it does NOT create an escape. Every entry the listing DOES
 /// contain is assembled under the kind the listing itself reported, and the
-/// applier materializes exactly that kind (or leaves the path absent); a path
-/// the listing omits is therefore never materialized as a symlink the listing
-/// did not describe. In particular, an omitted `l` entry is materialized as
-/// whatever its PARENT listing says (a directory, or nothing), so a
-/// source-symlink containment walk can never be satisfied by a kind the
-/// manifest does not contain. The defect is a faithful-to-the-listing,
-/// non-escaping manifest that mis-describes the tree — a correctness/
-/// completeness bug at the caller, never a containment hole here.
-///
-/// A completeness TERMINATOR on the wire would also close this, but it CHANGES
-/// THE WIRE FORMAT (the far side would print a final sentinel line), so it is
-/// deliberately NOT done here: the exit status already carries the evidence.
+/// applier materializes exactly that kind (or leaves the path absent), so a
+/// path the listing omits is never materialized as a symlink the listing did
+/// not describe. The defect is a faithful-to-the-listing, non-escaping manifest
+/// that mis-describes the tree — a correctness/completeness bug at the caller,
+/// never a containment hole here.
 pub(crate) fn canonicalize_remote_entries(listing: CompleteListing<'_>) -> Result<TreeMetadata> {
     canonicalize_remote_entries_with(listing, RefuseUnsupported)
 }
@@ -2144,7 +2054,8 @@ pub(crate) fn canonicalize_remote_entries(listing: CompleteListing<'_>) -> Resul
 /// ([`MaterializationKind::IncompleteListing`]) so a caller can tell it from a
 /// wire-format refusal, whose remedy is different.
 ///
-/// This is the ONLY public assembler for the wire format: the raw form takes a
+/// This pair of `*_checked` functions is the only public assembler surface for
+/// the wire format: the raw forms take a
 /// [`CompleteListing`], whose only constructor requires the completeness
 /// evidence, so a caller cannot assemble a listing while forgetting it. A
 /// caller whose listing did not come with an exit status must still establish
@@ -2306,7 +2217,7 @@ fn canonicalize_remote_entries_with<S: UnsupportedSink>(
                 // spelled walk reaches (a component that is a symlink makes the
                 // lexical collapse lie) and a target may name an entry that
                 // appears later in the listing. See
-                // [`check_relative_symlink_target`].
+                // [`check_relative_symlink_target_indexed`].
                 let recomputed = sha256_bytes(symlink_target.as_bytes());
                 if recomputed != content_hash {
                     return Err(Error::materialization(format!(
@@ -2448,11 +2359,11 @@ pub fn verify_tree_metadata(root: &Path, stored: &TreeMetadata) -> Result<TreeMe
     Ok(canonical)
 }
 
-/// Compute the canonical tree digest from metadata. Deterministic, independent
-/// of filesystem layout or source ordering, and canonical by construction: the
-/// `tree_sha256` field is CLEARED before hashing, so a caller that passes the
-/// metadata it read back cannot fold the old digest into the new one (the field
-/// is part of the serialized form).
+/// Compute the canonical tree digest from metadata. Deterministic, and
+/// canonical for a record built by [`build_metadata`] (which sorts the
+/// entries): the `tree_sha256` field is CLEARED before hashing, so a caller
+/// that passes the metadata it read back cannot fold the old digest into the
+/// new one (the field is part of the serialized form).
 pub fn compute_tree_digest(meta: &TreeMetadata) -> String {
     let mut meta = meta.clone();
     meta.tree_sha256 = String::new();
@@ -2711,12 +2622,9 @@ mod tests {
 
     /// The mode wire spelling is EXACTLY the four-digit octal string the
     /// serializer emits; every other spelling is REFUSED at the Deserialize
-    /// boundary. The parser used to do `u32::from_str_radix(m, 8) & 0o7777`,
-    /// which silently accepted a leading `+`, over-long octal strings, and a
-    /// spelling whose top digit carried the setuid/setgid/sticky bits:
-    /// `"10644"` became `0o644`, `"644"`/`"00644"` became `0o644`, and
-    /// `"37777777777"` became `0o7777`. Each of those then re-serialized to a
-    /// canonical spelling and hashed identically to it.
+    /// boundary: a leading `+`, a short or over-long octal string, a
+    /// spelling whose top digit carries the setuid/setgid/sticky bits, and
+    /// non-octal or empty text.
     #[test]
     fn non_canonical_mode_spellings_are_refused_at_the_wire_boundary() {
         for spelling in [
@@ -2728,7 +2636,7 @@ mod tests {
             "+755",
             // Eleven digits of octal overflow the low twelve bits.
             "37777777777",
-            // Five digits that the old mask folded onto a low value.
+            // Five digits that a `& 0o7777` mask would fold onto a low value.
             "77777",
             "07777",
             "17777",
@@ -2783,12 +2691,10 @@ mod tests {
         }
     }
 
-    /// The regression this fixes: `"10644"` and `"0644"` are different wire
-    /// byte strings that used to deserialize to the SAME `TreeEntry` mode and
-    /// therefore hash to the SAME `compute_tree_digest` (the digest hashes the
-    /// re-serialized VALIDATED value as `"0644"`). Now the non-canonical
-    /// spelling is refused, so no second wire byte string can alias the
-    /// canonical record's digest.
+    /// `"10644"` and `"0644"` are different wire byte strings; the
+    /// non-canonical spelling is refused, so no second wire byte string can
+    /// alias the canonical record's `compute_tree_digest` (the digest hashes
+    /// the re-serialized VALIDATED value as `"0644"`).
     #[test]
     fn a_non_canonical_mode_cannot_alias_a_canonical_manifest_digest() {
         let entry = TreeEntry {
@@ -2810,10 +2716,8 @@ mod tests {
             aliased, canonical,
             "the aliased wire bytes must differ from the canonical wire bytes"
         );
-        // Pre-fix this parsed to the SAME record (mode 0o644) and re-serialized
-        // to `"0644"`, so `compute_tree_digest` returned `meta.tree_sha256` for
-        // BOTH byte strings. It is now refused, so only one byte string names
-        // this record.
+        // The refusal is what makes the alias impossible: only one byte string
+        // names this record.
         let err = serde_json::from_str::<TreeMetadata>(&aliased).expect_err(
             "the setuid-dropping spelling \"10644\" must not parse into the canonical record",
         );
@@ -2974,9 +2878,9 @@ mod tests {
     /// A legitimate filename containing `..` as a SUBSTRING (e.g. `a..b`,
     /// `..hidden`) is NOT traversal — the component-wise check accepts it.
     /// (An exact `..` path component cannot be created on POSIX — it is the
-    /// parent — so the rejection arm is defensive; the acceptance arm is the
-    /// regression this test pins: the old substring check falsely rejected
-    /// these valid filenames.)
+    /// parent — so the rejection arm is defensive; the acceptance arm is what
+    /// this test pins: a component-wise check must not reject these valid
+    /// filenames.)
     #[test]
     fn dotdot_substring_is_not_traversal() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -3247,9 +3151,9 @@ mod tests {
     /// caller can assert on the EXIT STATUS (the script must fail closed when
     /// it cannot enumerate the whole tree).
     ///
-    /// The previous bare `Command::output()` had no bound at all: a script
-    /// that blocked in a read-only `open` of a FIFO would hang the suite
-    /// forever rather than fail a test. Past the cap the child is KILLED and
+    /// The bound matters because a script that blocked in a read-only `open`
+    /// of a FIFO would hang the suite rather than fail a test. Past the cap the
+    /// child is KILLED and
     /// the test PANICS naming the FIFO hang — the script never blocks on a
     /// regular file, so a hang can only be a blocking open of a special file —
     /// so the suite itself can never hang.
@@ -3667,9 +3571,7 @@ mod tests {
     }
 
     /// Constraint #8: the CHECKED assembler makes the completeness
-    /// precondition un-missable. Before it, any caller holding only the
-    /// listing string could assemble an INCOMPLETE walk — an empty listing
-    /// from a `die`-ing walk would be accepted as the empty manifest. The
+    /// precondition un-missable: the
     /// checked constructor refuses a non-zero exit with the typed
     /// completeness kind, BEFORE assembly, while a zero exit with empty
     /// output IS the empty manifest.
@@ -3894,9 +3796,10 @@ mod tests {
     }
 
     /// A symlink whose target escapes the tree root must be refused by BOTH
-    /// verification paths: each resolves the relative target lexically against
-    /// the directory CONTAINING the link (its own parent, per POSIX) and then
-    /// tests containment in the root. An escaping link would let a
+    /// verification paths: each resolves the relative target against the
+    /// directory CONTAINING the link (its own parent, per POSIX) and walks its
+    /// spelled components physically, refusing a `..` that pops above the root.
+    /// An escaping link would let a
     /// manifest describe bytes outside the tree.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
@@ -3995,8 +3898,7 @@ mod tests {
     /// root. `dir/up -> ../other` resolves to `<root>/other` and is ACCEPTED by
     /// BOTH canonicalizers, as is a multi-separator `..` target that walks up
     /// and back down (`dir/sub/up -> ../../file`). The targets are stored
-    /// VERBATIM as link data. This test FAILS against the pre-fix code, whose
-    /// root-based base refused `dir/up -> ../other` as an "escaping symlink".
+    /// VERBATIM as link data.
     // unix-only: builds symlink fixtures with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4097,9 +3999,9 @@ mod tests {
 
     /// The base's own resolution: when the ROOT is reached through a
     /// symlink, a target that stays inside the root (`../other` from `dir`) is
-    /// accepted, and a target that escapes it is refused. The local walk's
-    /// `lstat` base is the CANONICALIZED root, so it sees the live tree the
-    /// kernel resolves against, while the containment walk itself is
+    /// accepted, and a target that escapes it is refused. The local walk
+    /// canonicalizes the root before walking it, while the containment walk
+    /// itself is
     /// root-relative and does not depend on the root's spelling (which is what
     /// lets the wire assembler reach the same verdict).
     // unix-only: builds symlink fixtures with symlink(2).
@@ -4146,9 +4048,7 @@ mod tests {
     /// `dir/sub` symlink to `R/other`, so the next `..` reaches the root's
     /// PARENT and `outside` is OUTSIDE. Containment is therefore decided on the
     /// spelled components: the walk reaches `dir/sub`, which the listing says is
-    /// a symlink, and BOTH canonicalizers refuse it. Before the fix the local
-    /// walk and the wire assembler both ACCEPTED this tree, and
-    /// `read(dst/dir/link/secret)` returned the outside file.
+    /// a symlink, and BOTH canonicalizers refuse it.
     // unix-only: builds symlink fixtures with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4196,8 +4096,8 @@ mod tests {
 
     /// The SAME disagreement with NO escape: `R/dir/sub -> ../other` and
     /// `R/dir/link -> sub/../other` collapse lexically to `R/dir/other`, but the
-    /// kernel resolves `R/other`. Both land inside the root here, so the old
-    /// lexical test accepted the tree with a WRONG answer; the physical rule
+    /// kernel resolves `R/other`. Both land inside the root here, so a lexical
+    /// test would accept the tree with a WRONG answer; the physical rule
     /// refuses it (the `dir/sub` component is a symlink) rather than record a
     /// containment answer that does not match the kernel.
     // unix-only: builds symlink fixtures with symlink(2).
@@ -4280,13 +4180,10 @@ mod tests {
 
     /// The two MANIFEST views (the local walk and the wire assembler) must reach
     /// the SAME verdict when the ROOT is reached
-    /// through a symlink, because the local walk used to canonicalize the root
-    /// and the wire assembler could not. The relative walk is the same on both
-    /// sides now, so a genuinely in-root target is ACCEPTED with byte-equal
+    /// through a symlink: the relative walk is the same on both
+    /// sides, so a genuinely in-root target is ACCEPTED with byte-equal
     /// manifests on both, and a target that crosses the spelled root and
-    /// re-enters only by spelling the root's own name is REFUSED by both. Before
-    /// the fix `dir/link -> ../../real/other` was accepted locally and refused
-    /// on the wire.
+    /// re-enters only by spelling the root's own name is REFUSED by both.
     // unix-only: builds symlink fixtures with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -4409,16 +4306,16 @@ mod tests {
     /// case-folding filesystem. `R/dir/sub -> ../other` and `R/dir/link ->
     /// Sub/../../outside`: the kernel resolves the spelled `Sub` onto the
     /// on-disk `sub` (a symlink), so the walk reaches a symlink and the target
-    /// escapes the root. The wire assembler's exact-string set lookup used to
-    /// miss that fold and ACCEPT the tree while the local walk refused it, so
-    /// the two predicates did not compute the same function. Both views now
+    /// escapes the root. An exact-string set lookup
+    /// misses that fold and ACCEPTS the tree, so
+    /// the two predicates would not compute the same function. Both views
     /// fold every walked component with the crate's name-identity fold, so
     /// both refuse and name the component the walk reached.
     ///
     /// The fold is platform-INDEPENDENT (the crate's name rules deliberately
     /// are), so on a case-SENSITIVE filesystem both views refuse the same tree
     /// even though the spelled path does not resolve there; that over-refusal
-    /// is the erring direction this fix chooses, and it keeps the two views in
+    /// is the erring direction the rule chooses, and it keeps the two views in
     /// agreement. The live-escape premise is asserted only where the filesystem
     /// really folds.
     // unix-only: builds symlink fixtures with symlink(2).
@@ -4646,13 +4543,9 @@ mod tests {
     }
 
     /// The widened fold, `ß`/`SS`: `str::to_lowercase` maps NEITHER `ß` to `ss` NOR `SS` to
-    /// `ß`, so the old fold answered `Absent` for a spelled `SS`/`STRASSE`
-    /// component the kernel resolves onto the `ß` symlink and accepted the
+    /// `ß`, so a `to_lowercase` fold answers `Absent` for a spelled `SS`/`STRASSE`
+    /// component the kernel resolves onto the `ß` symlink and accepts the
     /// escape. The full Unicode case fold matches them, so BOTH views refuse.
-    /// PRE-FIX this test FAILED: the local walk and the wire assembler both
-    /// returned `Ok` (the wire assembler only agrees because it shares the
-    /// index; the local walk's old exact-string/`to_lowercase` lookup also
-    /// missed).
     #[test]
     #[cfg(unix)]
     fn full_fold_sharp_s_component_is_refused_by_both_canonicalizers() {
@@ -4667,8 +4560,7 @@ mod tests {
     /// The widened fold, the `ﬁ`/`FI` ligature: `to_lowercase` leaves U+FB01 alone, so a
     /// spelled `FILE` component was answered `Absent` and accepted although the
     /// host resolves it onto the `ﬁle` symlink. The full case fold maps the
-    /// ligature to `fi`, so both views refuse. PRE-FIX this FAILED on both
-    /// views.
+    /// ligature to `fi`, so both views refuse.
     #[test]
     #[cfg(unix)]
     fn full_fold_ligature_component_is_refused_by_both_canonicalizers() {
@@ -4683,9 +4575,8 @@ mod tests {
     /// The widened fold, final sigma: `to_lowercase` keeps U+03C2 (final sigma) distinct from
     /// U+03C3/U+03A3, so a spelled `Σ` component was answered `Absent` and
     /// accepted although APFS resolves final sigma onto sigma. The full case
-    /// fold maps `ς`/`Σ` to `σ`, so both views refuse. PRE-FIX this FAILED on
-    /// both views (macOS APFS folds the pair; the fold is platform-independent,
-    /// so it is refused on every host after the fix).
+    /// fold maps `ς`/`Σ` to `σ`, so both views refuse (macOS APFS folds the
+    /// pair; the fold is platform-independent, so it is refused on every host).
     #[test]
     #[cfg(unix)]
     fn full_fold_final_sigma_component_is_refused_by_both_canonicalizers() {
@@ -4697,16 +4588,16 @@ mod tests {
         );
     }
 
-    /// ORDER-FIX: the three Greek precomposed perispomeni+ypogegrammeni forms
+    /// The three Greek precomposed perispomeni+ypogegrammeni forms
     /// and their canonically-related capital spellings. Unicode caseless
-    /// matching is NFD-based, so the pre-fix order `NFC -> fold -> NFC` folded
+    /// matching is NFD-based, so an `NFC -> fold -> NFC` order folds
     /// the small and capital spellings to DIFFERENT strings and the walk
-    /// answered `Absent` for a component the host resolves onto a symlink — the
-    /// escape was ACCEPTED. `NFD -> fold -> NFC` merges them. Each pair is
+    /// answers `Absent` for a component the host resolves onto a symlink — the
+    /// escape would be ACCEPTED. `NFD -> fold -> NFC` merges them. Each pair is
     /// covered in both capital witness spellings (`U+1FBC U+0342` and the fully
     /// decomposed `U+0391 U+0342 U+0345` family), and on a host that folds the
     /// pair the LIVE escape is asserted first so the refusal closes a real
-    /// hole. PRE-FIX this FAILED on macOS APFS.
+    /// hole.
     #[test]
     #[cfg(unix)]
     fn greek_perispomeni_ypogegrammeni_pairs_are_refused_by_both_canonicalizers() {
@@ -4729,7 +4620,7 @@ mod tests {
         }
     }
 
-    /// The pre-fix fold order, inlined ONLY so the change below can be shown to
+    /// The NFC-first fold order, inlined so the NFD-first change can be shown to
     /// be a strict COARSENING of the equivalence relation it produces.
     fn pre_fix_fold_component(name: &str) -> String {
         let nfc: String = name.nfc().collect();
@@ -4737,10 +4628,11 @@ mod tests {
         folded.trim_end_matches(['.', ' ']).to_string()
     }
 
-    /// Order half: the NFD-first change only MERGES
-    /// equivalence classes. It never splits a pair the pre-fix fold already
-    /// agreed on, so no pair the old fold caught is now missed; on top of that
-    /// the three Greek pairs move from SPLIT (pre-fix) to MERGED (post-fix).
+    /// Order half: the NFD-first fold only MERGES equivalence classes. It never
+    /// splits a pair [`pre_fix_fold_component`]
+    /// (the NFC-first order) already agrees on, so no pair that fold caught is
+    /// missed; on top of that the three Greek pairs move from SPLIT (NFC-first)
+    /// to MERGED (NFD-first).
     #[test]
     fn the_fold_change_only_merges_equivalence_classes() {
         let corpus = [
@@ -4905,11 +4797,10 @@ mod tests {
         );
     }
 
-    /// An EMPTY symlink target is refused by BOTH views. Before the fix
-    /// the local walk ACCEPTED `""` (its component walk over an empty path
-    /// reaches nothing) while the wire assembler refused it, so a macOS source
-    /// (where APFS stores an empty-target link) was accepted by one view and
-    /// refused by the other. The predicate-level arm runs on every platform;
+    /// An EMPTY symlink target is refused by BOTH views: an empty
+    /// target is no faithful address, so a macOS source
+    /// (where APFS stores an empty-target link) must not be accepted by one view
+    /// and refused by the other. The predicate-level arm runs on every platform;
     /// the local end-to-end arm runs where the filesystem can store such a
     /// link.
     // unix-only: builds an empty-target symlink with symlink(2).
@@ -4988,13 +4879,13 @@ mod tests {
         );
     }
 
-    /// The digest-equivalence pin extended to the entry classes the original
-    /// test missed: an EMPTY file (zero-length content hash) and an
+    /// The digest-equivalence pin extended to an EMPTY file (zero-length content
+    /// hash) and an
     /// already-NFC UNICODE filename (the two canonicalizers must agree on the
-    /// stored spelling). It also pins the new refusal: a tree whose on-disk
+    /// stored spelling). It also pins that a tree whose on-disk
     /// name is decomposed is refused by BOTH the local walk and the wire
     /// assembler, naming the offending entry, instead of being silently
-    /// normalized into a spelling that cannot address the file on Linux.
+    /// normalized into a spelling that cannot address the file.
     #[test]
     fn remote_script_digest_matches_for_empty_and_nfc_unicode_files() {
         skip_without_perl!("remote_script_digest_matches_for_empty_and_nfc_unicode_files");
@@ -5105,11 +4996,7 @@ mod tests {
     }
 
     /// A symlink TARGET containing a tab (a wire separator) is refused by the
-    /// LOCAL walk, exactly as a tab-containing NAME is. Pre-fix only the PATH
-    /// was checked, so the local walk ACCEPTED this tree and stored the target
-    /// verbatim; the far side split the printed line at the tab and the pull
-    /// installed a link to `a` instead of `a\tb` while reporting success. This
-    /// assertion therefore FAILS against the pre-fix code.
+    /// LOCAL walk, exactly as a tab-containing NAME is.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5134,11 +5021,9 @@ mod tests {
     }
 
     /// A symlink TARGET that is not valid UTF-8 is refused by the LOCAL walk,
-    /// never lossily stored. Pre-fix the walk wrote the `U+FFFD` replacement
-    /// (and hashed the raw bytes), so the destination link pointed at a
-    /// DIFFERENT path than the source and only post-transfer verification
-    /// caught it — after the destination had already been mutated. This
-    /// assertion therefore FAILS against the pre-fix code. macOS and Linux both
+    /// never lossily stored: a `U+FFFD` replacement would make the destination
+    /// link point at a
+    /// DIFFERENT path than the source. macOS and Linux both
     /// allow a non-UTF-8 symlink target (unlike a non-UTF-8 name).
     #[cfg(unix)]
     #[test]
@@ -5163,8 +5048,6 @@ mod tests {
     /// The far-side SCRIPT refuses a tab-containing symlink TARGET before
     /// printing, so the client's `!out.success()` path turns it into an error
     /// instead of splitting the target at the tab and assembling a shorter one.
-    /// Pre-fix the script exited 0 and printed `...<hash>\ta\tb`, which the
-    /// assembler read as target `a` — this assertion FAILS against it.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5189,8 +5072,6 @@ mod tests {
 
     /// The far-side SCRIPT refuses a non-UTF-8 symlink TARGET before printing
     /// (a lossy `U+FFFD` target would install a link to a different path).
-    /// Pre-fix the script exited 0 and the assembler accepted the `U+FFFD`
-    /// spelling — this assertion FAILS against it.
     #[cfg(unix)]
     #[test]
     fn wire_script_refuses_non_utf8_symlink_target() {
@@ -5222,8 +5103,6 @@ mod tests {
     /// surfaces it as an error naming the far side rather than an empty or
     /// partial manifest. Linux-only: APFS refuses to create such a name
     /// (`EILSEQ`), so the test SKIPS with a visible reason when creation fails.
-    /// Pre-fix the script exited 0 (the name arrived as `U+FFFD`) — this
-    /// assertion FAILS against it.
     #[cfg(unix)]
     #[test]
     fn wire_script_refuses_non_utf8_entry_name() {
@@ -5281,11 +5160,9 @@ mod tests {
     /// tree the LOCAL walk refuses on a name/target rule, the WIRE path (the
     /// real perl script, whose raw-byte checks are the only ones that can see a
     /// tab or a non-UTF-8 byte) must also refuse. This is the test that catches
-    /// a divergence of the local/wire parity class: before the far-side check a
-    /// non-UTF-8 name was refused locally but accepted (as `U+FFFD`) over the
-    /// wire. Pre-fix the local walk ACCEPTED the tab and non-UTF-8 TARGET cases
-    /// and the script exited 0 for the tab NAME case, so this test FAILS
-    /// against the pre-fix code in every case it can construct on the host.
+    /// a divergence of the local/wire parity class: a
+    /// non-UTF-8 name refused locally would otherwise be accepted (as `U+FFFD`)
+    /// over the wire.
     #[cfg(unix)]
     #[test]
     fn canonicalizers_agree_on_unrepresentable_names_and_targets() {
@@ -5427,9 +5304,9 @@ mod tests {
     /// fields it carries agree EXACTLY — a `dir` carries neither a content
     /// hash nor a target, a `file` a hash over its own bytes and no target, a
     /// `symlink` both, with the fixed `0o777` mode and a hash over its OWN
-    /// target. Neither walk keeps a kind and a field set as two independent
-    /// computations any more (one [`Classified`] variant per kind), and this is
-    /// the assertion that fails if a walk ever projects them separately again.
+    /// target. Both walks carry one [`Classified`] variant per kind, and this is
+    /// the assertion that fails if a walk ever projects a kind and a field set
+    /// separately.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5491,13 +5368,11 @@ mod tests {
     }
 
     /// A symlink target ending in CR is refused by the LOCAL walk. CR is not a
-    /// wire separator, so pre-fix the walk stored `x\r` verbatim (hash
-    /// `896dfdac…`), while the far side printed `…\tx\r\n` and the assembler's
-    /// `output.lines()` stripped the CR and re-hashed `x` (`2d711642…`): two
-    /// DIFFERENT manifests for one tree, falsifying the "both canonicalizers
-    /// accept exactly the same trees" invariant, and an end-to-end sync that
-    /// reported `Ok`/`skipped` while the destination still held `x\r`. This
-    /// assertion FAILS against the pre-fix code (`unwrap_err` on `Ok`).
+    /// wire separator, but a CRLF-folding reader strips a CR that ends a line
+    /// and the LAST wire field is the target, so the far side's target would be
+    /// truncated and re-hashed: two DIFFERENT manifests for one tree, and an
+    /// end-to-end sync that reported `Ok` while the destination still held the
+    /// full target.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5523,8 +5398,6 @@ mod tests {
 
     /// The far-side script refuses a CR-containing symlink TARGET on the RAW
     /// bytes, before printing a line that a CRLF-folding reader would misread.
-    /// Pre-fix the script exited 0 and the client assembled `x` (the CR
-    /// already folded away) — this assertion FAILS against it.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5551,8 +5424,7 @@ mod tests {
     /// canonicalizers. A trailing CR in a name is not folded by a tab-splitting
     /// reader (the name is not the last field), but the wire format has ONE
     /// refused set: any NUL/LF/CR/TAB in a name is refused everywhere so no
-    /// reader can depend on field position. Pre-fix both canonicalizers
-    /// ACCEPTED these names — this assertion FAILS against the pre-fix code.
+    /// reader can depend on field position.
     #[test]
     fn cr_in_entry_name_rejected_by_both_canonicalizers() {
         skip_without_perl!("cr_in_entry_name_rejected_by_both_canonicalizers");
@@ -5589,8 +5461,6 @@ mod tests {
     /// (3) a symlink whose hash disagrees with the target that crossed the
     ///     wire is refused instead of re-hashing the (possibly truncated)
     ///     target — the exact recomputation that made the defect invisible.
-    /// The mismatch case specifically FAILS against the pre-fix assembler,
-    /// which recomputed `sha256("x")` and accepted.
     #[test]
     fn assembler_refuses_bare_cr_and_mismatched_symlink_hash() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
@@ -5598,8 +5468,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let hash = "0".repeat(64);
 
-        // (1) The exact reproduction line: stdout `L\tl\t1ff\t1\t<hash>\tx\r\n`.
-        // Pre-fix `lines()` folded the CR and accepted target `x`.
+        // (1) A line ending in a bare CR.
         let cr_target_hash = crate::digest::sha256_bytes(b"x\r");
         let raw = format!("L\tl\t1ff\t1\t{cr_target_hash}\tx\r\n");
         let err = canonicalize_remote_entries(CompleteListing::new(&raw, &root, true).unwrap())
@@ -5609,8 +5478,8 @@ mod tests {
             "a bare CR before the line terminator must be refused, got: {err}"
         );
 
-        // (2) A dir line with a CR-only final field: pre-fix `lines()` folded
-        // the CR and the dir was accepted (the target is ignored for dirs).
+        // (2) A dir line with a CR-only final field, which a CRLF-folding reader
+        // would fold away and accept (the target is ignored for dirs).
         let dir_line = "d\td\t1ed\t1\t\t\r\n";
         assert!(
             canonicalize_remote_entries(CompleteListing::new(dir_line, &root, true).unwrap())
@@ -5620,8 +5489,6 @@ mod tests {
 
         // (3) The far side hashed `x\r` but the line carries target `x`: the
         // assembler must NOT recompute the hash over `x` and call it equal.
-        // Pre-fix it recomputed (`sha256("x")`), stored the recomputed hash,
-        // and accepted the divergent line.
         let mismatch = format!("L\tl\t1ff\t1\t{cr_target_hash}\tx\n");
         let err =
             canonicalize_remote_entries(CompleteListing::new(&mismatch, &root, true).unwrap())
@@ -5651,9 +5518,7 @@ mod tests {
     /// character the local walk and the wire path agree. NUL cannot appear in
     /// an on-disk name or target (POSIX names and link targets are C strings),
     /// so it is checked through the shared validators and a hand-built line;
-    /// LF, CR, and TAB are checked end to end on real trees. Pre-fix the local
-    /// walk and the script both ACCEPTED CR in names and targets, so the CR
-    /// rows FAIL against the pre-fix code.
+    /// LF, CR, and TAB are checked end to end on real trees.
     // unix-only: builds symlink fixtures with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -5723,7 +5588,7 @@ mod tests {
 
     /// Non-regression: a legitimate target containing a SPACE still round-trips
     /// byte-for-byte through BOTH canonicalizers (the shared refused set must
-    /// not reject legal link data). This guards the new refusal rules against
+    /// not reject legal link data). This guards the refusal rules against
     /// over-reach.
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
@@ -5804,18 +5669,14 @@ mod tests {
 
     /// A wire manifest must be PARENT-CLOSED: every entry with a `/` must have
     /// an entry for its parent directory, and that parent entry must be a
-    /// `dir`. The wire walk emits parents first, but the FORMAT did not require
-    /// it, so a crafted `d/x` line with no `d` line was accepted. The apply
-    /// layer verifies only the FINAL path component, so the parent's spelling
-    /// was never checked unless it happened to be a source entry: on a
-    /// case-insensitive destination `applied` could name `d/x` while the
-    /// destination held `D/x` (one on-disk entry under two spellings, broken
+    /// `dir`. The wire walk emits parents first, but the FORMAT does not require
+    /// it, so a crafted `d/x` line with no `d` line would be accepted. Without
+    /// the gate the parent's spelling is never checked: on a case-insensitive
+    /// destination `applied` could name `d/x` while the
+    /// destination holds `D/x` (one on-disk entry under two spellings, broken
     /// report injectivity, every re-run repeating), and on a case-sensitive one
-    /// the durable write's `ensure_private_dir_fd` IMPLICITLY created `d`, an
-    /// on-disk entry no report list named (with `delete_extraneous` the
-    /// just-installed entry was then destroyed by the sanctioned removal of the
-    /// pre-existing `D`). This assertion FAILS against the pre-fix assembler,
-    /// which accepted the crafted line.
+    /// the durable write's `ensure_private_dir_fd` IMPLICITLY creates `d`, an
+    /// on-disk entry no report list names.
     #[test]
     fn assembler_requires_parent_closed_manifests() {
         let dir = fixture_tmpdir(&fixture_env()).unwrap();
