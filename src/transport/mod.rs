@@ -199,6 +199,25 @@ impl std::fmt::Display for ReceiverId {
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// The protocol token the far-side executable `storekit-remote` states for
+/// `storekit-remote protocol`, and the ONE value the transport accepts as
+/// evidence that the far side carries a compatible CLI.
+///
+/// The wire form is this token followed by ONE `\n`; the transport compares
+/// the probe's whole stdout against [`far_side_protocol_wire`] byte for byte,
+/// so extra output, a different version, or a missing newline is a WRONG
+/// token (the far side falls back to the scripts), never a partial match. The
+/// binary and the transport both read this constant, so a protocol bump
+/// cannot leave one half behind.
+pub const STOREKIT_REMOTE_PROTOCOL_TOKEN: &str = "storekit-remote-protocol 1";
+
+/// The exact bytes `storekit-remote protocol` writes — the token and one LF
+/// ([`STOREKIT_REMOTE_PROTOCOL_TOKEN`]).
+#[doc(hidden)]
+pub fn far_side_protocol_wire() -> String {
+    format!("{STOREKIT_REMOTE_PROTOCOL_TOKEN}\n")
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteEntry {
     pub name: String,

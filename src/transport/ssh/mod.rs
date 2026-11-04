@@ -59,6 +59,28 @@ use runner::{
 const LSTAT_ERRNO_ENOENT: i32 = 2;
 const LSTAT_ERRNO_ENOTDIR: i32 = 20;
 
+/// The far-side executable's program name: resolved through the remote `PATH`
+/// by every probe and CLI command, exactly as the scripts resolve `perl`.
+const STOREKIT_REMOTE_PROGRAM: &str = "storekit-remote";
+
+/// The explicit deadline for the one-shot `storekit-remote protocol` probe:
+/// a compat check must not be able to stall a run for the full command
+/// deadline. It is CONNECTION-SCALE — it must outlast `ssh`'s own
+/// [`SSH_CONNECT_TIMEOUT_SECS`] connection bound, or the compat check itself
+/// would kill a slow-but-healthy connection and fail the run instead of
+/// letting it fall back. Five seconds past that bound covers authentication
+/// and the first exec while staying far below the 60s command deadline. It
+/// still goes through the shared bounded runner (kill + reap on the deadline),
+/// so a hung far side cannot hang the probe past this bound plus the runner's
+/// termination/drain tail.
+const FAR_SIDE_PROBE_DEADLINE: Duration = Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS + 5);
+
+/// The exit statuses that mean "the far-side executable is not installable
+/// here": 127 (`command not found`) and 126 (`found but not executable`). Only
+/// these two are EVIDENCE OF ABSENCE; every other nonzero status — `ssh`'s own
+/// 255 in particular — is a transport failure, never "no CLI".
+const FAR_SIDE_ABSENT_EXITS: [i32; 2] = [126, 127];
+
 /// The number of bytes the platform's `sockaddr_un.sun_path` can hold,
 /// INCLUDING the terminating NUL. An OpenSSH `ControlPath` longer than
 /// `SUN_PATH_BYTES - 1` is a FATAL configuration error (`ssh` exits 255 with
@@ -589,6 +611,23 @@ impl HostIdentity {
     }
 }
 
+/// The far side's command dialect, decided ONCE per transport by the
+/// `storekit-remote protocol` probe and cached in [`SshTransport::far_side`].
+///
+/// It selects between the two forms of ONE operation through
+/// [`SshTransport::far_command`]; both forms are then built into an ssh argv by
+/// the same [`SshTransport::ssh_command_argv`]. Nothing else may classify the
+/// far side, and no operation probes per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FarSide {
+    /// `storekit-remote protocol` exited 0 with the exact protocol token: the
+    /// far side has a compatible CLI, so operations prefer the CLI argv.
+    Cli,
+    /// The probe exited 126/127 (no executable), or exited 0 with a WRONG
+    /// token (an incompatible version): operations use the original scripts.
+    Scripts,
+}
+
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
     /// `user@address` passed to `ssh` as the connection target.
@@ -667,6 +706,14 @@ pub struct SshTransport {
     /// builds.
     #[cfg(test)]
     test_verify_swap: std::sync::Mutex<Option<crate::transport::VerifySwap>>,
+    /// The far side's command dialect, decided ONCE by the
+    /// `storekit-remote protocol` probe and cached here: `None` until the first
+    /// remote operation needs the decision, then [`FarSide::Cli`] or
+    /// [`FarSide::Scripts`] for the transport's whole lifetime. The lock is
+    /// held ACROSS the probe, so concurrent first operations still run exactly
+    /// one probe. A local transport never consults it (this type is the only
+    /// owner), and a transport that never issues a remote command never probes.
+    far_side: std::sync::Mutex<Option<FarSide>>,
 }
 
 impl SshTransport {
@@ -775,6 +822,7 @@ impl SshTransport {
             ssh_options: Vec::new(),
             #[cfg(test)]
             test_verify_swap: std::sync::Mutex::new(None),
+            far_side: std::sync::Mutex::new(None),
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
@@ -1167,21 +1215,115 @@ impl SshTransport {
     /// command deadline. `run_remote` and `run_remote_ok` differ only in the
     /// recorded operation kind and in whether they check the exit status.
     fn run_remote_op(&self, op: OpKind, command: &str) -> Result<std::process::Output> {
+        self.run_remote_bounded(op, command, None)
+    }
+
+    /// [`Self::run_remote_op`] with an EXPLICIT deadline (`None` keeps the
+    /// runner's own command deadline). The far-side probe is the one caller
+    /// that passes a short bound, so a compat check cannot stall for the full
+    /// command deadline.
+    fn run_remote_bounded(
+        &self,
+        op: OpKind,
+        command: &str,
+        deadline: Option<Duration>,
+    ) -> Result<std::process::Output> {
         self.prepare_for_request()?;
         let argv = self.ssh_command_argv(command)?;
-        self.runner.run(op, &argv, None, None).map_err(|e| match e {
-            RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
-            RunError::StdinWrite(m) => Error::transport(format!("ssh {command}: {m}")),
-            RunError::Wait(m) => Error::transport(format!("ssh {command}: {m}")),
-            RunError::Background(m) => Error::transport(format!("ssh {command}: {m}")),
-            RunError::Timeout {
-                after,
-                leftover_pipes,
-            } => Error::transport(format!(
-                "ssh command timed out after {after:?}{}: {command}",
-                leftover_pipe_note(&leftover_pipes)
-            )),
-        })
+        self.runner
+            .run(op, &argv, None, deadline)
+            .map_err(|e| match e {
+                RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
+                RunError::StdinWrite(m) => Error::transport(format!("ssh {command}: {m}")),
+                RunError::Wait(m) => Error::transport(format!("ssh {command}: {m}")),
+                RunError::Background(m) => Error::transport(format!("ssh {command}: {m}")),
+                RunError::Timeout {
+                    after,
+                    leftover_pipes,
+                } => Error::transport(format!(
+                    "ssh command timed out after {after:?}{}: {command}",
+                    leftover_pipe_note(&leftover_pipes)
+                )),
+            })
+    }
+
+    /// The far side's command dialect, decided ONCE per transport.
+    ///
+    /// The first remote operation that needs a choice runs
+    /// `storekit-remote protocol` through the shared bounded runner under
+    /// [`FAR_SIDE_PROBE_DEADLINE`] and caches the classification; later
+    /// operations read the cache and never probe again. The lock is held
+    /// ACROSS the probe, so concurrent first operations cannot both spawn one.
+    /// A failed probe (a transport-level error, see
+    /// [`Self::classify_far_side_probe`]) is returned WITHOUT caching, so the
+    /// absence of a decision is never mistaken for [`FarSide::Scripts`].
+    fn far_side(&self) -> Result<FarSide> {
+        let mut slot = self
+            .far_side
+            .lock()
+            .map_err(|_| Error::transport("the far-side mode cache is poisoned"))?;
+        if let Some(mode) = *slot {
+            return Ok(mode);
+        }
+        let mode = self.probe_far_side()?;
+        *slot = Some(mode);
+        Ok(mode)
+    }
+
+    /// Run the one-shot `storekit-remote protocol` probe and classify it.
+    fn probe_far_side(&self) -> Result<FarSide> {
+        let command = format!("{STOREKIT_REMOTE_PROGRAM} protocol");
+        let out =
+            self.run_remote_bounded(OpKind::Remote, &command, Some(FAR_SIDE_PROBE_DEADLINE))?;
+        self.classify_far_side_probe(&out)
+    }
+
+    /// Classify the probe's collected output — the ONLY place a far side is
+    /// declared absent or compatible:
+    ///
+    /// * exit 0 with stdout EXACTLY the protocol wire bytes
+    ///   ([`crate::transport::far_side_protocol_wire`]) is [`FarSide::Cli`];
+    /// * exit 0 with any OTHER stdout is a WRONG TOKEN — an incompatible CLI —
+    ///   so [`FarSide::Scripts`];
+    /// * exit 126 or 127 ([`FAR_SIDE_ABSENT_EXITS`]) is no executable, so
+    ///   [`FarSide::Scripts`];
+    /// * every other status, including `ssh`'s own 255 and a signal-killed
+    ///   child with no status, is a TRANSPORT ERROR. It is never absence: a
+    ///   broken connection must fail the run, not silently downgrade it to the
+    ///   scripts.
+    fn classify_far_side_probe(&self, out: &std::process::Output) -> Result<FarSide> {
+        if out.status.success() {
+            let wire = crate::transport::far_side_protocol_wire();
+            if out.stdout == wire.as_bytes() {
+                return Ok(FarSide::Cli);
+            }
+            return Ok(FarSide::Scripts);
+        }
+        match out.status.code() {
+            Some(code) if FAR_SIDE_ABSENT_EXITS.contains(&code) => Ok(FarSide::Scripts),
+            code => Err(Error::transport(format!(
+                "the `{STOREKIT_REMOTE_PROGRAM} protocol` probe on {} failed (exit {}): {} — this is a transport-level failure, never evidence that the far side lacks the CLI",
+                self.target,
+                match code {
+                    Some(code) => code.to_string(),
+                    None => "no exit status (killed by a signal)".to_string(),
+                },
+                String::from_utf8_lossy(&out.stderr).trim_end_matches('\n'),
+            ))),
+        }
+    }
+
+    /// The ONE command selector both far-side forms pass through: return the
+    /// command string to run — the CLI `argv` quoted by [`Self::argv_cmd`] when
+    /// the far side has the CLI, otherwise the operation's original script
+    /// VERBATIM. The result is always handed to [`Self::ssh_command_argv`] by
+    /// the caller (through [`Self::run_remote`]), so both forms share the
+    /// `bash -c` wrapping and the rest of the ssh argv.
+    fn far_command(&self, script: String, cli_argv: &[String]) -> Result<String> {
+        match self.far_side()? {
+            FarSide::Cli => Ok(Self::argv_cmd(cli_argv)),
+            FarSide::Scripts => Ok(script),
+        }
     }
 
     /// Build the `ssh <args> -- <command>` argv, forcing the remote command to
@@ -2158,6 +2300,20 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
         )
     }
 
+    /// The CLI form of [`Self::lstat_script`]: `storekit-remote lstat <path>`,
+    /// one argv element per word (the selector quotes each with
+    /// [`Self::argv_cmd`], so the remote shell re-tokenizes exactly these
+    /// words). The path is the SAME absolute `root.join(rel)` the script is
+    /// given — through `to_string_lossy`, exactly as the script builds it — so
+    /// the two forms inspect the same entry.
+    fn lstat_cli_argv(&self, rel: &Path) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "lstat".to_string(),
+            self.root.join(rel).to_string_lossy().into_owned(),
+        ]
+    }
+
     /// Build the remote DESCRIPTOR-BOUND verification helper for `rel`: ONE
     /// remote exec whose SINGLE stdout payload performs the open→fstat→read
     /// sequence on ONE opened inode — `sysopen` with `O_NOFOLLOW` (a symlink
@@ -2986,14 +3142,22 @@ impl Remote for SshTransport {
     }
 
     fn metadata_opt(&self, rel: &RootedRelativePath) -> Result<Option<RemoteMeta>> {
-        // ONE remote exec: the framed perl `lstat` helper reports the OUTCOME
-        // WITH THE ERRNO (a `P`/`A`/`E` frame on stdout, exit 0 for every
-        // outcome). The frame is the signal — no shell booleans, no reserved
-        // exit code — so a permission failure (EACCES) can never be mistaken
-        // for absence. A transport failure, a signal-killed command, or any
-        // nonzero exit is an error; the single stdout frame is parsed
-        // strictly (malformed output is never a silent default).
-        let out = self.run_remote(&self.lstat_script(rel.as_path()))?;
+        // ONE remote exec: the framed `lstat` helper reports the OUTCOME WITH
+        // THE ERRNO (a `P`/`A`/`E` frame on stdout, exit 0 for every outcome).
+        // The frame is the signal — no shell booleans, no reserved exit code —
+        // so a permission failure (EACCES) can never be mistaken for absence.
+        // The helper is the CLI when the far side carries a compatible
+        // `storekit-remote` (decided once by the transport's probe) and the
+        // original perl script otherwise; both forms emit the same frame and
+        // pass through the same selector/ssh argv. A transport failure, a
+        // signal-killed command, or any nonzero exit is an error; the single
+        // stdout frame is parsed strictly (malformed output is never a silent
+        // default).
+        let command = self.far_command(
+            self.lstat_script(rel.as_path()),
+            &self.lstat_cli_argv(rel.as_path()),
+        )?;
+        let out = self.run_remote(&command)?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh lstat failed: {}",
@@ -7921,7 +8085,29 @@ exec /bin/mv "$@"
                     // The remote command is killed by a signal: the runner's
                     // direct child dies by SIGTERM, so its exit status carries
                     // no code (never a success).
-                    write_fake_bin(&fake.bin, "ssh", "#!/bin/sh\nkill -TERM $$\n");
+                    //
+                    // The probe runs BEFORE the lstat, so a compatible CLI is
+                    // installed to answer it and the fake ssh kills only the
+                    // LSTAT command: otherwise the signal would hit the
+                    // probe, and this property would no longer inject a
+                    // signal-killed LSTAT.
+                    write_fake_bin(
+                        &fake.bin,
+                        "storekit-remote",
+                        &format!(
+                            "#!/bin/sh\nprintf '{}\\n'\n",
+                            crate::transport::STOREKIT_REMOTE_PROTOCOL_TOKEN
+                        ),
+                    );
+                    write_fake_bin(
+                        &fake.bin,
+                        "ssh",
+                        "#!/bin/sh\nlast=''; for a in \"$@\"; do last=$a; done\n\
+                         case \"$last\" in\n\
+                           *'storekit-remote protocol'*) exec sh -c \"$last\" ;;\n\
+                         esac\n\
+                         kill -TERM $$\n",
+                    );
                 }
                 LstatOutcome::TransportSpawnFailure => {
                     // The transport cannot even spawn the remote command (a
