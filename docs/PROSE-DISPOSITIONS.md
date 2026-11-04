@@ -254,3 +254,16 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | runner/mod.rs | module docs: bounded lifecycle, reap per platform (`try_wait` Windows; `waitid(WNOWAIT)` + `Child::wait` Unix; drop backstop), `RunError::Background` (in-group leftover with group termination; pipe-holder with none), `Termination`/`Escalating`/`KillFailure`, `ChildLifecycle`, `DrainState` | kept-corrected | `child_exited_unreaped`, `OwnedChild::{wait,try_wait,live_child}`, `Termination::{termed,group_killed,child_killed}`, `drain_to_eof` |
 | runner/unix.rs, runner/windows.rs | per-arm claims (group enumeration/termination, reader threads, bounded vs unbounded drain, `proc_listpgrppids`) | kept-corrected | each arm's code; `proc_listpgrppids` extern |
 | ssh/runner/mod.rs, unix.rs, windows.rs | `WaitStatus`/`WaitStatusCell`/`WaitResult`, SSH timeout/drain accounting (Unix 4.2 s; Windows unbounded), `SpawnedChild::kill` (group TERM→KILL; owned kill fallback), test docs | kept-corrected | seam closures, `TERM_TO_KILL_GRACE`, `KILL_REAP_BOUND`, `recv`/`recv_bounded` |
+
+## Slice 13 — `tests/**`, `src/deep_tree_regression.rs`, `src/fifo_regression.rs` (change `skusotwv`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| tests/casefold_confinement.rs | module doc + test docs | kept-corrected (`ComponentResolution` vocabulary) | `fold_component`, `ComponentResolution` |
+| tests/push_atomicity.rs, tests/ssh_farside_quoting.rs | NAME_MAX tests | kept-corrected (sampled lengths `[1,243,244,254,255]`) | `bounded_temp_trunk`, the loops |
+| tests/consumer_fit.rs | header + shape list | kept-corrected (consumer revision `a76da6d4`/`2a2af061` restored; `id_newtype!` named-only) | `deploy` tree at that revision, `SyncReport`/`copy_tree_verbatim` calls |
+| tests/copy_primitive_regressions.rs | module bullet + fold-equal test | kept-corrected (identity arm scoped; seven kind pairs) | `refuse_overlapping_copy`, the test bodies |
+| tests/ssh_farside_portability.rs | rename section | kept-corrected (no "each" universal) | the seven positive tests |
+| tests/{composed_lock,confinement,id_macro,operation_lock_sidecar_reserved,ownership_endpoint,platform_symlink_reserved,remote_lock}.rs | module docs + test docs | kept-corrected | the symbols each test names |
+| src/deep_tree_regression.rs | module doc + probe docs | kept-corrected | heap-stack walks, calibration |
+| src/fifo_regression.rs | `PROBE_LIMIT`/`CHILD_LIMIT` docs | kept-corrected (`4 × PROBE_LIMIT = CHILD_LIMIT`; blocking open caught by the hard cap) | `probe`, `fifo_child`, the limits |
