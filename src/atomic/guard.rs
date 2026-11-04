@@ -1,156 +1,111 @@
-//! THE crate's one lock-record mutation guard, and the unforgeable
-//! capability that any name-mutating operation must present.
+//! THE crate's one lock-record mutation guard, and the unforgeable capability
+//! the rel-path mutators demand.
 //!
-//! The single-holder guarantee of [`crate::lock::FileLock`] rests on the
-//! lock record's INODE never changing under its path: a later acquisition
-//! must flock the SAME inode the live holder holds. Any operation that
-//! unlinks, replaces, renames, or truncates the record breaks that, so the
-//! crate must have no reachable path to such a mutation.
+//! The single-holder guarantee of [`crate::lock::FileLock`] rests on the lock
+//! record's INODE never changing under its path: a later acquisition must
+//! flock the SAME inode the live holder holds. Any operation that unlinks,
+//! replaces, renames, or truncates the record breaks that, so the crate must
+//! have no reachable path to such a mutation.
 //!
-//! Enumeration is the wrong shape, and was tried: the call sites found by hand
-//! each missed one of these — a second symlink implementation, the raw rename
-//! primitive under the guarded rename, a raw truncating open, and the Windows
-//! transport's direct `std::fs` seams.
-//! This module makes the guard STRUCTURAL instead:
+//! The guard is STRUCTURAL rather than a list of call sites:
 //!
-//! * [`refuse_lock_record`] is the ONE spelling authority. Every
-//!   name-mutating primitive in [`crate::atomic`] consults it, and it folds
-//!   the spelling ALIASES (case; and the Win32 trailing dot/space) through the
-//!   reserved-name authority, so a case or trailing-dot spelling cannot slip
-//!   past it.
-//! * [`GuardedRel`] is an unforgeable proof that the guard ran, carrying the
-//!   [`GuardScope`] the guard authorized. Its fields are private to THIS
-//!   module, so no other module — not [`super`] itself, not [`super::unix`] /
-//!   `super::windows`, not `transport` / `sync` — can build one except
-//!   through the THREE minting constructors [`GuardedRel::new`],
+//! * [`refuse_reserved_mutation`] is the ONE gate. It runs BOTH
+//!   reserved-spelling authorities — the LOCK-record spelling
+//!   ([`crate::reserved::is_lock_record_name`], through the private
+//!   [`refuse_lock_record`], folded so a case or trailing-dot/space alias
+//!   cannot slip past) and the RESIDUE spelling
+//!   ([`crate::reserved::is_residue_name`]) — and its [`Sanction`] names the ONE
+//!   spelling it may let through.
+//! * [`GuardedRel`] is proof that the gate ran, carrying the [`GuardScope`] it
+//!   authorized. Its fields are private to THIS module, so the only way to
+//!   build one is the THREE minting constructors [`GuardedRel::new`],
 //!   [`GuardedRel::new_for_owned_lock_record`], and
-//!   [`GuardedRel::new_for_residue`], each of which runs the ONE reserved-
-//!   spelling authority [`refuse_reserved_mutation`]. The rel-path mutators
-//!   take one by value, so a NEW primitive cannot name a multi-component
-//!   mutation without first proving it guarded.
+//!   [`GuardedRel::new_for_residue`], each of which runs
+//!   [`refuse_reserved_mutation`]. The rel-path mutators take one by value, so a
+//!   NEW primitive cannot name a multi-component mutation without first proving
+//!   it guarded.
 //!
-//! # What this does NOT cover (the honest residual)
+//! # What this does NOT cover
 //!
-//! A developer who writes a brand-new direct `libc::unlinkat` /
-//! `libc::renameat` / `libc::open` / `libc::rmdir` call into a module that is
-//! not a funnel module is not stopped by the type system: `libc` is an ordinary
-//! dependency and Rust cannot forbid a call to it. Two devices narrow the gap,
+//! Two devices narrow the gap for a mutation spelled outside these primitives,
 //! with DIFFERENT jobs:
 //!
 //! * the resolved-symbol deny in `clippy.toml` REFUSES a call to a denied
-//!   `libc` mutation symbol from any module not granted the allow: it matches
-//!   the symbol the compiler RESOLVED, so no alias, raw identifier, glob,
-//!   parenthesized callee, macro body, or cross-module re-export evades it. The
-//!   symbols it names are the mutation symbols THIS crate funnels (and a
-//!   reviewed set around them); it is NOT a claim to name every mutating symbol
-//!   in existence, and a symbol nobody listed is a REVIEW responsibility,
-//!   stated rather than certified.
-//! * `atomic::guard::tests::every_production_libc_reference_is_pinned` NOTICES
-//!   a change: it scans every production `.rs` file for the token `libc` and
-//!   pins the per-file, per-reference counts exactly, with the unpinned
-//!   ("outside") map asserted EMPTY. A new, removed, respelled, or re-counted
-//!   reference fails here and forces review.
+//!   `std::fs`/`libc` mutation symbol from any module not granted the allow: it
+//!   matches the symbol the compiler RESOLVED, so no alias, raw identifier,
+//!   glob, parenthesized callee, macro body, or cross-module re-export evades
+//!   it. The symbols it names are the mutation symbols THIS crate funnels (and
+//!   a reviewed set around them); it is NOT a claim to name every mutating
+//!   symbol in existence, and a symbol nobody listed is a REVIEW
+//!   responsibility, stated rather than certified.
+//! * `atomic::guard::tests::every_production_libc_reference_is_pinned` and
+//!   `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` NOTICE a
+//!   change: both scan every production `.rs` file and pin the per-file `libc`
+//!   reference counts and the per-file, per-symbol resolved `std::fs`
+//!   name-mutation counts, with the unpinned set asserted EMPTY. A new, removed,
+//!   respelled, or re-counted reference fails there and forces review.
 //!
-//!   THE SCAN'S LIMIT, stated: it is PER-FILE TEXT, so a `pub(crate) use libc
-//!   as c;` declared in a funnel module and reached from a non-funnel file as
-//!   `crate::…::c::chmod(…)` leaves NO `libc` token in the CALLING file and is
-//!   invisible here. That route is covered by the compiler's resolved-symbol
-//!   deny, not by this pin; a mutating symbol the deny does not name, a raw
-//!   `syscall(SYS_…)`, a local `extern "C"` declaration, a macro that emits a
-//!   call, and third-party code are REVIEW responsibilities, named as the
-//!   boundary of this contract rather than certified.
-//! * `atomic::guard::tests::std_fs_name_mutation_counts_are_pinned` PARSES every
-//!   crate `.rs` file into the crate's module graph with `syn` (after
-//!   `#[cfg(test)]` items are removed) and pins the per-file per-symbol counts
-//!   of the RESOLVED production calls to every name mutator on `clippy.toml`'s deny
-//!   list — a DERIVED set, not a hand-kept list: the removal/replace family
-//!   (`remove_file` / `remove_dir` / `remove_dir_all` / `rename` / `hard_link`), the
-//!   name CREATORS (`create_dir`, `create_dir_all`, `symlink*`, `set_permissions`,
-//!   `OpenOptions::create`, `OpenOptions::create_new`, `OpenOptions::custom_flags`,
-//!   `write`) — so a new DIRECT production call, or a new canonical mutator
-//!   occurrence in a macro body, changes a count and forces review. Because the
-//!   sources are parsed, the DIRECT spelling of a path is not a variable: a raw
-//!   identifier (`std::fs::r#remove_file`, `use r#std as s;`), whitespace,
-//!   `self`, a leading `::`, and a DIRECT callee written in parentheses or
-//!   behind a reference (`(std::fs::remove_file)(p)`, `(&std::fs::rename)(a, b)`)
-//!   all resolve to the one symbol they name. A crate-wide alias table maps an
-//!   absolute path such as `crate::a::hidden_fs` to the canonical `std` path it
-//!   names, so a `pub(crate) use std::fs as hidden_fs;` declared in ANOTHER
-//!   MODULE is resolved at its call sites, and a glob over such a module
-//!   (`use crate::alias_a::*;`) propagates its aliases into the importing
-//!   module. The same parsed pass reports a production path that reaches one of
-//!   THAT set through an ENUMERATED route — an IMPORTED symbol, a MODULE ALIAS
-//!   (including a cross-file re-export and a `std`-crate-root alias), or a GLOB.
-//!   It does NOT claim to refuse "every IMPORT route": that completeness job is
-//!   the resolved-symbol clippy deny, not this audit. A production file that
-//!   holds a `#[path]` attribute or an `include!` invocation is REFUSED — the
-//!   audit fails closed — rather than resolved, because either decouples a
-//!   module's path from its location and defeats the location-derived alias
-//!   table. A file is test-only iff its FIRST path component is one of the
-//!   crate-root directories `tests/` / `benches/` / `examples/` (and the path
-//!   continues into it), or EVERY `mod` declaration that names it is
-//!   `#[cfg(...)]`-gated on `test` — never a name or an interior path component,
-//!   so an ungated `src/**/tests.rs` compiled into the lib is PRODUCTION, and a
-//!   file declared BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is
-//!   PRODUCTION, because the second declaration compiles it into the lib.
+//! `every_production_libc_reference_is_pinned` is a PER-FILE TEXT scan, so a
+//! `pub(crate) use libc as c;` declared in a funnel module and reached from a
+//! non-funnel file as `crate::…::c::chmod(…)` leaves NO `libc` token in the
+//! CALLING file and is invisible there; that route is covered by the compiler's
+//! resolved-symbol deny, not by the pin. The `std::fs` pin parses each file with
+//! `syn` and resolves a crate-wide alias table, so a cross-file
+//! `pub(crate) use std::fs as hidden_fs;` is resolved at its call sites; a
+//! production file that holds a `#[path]` attribute or an `include!` invocation
+//! is REFUSED rather than resolved. Both pins use the same test-only rule: a
+//! file is exempt iff its FIRST path component is one of the crate-root
+//! directories `tests/` / `benches/` / `examples/` (and the path continues into
+//! it), or EVERY `mod` declaration that names it is `#[cfg(...)]`-gated on
+//! `test` — never a name or an interior path component, so an ungated
+//! `src/**/tests.rs` compiled into the lib is PRODUCTION, and a file declared
+//! BOTH `#[cfg(test)] mod x;` and `#[cfg(not(test))] mod x;` is PRODUCTION.
 //!
 //! The COMPLETENESS device — "no call to a mutation symbol THIS CRATE FUNNELS
-//! outside the funnel, whatever the spelling" — is a resolved-symbol clippy
-//! deny, not these audits. The deny names the mutation symbols the crate
-//! funnels and a reviewed set around them; it is NOT a claim to name every
-//! mutating symbol in existence, and a symbol it does not name is a REVIEW
-//! responsibility. These audits do what a lint cannot: they notice when the
-//! crate's OWN calls change (the per-file pinned `std::fs` counts and the
-//! pinned per-file `libc` counts) and they resolve the enumerated import
-//! routes as a second, independent detector. Neither audit is total, and
-//! neither is offered as a spelling oracle.
+//! outside the funnel, whatever the spelling" — is the resolved-symbol clippy
+//! deny, not these audits. Neither audit is total, and neither is offered as a
+//! spelling oracle.
 //!
-//! The residual holes these audits CANNOT close, and which no claim above is
-//! scoped to include: a proc macro that EMITS a mutator call (its expansion is
-//! not source this crate parses); a call made through a function POINTER or
-//! `dyn` dispatch — an ALIASED `let f = fx::remove_file;` IS reported as a
-//! route, but the audit does not carry a value across a variable or resolve a
-//! `dyn` method; a `std::fs` mutator reached inside a MACRO through an
-//! alias/import rather than the canonical `std::fs::<symbol>` path (the macro
-//! token scan matches the canonical token sequence only, and counts the
-//! occurrence ONCE, not once per macro expansion); a raw FFI declaration —
+//! The residual holes these audits CANNOT close: a proc macro that EMITS a
+//! mutator call (its expansion is not source this crate parses); a call made
+//! through a function POINTER or `dyn` dispatch — an ALIASED
+//! `let f = fx::remove_file;` IS reported as a route, but the audit does not
+//! carry a value across a variable or resolve a `dyn` method; a `std::fs`
+//! mutator reached inside a MACRO through an alias/import rather than the
+//! canonical `std::fs::<symbol>` path (the macro token scan matches the
+//! canonical token sequence only, and counts the occurrence ONCE, not once per
+//! macro expansion); a raw FFI declaration —
 //! `extern "C" { fn unlinkat(…); }` followed by a call — which names neither
-//! `libc` nor `std::fs`, so NEITHER audit sees it; and an INODE-PRESERVING
-//! content mutation on an ALREADY-EXISTING path through a call that stays legal
-//! outside the funnel, which cannot split a holder because the flock is
-//! attached to the unchanged inode. The mode setter
-//! (`std::fs::set_permissions`), the name CREATORS (`std::fs::create_dir*`, the
-//! platform `symlink` wrappers), and `std::fs::write` — whose create-on-absent
-//! path ADOPTS a name — are NO LONGER in this residue: all are on
-//! `clippy.toml`'s deny list, counted by the `std::fs` pin where applicable,
-//! and covered by the cross-artifact consistency test, so an adopt-a-name or
-//! re-mode call outside the funnel fails the lint. The only `std::fs::write`
-//! left in production is the funnel's own `write_file_fd`, which calls
-//! [`refuse_reserved_mutation`] first and preserves the inode of an EXISTING
-//! entry. The reach of
-//! a raw FFI declaration is one declaration the crate's
-//! own author writes — exactly the residue a source audit carries and names
-//! rather than denies. A foreign process, or a raw `std::fs` call the caller
-//! writes itself, is outside the crate entirely and is not stopped by any of
-//! this.
+//! `libc` nor `std::fs`, so NEITHER audit sees it; a mutating `libc` symbol the
+//! deny does not name; and an INODE-PRESERVING content mutation on an
+//! ALREADY-EXISTING path through a call that stays legal outside the funnel,
+//! which cannot split a holder because the flock is attached to the unchanged
+//! inode.
 //!
-//! TWO name-ADOPTING forms joined the deny list and are NOT residue:
-//! `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags` (on Unix it
-//! forwards ARBITRARY `open(2)` bits and `O_CREAT` through it creates a name;
-//! on Windows it forwards `dwFlagsAndAttributes`, where the creation
-//! disposition is a separate argument, so the Windows form is denied for parity
-//! rather than adoption) and `std::os::unix::net::{UnixListener,UnixDatagram}::bind`
-//! (a pathname-socket bind creates a directory entry). One NAMED RESIDUAL remains,
-//! stated rather than implied: the deny list names RESOLVED `std`/`libc`
-//! symbols, so a Windows named-pipe creator (`CreateNamedPipeW`) or a raw
-//! `CreateFileW`/`NtCreateFile` reached through `windows_sys` is outside the
-//! clippy deny (and the `libc` deny is libc-specific). Rust's stable `std`
-//! exposes no named-pipe creator, and the crate's own `windows_sys` uses today
-//! are non-adopting (`GetFileInformationByHandle`, `LockFileEx`/`UnlockFileEx`),
-//! so the reach is "a raw Win32 creator the crate would have to add" — the same
-//! reach as the raw `extern "C"` declaration above. The residual is repeated at
-//! the deny list in `clippy.toml` so the completeness claim and the lint agree
-//! about what they do not cover.
+//! The mode setter (`std::fs::set_permissions`), the name CREATORS
+//! (`std::fs::create_dir*`, the platform `symlink` wrappers,
+//! `OpenOptions::create`/`create_new`, `File::create`/`create_new`,
+//! `DirBuilder::create`, `std::fs::copy`), the `OpenOptionsExt::custom_flags`
+//! forwarders, the pathname-socket binds, and `std::fs::write` (whose
+//! create-on-absent path ADOPTS a name) are NOT residue: all are on
+//! `clippy.toml`'s deny list and counted by the `std::fs` pin where applicable.
+//! On Unix, `custom_flags` forwards ARBITRARY `open(2)` bits and `O_CREAT`
+//! through it creates a name; the Windows form is denied for parity. The only
+//! `std::fs::write` left in production is the funnel's own `write_file_fd`,
+//! which calls [`refuse_reserved_mutation`] first and preserves the inode of an
+//! EXISTING entry.
+//!
+//! One NAMED RESIDUAL remains, stated rather than implied: the deny list names
+//! RESOLVED `std`/`libc` symbols, so a Windows named-pipe creator
+//! (`CreateNamedPipeW`) or a raw `CreateFileW`/`NtCreateFile` reached through
+//! `windows_sys` is outside it. Rust's stable `std` exposes no named-pipe
+//! creator, and the crate's own `windows_sys` uses today are non-adopting
+//! (`GetFileInformationByHandle`, `LockFileEx`/`UnlockFileEx`), so the reach is
+//! "a raw Win32 creator the crate would have to add" — the same reach as the raw
+//! `extern "C"` declaration above. `clippy.toml` repeats the residual at the
+//! deny list so the completeness claim and the lint agree about what they do not
+//! cover. A foreign process, or a raw `std::fs` call the caller writes itself,
+//! is outside the crate entirely and is stopped by none of this.
 
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
@@ -185,9 +140,7 @@ pub(crate) fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentit
 // `share_mode`, no `create`/`create_new`), so no name is created and no
 // creation flag is among the forwarded bits. This file is a CHILD of
 // `atomic/mod.rs`, whose module-level `#![allow(clippy::disallowed_methods)]`
-// already covers every item here, so no item-level attribute is needed (and
-// adding one would be dead weight); a move of this function OUT of the module
-// would leave it correctly un-allowed.
+// covers every item here, so no item-level attribute is needed.
 #[cfg(windows)]
 pub(crate) fn entry_identity(path: &Path) -> std::io::Result<Option<EntryIdentity>> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -243,12 +196,6 @@ pub(crate) fn entry_identity(_path: &Path) -> std::io::Result<Option<EntryIdenti
 ///   spelling. That is strictly more conservative (more refusals), never an
 ///   escalation, because a case/dot alias of a REMOTE entry may describe a
 ///   distinct far-side entry the local process cannot see.
-///
-/// An in-crate author who wants to repeat the old hole must now explicitly
-/// DECLARE a fraudulent layout (`Layout { lock: <victim>, ..Layout::empty() }`)
-/// and build an authority from it; they can no longer name the candidate
-/// itself as the owned record in one expression. The single legitimate
-/// construction site is the transport that holds the layout.
 pub(crate) struct OwnedLockRecord {
     /// The local root the record lives under, or `None` for a REMOTE record.
     root: Option<PathBuf>,
@@ -279,13 +226,10 @@ impl OwnedLockRecord {
     ///
     /// * Both exist: grant iff their resolved identities are EQUAL. A case or
     ///   trailing-dot/space alias that resolves to the same inode is the owned
-    ///   record; one that resolves to a DISTINCT inode (the constant case on a
-    ///   case-sensitive filesystem, and the trailing-dot case on macOS and
-    ///   Linux alike) is not.
+    ///   record; one that resolves to a DISTINCT inode is not.
     /// * The candidate does not exist: grant iff its spelling is byte-equal to
-    ///   the owned record's. This is the record-CREATION case — there is no
-    ///   entry yet to compare, and creating any other lock-record spelling is
-    ///   not the protocol's own record.
+    ///   the owned record's — the record-CREATION case, where there is no entry
+    ///   yet to compare.
     /// * Anything else (the candidate exists but the owned record does not, or
     ///   an identity probe failed) is NOT the owned record, so a lock-record
     ///   spelling is refused by [`refuse_lock_record`].
@@ -311,11 +255,10 @@ impl OwnedLockRecord {
 /// descends THROUGH a record is refused, not only a path whose final component
 /// is the record.
 ///
-/// PRIVATE to this module by design: the only in-crate ways to run it are the
-/// THREE [`GuardedRel`] minting constructors ([`GuardedRel::new`],
-/// [`GuardedRel::new_for_owned_lock_record`], [`GuardedRel::new_for_residue`]),
-/// so a caller cannot consult the guard
-/// without minting the capability the mutators demand.
+/// PRIVATE to this module: the only in-crate route to it is
+/// [`refuse_reserved_mutation`], which `crate::atomic` re-exports as
+/// `refuse_reserved_mutation`. Consulting the gate therefore does not by itself
+/// mint the [`GuardedRel`] the rel-path mutators demand.
 fn refuse_lock_record(rel: &Path) -> Result<()> {
     for component in rel.components() {
         let Component::Normal(name) = component else {
@@ -342,14 +285,13 @@ fn refuse_lock_record(rel: &Path) -> Result<()> {
 /// The crate has exactly TWO reserved-spelling authorities: the LOCK-record
 /// spelling ([`crate::reserved::is_lock_record_name`]) and the RESIDUE
 /// spelling ([`crate::reserved::is_residue_name`], an unaddressable,
-/// non-temp name that HOLDS a stranded original). A primitive that consulted
-/// one and not the other is exactly how a stranded ORIGINAL was destroyed, so
-/// there is ONE gate ([`refuse_reserved_mutation`]) and this parameter names
+/// non-temp name that HOLDS a stranded original). ONE gate
+/// ([`refuse_reserved_mutation`]) runs both, and this parameter names
 /// the ONE reserved spelling it may let through.
 #[derive(Clone, Copy)]
 pub(crate) enum Sanction<'a> {
     /// No reserved spelling may be broken. Every name-mutating primitive that
-    /// is not one of the two deliberate exceptions presents this.
+    /// has no sanctioned exception presents this.
     None,
     /// The ONE lock record the presented [`OwnedLockRecord`] owns (by resolved
     /// identity, or by the byte-exact creation spelling while no entry exists).
@@ -362,15 +304,13 @@ pub(crate) enum Sanction<'a> {
     /// residue spelling), and a residue in any NON-final component is still
     /// refused, so a discard can never touch a NESTED strand.
     FinalResidue,
-    /// EVERY residue spelling is permitted, because the operation cannot
-    /// DESTROY an existing strand BY ITS SPELLING: it only CREATES a fresh
-    /// entry (a directory or a symlink) or MOVES one (a rename endpoint).
-    /// `mkdir`/`symlink` fail on an existing entry, and a rename only replaces
-    /// what the caller explicitly names — so the engine's own claim-aside
-    /// renames and case-probe directory still work, while the LOCK authority
-    /// is still enforced. The public rename nevertheless applies the residue
-    /// authority (a rename CAN replace a strand), so this sanction is used
-    /// only by the crate's own sanctioned rename/creation primitives.
+    /// EVERY residue spelling is permitted: the caller is one of the engine's
+    /// own operations, which cannot DESTROY a strand BY ITS SPELLING — a
+    /// `mkdir`/`symlink` fails on an existing entry, a rename endpoint only
+    /// replaces a name the caller explicitly names (and the public rename
+    /// refuses an existing residue destination), and a claim-walk removal acts
+    /// on entries the engine itself renamed aside. The LOCK authority is still
+    /// enforced.
     Residue,
 }
 
@@ -380,18 +320,14 @@ pub(crate) enum Sanction<'a> {
 /// * the LOCK-record authority ([`refuse_lock_record`]) unless `sanction`
 ///   proves the candidate IS the owned record; and
 /// * the RESIDUE authority ([`crate::reserved::is_residue_name`]) on EVERY
-///   component, except (a) the owned lock record itself and (b) the FINAL
-///   component under [`Sanction::FinalResidue`].
+///   component, except (a) the owned lock record itself, (b) the FINAL
+///   component under [`Sanction::FinalResidue`], and (c) every component under
+///   [`Sanction::Residue`].
 ///
-/// A primitive therefore CANNOT carry the lock authority and skip the residue
-/// authority: this function is the only reachable way to run either check
-/// (`refuse_lock_record` is private to this module, and the residue loop lives
-/// here), and it always runs both. A future mutator that wants a lock-record
-/// grant presents [`Sanction::OwnedLockRecord`] and still gets the residue
-/// refusal on every spelling that is not the granted record; one that wants the
-/// explicit discard presents [`Sanction::FinalResidue`] and still gets the lock
-/// refusal and the nested-residue refusal. [`GuardedRel`] is the unforgeable
-/// proof that this gate ran.
+/// [`refuse_lock_record`] is private to this module and the residue loop lives
+/// here, so this function is the only reachable route to either check: a
+/// primitive cannot run the lock authority while skipping the residue
+/// authority, and [`GuardedRel`] is the unforgeable proof that this gate ran.
 pub(crate) fn refuse_reserved_mutation(rel: &Path, sanction: Sanction<'_>) -> Result<()> {
     let owned_grant = match sanction {
         Sanction::OwnedLockRecord(owned) => owned.owns(rel),
@@ -453,8 +389,7 @@ impl<'a> GuardedRel<'a> {
     /// COMPILE-LEVEL ARGUMENT: the fields are private to this module, so a
     /// struct-literal construction (`GuardedRel { rel, scope }`) anywhere else
     /// — including in [`super::unix`] / `super::windows` — is `E0451`
-    /// ("field is private"), and no `unsafe`/`transmute` route exists in safe
-    /// code. This constructor is one of the THREE minting constructors (with
+    /// ("field is private"). This constructor is one of the THREE minting constructors (with
     /// [`Self::new_for_owned_lock_record`] and [`Self::new_for_residue`]), the
     /// only minters of the capability: every one runs
     /// [`refuse_reserved_mutation`], the ONE reserved-spelling authority, so a
@@ -486,10 +421,7 @@ impl<'a> GuardedRel<'a> {
     /// EVERY other lock-record spelling — a bare `operation.lock`, a nested
     /// `snapshots/.001.operation.lock`, an interior component, or an alias that
     /// resolves elsewhere — is refused by the same [`refuse_lock_record`]
-    /// authority the ordinary constructor uses. A future `*_if`-style
-    /// primitive that reaches for this constructor therefore still cannot smash
-    /// a foreign record, and one that reaches for [`Self::new`] cannot smash
-    /// any.
+    /// authority the ordinary constructor uses.
     pub(crate) fn new_for_owned_lock_record(
         rel: &'a Path,
         owned: &OwnedLockRecord,
@@ -508,9 +440,10 @@ impl<'a> GuardedRel<'a> {
 
     /// The SANCTIONED residue-movement constructor: run the gate with
     /// [`Sanction::Residue`] (every residue spelling is permitted; the lock
-    /// authority is still enforced). Used ONLY by the crate's own rename of a
-    /// claim-aside and by `sync::Residue::recover_to`, where the residue
-    /// spelling is the point of the operation. The PUBLIC
+    /// authority is still enforced). Used only by
+    /// [`crate::atomic::rename_residue_paths`], the rename primitive behind the
+    /// engine's own claim-aside rename and `sync::Residue::recover_to`, where
+    /// the residue spelling is the point of the operation. The PUBLIC
     /// [`GuardedRel::new`] refuses residue spellings, so a caller that reaches
     /// for the ordinary rename cannot move or replace a strand.
     pub(crate) fn new_for_residue(rel: &'a Path) -> Result<Self> {
@@ -537,8 +470,8 @@ impl<'a> GuardedRel<'a> {
 mod tests {
     #![allow(clippy::disallowed_methods)]
     use super::GuardedRel;
-    // `OwnedLockRecord` is exercised only by the identity/fold tests below,
-    // which need a real (device, inode) pair: a Unix filesystem property.
+    // `OwnedLockRecord` is exercised only by the identity test below, which
+    // needs a real (device, inode) pair: a Unix filesystem property.
     #[cfg(unix)]
     use super::OwnedLockRecord;
     use std::collections::{BTreeMap, BTreeSet};
@@ -546,8 +479,7 @@ mod tests {
 
     /// The ONE guard refuses every lock-record spelling — the application
     /// record, the sibling record, and their case aliases — in ANY component,
-    /// and the capability cannot be minted for any of them. This is the
-    /// authority every name-mutating primitive consults.
+    /// and the capability cannot be minted for any of them.
     #[test]
     fn the_guard_refuses_every_lock_record_spelling_in_any_component() {
         for bad in [
@@ -577,11 +509,10 @@ mod tests {
         }
     }
 
-    /// The owned-record grant is decided by IDENTITY,
-    /// not by a spelling fold, and the authority is built from the transport's
-    /// own `Layout` (a candidate path cannot be its own authority — the guard's
-    /// second parameter is an [`OwnedLockRecord`], not a `Path`, so the old
-    /// `new_for_owned_lock_record(rel, rel)` does not typecheck).
+    /// The owned-record grant is decided by IDENTITY, not by a spelling fold,
+    /// and the authority is built from the transport's own `Layout`: the second
+    /// parameter is an [`OwnedLockRecord`], not a `Path`, so the candidate
+    /// cannot be its own authority.
     #[cfg(unix)]
     #[test]
     fn ownership_is_decided_by_identity_not_by_a_fold() {
@@ -599,7 +530,7 @@ mod tests {
         };
         let owned = OwnedLockRecord::local(&root, &layout);
 
-        // (a) the byte-exact owned spelling is the owned record.
+        // The byte-exact owned spelling is the owned record.
         let exact =
             GuardedRel::new_for_owned_lock_record(Path::new("state/operation.lock"), &owned)
                 .expect("the owned spelling is admitted");
@@ -608,7 +539,7 @@ mod tests {
             "the byte-exact owned spelling must be the OwnedLockRecord scope"
         );
 
-        // (a) a case alias resolving to the SAME inode is the owned record; on a
+        // A case alias resolving to the SAME inode is the owned record; on a
         // case-SENSITIVE filesystem it is a DISTINCT (absent) entry and refused.
         let case_alias = root.join("state/OPERATION.LOCK");
         match std::fs::metadata(&case_alias) {
@@ -635,14 +566,14 @@ mod tests {
             }
         }
 
-        // (a) a DISTINCT on-disk entry is refused, whatever it folds to.
+        // A DISTINCT on-disk entry is refused, whatever it folds to.
         std::fs::write(root.join("state/operation.lock."), b"B").unwrap();
         assert!(
             GuardedRel::new_for_owned_lock_record(Path::new("state/operation.lock."), &owned)
                 .is_err(),
             "a trailing-dot spelling that is a distinct entry must be refused"
         );
-        // (b) a lock-record spelling that does not exist and is not byte-equal is
+        // A lock-record spelling that does not exist and is not byte-equal is
         // refused (it is not the record being created).
         assert!(
             GuardedRel::new_for_owned_lock_record(
@@ -653,7 +584,7 @@ mod tests {
             "creating some OTHER lock-record spelling is not the protocol's record"
         );
 
-        // (b) the byte-exact spelling with NO entry yet is the creation case.
+        // The byte-exact spelling with NO entry yet is the creation case.
         let fresh =
             crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let owned_fresh = OwnedLockRecord::local(fresh.path(), &layout);
@@ -753,9 +684,7 @@ mod tests {
     /// `disallowed-methods` list by [`reconciled_denied_symbols`] — the same
     /// file the compiler reads — through [`pin_key_for`]. A name-mutating entry
     /// added to `clippy.toml` therefore enters the pin AUTOMATICALLY, so the
-    /// cross-artifact completeness device and the count pin cannot drift: the
-    /// failure mode this replaces was seven adopting symbols the lint denied
-    /// but the pin did not count.
+    /// cross-artifact completeness device and the count pin cannot drift.
     fn name_mutation_symbols() -> &'static BTreeMap<&'static str, Vec<String>> {
         static TABLE: std::sync::OnceLock<BTreeMap<&'static str, Vec<String>>> =
             std::sync::OnceLock::new();
@@ -800,7 +729,7 @@ mod tests {
         /// followed by `s::fs::remove_file(…)`.
         ModuleAlias,
         /// `use std::fs::*;` — the glob itself is the route, since any of the
-        /// five symbols (and a function pointer to one) comes into scope.
+        /// pinned symbols (and a function pointer to one) comes into scope.
         Glob,
     }
 
@@ -814,7 +743,7 @@ mod tests {
         }
     }
 
-    /// One production use of a `std::fs` inode mutator through a route the
+    /// One production use of a pinned `std::fs` name mutator through a route the
     /// exact-count pin does not cover.
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct Violation {
@@ -907,8 +836,7 @@ mod tests {
     }
 
     /// The local spelling of an identifier with the raw-identifier prefix
-    /// removed, so `r#fx` and `fx` are ONE name: the flag lives on the AST node,
-    /// not in the spelling the byte matcher used to compare.
+    /// removed, so `r#fx` and `fx` are ONE name.
     fn unraw(ident: &syn::Ident) -> String {
         let text = ident.to_string();
         text.strip_prefix("r#").unwrap_or(&text).to_string()
@@ -1015,14 +943,7 @@ mod tests {
 
     /// A local NON-GENERIC `type` alias (`type ZZBuilder =
     /// std::fs::OpenOptions;`) with the path it names and the module it is
-    /// declared in. An earlier resolver keyed the owner on the literal
-    /// last-segment name, so a `type` alias of a builder type was invisible to
-    /// BOTH the funnel closure and the count pin: inside a funnel module,
-    /// `type ZZBuilder = std::fs::OpenOptions;` followed by
-    /// `ZZBuilder::new().write(true).create_new(true).open(p)?` left clippy,
-    /// `every_mutation_symbol_the_funnel_uses_is_denied_crate_wide` and
-    /// `std_fs_name_mutation_counts_are_pinned` all green. A `use … as` alias
-    /// WAS resolved; a `type` alias was not.
+    /// declared in.
     struct TypeAlias {
         module: CanonPath,
         local: String,
@@ -1035,7 +956,7 @@ mod tests {
     /// alias (`type X<T> = …`) is skipped deliberately: the resolver
     /// substitutes a path PREFIX, and a generic alias is not usable as a bare
     /// prefix without turbofish (`X::<T>::new`), which this resolver does not
-    /// model; the pair-less boundary names the omission.
+    /// model.
     struct TypeAliasCollector<'out> {
         module: CanonPath,
         out: &'out mut Vec<TypeAlias>,
@@ -1086,9 +1007,9 @@ mod tests {
 
     /// The canonical `std` name-mutation symbol `path` names, if any, from
     /// [`name_mutation_symbols`]: `std::fs::remove_file`, `std::fs::create_dir`,
-    /// `std::os::unix::fs::symlink`, …, but equally the adopting spellings the
-    /// pin used to miss (`std::fs::File::create`, `std::fs::write`). The table
-    /// is DERIVED from `clippy.toml`, so the count pin, the route detector, the
+    /// `std::os::unix::fs::symlink`, …, but equally the adopting spellings
+    /// `std::fs::File::create` and `std::fs::write`. The table is DERIVED from
+    /// `clippy.toml`, so the count pin, the route detector, the
     /// canonical-spelling test, and the deny list cannot drift apart.
     fn mutator_symbol(path: &[String]) -> Option<&'static str> {
         name_mutation_symbols().iter().find_map(|(key, canonical)| {
@@ -1222,10 +1143,7 @@ mod tests {
 
     /// The `std` name-mutation symbols named by a macro token stream as a
     /// canonical `::`-joined path — `std::fs::<symbol>`, `std::fs::create_dir`,
-    /// and the `std::os::…::fs::symlink*` creators alike. This restores the
-    /// coverage the parse lost: the old byte count saw the literal
-    /// `std::fs::<symbol>(` text inside a `macro_rules!` body, and this scan
-    /// sees that sequence again, plus the creation family. It is deliberately
+    /// and the `std::os::…::fs::symlink*` creators alike. It is deliberately
     /// NOT a general resolver — a mutator reached inside a macro through an
     /// alias/import is not matched, and the occurrence is counted once per
     /// macro, not once per expansion; both are named in the audit's residue.
@@ -1381,13 +1299,6 @@ mod tests {
     /// an allow to the module's own items and to every module nested inside it,
     /// so the region is the set of module paths that have one of these as an
     /// ancestor-or-self prefix.
-    ///
-    /// The old per-file predicate ([`attrs_allow_disallowed`] on one file's own
-    /// attrs) could only see a region declared IN that file, so a `mod child;`
-    /// whose PARENT module carried the allow was invisible — measured: a
-    /// non-adopting `File::options`-chain planted at the top level of
-    /// `src/atomic/guard.rs` changed nothing, while the identical call in
-    /// `src/error.rs` was a clippy error.
     fn funnel_region_modules(
         parsed: &[ParsedSource],
         gated: &BTreeSet<String>,
@@ -1461,9 +1372,7 @@ mod tests {
     /// Whether a `syn::ImplItem` — a method, const, type, or macro inside an
     /// `impl` block — carries `#[allow(clippy::disallowed_methods)]`. The
     /// `syn::Item` arm above CANNOT see these: an `impl`'s children are
-    /// `ImplItem`s, not `Item`s, so before this arm existed an `#[allow]` on a
-    /// METHOD was invisible to the surface derivation (an earlier draft of this
-    /// audit claimed the arm existed; it did not).
+    /// `ImplItem`s, not `Item`s.
     fn impl_item_allows_disallowed(item: &syn::ImplItem) -> bool {
         let attrs = match item {
             syn::ImplItem::Const(item) => &item.attrs,
@@ -1602,15 +1511,14 @@ mod tests {
                     }
                 }
             }
-            // Local non-generic `type` aliases are bindings too.
-            // A `type ZZBuilder = std::fs::OpenOptions;` inside a funnel module
+            // Local non-generic `type` aliases are bindings too: a
+            // `type ZZBuilder = std::fs::OpenOptions;` inside a funnel module
             // must resolve to the same canonical builder owner as the direct
-            // spelling, or `ZZBuilder::new()…create_new(…)` is invisible to both
-            // the closure derivation and the count pin. Resolve the alias TARGET
-            // through the same table (so `type A = O;` chains through a `use …
-            // as`), and only keep bindings that resolve under `std`/`libc`: the
-            // index is a `std::fs`/`libc` resolver, and admitting a local type
-            // path would let an unrelated `type` name canonicalize to `std::fs`.
+            // spelling. Resolve the alias TARGET through the same table (so
+            // `type A = O;` chains through a `use … as`), and only keep bindings
+            // that resolve under `std`/`libc`: the index is a
+            // `std::fs`/`libc` resolver, and admitting a local type path would
+            // let an unrelated `type` name canonicalize to `std::fs`.
             for aliases in &type_aliases {
                 for alias in aliases {
                     let canonical = index.resolve_path(&alias.module, &alias.target);
@@ -1701,10 +1609,10 @@ mod tests {
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
             // `syn::visit` does not descend into a macro's tokens, so scan them
-            // here for a canonical `std::fs::<symbol>` sequence (the spelling
-            // the old byte count saw). This counts a mutator written in a
-            // `macro_rules!` body or any macro invocation; it does NOT resolve
-            // an aliased path inside the macro, nor count once per expansion.
+            // here for a canonical `std::fs::<symbol>` sequence. This counts a
+            // mutator written in a `macro_rules!` body or any macro invocation;
+            // it does NOT resolve an aliased path inside the macro, nor count
+            // once per expansion.
             for symbol in macro_mutator_symbols(&mac.tokens) {
                 *self.calls.entry((self.file.clone(), symbol)).or_default() += 1;
             }
@@ -2272,9 +2180,8 @@ mod tests {
     }
 
     /// Remove every `#[cfg(test)]`-gated item/statement from already
-    /// comment/string-stripped code, leaving PRODUCTION code. Counting test
-    /// occurrences as production is what made six pin entries advertise a
-    /// production call that did not exist. An ATTRIBUTE RUN is buffered whole,
+    /// comment/string-stripped code, leaving PRODUCTION code. An ATTRIBUTE RUN
+    /// is buffered whole,
     /// so a `#[cfg(unix)]` that PRECEDES the `#[cfg(test)]` of the same item is
     /// removed with it instead of being left dangling (which a `syn` parse
     /// rejects, though a byte match did not). The skip is brace/paren/bracket
@@ -2447,11 +2354,9 @@ mod tests {
     /// `use libc::{self as c};`). WHITESPACE-INSENSITIVE, so `libc :: unlinkat`
     /// and a newline before `(` are both seen, and RAW-IDENTIFIER-INSENSITIVE,
     /// so `libc::r#rmdir` is the SAME key as `libc::rmdir` (a raw identifier
-    /// names the same item; without the `r#` strip it was recorded as the
-    /// distinct key `libc::r`, which the funnel's exact `libc::<symbol>` pin did
-    /// not see). This is ONE rule instead of a list of mutating-symbol
-    /// patterns, so a module alias or a cross-file re-export cannot slip past
-    /// it.
+    /// names the same item). This is ONE rule instead of a list of
+    /// mutating-symbol patterns, so a module alias or a cross-file re-export
+    /// cannot slip past it.
     fn libc_references(code: &str) -> BTreeMap<String, usize> {
         let bytes = code.as_bytes();
         let mut map: BTreeMap<String, usize> = BTreeMap::new();
@@ -2630,25 +2535,22 @@ mod tests {
     /// that are NOT pinned — the only "outside" this audit knows — is asserted
     /// EMPTY.
     ///
-    /// WHAT THIS DEVICE IS, AND WHAT IT IS NOT. It is a bounded COUNT of the
-    /// crate's OWN `libc` calls, whichever module they are in: a new, removed,
-    /// respelled, or re-counted reference changes the pin and forces review.
-    /// It is NOT the completeness device for the `libc` name-mutation class.
-    /// That is the resolved-symbol deny in `clippy.toml`, which the compiler
-    /// applies to every spelling, alias, cross-module re-export, glob, macro
-    /// body, and module, and which is what refuses a mutating call outside the
-    /// funnel modules. The two devices have different jobs: the deny REFUSES,
+    /// It is a bounded COUNT of the crate's OWN `libc` calls, whichever module
+    /// they are in: a new, removed, respelled, or re-counted reference changes
+    /// the pin and forces review. It is NOT the completeness device for the
+    /// `libc` name-mutation class; that is the resolved-symbol deny in
+    /// `clippy.toml`, which the compiler applies to every spelling, alias,
+    /// cross-module re-export, glob, macro body, and module. The deny REFUSES,
     /// this pin NOTICES.
     ///
-    /// THE LIMIT OF A PER-FILE TEXT SCAN, named not hidden. It sees the token
-    /// `libc` in a file, so a `pub(crate) use libc as c;` declared in a funnel
-    /// module and reached from a non-funnel file as `crate::…::c::chmod(…)`
-    /// leaves NO `libc` token in the CALLING file and is invisible here. That
-    /// route is covered by the compiler's resolved-symbol deny, not by this
-    /// pin. A mutating `libc` symbol the deny does not name, a raw
-    /// `syscall(SYS_…)`, a local `extern "C"` declaration, a macro that EMITS a
-    /// call, and third-party code are REVIEW responsibilities, stated as the
-    /// boundary of this contract rather than certified by it.
+    /// THE LIMIT OF A PER-FILE TEXT SCAN: it sees the token `libc` in a file,
+    /// so a `pub(crate) use libc as c;` declared in a funnel module and reached
+    /// from a non-funnel file as `crate::…::c::chmod(…)` leaves NO `libc` token
+    /// in the CALLING file and is invisible here. A mutating `libc` symbol the
+    /// deny does not name, a raw `syscall(SYS_…)`, a local `extern "C"`
+    /// declaration, a macro that EMITS a call, and third-party code are REVIEW
+    /// responsibilities, stated as the boundary of this contract rather than
+    /// certified by it.
     ///
     /// The `std::fs` side has the analogous per-production-file count pin in
     /// [`std_fs_name_mutation_counts_are_pinned`], and the cross-artifact
@@ -2708,11 +2610,6 @@ mod tests {
             ("src/atomic/unix.rs", "libc::F_GETPATH", 1),
             ("src/atomic/unix.rs", "libc::O_APPEND", 1),
             ("src/atomic/unix.rs", "libc::O_CLOEXEC", 8),
-            // The linear temp centralizes the two `O_WRONLY | O_CREAT |
-            // O_EXCL` creation spellings (`replace_core` and
-            // `write_atomic_cas_fd`) into ONE `Temp::create`, so each of those
-            // three flags loses one production reference. No flag or create
-            // site was otherwise changed.
             ("src/atomic/unix.rs", "libc::O_CREAT", 4),
             ("src/atomic/unix.rs", "libc::O_DIRECTORY", 18),
             ("src/atomic/unix.rs", "libc::O_EXCL", 2),
@@ -2889,23 +2786,13 @@ mod tests {
     /// `DirBuilder::create`, `custom_flags`) whose receiver chain or enclosing
     /// `let` binding resolves to an `OpenOptions`/`DirBuilder` owner is one
     /// more, attributed by the SAME [`builder_owner`] the closure derivation
-    /// uses. This is a SUPERSET of the old byte count, which saw only the
-    /// literal `std::fs::<symbol>(` text: every occurrence the byte count saw —
-    /// including one inside a `macro_rules!` body — is seen here too, plus
-    /// resolved aliases, parenthesized/referenced direct callees, and the
-    /// inherent/builder adoption forms. It is NOT a superset of every possible
-    /// call: a mutator reached inside a macro through an alias, or a call
-    /// through a function-pointer variable, is not counted (see RESIDUE), so
-    /// adding such a call does not change a count.
+    /// uses. It is NOT a superset of every possible call: a mutator reached
+    /// inside a macro through an alias, or a call through a function-pointer
+    /// variable, is not counted (see RESIDUE), so adding such a call does not
+    /// change a count.
     ///
     /// SYMBOL SET: DERIVED from `clippy.toml` ([`name_mutation_symbols`]), not
-    /// hand-kept — the finding was seven ADOPTING symbols the lint
-    /// denied but a hand-kept table did not count, so a funnel-module call to
-    /// one left this pin green. A new deny entry now changes this pin
-    /// automatically. The pinned VALUES changed for exactly that
-    /// reason (`create_new`, `create`, `custom_flags`, and `write` calls that
-    /// were always there are now counted); each new value is a deliberate,
-    /// reviewed entry recorded at the pin with its reason.
+    /// hand-kept, so a new deny entry changes this pin automatically.
     ///
     /// EXEMPTION: a file is test-only iff its FIRST path component is one of the
     /// crate-root directories `tests/` / `benches/` / `examples/` (and the path
@@ -2933,10 +2820,8 @@ mod tests {
     /// legal outside the funnel is not pinned: it cannot split a holder because
     /// the flock stays on the unchanged inode. The mode setter, the name
     /// CREATORS, and `std::fs::write` (create-or-truncate, and therefore an
-    /// ADOPTION when the path is absent) are DENIED now, not residue. The audit
-    /// resolves the
-    /// ENUMERATED routes and NAMES this residue rather than implying totality;
-    /// the clippy deny carries the completeness claim.
+    /// ADOPTION when the path is absent) are DENIED, not residue. The clippy
+    /// deny carries the completeness claim.
     #[test]
     fn std_fs_name_mutation_counts_are_pinned() {
         let mut paths = Vec::new();
@@ -2965,116 +2850,36 @@ mod tests {
         );
         let expected: &[(&str, &str, usize)] = &[
             ("src/atomic/mod.rs", "remove_file", 1),
-            // CHANGED DELIBERATELY (constraint #1): the path-based
-            // `remove_dir_all_path` became `#[cfg(test)]` (it has no
-            // production caller; the fd-confined `remove_dir_all_fd` is the
-            // production authority), so its `std::fs::remove_file` left the
-            // PRODUCTION count.
-            //
-            // The `rename` below is the path-based `write_atomic_replace`'s
-            // commit-point-1 rename. It was briefly dropped from this pin when
-            // that replace was demoted to `#[cfg(test)]`/`pub(crate)`; the
-            // demotion was REVERTED because a CONSUMER's interface requires
-            // the name (deploy's retention history-floor writer calls the path-based replace —
-            // see docs/CONSISTENCY.md axis M), so the rename is production code
-            // again and is pinned here. The guard still runs on the function.
             ("src/atomic/unix.rs", "rename", 1),
             ("src/atomic/windows.rs", "remove_dir", 2),
-            // TWO production `remove_dir_all` calls: the implicit
-            // recursive removal (`remove_dir_all_fd`, refused for residue) and
-            // the EXPLICIT discard (`remove_residue_dir_all_fd`), whose caller
-            // has already decided the strand is disposable. Both run the lock
-            // authority on the whole path/tree before the call, so neither can
-            // name the record; the count is raised deliberately, not silently.
             ("src/atomic/windows.rs", "remove_dir_all", 2),
-            // SEVEN production `remove_file` calls: the pre-existing five plus the two
-            // sanctioned claim-aside walk primitives (`remove_claim_file_fd`
-            // and the discard `remove_residue_file_fd`), whose paths include
-            // the claim root and therefore permit residues.
             ("src/atomic/windows.rs", "remove_file", 7),
             ("src/atomic/windows.rs", "rename", 2),
-            // FOUR production `remove_file` calls: TWO are
-            // `durable_create_new`'s temp lifecycle — the linear
-            // `CreateNewTemp`'s ONE `Drop` unlink (armed on every exit before
-            // the commit point) and the ONE best-effort release inside
-            // `CreateNewTemp::publish` — and TWO are the compare-and-delete
-            // protocol's: the serialized read-compare-unlink and the ONE
-            // `Claimed::drop` that discards a claim aside. The count DROPPED
-            // from six because the four hand-written create-new unlinks
-            // (create-error, verify-error, install-error, step 6) became those
-            // two — the same consolidation the claim temp went through; the
-            // temp spelling itself is unchanged.
             ("src/transport/mod.rs", "remove_file", 4),
             ("src/transport/mod.rs", "rename", 1),
             ("src/transport/mod.rs", "hard_link", 1),
             ("src/transport/ssh/hostkey.rs", "remove_file", 1),
-            // --- The CREATION wrappers: `std::fs::create_dir*` and
-            // the platform symlink creators ADOPT a name, so they are on
-            // `clippy.toml`'s deny list and this pin tracks their production
-            // call counts too. Every site below is either a funnel module
-            // (module-level allow), an item-level allow reviewed for the
-            // creation it performs, or the ONE platform symlink helper.
-            //
-            // funnel modules: the fd-confined `create_dir_fd` +
-            // `create_dir_all` fallback, and the macOS/Windows ports.
             ("src/atomic/unix.rs", "create_dir", 2),
             ("src/atomic/unix.rs", "create_dir_all", 1),
             ("src/atomic/windows.rs", "create_dir", 3),
             ("src/atomic/windows.rs", "create_dir_all", 5),
-            // the ONE platform std-symlink helper (`platform::symlink`), which
-            // is the single reviewed allow for all three creators, plus the
-            // path-based mode authority (`platform::chmod`).
             ("src/platform.rs", "symlink", 1),
             ("src/platform.rs", "symlink_dir", 1),
             ("src/platform.rs", "symlink_file", 1),
             ("src/platform.rs", "set_permissions", 1),
-            // item-level-reviewed creation sites outside the funnel: the
-            // destination lock record's parent chain (`create_lock_parent`),
-            // the destination root itself (`root_for_mutation`), the sidecar
-            // parent chain (`ensure_operation_lock_sidecar_durable`), the
-            // local root + layout (`root_dir`/`provision_layout`), and the ssh
-            // mux directory (`prepare_identity`) / known-hosts cache
-            // (`pin_known_hosts`).
             ("src/sync/apply.rs", "create_dir_all", 2),
             ("src/transport/mod.rs", "create_dir_all", 5),
             ("src/transport/ssh/hostkey.rs", "create_dir_all", 1),
             ("src/transport/ssh/mod.rs", "create_dir_all", 1),
-            // --- The ADOPTION family the pin MISSED.
-            // These symbols were on `clippy.toml`'s deny list but NOT in the
-            // hand-kept pin table, so a call to one INSIDE a funnel module —
-            // where the module-level `#[allow]` blinds the lint — left the count
-            // pin green. The pin's table is now DERIVED from `clippy.toml`
-            // ([`name_mutation_symbols`] -> [`reconciled_denied_symbols`] ->
-            // [`denied_symbols_from_clippy_toml`]), so these entries appear
-            // automatically and every future deny entry does too. Each site is
-            // either a funnel module (module-level allow) or an item-level
-            // allow reviewed for the creation it performs. (`File::create` and
-            // `std::fs::copy` are in the derived set but have NO production
-            // call, so they are absent here by construction — the pin lists
-            // nonzero counts only.)
-            //
-            // `create_new` (O_EXCL creation — "create a name, FAIL if it
-            // exists"): the temp create in `write_atomic_replace` (unix +
-            // windows), `copy_tree_verbatim`'s destination create (unix +
-            // windows), windows' `write_file_new_fd`, the transport's
-            // `durable_create_new` + its own temp create, and the known-hosts
-            // pin. All run inside the funnel or under an item-level allow.
             ("src/atomic/unix.rs", "OpenOptions::create_new", 2),
             ("src/atomic/windows.rs", "OpenOptions::create_new", 4),
             ("src/transport/mod.rs", "OpenOptions::create_new", 2),
             ("src/transport/ssh/hostkey.rs", "OpenOptions::create_new", 1),
-            // `OpenOptions::create`: the LOCK PROTOCOL's own record open
-            // (creating the record on first use), item-level allowed in each
-            // port and refusing a symlink/reparse point at the record spelling.
             ("src/lock/unix.rs", "OpenOptions::create", 1),
             ("src/lock/windows.rs", "OpenOptions::create", 1),
-            // `custom_flags`: the reviewed NON-ADOPTING opens that forward only
-            // no-create bits (`O_NOFOLLOW`/`O_CLOEXEC`/`O_NONBLOCK`/
-            // `O_DIRECTORY`/`FILE_FLAG_OPEN_REPARSE_POINT`/
-            // `FILE_FLAG_BACKUP_SEMANTICS`) — the same reviewed sites that carry
-            // the item-level allow for the crate-wide deny. The ADOPTING
-            // `custom_flags(O_CREAT)` form is what was
-            // reachable with every gate green.
+            // This file's ONE `custom_flags` site: the Windows identity probe in
+            // `entry_identity`, a READ-ONLY open forwarding
+            // `FILE_FLAG_OPEN_REPARSE_POINT` only.
             ("src/atomic/guard.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/unix.rs", "OpenOptions::custom_flags", 1),
@@ -3082,11 +2887,8 @@ mod tests {
             ("src/lock/unix.rs", "OpenOptions::custom_flags", 1),
             ("src/lock/windows.rs", "OpenOptions::custom_flags", 1),
             ("src/transport/mod.rs", "OpenOptions::custom_flags", 1),
-            // `std::fs::write` (create-or-truncate, which ADOPTS an absent
-            // name): the Windows `write_file_fd`, which runs
-            // `refuse_reserved_mutation` first and preserves the inode of an
-            // EXISTING entry. Unix's `write_file_fd` writes through the
-            // descriptor, so it has no `std::fs::write` and does not appear.
+            // The Windows `write_file_fd`, which runs `refuse_reserved_mutation`
+            // first and preserves the inode of an EXISTING entry.
             ("src/atomic/windows.rs", "write", 1),
         ];
         let expected: BTreeMap<(String, &'static str), usize> = expected
@@ -3104,9 +2906,7 @@ mod tests {
     /// The count pin's symbol set is DERIVED from
     /// `clippy.toml`, so every ADOPTING symbol the lint denies is counted even
     /// inside a funnel module, where the module-level `#[allow]` blinds the
-    /// lint. Before this arm, seven adopting symbols were denied by the lint but
-    /// absent from the hand-kept pin table: a funnel-module call to one changed
-    /// no count. The CONTROL is a read-only symbol the deny list does NOT name —
+    /// lint. The CONTROL is a read-only symbol the deny list does NOT name —
     /// it must change no count, so this is not merely "count every `std::fs`
     /// call".
     #[test]
@@ -3114,12 +2914,8 @@ mod tests {
         // (1) The two devices cannot drift: every path-shaped `clippy.toml`
         // entry, read INDEPENDENTLY from the raw file — NOT by iterating the
         // function that built `table` — is in the derived pin table, mapped to
-        // its canonical path. This arm used to loop over
-        // `reconciled_denied_symbols()` and compare against the table that same
-        // function produced: a map checked against its own producer, which
-        // stayed green while a reformatted entry dropped `std::fs::hard_link`
-        // from BOTH sides (measured). The raw read cannot be produced by the
-        // table, so losing a symbol now fails here.
+        // its canonical path. The raw read cannot be produced by the table, so
+        // losing a symbol fails here.
         let table = name_mutation_symbols();
         let clippy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("clippy.toml");
         let clippy_text = std::fs::read_to_string(&clippy_path)
@@ -3350,12 +3146,11 @@ mod tests {
         }
     }
 
-    /// The THREE routes the text scanner walked around, all reproduced at the
-    /// scanner level: a CROSS-FILE module alias (the alias is declared in
-    /// another module and invisible to a per-file text match), a RAW-identifier
-    /// spelling of any of the three import routes, and a POSITIONAL exemption
-    /// (see the exemption test below). The same-file alias is the CONTROL: it
-    /// was already caught before the parse, so it must stay caught.
+    /// Three routes a per-file text match cannot see, reproduced at the scanner
+    /// level: a CROSS-FILE module alias (the alias is declared in another
+    /// module), a RAW-identifier spelling of any of the three import routes, and
+    /// a POSITIONAL exemption (see the exemption test below). The same-file
+    /// alias is the CONTROL: it must stay caught.
     #[test]
     fn the_parsed_scanner_resolves_cross_file_aliases_and_raw_identifiers() {
         let files: Vec<(String, String)> = [
@@ -3517,8 +3312,7 @@ mod tests {
 
     /// The pin's matcher is PARSED, so a call whose callee and paren are
     /// separated by whitespace, a leading-`::` path, and a RAW-identifier
-    /// symbol are all the SAME resolved call. (The pin's VALUES are unchanged;
-    /// only the matcher that drives them is spelling-insensitive now.)
+    /// symbol are all the SAME resolved call.
     #[test]
     fn the_parsed_pin_counts_whitespace_and_raw_spellings() {
         for case in [
@@ -3555,11 +3349,10 @@ mod tests {
         );
     }
 
-    /// Test-only-ness comes from the GATING, not the NAME.
-    /// A production `src/review_regression.rs` — a name the old suffix rule
-    /// exempted — is scanned and its import route is reported. The two real
-    /// gated modules stay exempt, and the exemption follows the `#[cfg]` rather
-    /// than the suffix: `not(test)` and a bare `unix` do NOT exempt.
+    /// Test-only-ness comes from the GATING, not the NAME: a production
+    /// `src/review_regression.rs` is scanned and its import route is reported.
+    /// The real gated modules stay exempt, and the exemption follows the
+    /// `#[cfg]`: `not(test)` and a bare `unix` do NOT exempt.
     #[test]
     fn a_production_regression_suffixed_path_is_scanned() {
         let gated = test_only_gated_paths();
@@ -3613,7 +3406,7 @@ mod tests {
         );
     }
 
-    /// DEFECT (exemption): a file declared BOTH `#[cfg(test)] mod trick;` and
+    /// A file declared BOTH `#[cfg(test)] mod trick;` and
     /// `#[cfg(not(test))] mod trick;` is compiled into the non-test library, so
     /// the test-implying declaration must NOT exempt it from either audit. The
     /// fold keeps `test_gated` and `production_declared` apart and subtracts the
@@ -3643,12 +3436,11 @@ mod tests {
         assert!(!is_test_only("src/trick.rs", &gated));
     }
 
-    /// DEFECT (non-path callee): `(std::fs::remove_file)(p)` and
-    /// `(&std::fs::rename)(a, b)` are DIRECT calls, not function-pointer
-    /// residue, but a visitor that matched only `Expr::Path` callees saw
-    /// neither. The callee is unwrapped through parentheses, references, and
-    /// invisible groups before counting. The function-pointer-through-a-VARIABLE
-    /// form stays uncounted, asserted here as the named residue.
+    /// `(std::fs::remove_file)(p)` and `(&std::fs::rename)(a, b)` are DIRECT
+    /// calls, not function-pointer residue: the callee is unwrapped through
+    /// parentheses, references, and invisible groups before counting. The
+    /// function-pointer-through-a-VARIABLE form stays uncounted, asserted here
+    /// as the named residue.
     #[test]
     fn the_parsed_pin_sees_through_a_parenthesized_or_referenced_callee() {
         for (label, case, symbol) in [
@@ -3701,11 +3493,11 @@ mod tests {
         );
     }
 
-    /// DEFECT (glob over a local re-export): `src/alias_a.rs` re-exports
+    /// A glob over a local re-export: `src/alias_a.rs` re-exports
     /// `std::fs as hidden_fs`, and `src/alias_b.rs` pulls it in with
-    /// `use crate::alias_a::*;`. The alias table skipped glob leaves, so
-    /// `hidden_fs::remove_file(p)` in `alias_b` resolved to nothing. The glob
-    /// now propagates the target module's aliases into the importing module.
+    /// `use crate::alias_a::*;`, so `hidden_fs::remove_file(p)` in `alias_b`
+    /// resolves. The glob propagates the target module's aliases into the
+    /// importing module.
     #[test]
     fn a_glob_over_a_local_reexport_module_propagates_its_aliases() {
         let files: Vec<(String, String)> = [
@@ -3742,10 +3534,8 @@ mod tests {
         }
     }
 
-    /// DEFECT (raw-identifier libc symbol): `libc::r#rmdir` tokenised to the
-    /// key `libc::r`, which the funnel's exact `libc::<symbol>` pin never
-    /// looked up, so a raw-identifier spelling of a funnel call changed no
-    /// count. The `r#` prefix is now stripped, so the key is `libc::rmdir`.
+    /// A raw-identifier `libc` symbol: the `r#` prefix is stripped, so
+    /// `libc::r#rmdir` is the same key as `libc::rmdir`.
     #[test]
     fn the_libc_scanner_normalises_a_raw_identifier_symbol() {
         let refs = libc_references(&normalize_ws(&code_only("libc::r#rmdir(p);")));
@@ -3763,11 +3553,10 @@ mod tests {
         assert_eq!(refs.get("libc::rmdir").copied(), Some(1), "{refs:?}");
     }
 
-    /// DEFECT (`#[path]`/`include!`): a `#[path]` attribute makes a file's
-    /// module path differ from its package-relative location, which is the key
-    /// the alias table is built from, so `crate::aliased_mod::hidden_fs` never
-    /// resolved; an `include!` pulls in source the walk did not collect. The
-    /// audit now FAILS CLOSED on either in production source.
+    /// A `#[path]` attribute makes a file's module path differ from its
+    /// package-relative location, which is the key the alias table is built
+    /// from; an `include!` pulls in source the walk did not collect. The audit
+    /// FAILS CLOSED on either in production source.
     #[test]
     #[should_panic(expected = "REFUSES")]
     fn a_path_attribute_in_production_source_is_refused() {
@@ -3804,12 +3593,10 @@ mod tests {
         );
     }
 
-    /// DEFECT (macro tokens): the old byte count saw a `macro_rules!` body's
-    /// literal `std::fs::<symbol>(`; the parse could not, because `syn` does
-    /// not descend into a macro's token stream. The macro token scan restores
-    /// that coverage for the CANONICAL sequence — the spelling the byte count
-    /// saw — in a `macro_rules!` definition and in any macro invocation. An
-    /// aliased mutator inside a macro stays a named residue.
+    /// `syn` does not descend into a macro's token stream, so the macro token
+    /// scan counts a mutator spelled as the CANONICAL sequence in a
+    /// `macro_rules!` definition and in any macro invocation. An aliased
+    /// mutator inside a macro stays a named residue.
     #[test]
     fn the_parsed_pin_counts_a_mutator_inside_a_macro_token_stream() {
         for (label, case, symbol) in [
@@ -3869,19 +3656,12 @@ mod tests {
 
     /// The `std::fs` / `libc` call targets the FUNNEL regions use that are NOT
     /// on `clippy.toml`'s deny list, each reviewed as unable to ADOPT a name
-    /// the funnel's reserved-spelling guard must refuse, and therefore
-    /// deliberately left to the crate-root deny's blind side.
+    /// the funnel's reserved-spelling guard must refuse.
     ///
-    /// This list is the READ-ONLY / DESCRIPTOR-BOUND side of the PARTITION that
-    /// closes the class. [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`]
-    /// derives the funnel's whole resolved call surface and insists each symbol
-    /// is HERE or DENIED; a symbol in NEITHER is a new funnel primitive that
-    /// would escape the crate-wide deny, and the test fails naming it. That is
-    /// the mechanical form of "a new funnel primitive is impossible to use
-    /// without also being denied outside the funnel": a new symbol must pass
-    /// through one of the two review doors — `clippy.toml` (name-mutating) or
-    /// this list (cannot adopt a reserved name) — because the test refuses the
-    /// third state.
+    /// This list is the READ-ONLY / DESCRIPTOR-BOUND side of a PARTITION that
+    /// closes the class: [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`]
+    /// derives the funnel's resolved call surface and insists each symbol is
+    /// HERE or DENIED, so a symbol in NEITHER fails that test.
     ///
     /// The entries are DESCRIPTOR-BOUND or NAME-PRESERVING calls:
     /// `std::fs::read`/`read_to_string`/`metadata`/`symlink_metadata`/
@@ -3890,36 +3670,27 @@ mod tests {
     /// `readdir`, `fdopendir`, `closedir`, `fcntl`) read or manage an open
     /// descriptor. `std::fs::write` is deliberately NOT here: it CREATES on an
     /// absent path, so it can ADOPT a name and is on `clippy.toml`'s deny list.
-    /// The funnel's one production site (`atomic::windows::write_file_fd`)
-    /// carries the module-level allow and runs `refuse_reserved_mutation`
-    /// FIRST, and the inode of an existing entry is preserved, so its only
-    /// adoption is of a name the guard has already cleared.
     ///
     /// `libc::openat` is deliberately NOT here: it CAN adopt a name (with
-    /// `O_CREAT`), so it is on clippy.toml's deny list with the other open
+    /// `O_CREAT`), so it is on `clippy.toml`'s deny list with the other open
     /// spellings. Every other `libc` entry here is read-only.
     ///
-    /// TWO more families joined this list when the surface derivation learned
-    /// to see inherent forms. The `OpenOptions` BUILDER surface
-    /// (`new`/`read`/`write`/`share_mode`/`open`) is here because
-    /// the ADOPTION decision is the `create`/`create_new` FLAG, which IS denied
-    /// (`std::fs::OpenOptions::create`, `.create_new`); the constructor, the
-    /// configuration setters, and the terminal `open` cannot adopt a name on
-    /// their own, and a read-only open must stay legal everywhere, so denying
-    /// the terminal call would be the wrong device. The ASSOCIATED/CONVERSION
-    /// surface (`std::fs::File::open` — read-only;
-    /// `std::fs::File::from` — an `OwnedFd`→`File` conversion;
-    /// `std::fs::Permissions::from_mode` — a mode-VALUE construction) touches no
-    /// name at all.
+    /// The `OpenOptions` BUILDER surface (`new`/`read`/`write`/`share_mode`/
+    /// `open`) is here because the ADOPTION decision is the
+    /// `create`/`create_new` FLAG, which IS denied (`std::fs::OpenOptions::create`,
+    /// `.create_new`); the constructor, the configuration setters, and the
+    /// terminal `open` cannot adopt a name on their own, and a read-only open
+    /// must stay legal everywhere. The ASSOCIATED/CONVERSION surface
+    /// (`std::fs::File::open` — read-only; `std::fs::File::from` — an
+    /// `OwnedFd`→`File` conversion; `std::fs::Permissions::from_mode` — a
+    /// mode-VALUE construction) touches no name at all.
     ///
-    /// `std::fs::OpenOptions::custom_flags` is deliberately NOT here. It
+    /// `std::fs::OpenOptions::custom_flags` is deliberately NOT here: it
     /// forwards ARBITRARY bits to `open(2)`/`CreateFile`, and `O_CREAT` through
     /// it ADOPTS a name, so it is DENIED crate-wide as the resolved trait
-    /// methods `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`. The
-    /// finding was that this list carried the synthetic spelling with a
-    /// comment claiming the method "cannot adopt": both the entry and the
-    /// reason were false. Reviewed non-adopting sites now carry an item-level
-    /// `#[allow]` instead, exactly as `set_permissions` does.
+    /// methods `std::os::{unix,windows}::fs::OpenOptionsExt::custom_flags`.
+    /// Reviewed non-adopting sites carry an item-level `#[allow]` instead,
+    /// exactly as `set_permissions` does.
     const FUNNEL_SYMBOLS_NOT_DENIED: &[&str] = &[
         "std::fs::read",
         "std::fs::read_to_string",
@@ -3935,15 +3706,11 @@ mod tests {
         "std::fs::OpenOptions::write",
         "std::fs::OpenOptions::share_mode",
         "std::fs::OpenOptions::open",
-        // `std::os::unix::fs::OpenOptionsExt::mode` and `OpenOptions::truncate`,
-        // used by the reviewed `lock::unix::open_lock_file` exception (now a
-        // funnel region because it carries the `#[allow]`). Both are set on a
-        // builder that is about to `open`; NEITHER can adopt a name (`create`
-        // and `create_new` are the adoption flags and both ARE denied), and the
-        // lock's own open spells `.truncate(false)` explicitly, which is exactly
-        // why `OpenOptions::truncate` is reviewed here rather than denied
-        // crate-wide (a deny matches the METHOD NAME and would false-positive on
-        // every read-only `.truncate(false)`).
+        // `std::os::unix::fs::OpenOptionsExt::mode` and `OpenOptions::truncate`.
+        // Both are set on a builder that is about to `open`; NEITHER can adopt
+        // a name (`create` and `create_new` are the adoption flags and both ARE
+        // denied), and a deny of `truncate` would match the METHOD NAME and
+        // false-positive on every read-only `.truncate(false)`.
         "std::fs::OpenOptions::truncate",
         "std::fs::OpenOptions::mode",
         // Read-only / conversion associated calls: no name is touched.
@@ -3970,9 +3737,8 @@ mod tests {
     /// pathname-socket creator, or a `libc::<fn>`.
     ///
     /// The segment count of the `std::fs` arm is deliberately NOT pinned to
-    /// three: the completeness device's escaping spellings are the INHERENT
-    /// forms (`File::create`, `OpenOptions::create`), whose canonical paths
-    /// are four segments, so a length filter would exclude exactly the class
+    /// three: the INHERENT forms (`File::create`, `OpenOptions::create`) are
+    /// four-segment paths, and a length filter would exclude exactly the class
     /// this arm must see. The `std::os` arms keep their `unix`/`windows` gate
     /// and their `fs`/`net` discriminator, so a deeper unrelated `std::os`
     /// path cannot be mistaken for a creator.
@@ -4041,10 +3807,7 @@ mod tests {
     /// spelling: `std::fs::File::options()` is the documented synonym of
     /// `OpenOptions::new()` (both return an `OpenOptions`), and
     /// `OpenOptions::default()` / `DirBuilder::default()` are the `Default`
-    /// builders. Before this arm they resolved to NO owner, so an adoption flag
-    /// (`create`/`create_new`) reached through `File::options().create(true)`
-    /// was invisible to BOTH the closure derivation and the count pin while the
-    /// identical `OpenOptions::new().create(true)` was counted and denied.
+    /// builders.
     ///
     /// `File` itself is still deliberately excluded: its name-mutating
     /// four-segment ASSOCIATED functions (`File::create`, `File::create_new`)
@@ -4226,9 +3989,7 @@ mod tests {
         /// An `#[allow]` on an IMPL METHOD is a funnel region exactly as one on
         /// a freestanding `fn` is. `visit_item` cannot see it: an impl method
         /// is a `syn::ImplItem`, which the `Item` arm never reaches with its
-        /// own attribute check, so before this override the derived surface
-        /// missed every item-level-allow impl method — including the five
-        /// PRODUCTION `std::fs::create_dir_all` sites this crate ships.
+        /// own attribute check.
         fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
             let saved = self.in_funnel;
             if impl_item_allows_disallowed(item) {
@@ -4301,8 +4062,7 @@ mod tests {
     /// derived by [`funnel_region_modules`], so a child FILE of an
     /// allow-bearing module (`src/atomic/guard.rs` under `src/atomic/mod.rs`)
     /// starts inside the region exactly as an inline `mod { … }` under an
-    /// annotated item does; starting the visitor at `false` per file was the
-    /// per-file defect that hid every cross-file child.
+    /// annotated item does.
     fn funnel_symbol_surface(
         files: &[(String, String)],
         gated: &BTreeSet<String>,
@@ -4372,18 +4132,10 @@ mod tests {
     /// PARSING the file as TOML — the way clippy reads it — so every valid
     /// spelling clippy accepts is a spelling this reader accepts too.
     ///
-    /// A line-shaped reader that required one exact spelling
-    /// (`line.strip_prefix("{ path = \"")`) silently DROPPED a reformatted
-    /// entry, which made the derived pin table and the crate-wide deny
-    /// DISAGREE: clippy still refused a non-funnel call (exit 101) while the
-    /// derived table lacked the symbol, so the count pin lost it — two views of
-    /// the same fact disagreeing silently — and the closure reported a FALSE
-    /// "undefended" symbol.
-    ///
     /// The CROSS-CHECK below compares the parse against
     /// [`raw_denied_path_strings`]: every path-shaped string in the array must
-    /// be in the parsed set, so a future spelling this extraction misses fails
-    /// a test instead of silently losing a deny.
+    /// be in the parsed set, so a spelling this extraction misses fails a test
+    /// instead of silently losing a deny.
     fn denied_symbols_from_clippy_toml() -> BTreeSet<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("clippy.toml");
         let text = std::fs::read_to_string(&path)
@@ -4436,9 +4188,7 @@ mod tests {
     /// what the compiler resolves; the surface derivation and the count pin
     /// see the SYNTACTIC builder method (`std::fs::OpenOptions::custom_flags`),
     /// because `syn` has no type information. Mapping one to the other keeps
-    /// the closure test and the deny from silently disagreeing — the failure mode
-    /// where the closure's review list carried a symbol the deny list did not
-    /// name.
+    /// the closure test and the deny from silently disagreeing.
     fn synthetic_builder_spelling(path: &str) -> Option<String> {
         let segments: Vec<&str> = path.split("::").collect();
         let [std, os, unix_or_windows, fs, owner, method] = segments.as_slice() else {
@@ -4486,8 +4236,7 @@ mod tests {
     /// derived mechanically: the deny list from `clippy.toml`, the used side
     /// from the funnel's resolved symbol surface. Removing a symbol from
     /// `clippy.toml` while the funnel still uses it fails this test, naming the
-    /// now-undefended symbol — which is exactly how the two artifacts stay from
-    /// drifting.
+    /// now-undefended symbol.
     ///
     /// The USED side sees three spellings of a name-adopting call (see
     /// [`FunnelSymbols`]): a path-callee call at any depth (`std::fs::File::create`,
@@ -4501,7 +4250,7 @@ mod tests {
     /// by a `let` binding in an ENCLOSING block, so a builder that reaches a
     /// method through a FUNCTION PARAMETER or a STRUCT FIELD (`fn f(o: &mut
     /// OpenOptions) { o.create(true) }`), through a FUNCTION RETURN
-    /// (`make_opts().create(true)` — measured: such a body puts only
+    /// (`make_opts().create(true)` — such a body puts only
     /// `std::fs::OpenOptions::new` in `used`, not the `OpenOptions::create` the
     /// chain spelling records), through a FUNCTION-POINTER binding (`let c =
     /// std::fs::File::create; c(p)`), or whose method call sits inside a macro
@@ -4515,14 +4264,10 @@ mod tests {
     /// which the arms above see; this residual is a real reach INSIDE the
     /// funnel, not a hole the lint closes.
     ///
-    /// A `type` ALIAS of the builder type
-    /// used to be a hole in BOTH devices — inside a funnel module,
-    /// `type ZZBuilder = std::fs::OpenOptions;` followed by
-    /// `ZZBuilder::new().write(true).create_new(true).open(p)?` left clippy,
-    /// this derivation and the count pin all green, because the owner was keyed
-    /// on the literal last-segment name and only `use … as` aliases were
-    /// resolved. [`build_index`] now resolves local non-generic `type` aliases
-    /// too, so the spelling IS seen; the direct-spelling control still exists in
+    /// A local non-generic `type` ALIAS of the builder type is resolved by
+    /// [`build_index`], so `type ZZBuilder = std::fs::OpenOptions;` followed by
+    /// `ZZBuilder::new().write(true).create_new(true).open(p)?` is seen; the
+    /// direct-spelling control is in
     /// [`funnel_symbol_surface_sees_associated_builder_and_local_arms`].
     #[test]
     fn every_mutation_symbol_the_funnel_uses_is_denied_crate_wide() {
@@ -4547,12 +4292,11 @@ mod tests {
 
         // SANITY: the derivation must see the funnel, or an empty `used` set
         // would make the closure vacuous. `create_dir_all` is a creation
-        // wrapper; `openat` is the funnel's canonical open. The two INHERENT
-        // arms are what this change added: `std::fs::File::from`/`File::open`
-        // are ASSOCIATED calls (four-segment paths the old three-segment filter
-        // dropped) and `std::fs::OpenOptions::create_new`/`open` are BUILDER
-        // METHOD calls, so a regression that stopped seeing either would leave
-        // the closure silently blind to exactly the escaping spellings.
+        // wrapper; `openat` is the funnel's canonical open; the INHERENT forms
+        // are `std::fs::File::from`/`File::open` (ASSOCIATED calls) and
+        // `std::fs::OpenOptions::create_new`/`open` (BUILDER METHOD calls), so a
+        // regression that stopped seeing either would leave the closure
+        // silently blind to exactly the escaping spellings.
         assert!(
             used.contains("std::fs::create_dir_all")
                 && used.contains("libc::openat")
@@ -4602,9 +4346,7 @@ mod tests {
     /// derivation sees the SYNTACTIC builder spelling
     /// (`std::fs::OpenOptions::custom_flags`). [`synthetic_builder_spelling`]
     /// and [`reconciled_denied_symbols`] make the two agree, so the deny and the
-    /// closure test cannot drift — the exact failure this test exists to catch: the
-    /// closure's own list carried the synthetic spelling with a false "cannot adopt"
-    /// reason while the lint did not name the method at all.
+    /// closure test cannot drift.
     #[test]
     fn custom_flags_adoption_is_denied_and_reconciled_across_both_spellings() {
         let raw = denied_symbols_from_clippy_toml();
@@ -4633,8 +4375,8 @@ mod tests {
                 .as_deref(),
             Some("std::fs::OpenOptions::custom_flags")
         );
-        // The false review entry is GONE, and the synthetic spelling is now a
-        // DENIED symbol, so the closure defends it instead of excusing it.
+        // The synthetic spelling is a DENIED symbol, so the closure defends it
+        // instead of excusing it.
         assert!(
             !FUNNEL_SYMBOLS_NOT_DENIED.contains(&"std::fs::OpenOptions::custom_flags"),
             "the review list must not excuse a symbol the deny list names"
@@ -4706,9 +4448,7 @@ mod tests {
     /// (including through a `use … as` alias) — or `clippy.toml`'s list could
     /// drift from the code without
     /// [`every_mutation_symbol_the_funnel_uses_is_denied_crate_wide`]
-    /// noticing. This is the regression guard for that: the old
-    /// three-segment filter and path-callee-only visitor saw NEITHER the
-    /// inherent nor the builder form.
+    /// noticing.
     #[test]
     fn funnel_symbol_surface_sees_associated_builder_and_local_arms() {
         let funnel = r##"#![allow(clippy::disallowed_methods)]
@@ -4716,7 +4456,7 @@ use std::fs::OpenOptions;
 use std::fs::OpenOptions as O;
 
 fn associated(p: &std::path::Path) {
-    // 4-segment ASSOCIATED calls: the old 3-segment filter dropped these.
+    // 4-segment ASSOCIATED calls.
     let _ = std::fs::DirBuilder::new();
     let _ = std::fs::File::from(p);
     let _ = std::fs::File::create_new(p);
@@ -4744,10 +4484,7 @@ fn split_local() {
     opts.append(true);
 }
 
-// A local non-generic `type` alias of the builder type. The
-// resolver used to key the owner on the literal last-segment name, so this
-// spelling recorded NOTHING and the closure + count pin were both blind to it;
-// a `use … as` alias WAS resolved.
+// A local non-generic `type` alias of the builder type.
 type ZZBuilder = std::fs::OpenOptions;
 
 fn type_alias_builder(p: &std::path::Path) {
@@ -4782,9 +4519,7 @@ fn not_attributed(p: &std::path::Path) {
             "std::fs::OpenOptions::write",
             "std::fs::OpenOptions::open",
             // The STABLE CONSTRUCTOR synonyms, and the flag method whose
-            // adoption they expose: without the `builder_type` extension the
-            // `File::options().create(true)` spelling recorded only the
-            // constructor, never the `OpenOptions::create` flag.
+            // adoption they expose.
             "std::fs::File::options",
             "std::fs::OpenOptions::default",
             "std::fs::DirBuilder::default",
@@ -4820,16 +4555,10 @@ fn not_attributed(p: &std::path::Path) {
         );
     }
 
-    /// REGRESSION ARM (an earlier draft of this audit CLAIMED this arm): the
-    /// surface derivation must see an `#[allow(clippy::disallowed_methods)]`
+    /// The surface derivation must see an `#[allow(clippy::disallowed_methods)]`
     /// on an IMPL METHOD and on a TRAIT METHOD exactly as it sees one on a
     /// freestanding `fn`. The impl/trait forms are `syn::ImplItem` /
-    /// `syn::TraitItem`, which `visit_item` never reaches, so before the
-    /// `visit_impl_item`/`visit_trait_item` overrides the A and B arms below
-    /// contributed NOTHING and
-    /// `every_mutation_symbol_the_funnel_uses_is_denied_crate_wide` was blind
-    /// to their bodies — including the five PRODUCTION create-only impl-method
-    /// sites this crate already ships.
+    /// `syn::TraitItem`, which `visit_item` never reaches.
     ///
     /// The symbol each body calls — `std::fs::DirBuilder::new` — is neither on
     /// `clippy.toml`'s deny list nor on `FUNNEL_SYMBOLS_NOT_DENIED`, so if it
@@ -4878,9 +4607,8 @@ trait T {
             "the derivation must see an `#[allow]`-ed trait method's body"
         );
 
-        // C — the CONTROL: the freestanding `#[allow]` form. It was already
-        // seen before the fix, so it isolates the impl/trait arms rather than
-        // proving the whole file is parsed.
+        // C — the CONTROL: the freestanding `#[allow]` form, which isolates the
+        // impl/trait arms rather than proving the whole file is parsed.
         let freestanding = r##"
 #[allow(clippy::disallowed_methods)]
 fn adopt(p: &std::path::Path) {
@@ -4890,7 +4618,7 @@ fn adopt(p: &std::path::Path) {
 "##;
         assert!(
             surface(freestanding).contains(SYMBOL),
-            "the freestanding `#[allow]` control must be seen (it was, before the fix)"
+            "the freestanding `#[allow]` control must be seen"
         );
 
         // D — NEGATIVE CONTROL: the SAME impl method with NO `#[allow]` is not
@@ -4923,14 +4651,10 @@ impl S {
         );
     }
 
-    /// `funnel_modules` / `funnel_symbol_surface`
-    /// treat a CHILD FILE of an allow-bearing parent module as inside the region
-    /// by an ANCESTOR-OR-SELF prefix test ([`module_is_in_funnel_region`]), the
-    /// exact reach of Rust's attribute inheritance. That derivation shipped with
-    /// NO test that fails when it regresses to an EXACT-module
-    /// match: the only symbol `src/atomic/guard.rs` contributes to the real
-    /// closure is already on the deny list, so replacing the prefix test with
-    /// equality left the whole suite green.
+    /// `funnel_modules` / `funnel_symbol_surface` treat a CHILD FILE of an
+    /// allow-bearing parent module as inside the region by an ANCESTOR-OR-SELF
+    /// prefix test ([`module_is_in_funnel_region`]), the exact reach of Rust's
+    /// attribute inheritance.
     ///
     /// This arm drives the closure over a SYNTHETIC source set — an
     /// allow-bearing parent module (`src/prod/parent/mod.rs`, which is how a
@@ -5068,13 +4792,8 @@ impl S {
     /// `&ZP` outside the class. The boundary is a stated property pinned in
     /// BOTH directions by
     /// [`pair_less_derivation_boundary_is_the_syntactic_path_class`], not an
-    /// implication of this list. The alias case is measured, not assumed:
-    /// `audited_fns` resolves neither an import nor a `type` alias, so the
-    /// predicate is deliberately name-based and the statement says so. (The
-    /// FsIndex-backed derivations — the funnel surface and the `std::fs` count
-    /// pin — DO resolve local non-generic `type` aliases; this syntactic
-    /// derivation deliberately does not, and the `type` case is pinned in both
-    /// directions to keep the statement matching the code.)
+    /// implication of this list: `audited_fns` resolves neither an import nor a
+    /// `type` alias, so the predicate is deliberately name-based.
     fn type_is_raw_path(ty: &syn::Type) -> bool {
         match ty {
             syn::Type::Reference(reference) => type_is_raw_path(&reference.elem),
@@ -5334,7 +5053,7 @@ impl S {
         ),
         (
             "OwnedRoot::parse",
-            "parses an endpoint + path; issues no syscall",
+            "parses an endpoint + path; stats the root read-only, mutates nothing",
         ),
         (
             "sync::apply::destination_lock_path",
@@ -5414,15 +5133,6 @@ impl S {
     /// the code does what the statement says — both directions, for the
     /// containers, the strings-in-containers, and the alias case — so the
     /// statement cannot rot into a false claim about the code.
-    ///
-    /// The CONTAINER extension is the fix for a measured hole: a
-    /// `pub fn f(paths: &[PathBuf])`, `(PathBuf,)`, or `Result<PathBuf>` was
-    /// neither in the stated in-class set nor the out-of-class set, and the
-    /// derivation passed for all three while the `&Path` control failed. A
-    /// container that carries a path IS a path-bearing public surface, so the
-    /// predicate now recurses through it; the element-type recursion is pinned
-    /// in BOTH directions (`&[Path]` in, `&[String]` out) rather than only the
-    /// positive one.
     #[test]
     fn pair_less_derivation_boundary_is_the_syntactic_path_class() {
         let derived_in = |prelude: &str, param: &str| {
@@ -5660,11 +5370,9 @@ impl S {
                 break;
             };
             k += 1;
-            // Skip a `<…>` GENERIC-PARAMETER group after the
-            // name. An earlier scan expected `(` IMMEDIATELY, so
-            // `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
-            // skipped entirely — a real public raw-path mutator with the
-            // tripwire AND the pair-less derivation both green.
+            // Skip a `<…>` GENERIC-PARAMETER group after the name, so a
+            // `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` is
+            // scanned rather than skipped.
             if list.get(k).map(String::as_str) == Some("<") {
                 match match_angle_group(&list, k) {
                     Some(close) => k = close + 1,
@@ -5685,10 +5393,9 @@ impl S {
                     continue;
                 }
             };
-            // An earlier scan stopped at the parameter list,
-            // so `pub fn f<T>(p: T) where T: AsRef<Path> {}` was invisible too.
             // Extend the scanned range across a trailing `where` clause, up to
-            // the body opener or the declaration terminator.
+            // the body opener or the declaration terminator, so a
+            // `pub fn f<T>(p: T) where T: AsRef<Path> {}` is scanned too.
             let mut end = close + 1;
             if list.get(end).map(String::as_str) == Some("where") {
                 let mut depth = 0i32;
@@ -5717,24 +5424,14 @@ impl S {
     /// graph, and `syn` does NOT descend into a macro's token stream (its
     /// `visit_token_stream` hook is a no-op), so a `macro_rules!` body that
     /// emits a `pub fn` taking a raw path is NOT derived: the walk sees the
-    /// macro ITEM and stops. The measured repro was
-    ///
-    /// ```text
-    /// macro_rules! zz_make { () => { pub fn zz_macro_mutate(_p: &Path) {} }; }
-    /// zz_make!();
-    /// ```
-    ///
-    /// in production: `zz_macro_mutate` is publicly reachable, and while the
-    /// direct control `pub fn zz_direct_mutate(_p: &Path)` fails
-    /// `pair_less_mutation_enumeration_is_the_derived_public_surface`, the
-    /// macro-generated fn passed every device. The class is stated OUT-OF-CLASS
-    /// in the derivation's boundary: a macro body is a TOKEN stream, not a
-    /// `syn::Item` sequence, and it may carry metavariables, fragment
-    /// specifiers, and repetitions, so parsing it as items is unsound in
-    /// general. The existing `std::fs` token walker CANNOT be reused soundly
-    /// here: it flattens tokens into a `Vec<String>` and recognises only
-    /// canonical `::`-joined paths, so it has no notion of an ITEM, a
-    /// VISIBILITY, or a parameter TYPE and cannot recover a signature.
+    /// macro ITEM and stops. The class is stated OUT-OF-CLASS in the
+    /// derivation's boundary: a macro body is a TOKEN stream, not a `syn::Item`
+    /// sequence, and it may carry metavariables, fragment specifiers, and
+    /// repetitions, so parsing it as items is unsound in general. The existing
+    /// `std::fs` token walker CANNOT be reused soundly here: it flattens tokens
+    /// into a `Vec<String>` and recognises only canonical `::`-joined paths, so
+    /// it has no notion of an ITEM, a VISIBILITY, or a parameter TYPE and cannot
+    /// recover a signature.
     ///
     /// Because the class is out of class, this TRIPWIRE is the control that
     /// keeps the stated boundary honest: it fails the moment a PRODUCTION
@@ -5750,19 +5447,10 @@ impl S {
     /// anywhere in a `pub fn` parameter list, a trailing `where` clause, or
     /// behind a `<…>` generic-parameter group is refused), so it cannot pass by
     /// accident.
-    ///
-    /// An earlier scan required `(` IMMEDIATELY after the fn
-    /// name, so `pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}` was
-    /// skipped, and it stopped at the parameter-list close, so a
-    /// `where T: AsRef<Path>` bound was invisible too. Both are now scanned and
-    /// both are pinned as test arms below.
     #[test]
     fn production_macro_bodies_emitting_public_path_fns_are_refused() {
         // The token scan must see a `pub fn` whose name is
         // followed by a `<…>` generic-parameter group and/or a `where` clause.
-        // Before the fix these returned EMPTY, which is why a generic
-        // `pub fn zz<T>(_p: &Path)` planted in a production `macro_rules!` body
-        // passed with the tripwire green.
         assert_eq!(
             macro_body_public_path_fns("pub fn zz_generic_path_fn<T>(_p: &std::path::Path) {}"),
             vec!["zz_generic_path_fn".to_string()],
@@ -5826,57 +5514,45 @@ impl S {
         );
     }
 
-    /// The constraint-1 enumeration is DERIVED, not enumerated. This
-    /// test (a) requires EXACTLY ONE marked block in `docs/API-CONSTRAINTS.md`,
+    /// The constraint-1 enumeration is DERIVED, not enumerated. This test
+    /// (a) requires EXACTLY ONE marked block in `docs/API-CONSTRAINTS.md`,
     /// (b) resolves every name in it to a real fn/method in the parsed
     /// production item graph, and (c) derives every PUBLIC fn/method that takes
     /// a raw path argument and requires each to be named in the block or in the
-    /// reviewed [`PAIR_LESS_EXEMPTIONS`] list. Any omission is therefore a
-    /// failing test rather than a silent omission: adding a new public
-    /// raw-path mutating fn makes `uncovered` non-empty until the block (or an
-    /// exemption with a reason) names it.
+    /// reviewed [`PAIR_LESS_EXEMPTIONS`] list, so an omission fails the test.
     ///
     /// THE DERIVATION'S BOUNDARY, stated rather than implied:
     /// * it is SYNTACTIC on the parameter TYPE. IN CLASS: `Path`/`PathBuf`,
     ///   the same nested through a PATH-BEARING CONTAINER
     ///   (`Option`/`Box`/`Cow`/`Rc`/`Arc`/`Vec`/`Result`, a slice/array, or a
     ///   tuple with a path element), `impl AsRef<Path>` / `impl Into<PathBuf>`,
-    ///   and a generic type param bounded the same way. OUT OF CLASS,
-    ///   explicitly: `&str`, `String`, `&OsStr`, `OsString`, `&[u8]`, a
-    ///   CONTAINER of those spellings (`&[String]`, `Vec<String>`, `(String,)`,
+    ///   and a generic type param bounded the same way. OUT OF CLASS: `&str`,
+    ///   `String`, `&OsStr`, `OsString`, `&[u8]`, a CONTAINER of those
+    ///   spellings (`&[String]`, `Vec<String>`, `(String,)`,
     ///   `Result<String>`), a type not on the container list
     ///   (`HashMap<_, PathBuf>`), any `use … as` ALIAS of `Path`/`PathBuf`, and a
     ///   LOCAL non-generic `type` ALIAS of `Path`/`PathBuf` (`type ZP =
     ///   std::path::Path;`) — for both aliases the predicate matches the NAME,
     ///   not the resolution, and `audited_fns` resolves neither. A STRING IS A
-    ///   PATH SPELLING, NOT A PATH: the
-    ///   type system does not distinguish a path-spelled string from any other
-    ///   string, this crate already has public fns taking a string for a
-    ///   non-path reason (`is_reserved_name`, `valid_hex_digest`, the error
-    ///   constructors), and extending the class would make the derivation a
-    ///   SUPERSET that no longer pins path mutations. A `pub fn f(name: &str)`
-    ///   that builds `Path::new(name)` and mutates is therefore out of class BY
-    ///   CONSTRUCTION; `pair_less_derivation_boundary_is_the_syntactic_path_class`
+    ///   PATH SPELLING, NOT A PATH: the type system does not distinguish a
+    ///   path-spelled string from any other string, this crate already has
+    ///   public fns taking a string for a non-path reason (`is_reserved_name`,
+    ///   `valid_hex_digest`, the error constructors), and extending the class
+    ///   would make the derivation a SUPERSET that no longer pins path
+    ///   mutations; `pair_less_derivation_boundary_is_the_syntactic_path_class`
     ///   pins both directions of that statement against the code. The same
     ///   reason covers `RootedRelativePath::with_file_name`'s `impl AsRef<OsStr>`
     ///   (it is a name COMPONENT, and the mutation is performed by the returned
     ///   validated type);
     /// * a `macro_rules!` BODY is not walked, so a `pub fn` it emits is NOT
-    ///   derived: a macro body is a TOKEN stream, not a `syn::Item` sequence,
-    ///   and it may carry metavariables, fragment specifiers, and repetitions,
-    ///   so parsing it as items is unsound in general. The `std::fs` macro
-    ///   token walker cannot be reused here soundly — it flattens tokens and
-    ///   recognises canonical `::`-joined paths, with no notion of an item,
-    ///   visibility, or parameter type. This class is therefore STATED out of
-    ///   class, and its control is the TRIPWIRE
-    ///   `production_macro_bodies_emitting_public_path_fns_are_refused`,
-    ///   which fails when a production `macro_rules!` body spells a `pub fn`
-    ///   with a `Path`/`PathBuf` parameter;
+    ///   derived: a macro body is a TOKEN stream, and parsing it as items is
+    ///   unsound in general (metavariables, fragment specifiers, repetitions).
+    ///   This class is STATED out of class, and its control is the TRIPWIRE
+    ///   `production_macro_bodies_emitting_public_path_fns_are_refused`;
     /// * a TRAIT-impl method (`impl Remote for X { fn symlink … }`) is not
-    ///   counted directly, because the TRAIT DECLARATION is counted instead; a
-    ///   FOREIGN trait's methods would be out of class, and this crate has
-    ///   none;
-    /// * a `mod` nested inside a fn BODY is not walked; this crate has none.
+    ///   counted directly, because the TRAIT DECLARATION is counted instead, so
+    ///   a foreign trait's methods are out of class;
+    /// * a `mod` nested inside a fn BODY is not walked.
     ///
     /// A member of any of those classes is added to
     /// [`PAIR_LESS_EXEMPTIONS`] with its reason rather than left implicit.
@@ -6056,9 +5732,7 @@ impl S {
     }
 
     /// Locate an INHERENT method `ty::name` anywhere in a parsed file's item
-    /// tree. The durable replace's temp syscalls now live in the linear temp's
-    /// stage methods, so the audit follows the call one level into that type
-    /// instead of losing the pin when the raw syscall left the replace body.
+    /// tree, so the audit can pin a stage's calls INSIDE that method's body.
     fn find_inherent_method<'a>(
         items: &'a [syn::Item],
         ty: &str,
@@ -6256,15 +5930,15 @@ impl S {
     /// sync, and those calls must be INSIDE the named function bodies — not
     /// merely present in the file, and not aimed at some OTHER descriptor.
     ///
-    /// WHY RECEIVER-SENSITIVE: the earlier audit only required a `sync_all`
-    /// token inside `PathTemp::sync`/`Temp::sync`, so opening the PARENT there
-    /// and syncing it passed while the temp went unsynced. The stage bodies now
-    /// call `self.file().sync_all()` and `self.file().set_permissions(...)` on
+    /// WHY RECEIVER-SENSITIVE: a `sync_all` token inside `PathTemp::sync`/
+    /// `Temp::sync` is not enough — opening the PARENT there and syncing it would
+    /// pass while the temp went unsynced. The stage bodies call
+    /// `self.file().sync_all()` and `self.file().set_permissions(...)` on
     /// the temp's OWN create handle, and this audit checks that receiver shape
     /// ([`HandleReceiver`]): a reopen by name (`File::open`,
     /// `openat_no_follow_path`, ...) is classified [`HandleReceiver::ReopenedByName`]
     /// and does NOT satisfy the assertion. The private-mode stage and
-    /// `write_atomic_cas_fd` — neither audited before — are covered too.
+    /// `write_atomic_cas_fd` are covered too.
     ///
     /// WHAT THIS PROVES: within the parsed body of `write_atomic_replace`
     /// (path-based) the linear temp's `make_private` and `sync` run BEFORE its
@@ -6348,8 +6022,7 @@ impl S {
         };
 
         // RECEIVER-SENSITIVITY CONTROL, negative: a sync on a descriptor
-        // reopened by NAME is not the temp's create handle. Before the receiver
-        // check, `File::open(&temp)?.sync_all()` passed as the "temp fsync".
+        // reopened by NAME is not the temp's create handle.
         for reopened in [
             "{ std::fs::File::open(\"t\").unwrap().sync_all().unwrap(); }",
             "{ openat_no_follow_path(p, n, 0, 0).unwrap().sync_all().unwrap(); }",
@@ -6366,7 +6039,7 @@ impl S {
                     .iter()
                     .all(|(_, receiver)| *receiver != HandleReceiver::OwnCreateHandle),
                 "a `sync_all` on a by-name reopen (or a local alias of one) must NOT be classified \
-                 as the temp's create handle, or this audit would pass for the pre-fix shape: \
+                 as the temp's create handle, or this audit would pass a reopen as the temp sync: \
                  {reopened} => {audit:?}"
             );
         }
@@ -6541,9 +6214,9 @@ impl S {
              point 1: {temp_publish:?}"
         );
 
-        // THE CAS PATH, which the earlier audit did not cover at all: create,
-        // write, sync, install without replacement, chmod the INSTALLED entry
-        // (the temp was created 0o600), then fsync the parent — in that order.
+        // THE CAS PATH: create, write, sync, install without replacement, chmod
+        // the INSTALLED entry (the temp was created 0o600), then fsync the
+        // parent — in that order.
         let audit = walk("write_atomic_cas_fd");
         let create = audit.temp_create_at.first().copied().unwrap_or_else(|| {
             panic!("write_atomic_cas_fd must create the linear temp through `Temp::create`")
