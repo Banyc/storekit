@@ -48,9 +48,18 @@ them.
   a consumer's domain stay in that consumer.
 - **Whole-project snapshots.** A tree containing a Python venv, `node_modules`
   or a pnpm store is refused: absolute symlinks and hard links are outside the
-  model. Sync the state or artifact subtree, normalize the tree first, or name
-  the subtree in `sync::Exclusions`, which omits it from both views so nothing
-  inside it is walked, transferred or removed.
+  model. The crate's own copy does not normalize one: on Unix
+  `copy_tree_verbatim` refuses a hard link (`StoreKind::CopyHardLink`),
+  reproduces an absolute or escaping symlink target verbatim, and refuses a
+  FIFO, socket or device (the Windows port duplicates hard links and recreates
+  symlinks best-effort). Sync the state or artifact subtree, or normalize the
+  tree OUTSIDE the crate before syncing — for example `rsync -a --copy-links`
+  without `-H`, or GNU tar's `--dereference --hard-dereference` — which turns
+  each link into a copy, so it changes the tree and that choice is the caller's.
+  The staged tree is an ordinary directory, not a store root: never hand it to
+  the recovery sweep. Alternatively name the subtree in `sync::Exclusions`,
+  which omits it from both views so nothing inside it is walked, transferred or
+  removed.
 - **Per-step incrementality.** Every run scans and hashes the whole synced tree;
   there is no dirty tracking and no reuse of a previous manifest. The one input
   that REMOVES work is `sync::Exclusions`, and it does so at subtree
@@ -218,10 +227,16 @@ Two consequences follow, and they are why this is not a backup format:
 
 - A source containing a hard link (on a Unix source), an absolute symlink, or an
   escaping symlink cannot be snapshotted at all: the strict source manifest
-  refuses the run. Normalize such a tree first, by copying the hard-linked
-  content and making the symlink relative, or exclude the subtree that holds it
-  with `sync::Exclusions` (an excluded subtree is not read, so it cannot refuse
-  the run). A relative target that contains `/`
+  refuses the run. `copy_tree_verbatim` is not a way out: on Unix it refuses a
+  hard link with `StoreKind::CopyHardLink`, reproduces an absolute or escaping
+  symlink target verbatim, and refuses special files (the Windows port
+  duplicates hard links and recreates symlinks best-effort). Normalize outside
+  the crate first, with `rsync -a --copy-links` without `-H` or GNU tar's
+  `--dereference --hard-dereference`, which changes the tree because a link
+  becomes a copy; or exclude the subtree that holds it with
+  `sync::Exclusions` (an excluded subtree is not read, so it cannot refuse the
+  run). The staged tree is an ordinary directory, not a store root, so never
+  hand it to the recovery sweep. A relative target that contains `/`
   or `..` but stays inside the root without walking through a symlink component
   (`dir/link -> ../other`) is lawful and is not one of these refusals. A target
   whose walk reaches a symlink component is refused even when it lands inside,

@@ -4398,13 +4398,18 @@ fn run(
     // read) and index THOSE, so a residue entry constrains the walk exactly as
     // the entry that will still be there does.
     //
-    // EXCLUSIONS ARE ALREADY APPLIED to that observation, because they are
-    // applied where it is READ (`destination_manifest(exclusions)`): an
-    // excluded component is absent from this view exactly as it is absent from
-    // the diff, so a source symlink whose target walks through one is judged
-    // against the views WITHOUT it. That is the cost of an exclusion and it is
-    // stated at [`Exclusions`]: the caller declared the subtree outside the
-    // transfer, so the crate does not read it and cannot index it.
+    // EXCLUSIONS ARE NOT ALWAYS APPLIED WHERE THAT OBSERVATION IS READ. A
+    // FAR-SIDE destination listing is filtered BEFORE assembly
+    // (`remote_destination_manifest_omitting`), so its excluded lines are
+    // already absent here. A LOCAL destination is read WHOLE
+    // (`LocalSide::destination_manifest` takes no `Exclusions`), and only its
+    // VIEW is filtered before the diff ([`apply_manifests`]), so this raw
+    // observation still CONTAINS every excluded entry. That is deliberate: an
+    // excluded destination entry SURVIVES the run, so it must still constrain
+    // a source symlink's target walk — which a far-side run cannot do, because
+    // its listing is read once and filtered before assembly. The cost of an
+    // exclusion is stated at [`Exclusions`]: the caller declared the subtree
+    // outside the transfer.
     let destination_result_view = &destination;
     // The strip is the PUBLIC diff surface's own authority
     // ([`apply_manifests`]), so a consumer that builds a status on the raw

@@ -66,6 +66,56 @@
 //! whose relative target walks through an excluded component is checked against
 //! the views WITHOUT that component.
 //!
+//! # Staging: the crate does not normalize a tree
+//!
+//! The strict source walk refuses what the model cannot carry: a hard link on a
+//! Unix source ([`crate::error::MaterializationKind::HardLink`]), an absolute
+//! symlink or one whose spelled walk escapes the root
+//! ([`crate::error::MaterializationKind::AbsoluteSymlink`],
+//! [`crate::error::MaterializationKind::EscapingSymlink`]), and a FIFO, socket
+//! or device ([`crate::error::MaterializationKind::SpecialFile`]). The crate
+//! normalizes nothing here: it refuses the tree, and no crate primitive offers a
+//! normalization step.
+//!
+//! [`crate::atomic::copy_tree_verbatim`] is NOT a normalizer. On Unix it
+//! REFUSES a hard link with [`crate::error::StoreKind::CopyHardLink`] (it does
+//! not split one into two files, and reproducing the link with `linkat` is
+//! deliberately not done), it reproduces an absolute or escaping symlink target
+//! VERBATIM rather than materialising or relative-ising it, and it refuses a
+//! special file with [`crate::error::StoreKind::CopySourceNotRegular`]. A tree
+//! it copies therefore still holds the link forms the strict walk refuses. The
+//! Windows port carries the documented weaker guarantees instead: it cannot see
+//! `nlink`, so it duplicates a hard link into an independent regular file, and
+//! it recreates a symlink best-effort through the unguarded creator (which
+//! needs admin/developer mode), while still refusing a special file.
+//!
+//! Normalization is an EXTERNAL step, run before the sync: materialise symlink
+//! targets and split hard links into a staging root, for example
+//! `rsync -a --copy-links` WITHOUT `-H`, or GNU tar's
+//! `--dereference --hard-dereference`. Either changes the tree — a link becomes
+//! a copy — so whether to accept that is the CALLER's decision, not the crate's.
+//! The in-crate alternative for a KNOWN-heavy subtree (`.git`, `node_modules`, a
+//! virtual environment) is [`exclusions::Exclusions`]: the subtree is named
+//! once and never enters the walk, so nothing inside it is read or refused (see
+//! the `Exclusions` section above).
+//!
+//! A staging root is an ORDINARY DIRECTORY, not a store root. The crate creates
+//! no [`crate::transport::Layout`] record or other bookkeeping there, so it must
+//! never be handed to the recovery sweep, which removes crate-temp names
+//! ([`crate::atomic::is_crate_temp_name`]) from a store root the crate manages.
+//! Hand the staged tree to [`apply::sync`] as an ordinary source or destination
+//! root.
+//!
+//! Two integration tests in `tests/tolerant_staging.rs` pin the limit.
+//! `sync_refuses_a_hard_link_and_the_verbatim_copy_does_too` pins the strict
+//! walk's typed refusal AND `copy_tree_verbatim`'s
+//! [`crate::error::StoreKind::CopyHardLink`] on the same source (the unit test
+//! `copy_tree_verbatim_refuses_what_it_cannot_copy_faithfully` pins that copy
+//! refusal in isolation).
+//! `a_verbatim_copy_reproduces_an_absolute_symlink_that_sync_refuses` pins the
+//! copy SUCCEEDING with the target reproduced, and the strict walk over the
+//! staged tree still refusing it.
+//!
 //! # The contract, and how the crate enforces it
 //!
 //! * **The transport's host identity is prepared before the first remote

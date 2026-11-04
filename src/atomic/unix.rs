@@ -594,6 +594,28 @@ fn ensure_private_dir_durable_chain(path: &Path) -> Result<DirChain> {
 /// * **ownership, xattrs, ACLs, timestamps, file flags, sparseness** — NOT
 ///   carried (the crate's fidelity scope). The caller restores them.
 ///
+/// # It is not a normalization step
+///
+/// A hard link and a special file are REFUSED, and an absolute or escaping
+/// symlink target is reproduced EXACTLY, so a tree this primitive copies still
+/// holds the entry forms the strict sync source walk refuses
+/// ([`crate::error::MaterializationKind::HardLink`],
+/// [`crate::error::MaterializationKind::AbsoluteSymlink`],
+/// [`crate::error::MaterializationKind::EscapingSymlink`]). This copy can
+/// therefore NOT turn a source the strict walk refuses into one it accepts.
+/// Normalizing the tree — materialising symlink targets and splitting hard
+/// links, which changes it, because a link becomes a copy — is the CALLER's
+/// step, taken with a tool outside the crate (`rsync -a --copy-links` without
+/// `-H`, or GNU tar's `--dereference --hard-dereference`); the
+/// [`crate::sync`] module docs state the boundary and the in-crate alternative
+/// for a known-heavy subtree ([`crate::sync::Exclusions`]).
+///
+/// The copy refusal is pinned by
+/// `copy_tree_verbatim_refuses_what_it_cannot_copy_faithfully`, and the
+/// reproduce-then-still-refuse limit by
+/// `a_verbatim_copy_reproduces_an_absolute_symlink_that_sync_refuses` in
+/// `tests/tolerant_staging.rs`.
+///
 /// # Landing is ALL-OR-NOTHING; the copy is NOT atomic or durable
 ///
 /// Every destination entry is created NEW: a pre-existing file, directory,

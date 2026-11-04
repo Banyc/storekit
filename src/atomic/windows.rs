@@ -344,6 +344,22 @@ fn ensure_private_dir_durable_chain(path: &Path) -> Result<DirChain> {
 /// * the shared overlap refusal and the all-or-nothing create-new landing
 ///   apply identically.
 ///
+/// # It is not a normalization step
+///
+/// Recreating the tree's link forms is not normalizing them. A symlink that IS
+/// recreated carries its target VERBATIM, so an absolute or escaping target
+/// still refuses the strict sync source walk
+/// ([`crate::error::MaterializationKind::AbsoluteSymlink`],
+/// [`crate::error::MaterializationKind::EscapingSymlink`]), and a special file
+/// is still REFUSED ([`crate::error::StoreKind::CopySourceNotRegular`]). A hard
+/// link — which this port cannot detect — is duplicated into an independent
+/// regular file: that is the documented divergence, not a supported
+/// normalization. Normalizing the tree (materialising symlink targets and
+/// splitting hard links, which changes it, because a link becomes a copy) is
+/// the CALLER's step, taken with a tool outside the crate (`rsync -a
+/// --copy-links` without `-H`, or GNU tar's `--dereference
+/// --hard-dereference`); the [`crate::sync`] module docs state the boundary.
+///
 /// The walk queues each directory on an explicit heap `Vec` instead of
 /// recursing one Rust frame per level, so a deep tree fails cleanly (or
 /// succeeds) rather than exhausting the C stack and aborting the host process.
