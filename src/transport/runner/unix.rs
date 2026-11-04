@@ -1,7 +1,7 @@
 //! The Unix implementation of the bounded child-runner: process-group
 //! lifecycle (`process_group(0)` spawn, `waitid` WNOWAIT peek, `killpg`
 //! termination), the foreground-only group check (Linux `/proc` scan,
-//! macOS `proc_listpgrp`), and `poll`/`fcntl` non-blocking pipe drains.
+//! macOS `proc_listpgrppids`), and `poll`/`fcntl` non-blocking pipe drains.
 //! Selected by the single `#[cfg(unix)]` `mod` declaration in [`super`].
 
 use super::*;
@@ -225,9 +225,7 @@ fn live_group_members(_pgid: i32, _exclude_pid: u32) -> Vec<i32> {
 ///
 /// Public because [`RunnerConfig`] is public and takes an `Arc<dyn KillSeam>`:
 /// a caller building its own [`RunnerConfig`] (and a test injecting a
-/// syscall-level fault) needs the trait to name its seam. The crate's own
-/// real-process lifecycle tests drive the runner under injected kill faults
-/// through it.
+/// syscall-level fault) needs the trait to name its seam.
 pub struct RealKill;
 
 impl KillSeam for RealKill {
@@ -299,14 +297,13 @@ impl Termination {
 /// THE shared bounded child-runner for local command execution: spawn the
 /// child into its OWN process group with piped stdout/stderr, wait with the
 /// caller's timeout, on timeout terminate the GROUP (TERM, grace, KILL) and
-/// escalate to the owned handle, and return every outcome — success, timeout,
-/// error — only after the child was REAPED exactly once. A timeout-kill or
-/// reap failure is an ERROR, never a successful timeout outcome.
+/// escalate to the owned handle, and return a success or timeout outcome only
+/// after the child was REAPED. A timeout-kill or reap failure is an ERROR,
+/// never a successful timeout outcome.
 ///
 /// The runner is per-exec and owns nothing between calls: the child lives in
 /// `OwnedChild` inside [`exec`] and is collected before the call returns, so
-/// there are no leaked threads, handles, or processes across calls — the
-/// lifecycle is bounded.
+/// no thread or handle outlives the call — the lifecycle is bounded.
 ///
 /// Execute `argv` (no shell) bounded by `timeout` — the Unix lifecycle:
 /// spawn into an OWN process group, `waitid` WNOWAIT peek, `killpg`
@@ -328,7 +325,7 @@ pub(crate) fn exec(
     cmd.stderr(Stdio::piped());
     // The child becomes its OWN process-group leader (pgid == pid):
     // timeout termination signals the WHOLE group, so grandchildren die
-    // with it. Unix-only crate; `process_group` is the std Unix API.
+    // with it. `process_group` is the std Unix API.
     cmd.process_group(0);
     let child = cmd
         .spawn()
@@ -377,7 +374,7 @@ pub(crate) fn exec(
         // The timeout rung: `Armed` → `Termed`, recording the graceful
         // signal's failure. `deadline()` is the DUE test (the ladder is still
         // `Armed` and its deadline passed); the transition is the ORDER
-        // authority and the ONLY writer of that failure, so a kill failure
+        // authority and the only carrier of that failure, so a kill failure
         // cannot exist without the timeout.
         if let Some(deadline) = termination.deadline()
             && now >= deadline
@@ -455,18 +452,15 @@ pub(crate) fn exec(
     // process-group id (the child is the group leader, pgid == pid) — is
     // still allocated. Every foreground-only check and group termination
     // below happens while the zombie holds the pgid, so a `killpg` can
-    // NEVER race a pid the OS recycled for an unrelated process (the
-    // failure mode that made a probe-after-reap racy under parallel
-    // execution).
+    // NEVER race a pid the OS recycled for an unrelated process.
     //
     // FOREGROUND-ONLY: enumerate the LIVE members of the child's process
     // group (our zombie excluded). If any remain, the command left a
     // background descendant: terminate the WHOLE group (TERM → grace →
     // KILL, the timeout path's escalation) and report the violation as
-    // an ERROR, never a successful outcome; the essential contract — no
-    // live process of the group after the return — is enforced BEFORE
-    // the outcome escapes. A CLEAN command (no live members — the common
-    // case) pays one enumeration and proceeds exactly as before.
+    // an ERROR, never a successful outcome; the check runs BEFORE the
+    // outcome escapes. A CLEAN command (no live members — the common
+    // case) pays one enumeration.
     let live = live_group_members(pgid, pid);
     if !live.is_empty() {
         // Terminate the whole group; a kill failure is surfaced inside
@@ -608,12 +602,8 @@ pub(crate) const DRAIN_AVAILABLE_CALL_CAP: usize = 1 << 20;
 /// `poll(2)` with a zero timeout reports readability, then a `read` appends a
 /// chunk; the poll/read pair repeats until the pipe reports no more readable
 /// data (or `read` returns `WouldBlock`/EOF). The wait loop therefore never
-/// parks on a pipe while the child is still running, and the OLD single-read
-/// shape — one 8192-byte chunk per wait-loop pass, with the caller sleeping
-/// 1 ms between passes — is gone: that shape capped EVERY remote read at
-/// ~8 MiB/s regardless of the link, because the pipe was drained one chunk
-/// per millisecond. A caller that receives a nonzero return has made
-/// progress and must NOT sleep before the next pass.
+/// parks on a pipe while the child is still running. A caller that receives a
+/// nonzero return has made progress and must NOT sleep before the next pass.
 ///
 /// `pub(crate)`: shared with the SSH runner's Unix seam (see
 /// [`set_nonblocking`]), so the drain policy has ONE implementation.
@@ -695,16 +685,14 @@ pub(crate) const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Drain a child pipe to EOF, bounded in BOTH time and size: reads never
 /// block (non-blocking read ends), the absolute `bound` deadline is consulted
-/// on EVERY loop iteration (a writer that keeps the pipe continuously
-/// readable can no longer spin in the `Ok(n)` arm), and at most
-/// [`MAX_DRAIN_BYTES`] may be appended. Returns [`DrainState::Eof`] when the
-/// pipe reached EOF within both bounds (no live holder remains) and
-/// [`DrainState::BoundExpired`] when either bound was reached with the pipe
-/// still open (a live holder — a contract violation the caller reports, never
-/// a silent clean outcome). `pub(crate)`: shared with the SSH runner's Unix
-/// seam, so the bound that makes the deadline truly bound the operation has
-/// ONE implementation ([`super::KILL_REAP_BOUND`] is the production value
-/// both pass).
+/// on EVERY loop iteration, and at most [`MAX_DRAIN_BYTES`] may be appended.
+/// Returns [`DrainState::Eof`] when the pipe reached EOF within both bounds
+/// (no live holder remains) and [`DrainState::BoundExpired`] when either bound
+/// was reached with the pipe still open (a live holder — a contract violation
+/// the caller reports, never a silent clean outcome). `pub(crate)`: shared
+/// with the SSH runner's Unix seam, so the bound that makes the deadline truly
+/// bound the operation has ONE implementation ([`super::KILL_REAP_BOUND`] is
+/// the production value both pass).
 pub(crate) fn drain_to_eof<R>(
     stream: &mut Option<R>,
     buf: &mut Vec<u8>,
@@ -722,10 +710,9 @@ where
     let start_len = buf.len();
     let mut chunk = [0u8; 8192];
     loop {
-        // Consult the ABSOLUTE deadline on EVERY arm, before the read: the
-        // former shape checked it only in the `WouldBlock` arm, so a writer
-        // that kept the pipe continuously readable kept the loop in `Ok(n)`
-        // and grew `buf` without bound.
+        // Consult the ABSOLUTE deadline on EVERY arm, before the read, so a
+        // writer that keeps the pipe continuously readable cannot grow `buf`
+        // without bound.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(DrainState::BoundExpired);
@@ -833,19 +820,16 @@ mod drain_tests {
     }
 
     /// ONE `drain_available` call must drain the WHOLE readable backlog,
-    /// not a single 8192-byte chunk. Pre-fix the wait loop appended one chunk
-    /// per call and slept 1 ms between passes, capping every remote read at
-    /// ~8 MiB/s regardless of the link; the fix loops until the pipe reports
-    /// no more data. (Verified before the fix: this assertion sees 8192, not
-    /// 65536.)
+    /// not a single 8192-byte chunk: the call loops until the pipe reports no
+    /// more data.
     #[test]
     fn drain_available_drains_the_whole_backlog_in_one_call() {
         let dev_null = std::fs::File::open("/dev/null").unwrap();
         let mut stream = Some(BurstRead {
             fd: dev_null.as_raw_fd(),
             remaining: 64 * 1024,
-            // The pre-fix per-read chunk, so a single-read implementation
-            // would stop at exactly one of these.
+            // The 8192-byte per-read chunk of the single-read shape, so such
+            // an implementation would stop at exactly one of these.
             chunk: 8192,
         });
         let mut buf = Vec::new();
@@ -882,11 +866,9 @@ mod drain_tests {
     }
 
     /// A `Read` that is ALWAYS readable: every `read` returns data, so the
-    /// drain loop can never reach its `WouldBlock` arm. Before the fix the
-    /// deadline was consulted ONLY in that arm, so this stream drove the loop
-    /// in `Ok(n)` forever and grew the buffer without bound (the test would
-    /// hang). A descriptor is still required by `AsRawFd`; `/dev/null`'s is
-    /// never read (the override never delegates).
+    /// drain loop can never reach its `WouldBlock` arm. A descriptor is still
+    /// required by `AsRawFd`; `/dev/null`'s is never read (the override never
+    /// delegates).
     struct EndlessRead {
         fd: RawFd,
     }
@@ -905,12 +887,9 @@ mod drain_tests {
         }
     }
 
-    /// The pre-fix shape: a writer that keeps the pipe continuously readable
-    /// spun in the `Ok(n)` arm, so the absolute deadline was never consulted
-    /// and `buf` grew without bound. With the deadline checked in EVERY arm
-    /// and the [`MAX_DRAIN_BYTES`] cap, the drain returns promptly with
+    /// With the deadline checked in EVERY arm and the [`MAX_DRAIN_BYTES`] cap,
+    /// a writer that keeps the pipe continuously readable returns promptly with
     /// [`DrainState::BoundExpired`] and a bounded buffer instead of hanging.
-    /// (Verified before the fix: this test hangs — the drain never returns.)
     #[test]
     fn drain_to_eof_bounds_a_continuously_readable_writer() {
         let dev_null = std::fs::File::open("/dev/null").unwrap();
@@ -940,8 +919,7 @@ mod drain_tests {
     /// The deadline is consulted even when the pipe is continuously readable:
     /// a stream that yields a LITTLE data per read (so the size cap is not the
     /// thing that stops it) must still return [`DrainState::BoundExpired`] near
-    /// the deadline. Before the fix this also hung, because `Ok(n)` never
-    /// re-checked the clock.
+    /// the deadline.
     #[test]
     fn drain_to_eof_consults_the_deadline_in_the_data_arm() {
         struct TrickleRead {
@@ -982,7 +960,7 @@ mod drain_tests {
 /// The Unix termination ladder as a VALUE: every rung past `Armed` carries the
 /// instant the timeout fired, and the kill-failure accumulator keeps the LAST
 /// FAILED signal — a later successful rung does not erase an earlier failure,
-/// and a later failure replaces it (exactly the rule the ladder replaced).
+/// and a later failure replaces it.
 #[cfg(all(test, unix))]
 mod termination_tests {
     use super::{KillFailure, Termination};
@@ -1050,9 +1028,7 @@ mod termination_tests {
     /// attempted from any rung but its predecessor it dispatches NOTHING (the
     /// closure is never called) and returns the ladder UNCHANGED, so KILL
     /// cannot precede TERM, a rung cannot repeat, and no failure is recorded
-    /// for a signal that was not sent. The chain asserted here is the one the
-    /// deleted `matches!` guards at the `exec` call sites used to enforce, and
-    /// `exec` now relies on the transitions alone for it.
+    /// for a signal that was not sent.
     #[test]
     fn a_transition_from_the_wrong_rung_dispatches_nothing_and_returns_the_ladder() {
         let deadline = Instant::now() + Duration::from_millis(5);

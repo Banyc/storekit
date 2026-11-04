@@ -173,10 +173,7 @@ pub(crate) fn spawn(
             let wait_res = loop {
                 let mut exited: Option<(OwnedChild, std::process::ExitStatus)> = None;
                 // Bytes drained THIS pass. A pass that moved data must not
-                // sleep before the next one: the old shape drained one chunk
-                // per 1 ms pass, capping every remote read at ~8 MiB/s
-                // regardless of the link (the fixed command deadline then
-                // killed a large read). Progress means no sleep; a silent
+                // sleep before the next one. Progress means no sleep; a silent
                 // running child yields so the loop does not busy-spin and the
                 // deadline path can still take the child slot.
                 let mut drained = 0usize;
@@ -245,8 +242,8 @@ pub(crate) fn spawn(
             // child was collected — which means the child's OWN stderr (and
             // exit status) are already drained and available. Preserve them
             // on the error: without the far-side diagnostic, a FAILED UPLOAD
-            // to a full disk (`cat: -: No space left on device`) was
-            // indistinguishable from a dead host, because the caller saw
+            // to a full disk (`cat: -: No space left on device`) is
+            // indistinguishable from a dead host, because the caller sees
             // only `stdin write: Broken pipe`. The error CLASS stays
             // [`RunError::StdinWrite`] — the local write DID fail — and the
             // far side's own words are appended so the CAUSE is recoverable.
@@ -286,10 +283,10 @@ pub(crate) fn spawn(
 }
 
 /// Real-subprocess tests for the Unix ssh seam: the drain's throughput, and
-/// the far-side diagnostic preserved on a failed upload. Both drive
-/// [`SshRunner`] through the REAL seam with an injected tiny command deadline,
-/// so a regression cannot hang the suite: the runner kills the child at the
-/// deadline and returns.
+/// the far-side diagnostic preserved on a failed upload. Every test here
+/// drives [`SshRunner`] through the REAL seam with an injected tiny command
+/// deadline, so a regression cannot hang the suite: the runner kills the
+/// child at the deadline and returns.
 #[cfg(test)]
 mod real_seam_tests {
     use super::*;
@@ -303,11 +300,9 @@ mod real_seam_tests {
     }
 
     /// The running-phase drain must not be capped at one 8192-byte chunk
-    /// per 1 ms wait-loop pass. Pre-fix that capped every remote read at
-    /// ~8 MiB/s, so this 64 MiB read outlived the tiny 3 s command deadline
-    /// and was KILLED (`RunError::Timeout`); post-fix the same tiny deadline
-    /// is ample because the drain runs at syscall speed. The injected
-    /// deadline means the pre-fix path fails fast instead of hanging.
+    /// per 1 ms wait-loop pass: this 64 MiB read must complete inside the tiny
+    /// 3 s command deadline, and a capped drain fails fast (`RunError::Timeout`)
+    /// instead of hanging because of the injected deadline.
     #[test]
     fn large_read_completes_under_a_tiny_command_deadline() {
         const BYTES: usize = 64 * 1024 * 1024;
@@ -364,9 +359,9 @@ mod real_seam_tests {
 
     /// A failed stdin write (the far side stopped reading / exited) must
     /// carry the far side's OWN stderr, so a full disk is not reported as a
-    /// bare `Broken pipe`. Pre-fix the message was only
+    /// bare `Broken pipe`: without it the caller sees only
     /// `stdin write: Broken pipe (os error 32)` and the far-side
-    /// `No space left on device` line was discarded.
+    /// `No space left on device` line is discarded.
     #[test]
     fn stdin_write_failure_preserves_the_far_side_stderr() {
         let runner = real_runner(Duration::from_secs(10));

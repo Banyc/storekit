@@ -3,11 +3,9 @@
 //! reader THREADS for the pipe drains (no `poll`/`fcntl` non-blocking
 //! pipes). The documented weaker guarantees of the Windows port: a
 //! background descendant survives a kill (only the direct child is
-//! terminated), and a command that leaves a descendant holding the output
-//! pipes can block the wait (the runner's deadline kill closes the direct
-//! child's handles, EOFing the pipes — a grandchild holding them is the
-//! documented exclusion, as on Unix). Selected by the single
-//! `#[cfg(windows)]` `mod` declaration in [`super`].
+//! terminated), and a descendant that keeps the output pipes open keeps the
+//! reader threads from EOF, so the buffer collection has no bound. Selected by
+//! the single `#[cfg(windows)]` `mod` declaration in [`super`].
 
 use super::*;
 use crate::transport::runner::{OwnedChild, RealKill};

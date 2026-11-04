@@ -3,29 +3,27 @@
 //!
 //! # The lifecycle contract
 //!
-//! `LocalTransport::exec` used to split the child between the caller and a
-//! DETACHED reaping thread and, on timeout, fire-and-forget an external
-//! `kill -9 <pid>` and return a SUCCESSFUL timeout outcome — before the child
-//! was proven dead and reaped, with a kill failure silently ignored and only
-//! the direct child (never its process GROUP) signalled. This runner replaces
-//! that with a bounded lifecycle:
-//!
 //! * **Synchronized child ownership** — the runner owns the `Child` handle
-//!   exclusively from spawn until the single reap. There is no detached
-//!   thread that can outlive the call, and no path that drops the handle
-//!   un-reaped: the drop backstop kills and waits (bounded) as a final
-//!   resort, so a live child is never abandoned even on an error path that
-//!   cannot complete the reap itself.
+//!   exclusively from spawn until the single reap. The wait runs inline on the
+//!   calling thread (no wait is delegated to a spawned thread), and a handle
+//!   dropped before it was reaped goes through the drop backstop, which kills
+//!   and waits (bounded) as a final resort.
 //! * **Process-group termination (Unix)** — the child is spawned into its
 //!   OWN process group (`process_group(0)` — the child becomes the group
 //!   leader, pgid == pid), so a timeout terminates the WHOLE group (`killpg`
 //!   SIGTERM, then — after a short grace — SIGKILL) and GRANDCHILDREN die
 //!   with it. Windows has no process groups: the timeout terminates the
 //!   direct child only (a background descendant survives).
-//! * **Mandatory wait/join before returning** — every returned outcome
-//!   (success, timeout, error) happens only after the child was REAPED: the
-//!   runner waits synchronously on its owned handle, `try_wait` consumes the
-//!   exit status exactly once, and "proven dead" means the wait returned.
+//! * **Mandatory reap before an outcome** — a returned outcome (success or
+//!   timeout) happens only after the child was REAPED: the runner waits
+//!   synchronously on its owned handle and "proven dead" means the wait
+//!   returned. The CONSUMING call is per platform: Windows polls `try_wait`,
+//!   which consumes the exit status; Unix PEEKS with `waitid(2)`/`WNOWAIT`
+//!   (`child_exited_unreaped` — no status consumed) and consumes it once
+//!   through [`OwnedChild::wait`] → [`Child::wait`]. Both reap exactly once;
+//!   the drop backstop reaps through `try_wait`. An error path that cannot
+//!   reap drops the handle, and the drop backstop's bounded kill-and-wait is
+//!   the final resort.
 //! * **Foreground-only (Unix)** — commands must not daemonize. After the
 //!   direct child exits, the runner checks its process group for LIVE
 //!   leftover members (a background descendant the command left behind). The
@@ -35,43 +33,44 @@
 //!   leader, pgid == pid), allocated until reaped, so a `killpg` in that
 //!   window can never hit a pid the OS recycled for an unrelated process),
 //!   the group is ENUMERATED (Linux: a `/proc/*/stat` scan; macOS:
-//!   `proc_listpgrp`) with our own zombie excluded, and any LIVE leftover
+//!   `proc_listpgrppids`) with our own zombie excluded, and any LIVE leftover
 //!   member triggers the termination (TERM, grace, KILL — the timeout path's
 //!   escalation) plus an ERROR — a command that leaves background processes
-//!   is a contract violation, NEVER a successful outcome. The foreground
-//!   containment INVARIANT (no live process after the return) covers
-//!   IN-GROUP descendants only. A descendant that ESCAPED the group via
-//!   `setsid` is OUTSIDE the guarantee: the runner can DETECT a
-//!   pipe-holding escapee — the inherited stdio pipes EOF exactly when the
-//!   last holder dies, so a pipe still open at the drain bound is a provable
-//!   violation → error — but it CANNOT TERMINATE an escaped process, because
-//!   no portable way to signal a process outside its group exists without
-//!   cgroups/subreaper support (Linux) or a remote supervisor (ssh). The ONE
-//!   documented exclusion covers BOTH setsid flavors: the pipe-holding
-//!   escapee (detected → error, but not terminated) and the FULLY daemonized
-//!   descendant (`setsid` AND closed descriptors — not even detectable);
-//!   commands must not daemonize. A CLEAN command (no live members —
-//!   the common case) pays one enumeration and its exit code and captured
-//!   output are exactly as before. On Windows the foreground-only check is
-//!   NOT performed (no process-group enumeration exists).
+//!   is a contract violation, NEVER a successful outcome. A descendant that
+//!   ESCAPED the group via `setsid` is OUTSIDE the guarantee: the runner can
+//!   DETECT a pipe-holding escapee — the inherited stdio pipes EOF exactly
+//!   when the last holder dies, so a pipe still open at the drain bound is a
+//!   provable violation → error — but it CANNOT TERMINATE an escaped
+//!   process. The ONE documented exclusion covers BOTH setsid flavors: the
+//!   pipe-holding escapee (detected → error, but not terminated) and the
+//!   FULLY daemonized descendant (`setsid` AND closed descriptors — not even
+//!   detectable); commands must not daemonize. A CLEAN command (no live
+//!   members — the common case) pays one enumeration. On Windows the
+//!   foreground-only check is NOT performed (no process-group enumeration
+//!   exists).
 //! * **A timeout-kill failure is an ERROR** — if the group kill fails (a real
 //!   failure, not the benign ESRCH of a group that is already gone), or the
 //!   escalated kill fails, or the reap cannot be confirmed within the bound,
 //!   the runner returns `Err` — NEVER a successful `exit_code: -1,
 //!   "timed out"` outcome. Only a confirmed terminated-and-reaped group yields
 //!   the timeout outcome.
-//! * **Bounded** — the lifecycle is bounded: per-exec, no leaked threads
-//!   (there are none), no leaked handles, no live processes across calls, and
-//!   every kill/reap wait is bounded by a configurable deadline.
+//! * **Bounded** — the lifecycle is bounded: per-exec, every kill/reap wait
+//!   is bounded by a configured policy value, the wait itself runs on the
+//!   calling thread, and the child is never leaked. The ONE named exception
+//!   is the Windows pipe-holding case: when a descendant keeps the inherited
+//!   output pipes open past the drain bound, the runner reports the violation
+//!   and returns while a pipe reader thread is still blocked in
+//!   `read_to_end` — deliberately left to EOF, which is when the descendant
+//!   dies. Unix has no reader threads: the drain is non-blocking
+//!   `poll`/`fcntl`, so nothing is left behind there.
 //!
 //! The kill path is a [`KillSeam`] (a kill-function seam): production uses
 //! [`RealKill`] (Unix: `killpg(2)` — no shell, no external `kill` binary;
-//! Windows: the owned `Child::kill`), and the property test injects
-//! syscall-level faults (a missing/unavailable kill, EPERM, ESRCH, an inert
-//! kill) without any subprocess fakery. The process group + escalation
+//! Windows: the owned `Child::kill`), and the tests inject their own seam (an
+//! inert kill) without any subprocess fakery. The process group + escalation
 //! primitives are shared with the SSH runner's real seam
-//! ([`kill_process_group`], [`TERM_TO_KILL_GRACE`]), so both transports
-//! terminate process groups, not bare pids.
+//! ([`kill_process_group`], [`TERM_TO_KILL_GRACE`]), so on Unix both
+//! transports terminate process groups, not bare pids.
 //!
 //! # The platform split (ONE cfg switch at the module boundary)
 //!
@@ -87,10 +86,9 @@
 //!
 //! "Is this process a LIVE member of the group?" must have exactly ONE
 //! answer within a platform, or production's enumeration and the test oracle
-//! drift (the bug that motivated this rule: an oracle that counted
-//! `EXIT_DEAD` as live while production did not). The decision is
-//! single-sourced per platform — NOT by one cross-platform predicate,
-//! because the two kernels report a process's state in incompatible shapes:
+//! drift. The decision is single-sourced per platform — NOT by one
+//! cross-platform predicate, because the two kernels report a process's state
+//! in incompatible shapes:
 //!
 //! * Linux — `is_live_state` over the `/proc/<pid>/stat` state CHARACTER:
 //!   `X` (`EXIT_DEAD`) and `Z` (`EXIT_ZOMBIE`) are not live; every other
@@ -140,17 +138,15 @@ pub use windows::RealKill;
 /// seam so both transports use the same termination policy.
 pub(crate) const TERM_TO_KILL_GRACE: Duration = Duration::from_millis(200);
 
-/// Bound on the post-termination reap: after the escalation, the child must
-/// be collected within this window or the runner reports a reap failure. A
-/// SIGKILL'd child dies in microseconds; this bound only guards the
-/// pathological cases (an ineffective kill), so it is generous in production
-/// and tiny in tests (see [`RunnerConfig::reap_bound`]).
+/// Bound on the post-termination reap: after the escalation the child must be
+/// collected within this window or the runner reports a reap failure (see
+/// [`RunnerConfig::reap_bound`]).
 pub(crate) const KILL_REAP_BOUND: Duration = Duration::from_secs(2);
 
 /// THE single LINUX definition of "this `/proc/<pid>/stat` state field names
 /// a LIVE process", shared by production's group-member enumeration (the
 /// Linux arm of `live_group_members`) and the test oracle's classification
-/// (`probe_process`), so the two can never drift apart again. macOS has its
+/// (`probe_process`), so the two cannot drift apart. macOS has its
 /// own single definition, `unix::macos_status_is_not_live`; the two
 /// platforms do NOT share one predicate, because their state encodings are
 /// incompatible (a state character vs a numeric BSD status).
@@ -188,10 +184,11 @@ pub(crate) fn is_live_state(state: &str) -> bool {
 /// Public because [`RunnerConfig`] is public and takes an `Arc<dyn KillSeam>`:
 /// a caller building its own [`RunnerConfig`] (and a test injecting a
 /// syscall-level fault) needs the trait to name its seam. The crate's own
-/// tests drive the runner under injected kill faults through it.
+/// tests drive the runner under an injected kill seam through it.
 pub trait KillSeam: Send + Sync {
-    /// Signal the whole process group `pgid`. On Windows (no process
-    /// groups) the implementation falls back to the owned child.
+    /// Signal the whole process group `pgid`. Windows has no process groups:
+    /// there the group kill is a no-op and the owned-handle kill is the
+    /// termination path.
     fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()>;
     /// Signal the OWNED child directly (`Child::kill`): the last-resort rung
     /// that catches a child which escaped its group (e.g. `setsid`), where
@@ -202,9 +199,7 @@ pub trait KillSeam: Send + Sync {
 }
 
 /// The [`OwnedChild::drop`] backstop's bounded wait: after killing the group
-/// and the owned child, drop waits this long for the reap before giving up —
-/// long enough for a real SIGKILL/TerminateProcess to land (microseconds),
-/// short enough that a test-injected inert kill cannot stall a suite.
+/// and the owned child, drop waits this long for the reap before giving up.
 const DROP_REAP_BOUND: Duration = Duration::from_millis(100);
 
 /// The signal [`OwnedChild::drop`] delivers to the child's process group.
@@ -233,10 +228,10 @@ pub(crate) enum ChildLifecycle {
 
 /// The LAST termination signal the runner failed to deliver, in the message
 /// form [`RunError::Kill`] reports. A newtype rather than a bare `String` so an
-/// escalation's failure cannot be confused with any other message, and so the
-/// only writer is the [`Termination`] transition that DISPATCHED the signal it
-/// names: a transition attempted from any rung but its predecessor dispatches
-/// nothing and records nothing (see [`Escalating`]).
+/// escalation's failure cannot be confused with any other message, and so a
+/// failure reaches a [`Termination`] only from the dispatch closure a
+/// transition calls in its own arm: a transition attempted from any rung but
+/// its predecessor dispatches nothing and records nothing (see [`Escalating`]).
 #[derive(Debug)]
 pub(crate) struct KillFailure(String);
 
@@ -269,9 +264,7 @@ pub(crate) struct Escalating {
 }
 
 /// The termination ladder as ONE ascending value: the timeout rung and every
-/// escalation after it, replacing the exec loop's independent
-/// timeout/kill/owned-kill booleans and the parallel `Instant` they were
-/// measured against.
+/// escalation after it.
 ///
 /// The ladder ASCENDS — `Armed` → `Termed` → `GroupKilled` → `ChildKilled` on
 /// Unix; `Armed` → `ChildKilled` on Windows, which has no process groups and
@@ -361,8 +354,9 @@ impl Termination {
 /// has ONE implementation. The local runner owns one directly; the SSH
 /// runner's seam owns one inside its shared slot (the same type, the same
 /// `Drop`), so a `drain_available`/`try_wait` error that returns early from
-/// the wait closure cannot abandon a live `Child` (whose own `Drop` neither
-/// waits nor kills — on Unix OR on Windows).
+/// the wait closure does not drop a live `Child` without the backstop's
+/// kill-and-wait (a bare `Child`'s own `Drop` neither waits nor kills — on
+/// Unix OR on Windows).
 ///
 /// The handle is shared EXCLUSIVELY between a runner's deadline/kill path and
 /// its wait path. A child that exited is consumed by [`OwnedChild::wait`] (or
@@ -370,9 +364,7 @@ impl Termination {
 /// [`ChildLifecycle`] moves to `Reaped` — after which no caller can reach the
 /// handle at all (`live_child()` is `None`) and the drop backstop returns
 /// early, so a signal after the reap is unrepresentable (a pid the OS recycled
-/// after the reap can never be hit). The guard has no reachable trigger on any
-/// runner path and is therefore witnessed DIRECTLY by
-/// `a_reaped_owned_child_is_never_signalled_by_the_drop_backstop`.
+/// after the reap can never be hit).
 ///
 /// The backstop's GROUP kill is a no-op on Windows (no process groups), so
 /// there it terminates the direct child only and reaps it, with the SAME
@@ -381,9 +373,8 @@ pub(crate) struct OwnedChild {
     /// The owned child, PRIVATE to this type: the seams drain its pipes and
     /// poll it through the accessors below, and reach the handle for a direct
     /// signal only through [`OwnedChild::live_child`], so the handle of a
-    /// reaped child is unreachable. It is never signalled directly on Unix —
-    /// the kill path goes through [`KillSeam`] / `killpg` so a group, not a
-    /// bare pid, is signalled.
+    /// reaped child is unreachable. On Unix the group kill (`killpg`) is the
+    /// primary termination path and this handle is the last-resort rung.
     child: Child,
     kill: Arc<dyn KillSeam>,
     /// LIVE until the single reap consumes the exit status, `Reaped(status)`
@@ -489,12 +480,10 @@ impl Drop for OwnedChild {
         if self.is_reaped() {
             return;
         }
-        // Final backstop: never abandon a live child. Kill the whole group
-        // (a no-op on Windows), then the owned handle, then wait (bounded) for
-        // the reap. Under the production seam a real SIGKILL/TerminateProcess
-        // lands in microseconds; under an injected inert kill the bound
-        // expires and the child is left to the test's own cleanup (the fault is
-        // exactly the kill not working).
+        // Final backstop: kill the whole group (a no-op on Windows), then the
+        // owned handle, then wait (bounded) for the reap. Under an injected
+        // inert kill the bound expires and the child is left to the caller's
+        // own cleanup (the fault is exactly the kill not working).
         let pgid = self.child.id() as i32;
         let _ = self.kill.kill_group(pgid, DROP_KILL_SIGNAL);
         let _ = self.kill.kill_owned(&mut self.child);
@@ -513,7 +502,7 @@ impl Drop for OwnedChild {
 /// The runner's policy knobs: termination timing, the reap bound, the kill
 /// seam, and (tests only) the spawn/reap observers that record the lifecycle
 /// in the parent. Construct via [`RunnerConfig::production`]; tests build
-/// their own with injected faults and tiny bounds.
+/// their own with injected faults.
 pub struct RunnerConfig {
     /// Grace between the group SIGTERM and the escalated group SIGKILL.
     pub term_to_kill_grace: Duration,
@@ -562,22 +551,32 @@ pub enum RunOutcome {
     TimedOut { stderr: String },
 }
 
-/// How a runner invocation failed. Every variant is returned only AFTER the
-/// runner cleaned up the child (kill + reap where possible) — an error can
-/// never leave a live, un-reaped child behind by contract (the drop backstop
-/// covers the paths where even that is impossible).
+/// How a runner invocation failed. An error path does not return while the
+/// runner still holds a live child: it kills and reaps where it can, and the
+/// drop backstop's bounded kill-and-wait covers the paths that cannot.
 #[derive(Debug)]
 pub enum RunError {
     /// The child could not be spawned.
     Spawn(String),
     /// Waiting on the child failed (wait error, pipe read error).
     Wait(String),
-    /// The command exited but left members of its process group alive — a
-    /// background descendant the command spawned outlived it. The group was
-    /// terminated (TERM → KILL) and the violation is reported as an error:
-    /// commands are FOREGROUND-ONLY, a command that leaves background
-    /// processes is never a successful outcome. (Unix only — Windows has no
-    /// process-group enumeration, so this variant is never produced there.)
+    /// A foreground-only CONTRACT VIOLATION: the command left a process
+    /// behind. Two conditions produce this variant.
+    ///
+    /// (1) A live member of the child's process group survives the child's
+    /// exit. Unix only, where the runner enumerates the group: the group
+    /// termination is attempted (TERM → grace → KILL), the child is reaped,
+    /// and the violation is then reported.
+    /// (2) A pipe is still open when the bounded post-exit drain expires.
+    /// Unix and Windows: a descendant holds the inherited stdout, or the
+    /// inherited stderr, write end. On Unix the group check has already
+    /// passed, so the holder is not a live in-group member — it is a
+    /// descendant that escaped the group (a `setsid` pipe-holder) while
+    /// keeping the pipes. NO group termination is attempted on this path;
+    /// the drain bound expiring IS the detection.
+    ///
+    /// Commands are FOREGROUND-ONLY: leaving a process behind is a violation
+    /// under either condition, never a successful outcome.
     Background(String),
     /// A timeout-termination signal could not be delivered (kill failure).
     Kill(String),
@@ -600,14 +599,19 @@ impl std::fmt::Display for RunError {
 /// THE shared bounded child-runner for local command execution: spawn the
 /// child (into its OWN process group on Unix), wait with the caller's
 /// timeout, on timeout terminate (TERM, grace, KILL on Unix; the owned
-/// child on Windows), and return every outcome — success, timeout, error —
-/// only after the child was REAPED exactly once. A timeout-kill or reap
-/// failure is an ERROR, never a successful timeout outcome.
+/// child on Windows), and return a success or timeout outcome only after the
+/// child was REAPED. A timeout-kill or reap failure is an ERROR, never a
+/// successful timeout outcome.
 ///
 /// The runner is per-exec and owns nothing between calls: the child lives
-/// inside the platform exec and is collected before the call returns, so
-/// there are no leaked threads, handles, or processes across calls — the
-/// lifecycle is bounded.
+/// inside the platform exec and is REAPED before the call returns, and the
+/// wait runs on the calling thread rather than a spawned one, so no child is
+/// leaked and the lifecycle is bounded. The ONE named exception is the Windows
+/// pipe-holding case: a descendant that keeps the inherited output pipes open
+/// past the drain bound leaves a pipe reader thread blocked in `read_to_end`,
+/// so the call returns (with [`RunError::Background`]) while that thread is
+/// still alive, left to EOF when the descendant dies. On Unix the drain holds
+/// no such thread, so nothing outlives the call there.
 pub struct ChildRunner {
     /// The child environment snapshot: every spawned child receives THIS
     /// snapshot as its ENTIRE environment ([`SysEnv::apply_to_command`]:
@@ -640,13 +644,13 @@ impl ChildRunner {
     /// yields a successful timeout outcome, and a command that exited but
     /// left background processes in its group is a violation, never a
     /// successful outcome. `timeout` is ADDITIVE with the termination and
-    /// bounded-drain tail (TERM grace + the post-exit drain), so a timed-out
-    /// call returns up to about `timeout + 2.2 s` later, never at `timeout`
-    /// exactly; a command that exits inside `timeout` still reports its real
-    /// result (a pipe-holding leftover is [`RunError::Background`], never a
-    /// deadline flip). The platform-specific lifecycle (process groups, the
-    /// foreground-only check, the pipe drain) lives in the [`unix`] /
-    /// `windows` submodules.
+    /// bounded-drain tail (TERM grace + the bounded post-exit drain of each of
+    /// the two pipes), so a timed-out call returns up to about `timeout +
+    /// 4.2 s` later, never at `timeout` exactly; a command that exits inside
+    /// `timeout` still reports its real result (a pipe-holding leftover is
+    /// [`RunError::Background`], never a deadline flip). The platform-specific
+    /// lifecycle (process groups, the foreground-only check, the pipe drain)
+    /// lives in the [`unix`] / `windows` submodules.
     pub fn exec(
         &self,
         argv: &[String],
@@ -832,7 +836,7 @@ mod tests {
 
     /// Poll `marker` for the pid the shell writes, then capture that process's
     /// identity WHILE IT IS STILL THE ORIGINAL — before the runner's timeout
-    /// kill re-parents it and launchd reaps it, when the pid could be
+    /// kill re-parents it and the init process reaps it, when the pid could be
     /// recycled. `None` when the marker never appeared or the pid was already
     /// reaped; the caller then falls back to the token-less check.
     fn capture_grandchild(marker: &std::path::Path, budget: Duration) -> Option<ProcessId> {
@@ -927,8 +931,8 @@ mod tests {
         let script = format!("sleep 30 & echo $! > {}; wait", marker.display());
         // Capture the grandchild's identity CONCURRENTLY with the run, while
         // it is still the original process: after the group kill it is
-        // re-parented and launchd reaps it asynchronously, and only a token
-        // taken before that can tell it apart from a recycled pid.
+        // re-parented and reaped asynchronously, and only a token taken before
+        // that can tell it apart from a recycled pid.
         let captured = {
             let marker = marker.clone();
             let reader = std::thread::spawn(move || capture_grandchild(&marker, GONE_BUDGET));
@@ -1015,8 +1019,11 @@ mod tests {
         }
     }
 
-    /// Every returned outcome happens only after the child was reaped: a
-    /// timeout kill failure is an error, and no live child survives the call.
+    /// On the paths where the reap succeeds, every returned outcome happens
+    /// only after the child was reaped: a timeout kill failure is an error.
+    /// An error path that CANNOT reap drops the handle, and the drop
+    /// backstop's bounded kill-and-wait is the final resort. This test drives
+    /// the success path, so the timed-out child is gone when the call returns.
     #[test]
     fn timed_out_child_is_never_left_live() {
         let pid_slot: Arc<Mutex<Option<ProcessId>>> = Arc::new(Mutex::new(None));
@@ -1076,13 +1083,12 @@ mod tests {
     /// PLATFORM: on Linux the oracle classifies a `/proc` state character
     /// through the SAME `is_live_state` predicate production uses, and the
     /// state-table loop below pins that mapping — so a regression that counts
-    /// `X` (EXIT_DEAD) as live again, the exact bug this definition exists to
-    /// catch, fails here. On macOS the oracle classifies the BSD status
-    /// through the SAME `unix::macos_status_is_not_live` production uses
-    /// (pinned by `macos_status_classifies_bsd_process_states` in `unix`),
-    /// and the live-child and un-reaped-zombie probes below exercise that
-    /// shared decision end to end. On top of the table: a LIVE process is not
-    /// gone, a ZOMBIE is gone, and a pid whose start token moved is a
+    /// `X` (EXIT_DEAD) as live fails here. On macOS the oracle classifies the
+    /// BSD status through the SAME `unix::macos_status_is_not_live` production
+    /// uses (pinned by `macos_status_classifies_bsd_process_states` in
+    /// `unix`), and the live-child and un-reaped-zombie probes below exercise
+    /// that shared decision end to end. On top of the table: a LIVE process is
+    /// not gone, a ZOMBIE is gone, and a pid whose start token moved is a
     /// DIFFERENT process, so the tracked one is gone even though the number
     /// still answers.
     #[test]
@@ -1252,11 +1258,8 @@ mod tests {
     /// reap: [`OwnedChild::wait`] (like [`OwnedChild::try_wait`]) moves the
     /// lifecycle to [`ChildLifecycle::Reaped`] and releases the pid, and a
     /// `killpg`/`kill` on the released number could land on an unrelated
-    /// process. The state it guards is therefore UNREACHABLE by design on the
-    /// runner's own paths — every path signals only BEFORE the reap — so no
-    /// reachable-path test can cover it; this test pins the guard DIRECTLY,
-    /// through the module's own reap path, and asserts the drop backstop does
-    /// NOT signal.
+    /// process; this test pins the guard DIRECTLY, through the module's own
+    /// reap path, and asserts the drop backstop does NOT signal.
     ///
     /// The REAPED arm calls [`OwnedChild::wait`] (it consumes the exit status,
     /// so the pid is really reaped, not merely declared so) and drops the

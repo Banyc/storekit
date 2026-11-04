@@ -40,7 +40,7 @@ impl KillSeam for RealKill {
 /// rung's one order authority — a rule its own `match` enforces at runtime, not
 /// a typing fact. `at` is the DEADLINE the rung crossed, not the instant the
 /// kill landed, because this port measures its reap bound from the deadline
-/// (`now - deadline`) — the anchor it used before the ladder existed.
+/// (`now - deadline`).
 impl Termination {
     fn child_killed(self, at: Instant, dispatch: impl FnOnce() -> Option<KillFailure>) -> Self {
         match self {
@@ -55,8 +55,8 @@ impl Termination {
 
 /// Execute `argv` (no shell) bounded by `timeout` — the Windows lifecycle:
 /// spawn plain, drain stdout/stderr via reader THREADS, poll `try_wait`
-/// with the timeout, terminate the OWNED child on timeout, collect the
-/// readers (bounded), reap. No foreground-only group check (no
+/// with the timeout, terminate the OWNED child on timeout, reap, then
+/// collect the readers (bounded). No foreground-only group check (no
 /// process-group enumeration on Windows) — the documented weaker
 /// guarantee. See [`super::ChildRunner::exec`] for the contract.
 pub(crate) fn exec(
