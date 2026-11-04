@@ -53,8 +53,8 @@ domain), and the receiver-marker adoption (done).
 | `remote/canonical/mod.rs` (tree half) | `manifest::*` | Pick by ROLE: `canonicalize_tree` for a source (strict), `canonicalize_tree_destination` for a destination (tolerant, `UnsupportedEntry { path, kind, reason }`). The `_checked` assemblers carry the completeness fact. **DONE**: `deploy`'s half is deleted and the substrate names re-exported; `deploy` has no tolerant destination path, so it uses the strict source walk for destinations and compares digests. |
 | `remote/canonical/materialize.rs` | — | **STAYS in `deploy`.** It is the config-driven mapping/template materializer (`materialize_variant`, `TemplateVars`, `render_template`), not a tree-transfer protocol and not a plain mirror, so `sync` does not replace it. |
 | *(new)* | `atomic::copy_dir_recursive_fd` + `fsync_tree_recursive_fd` | `deploy`'s shape: an arbitrary, possibly out-of-root `&Path` source into a root-confined `RootedRelativePath` staging destination, then canonicalize + digest + rename. |
-| *(new)* | `atomic::copy_tree_verbatim(src, dst)` | The TOLERANT clone: copies a tree (reserved spellings, the `operation.lock` record, and crate-temp shapes included) between two ordinary absolute paths. Intended for a live-base clone such as `retention`'s — searched, that checkpoint currently clones with its own test-only `std::fs::copy` and does not call this, so the name is held for the planned migration rather than attested by a call site. The destination is NOT a store root and must never be handed to the recovery sweep. |
-| *(new)* | `transport::{with_operation_lock_sidecar, SIDECAR_WAIT_TIMEOUT, SIDECAR_RETRY_INTERVAL}` | The operation-scoped sidecar critical section (blocking-with-deadline, re-entrant, same record/inode as the far-side lock path). Replaces `deploy`'s own platform flock triple in `deploy/lock/{unix,windows}.rs` and its `remote::transport::{with_operation_lock_sidecar, wait_for_sidecar_flock, ensure_operation_lock_sidecar_durable}`. |
+| *(new)* | `atomic::copy_tree_verbatim(src, dst)` | The TOLERANT clone: copies a tree (reserved spellings, the `operation.lock` record, and crate-temp shapes included) between two ordinary absolute paths. Intended for a live-base clone; no consumer calls it yet — `tests/consumer_fit.rs` records that measurement at the consumer revision it names — so the name is held for the planned migration rather than attested by a call site. The destination is NOT a store root and must never be handed to the recovery sweep. |
+| *(new)* | `transport::{with_operation_lock_sidecar, SIDECAR_WAIT_TIMEOUT, SIDECAR_RETRY_INTERVAL}` | The operation-scoped sidecar critical section (blocking-with-deadline, re-entrant; the SAME record and inode the transport's own lock-record mutations take, so a caller's critical section and a transport lock-record mutation contend on ONE file). Replaces `deploy`'s own platform flock triple in `deploy/lock/{unix,windows}.rs` and its `remote::transport::{with_operation_lock_sidecar, wait_for_sidecar_flock, ensure_operation_lock_sidecar_durable}`. |
 | *(new)* | `sync::sync(direction, .., ownership)` | One entry point. See the ownership note below. |
 | `remote/helper/**` (push engine) | — | **Stays in `deploy`.** |
 | `store/local/**`, `retention/**`, `kernel/**`, `ledger/**`, `verify/**`, `config/`, `init.rs` | — | **Stays in `deploy`.** |
@@ -190,7 +190,8 @@ beforehand; the adoption test now fails on the pre-change tree and passes after.
 ## Out of scope
 
 - the Windows runtime (`deploy`'s Windows port is type-checked only, and the
-  crate's Windows test target compiles but has never executed).
+  crate's Windows test target is compiled but not executed here, so the crate states
+  its Windows runtime as unverified).
 
 # `ckpt` (DONE)
 
@@ -204,7 +205,7 @@ locking and a true `O_APPEND` log, and both are contracts rather than omissions.
 
 | `ckpt` site | `storekit` item | the difference the migration had to preserve |
 |---|---|---|
-| `Store::read_record`, `sparse::read_owned_file` | `atomic::path_kind_fd` + `atomic::read_fd` | a MISSING file or ancestor must stay an ABSENCE (`Ok(None)`), so the absence check happens before the read; a file, symlink or foreign entry in its place must stay a `Corrupt` naming that path. `ckpt`'s own `nlink > 1` check stays: the atomic layer does not check hard links. |
+| `Store::read_record`, `sparse::read_owned_file` | `atomic::path_kind_fd` + `atomic::read_fd` | a MISSING file or ancestor must stay an ABSENCE (`Ok(None)`), so the absence check happens before the read; a file, symlink or foreign entry in its place must stay a `Corrupt` naming that path. `ckpt`'s own `nlink > 1` check stays: none of the read/write primitives it adopts checks hard links. |
 | `sparse::write_new_file` | `atomic::path_kind_fd` + `atomic::write_atomic_cas_fd` | the substrate treats an IDENTICAL re-write as an idempotent success; `ckpt` must REPORT a name that already holds a file, so its pre-check runs first. Files are now written mode `0o600` and fsynced (temp, file, parent), where `std::fs::write` used the umask with no fsync — a recorded tightening. |
 | `sparse::ensure_directory`, `create_record_dir`, `require_directory` | `atomic::path_kind_fd` + `atomic::create_dir_fd` | NOT `ensure_private_dir_durable_fd`: that chmods an existing directory to `0o700`, and `ckpt` leaves modes alone. |
 | `sparse::entries` | `atomic::path_kind_fd` + `atomic::read_dir_fd` | the two-character/38-character shard split, the dotfile skip and the `Missing` policy stay in `ckpt`; the substrate knows nothing about the layout. |

@@ -242,12 +242,14 @@ previously computed manifest: `canonicalize_tree` reads every file to hash it, a
 skipping the second read, would change that; neither is built here.
 
 **A deep tree is worse than linear, and the shape depends on fresh vs incremental.** A
-LOCAL path-based destination re-verifies a path's ancestry before each mutation — O(depth)
-per probe — so a depth-D chain with ONE changed leaf is super-linear in D, and a FRESH
-D-entry destination is worse still: each install pays its own O(D) probe, and one probe is
-O(D) syscalls. A checkpoint tool that recreates its destination per snapshot should budget
-cubic-or-worse. `canonicalize_tree` itself is not the cost; the engine's per-path
-verification is. A descriptor-relative walk would lift this, and it is not built.
+LOCAL path-based destination re-verifies a path's ancestry before each mutation: the probe
+COUNT is linear in depth, but each probed prefix is RESOLVED component-wise, so a depth-D
+path costs O(D^2) path operations and a chain with ONE changed leaf has super-linear wall
+time in D (budget for worse than quadratic). A FRESH D-entry destination is worse still:
+each install pays its own O(D^2) ancestry probe and listing, so the run is CUBIC in depth,
+and a checkpoint tool that recreates its destination per snapshot hits exactly that shape.
+`canonicalize_tree` itself is not the cost; the engine's per-path verification is. A
+descriptor-relative walk would lift this, and it is not built.
 
 ## Destination provisioning
 
@@ -259,10 +261,13 @@ destination works without the caller pre-creating it and `Layout::empty()` is en
 ## Platform
 
 Linux and macOS are supported and exercised. The far side of a remote transfer
-may be GNU or BSD userland; both are exercised. The Windows implementation
-type-checks but is not exercised, and is described as unverified — and it is not only
-untested: some rules are UNIX-only by construction, and each such claim says so where it
-is made (`atomic::COMPONENT_CONFINED`, the local walk's hard-link check).
+may be GNU or BSD userland: the far-side suites build the command string and run it
+through the HOST's own userland, so a run exercises BSD on macOS and GNU on Linux and
+no single run exercises both (`tests/ssh_farside_portability.rs` states the asymmetry).
+The Windows implementation type-checks but is not exercised, and is described as
+unverified — and it is not only untested: some rules are UNIX-only by construction, and
+each such claim says so where it is made (`atomic::COMPONENT_CONFINED`, the local walk's
+hard-link check).
 
 The Windows check compiles the WHOLE target, tests included:
 `cargo check --all-targets --target x86_64-pc-windows-msvc`. A signature change
@@ -355,9 +360,12 @@ lock.** Two records guard one destination — the sibling `.<name>.operation.loc
 NAME rather than chosen: `DestinationOwnership::lock_with_in_root_lock` takes the
 sibling record first and then the in-root one (both NON-BLOCKING, so the canonical
 order cannot deadlock), and it requires the destination root to PRE-EXIST. The in-root
-record is destination RESIDUE (`reserved::is_residue_path`), so the run strips it from
-the view it judges, never transfers it and never destroys it; it is reported in
-`SyncReport::residue`. A documented objection to composing them — "the record would
+record is destination RESIDUE when its spelling is one (`reserved::is_residue_path`: the
+application lock record and its aliases), and the run then strips it from the view it
+judges, never transfers it and never destroys it, reporting it in
+`SyncReport::residue`; an ADDRESSABLE caller-chosen spelling is not residue, so the record
+is ordinary destination-only content, reported extraneous and removable by an
+`Extraneous::Delete` run. A documented objection to composing them — "the record would
 create the destination root and enter the manifest the run is judging" — was false in
 its second half, which is why it was revisited.
 

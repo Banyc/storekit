@@ -22,11 +22,12 @@ the tests.
    one, that file is domain code and must be dropped.
 2. **Visibility.** An item is `pub` only if a CONSUMER needs it; `pub(crate)` is the
    default answer for anything the crate's own paths can reach. A deletion justified
-   by *"the crate's own tests do not use it"* is not justified at all. The
-   consumers are `~/code/deploy`, which depends on the crate, and `~/code/ckpt`,
-   which is the NEXT one and does not depend on it yet — so the durable guard,
-   `tests/consumer_fit.rs`, pins `deploy`'s needs and no `ckpt` need. That guard
-   fails to COMPILE if a consumer-required name is removed.
+   by *"the crate's own tests do not use it"* is not justified at all. The durable
+   guard is `tests/consumer_fit.rs`: it NAMES the call shapes a consumer's interface
+   requires, exercises them through the public API only, and fails to COMPILE if one
+   is removed or its signature changes — for a name a consumer CALLS today and for a
+   name the crate HOLDS for a planned consumer, which the guard's own header
+   distinguishes.
 3. **Test helpers.** `crate::testutil::{fixture_env, fixture_tmpdir, proptest_cases,
    slow_tests_enabled}` are `crate::test_support::{...}` here. Any other
    `crate::testutil::*` use means the test is domain-bound: drop it and record the drop.
@@ -44,8 +45,8 @@ the tests.
 8. **Windows.** The `#[cfg(windows)]` modules are required and part of the gate: a
    Windows file and its TESTS must COMPILE. Gate a test that genuinely needs a unix
    primitive with `#[cfg(unix)]` (and say what it needs); never gate a production
-   Windows file. The port's RUNTIME remains unverified — no Windows host has executed
-   it — and the crate says so.
+   Windows file. The port's RUNTIME remains unverified, and the crate says so
+   wherever it matters.
 
 ## Slices
 
