@@ -286,3 +286,4 @@ Overruled finding (naming nit): "the ONE entry point" names the public `try_writ
 | README.md | "Design conflicts the `deploy` migration surfaced" (a)(b)(c) | deleted — closed migration history; the record is `MIGRATION.md`, the rules are in `Rules for changing this crate` | `DestinationOwnership`, `Remote::lock_far_side`, `copy_dir_recursive_fd`, `copy_tree_verbatim` |
 | README.md | Goals / Non-goals | added (plain-language scope statement) | `manifest` scope docs, `atomic::COMPONENT_CONFINED`, sync disjointness, transport docs |
 | tests/consumer_fit.rs | header citation | corrected to the surviving README section | `copy_tree_verbatim`, `sync` |
+| README.md | whole document | rewritten in plain prose: every section re-derived; same facts, identifiers and gate commands, no history or shouting | all sections as cited in the previous rows |
