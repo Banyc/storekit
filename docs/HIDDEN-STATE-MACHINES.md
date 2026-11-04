@@ -68,12 +68,14 @@ its entry corrected, in the round that lands it.
 | `IdentityProbe` | TEST-ONLY |
 | Source audit traversal | TEST-ONLY |
 | Child-process orchestration | TEST-ONLY |
-| Prose sweep: stale comments and docs (opt-in) | OPEN — `prose-sweep`: every claim in the declared slice is re-derived or deleted |
+| Prose sweep: stale comments and docs (opt-in) | DONE — 14 slices landed; every section's disposition is in `docs/PROSE-DISPOSITIONS.md` |
 
 ## Prose sweep (opt-in)
 
 Not a state machine: a cleanup program over this inventory's prose and the rest
-of the crate's comments and docs.
+of the crate's comments and docs. **Landed:** slices 1–14 are on `master`; the
+ledger records each file/section's disposition and the symbols it was
+derived from. Prose written after this sweep is ordinary review territory.
 
 **Rule.** A claim survives only when it was RE-DERIVED from the symbols it
 names in the same round and corrected there. Prose nobody re-derived is
