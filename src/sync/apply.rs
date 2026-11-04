@@ -18,7 +18,9 @@
 //!   run cannot leave a torn entry: a PULL writes through this crate's durable,
 //!   fd-confined primitive ([`crate::atomic::write_atomic_replace_fd`]); a PUSH
 //!   into a LOCAL destination ([`crate::transport::LocalTransport`]) routes
-//!   through the SAME primitive, and a PUSH into a REMOTE one through the far-side
+//!   through the same atomic-replace primitive
+//!   (`write_atomic_replace_fd_under_existing_parent`), and a PUSH into a REMOTE
+//!   one through the far-side
 //!   temp-and-rename the SSH transport emits, so an interrupted push cannot destroy
 //!   the previous snapshot either. On a WINDOWS local destination the replace is
 //!   not ATOMIC — the target is removed before the rename, the ONE such case, named
@@ -49,8 +51,7 @@
 //!   ([`Applier::is_prohibited`]), so a conflict site cannot forget to block:
 //!   there is nothing separate to forget. This is what covers every
 //!   `AppendNotAFile` arm uniformly — a source file, directory, OR symlink over
-//!   a destination directory is forbidden, not only the two arms that used to
-//!   remember to insert into the set.
+//!   a destination directory is forbidden.
 //! * **Proof-carrying deletion.** [`Applier::remove_subtree`] requires a
 //!   [`Sanction`], not an ancestry question. [`Sanction::ExtraneousFlag`] is the
 //!   caller's [`Extraneous::Delete`], and it refuses any path the conflict-derived
@@ -75,7 +76,8 @@
 //!   per-child authority runs) cannot be bypassed by a caller presenting a
 //!   stale non-`Dir` kind; [`Claim`] stores no kind; `transfer_file`,
 //!   `append_tail`, and `make_overwritable` route on a live probe
-//!   ([`Applier::live_dest_kind`]); and [`Applier::restore`] reads the live kind
+//!   ([`Applier::live_dest_kind`] for the first two, [`Side::kind_opt`] in
+//!   `make_overwritable`); and [`Applier::restore`] reads the live kind
 //!   and REFUSES (and names) a kind the journal never recorded rather than
 //!   applying a mode to it. `transfer_dir` and `transfer_symlink` still choose
 //!   the ROUTE (a mode-only change over a directory, versus a claim+create)
@@ -91,8 +93,8 @@
 //!   writer creates after the last enumeration is therefore REFUSED and NAMED,
 //!   never destroyed unnamed, so the walk's claim — everything under this
 //!   directory was enumerated and sanctioned — is re-established by the
-//!   filesystem AT THE MOMENT OF REMOVAL. There is no recursive removal
-//!   primitive at all: the walk of a directory's children is iterative (an
+//!   filesystem AT THE MOMENT OF REMOVAL. This module has no recursive removal
+//!   primitive: the walk of a directory's children is iterative (an
 //!   explicit heap stack, one frame per directory), and every child is
 //!   re-checked against the live authority on the way in, so a deep tree is
 //!   bounded by memory rather than by the thread stack.
@@ -101,9 +103,8 @@
 //!   REPORTED in [`SyncReport::residue`], and — because it still exists — its
 //!   transient widen is STILL restored. A path this sync removed ends its mode
 //!   identity (`ModeRecord::Removed`): there is no mode left to restore and it
-//!   is never residue. Conflating the two silently left a widened residue
-//!   directory at its widened mode; `ModeRecord` is a sum type precisely so the
-//!   two cannot be conflated by a flag combination.
+//!   is never residue. `ModeRecord` is a sum type with one variant per legal
+//!   state, so the two cannot be conflated by a flag combination.
 //!
 //! # The mode-record invariant
 //!
@@ -133,11 +134,13 @@
 //!   directory), the record restarts, because the old identity no longer exists
 //!   to restore. A SYMLINK has no mode step (its manifest mode is fixed and
 //!   never chmodded), so it counts as settled once its target is verified.
-//! * **One widen choke point.** `widen_ancestors` (through `widen_dir`) is the
-//!   only path that widens a directory, and EVERY mutation kind calls it before
-//!   writing into a directory: a directory create, a regular-file write, an
-//!   append write, a symlink create, and a removal — which additionally widens
-//!   the TARGET of a subtree removal, not only its ancestors. The
+//! * **One widen choke point.** `widen_dir_verified` is the only place a
+//!   directory's mode is widened: `widen_ancestors` calls it for an entry's
+//!   ancestor chain, and `remove_subtree` calls it for each directory it is
+//!   about to empty, so EVERY mutation kind widens before it writes into a
+//!   directory: a directory create, a regular-file write, an append write, a
+//!   symlink create, and a removal — which additionally widens the TARGET of a
+//!   subtree removal, not only its ancestors. The
 //!   decision is read from the directory's CURRENT mode, never the source's and
 //!   never a cached "already widened" bit (a directory can need widening again
 //!   after `finalize` reinstated a read-only final mode, and the read-only
@@ -159,7 +162,8 @@
 //! * **The report is derived.** `transient_dirs` is the journal's set of
 //!   widened, not-removed paths; an entry is in `applied` only after its final
 //!   mode landed AND EVERY verification check passed — content/target AND mode;
-//!   `skipped` omits every path the journal touched. No field is accumulated by
+//!   `skipped` omits every path the journal recorded as widened. No field is
+//!   accumulated by
 //!   a parallel pass that could be drained or overwritten.
 //!
 //! ## Failure accounting: attempt-first, and the report partition
@@ -173,8 +177,7 @@
 //! result is unconfirmed — is therefore never invisible: the path it may have
 //! changed is named in [`SyncReport::indeterminate`] and its step is counted in
 //! `transfers`. This is what keeps `transfers == 0` a valid "nothing was
-//! mutated" oracle; the old order (count only after `Ok`) let a
-//! partially-applied mutation leave no trace at all.
+//! mutated" oracle.
 //!
 //! The name is cleared only by a LATER successful call OF THE SAME KIND. A
 //! successful chmod (the `settle` restore re-establishing a widened mode)
@@ -216,7 +219,7 @@
 //! unlinked from it. Before replacing a destination directory, the sanction
 //! check consults the UNSTRIPPED residue set as well as the diff, so a directory
 //! whose only child is an aside is never mistaken for an empty one. Same-kind
-//! file overwrites are already atomic (temp + rename) and are not claimed.
+//! file overwrites go through the replace primitive and are not claimed.
 //!
 //! The RESERVED namespace is defined ONCE by [`crate::reserved`] and has TWO
 //! families: the `.sync-aside.` claim-aside prefix AND the operation-lock
@@ -301,9 +304,9 @@
 //! path it is an ordinary destination-only entry: it is reported in
 //! [`SyncReport::extraneous`] and, under [`Extraneous::Delete`], removed
 //! through the SAME live-kind, fold-aware, non-recursive walk as any other
-//! (so the pre-fix "one unsupported entry blocks the whole run, including its
-//! own sanctioned deletion" is gone). When the SOURCE DOES hold that path the
-//! run is REFUSED before any mutation: the entry cannot be replaced in place
+//! (so one unsupported entry does not block its own sanctioned deletion). When
+//! the SOURCE DOES hold that path the run is REFUSED before any transfer: the
+//! entry cannot be replaced in place
 //! without destroying or aliasing data the manifest cannot describe, and the
 //! error names the path, the reason, and the remedy. A tolerated destination
 //! entry is therefore never silently transferred, aliased, or destroyed
@@ -429,9 +432,8 @@
 //! releases when the descriptor drops. The guard is therefore released on the
 //! success path, on EVERY error return, and on a panic that unwinds; a
 //! `SIGKILL`ed holder releases it too, because the kernel closes the process's
-//! descriptors. There is ONE authority for how a lock is taken —
-//! [`crate::lock::FileLock`], the same primitive the crate documents for its
-//! push and checkpoint pipelines — and the record reuses the crate's reserved
+//! descriptors. The LOCAL lock is taken by ONE authority,
+//! [`crate::lock::FileLock`], and the record reuses the crate's reserved
 //! `operation.lock` FILE NAME. That is a NAME, not the same file: the sibling
 //! record and the in-root [`crate::transport::Layout::lock`] are DIFFERENT
 //! files that do NOT exclude each other on their own. A caller that needs BOTH
@@ -439,8 +441,8 @@
 //! [`DestinationOwnership::lock_with_in_root_lock`], which acquires the sibling
 //! record then the caller's in-root record in that ONE order (see
 //! [`destination_lock_path`] and "Why the lock record is a SIBLING of the
-//! destination root"); the plain [`DestinationOwnership::lock`] is unchanged
-//! and takes the sibling record alone.
+//! destination root"); the plain [`DestinationOwnership::lock`] takes the
+//! sibling record alone.
 //!
 //! ### The conditions the crate ENFORCES (and what a caller still owes)
 //!
@@ -451,10 +453,8 @@
 //!    calls [`Remote::prepare_identity`] BEFORE the first remote request of
 //!    the run and BEFORE the destination lock record is created. For
 //!    [`crate::transport::SshTransport`] that creates the local
-//!    control-socket directory and pins the verified host key; without it the
-//!    documented API was unusable and the first remote request failed with a
-//!    misleading "host identity is not configured" (the identity WAS
-//!    configured, it had simply not been prepared). The default is a no-op and
+//!    control-socket directory and pins the verified host key. The default is
+//!    a no-op and
 //!    [`crate::transport::LocalTransport`] does not override it, so a local
 //!    destination is unaffected. The crate discharges the PREPARATION; the
 //!    caller still owes the identity MATERIAL — a `known_hosts` path or a
@@ -490,7 +490,8 @@
 //!    for it. The run therefore re-reads the source manifest after the transfer
 //!    and compares it to the one the plan was made against: an entry that ADDED,
 //!    DISAPPEARED, or CHANGED makes the run FAIL CLOSED and is NAMED, and a
-//!    source read that cannot be repeated is likewise a failure. What a caller still owes is honesty about
+//!    source read that cannot be repeated is likewise a failure. What a caller
+//!    still owes is honesty about
 //!    ABA: a source that changes and changes BACK between the two reads is
 //!    indistinguishable from a stable one — two samples can refute quiescence,
 //!    never prove it.
@@ -572,18 +573,16 @@
 //! record reuses the reserved `operation.lock` FILE NAME, not the PATH of
 //! [`crate::transport::Layout::lock`].
 //!
-//! PREMISE CHECK (what actually happens if an in-root record IS taken): an
-//! earlier revision of this module claimed an in-root `state/operation.lock`
-//! "would enter the destination manifest the run is judging". That is FALSE for
-//! the record itself. The destination view strips it as RESIDUE:
-//! [`apply_manifests`] strips the destination with
-//! [`crate::reserved::is_residue_path`], and a component that is the
+//! WHAT AN IN-ROOT RECORD DOES (the composed form takes one): the record
+//! itself never enters the diff. [`apply_manifests`] strips the destination
+//! with [`crate::reserved::is_residue_path`], and a component that is the
 //! application-lock spelling (`operation.lock`) is residue, so the record is
 //! invisible to the diff, never transferred, and never destroyed. What DOES
 //! remain is the record's PARENT directory when the lock creates it: an
 //! ordinary empty `state/` is destination-only content, so it appears in the
-//! diff; under [`Extraneous::Delete`] its removal is refused because it holds
-//! residue, and it is reported as residue rather than destroyed. That is why
+//! diff, and under [`Extraneous::Delete`] its removal is refused as a
+//! [`ConflictReason::ResidueBelow`] CONFLICT rather than destroyed (see
+//! [`Applier::delete_verdict`]). That is why
 //! the COMPOSED form ([`DestinationOwnership::lock_with_in_root_lock`]) still
 //! requires the destination root to pre-exist and never creates the root, and
 //! why the plain form keeps the sibling location.
@@ -776,9 +775,10 @@
 //! a CONFIRMED absent path enumerates as empty) and carries the live KIND, so a
 //! symlink where the manifest says `Dir` is never treated as an intact
 //! directory. The preflight duplicates a window a component-confined
-//! destination already closes in `crate::atomic`; for a
-//! [`LocalTransport`](crate::transport::LocalTransport) the transport itself
-//! resolves every non-root path component-wise with `O_NOFOLLOW` (no window) —
+//! destination already closes in `crate::atomic`; on a component-confined
+//! platform a
+//! [`LocalTransport`](crate::transport::LocalTransport) resolves every non-root
+//! path component-wise with `O_NOFOLLOW` (no window) —
 //! mutations AND the reads this applier verifies against (`read`, `read_link`,
 //! `metadata_opt`, `exists`), so a verification verdict cannot be sourced from
 //! outside the pinned root; for an
@@ -979,14 +979,9 @@
 //!   ([`Applier::refuse_address_folded_onto_another_name`]) and the
 //!   identity-aware removal branch ([`Applier::remove_extraneous`]) — are
 //!   pinned ONLY on a case-insensitive (or otherwise aliasing) destination.
-//!   Their tests skip when `filesystem_is_case_insensitive()` is false, and a
-//!   disable-alone run on a case-sensitive Linux/ext4 destination leaves the
-//!   suite GREEN: neither check's refusal is exercised there. This is recorded
-//!   rather than claimed away. Pinning them on Linux needs a TEST-ONLY aliasing
-//!   [`Remote`] wrapper (one that folds names as it stores and lists them so a
-//!   manifest spelling resolves to a differently-spelled entry on ext4); none
-//!   is present, so the Linux coverage of those two checks is, precisely: not
-//!   covered by the reproductions, only on macOS/ext4-with-casefold.
+//!   Their tests skip when `filesystem_is_case_insensitive()` is false, so on a
+//!   case-sensitive Linux/ext4 destination neither check's refusal is exercised
+//!   by the suite.
 //!
 //! # `AppendTail`
 //!
@@ -1117,10 +1112,10 @@ pub enum Extraneous {
     /// [`crate::manifest::canonicalize_tree_destination`]). Such an entry is
     /// classified [`EntryDiff::Extraneous`] like any other destination-only
     /// path and removed through the SAME live-kind, fold-aware, non-recursive
-    /// walk, so a run no longer dies at destination-manifest time without
-    /// ever reaching the sanctioned entry. This does NOT let such an entry be
+    /// walk, so such an entry does not block its own sanctioned removal. This
+    /// does NOT let such an entry be
     /// TRANSFERRED: if the SOURCE holds a path at that spelling the run is
-    /// refused before any mutation (the entry cannot be replaced in place
+    /// refused before any transfer (the entry cannot be replaced in place
     /// without destroying or aliasing data the manifest cannot describe). The
     /// prohibition rules are unchanged: a conflict or residue leaves the
     /// entry in place and reports it.
@@ -1220,8 +1215,7 @@ pub enum EntryPolicy {
     /// through the transport and THEN written through it, so a writer that
     /// changes the entry during that write (after the compare) is lost; and
     /// even locally a writer that wins the window between the final comparison
-    /// and the `renameat` is lost. Every one of those residuals is NARROWER
-    /// than the pre-fix whole-file overwrite, and a change that lands before
+    /// and the `renameat` is lost. A change that lands before
     /// the comparison is never lost silently.
     AppendTail,
 }
@@ -1369,7 +1363,8 @@ impl ConflictReason {
 pub struct Conflict {
     /// The canonical manifest path.
     pub path: String,
-    /// The source entry kind.
+    /// The entry's kind: the SOURCE entry's for a transfer conflict, the
+    /// DESTINATION entry's for a removal conflict.
     pub kind: EntryKind,
     /// The policy that produced the conflict.
     pub policy: EntryPolicy,
@@ -1388,8 +1383,9 @@ pub struct Conflict {
 /// What a [`sync`] did, or — on failure — what it had already done when the
 /// failure occurred. See [`SyncError`].
 ///
-/// The lists are DERIVED at the end of a run from two records: the per-entry
-/// outcome map and the `ModeJournal` (both private). They are mutually
+/// The lists are DERIVED at the end of a run from the applier's own records —
+/// the per-entry outcome map, the `ModeJournal`, and the conflict, verification,
+/// residue, and indeterminate records (all private). They are mutually
 /// consistent: they are sorted by path, and a path never appears in two
 /// contradictory lists.
 #[derive(Clone, Debug, Default)]
@@ -1485,8 +1481,8 @@ pub struct SyncReport {
     /// [`Remote::remove_file`] /
     /// [`Remote::remove_dir_all`] all
     /// carry the refusal — the remote `remove_dir_all` checks the strand's
-    /// locally-knowable name before it builds its command), so the old
-    /// `remove_dir_all` recipe is no longer a silent way to destroy the
+    /// locally-knowable name before it builds its command), so a blanket
+    /// `remove_dir_all` is refused rather than silently destroying the
     /// original. For a REMOTE destination the crate
     /// has no far-side recovery primitive: the caller must run the same two
     /// steps through the far-side tools, and MUST NOT blanket-remove the aside
@@ -1700,7 +1696,8 @@ impl SyncError {
     /// far-side operation-lock session lost mid-run — where the new condition
     /// (the destination is no longer owned) is the failure the caller must act
     /// on, but the engine's own error text must survive. The new error keeps its
-    /// own class AND typed kind; the old text rides along as context.
+    /// own class AND typed kind; the replaced error's text rides along as
+    /// context.
     pub(crate) fn with_replaced_error(mut self, error: Error) -> Self {
         let original = std::mem::replace(&mut self.error, Error::preflight(""));
         self.error = error.with_context(original.to_string());
@@ -1800,7 +1797,7 @@ pub fn destination_lock_path(dest_root: &Path) -> Option<PathBuf> {
     // name even one byte longer would make `FileLock::acquire` fail with
     // `ENAMETOOLONG` on a destination the crate accepts. The derivation stays
     // deterministic (the same root derives the same record), so the
-    // port-keyed, stable-inode property is untouched.
+    // stable-inode property is untouched.
     let record = OsString::from(format!(
         ".{}{}",
         crate::atomic::bounded_temp_trunk(&base.to_string_lossy(), OPERATION_LOCK_SUFFIX),
@@ -1848,8 +1845,7 @@ pub enum RetireOutcome {
 /// This exists because the crate's STABLE-INODE discipline (`FileLock` never
 /// removes the record, and the mutation guard refuses one) makes a
 /// many-snapshot store accumulate one sibling `.<name>.operation.lock` per
-/// snapshot forever; the only workaround a caller had was a raw `std::fs`
-/// unlink that bypasses the guard. Retirement is the SANCTIONED break, and it
+/// snapshot root. Retirement is the SANCTIONED break, and it
 /// reuses the crate's ONE ownership authority rather than inventing a second:
 ///
 /// * the record is recognized by IDENTITY
@@ -2005,8 +2001,8 @@ fn destination_op_id(direction: Direction, dest_root: &Path) -> String {
 /// PURE by construction: it derives the sibling record path and validates that
 /// the record has a real parent directory, but creates nothing and takes no
 /// lock. It exists so [`prepare`] can refuse a destination the crate cannot
-/// hold BEFORE it prepares a transport identity or creates any file — a
-/// refusal must leave no residue. [`lock_destination`] runs the same check and
+/// hold BEFORE it prepares a transport identity or creates any lock file.
+/// [`lock_destination`] runs the same check and
 /// then performs the acquisition.
 fn destination_lock_record(dest_is_local: bool, dest_root: &Path) -> Result<PathBuf> {
     if !dest_is_local {
@@ -2191,8 +2187,9 @@ fn acquire_in_root_lock(
 ///
 /// A **PUSH PROVISIONS its destination before its manifest is read**: for a
 /// remote destination ([`Remote`], including `LocalTransport`) the run calls
-/// `provision_layout`, which creates the destination ROOT and the caller's
-/// `Layout::bootstrap_dirs`. A fresh destination therefore works through this
+/// `provision_layout`, which creates the destination ROOT, the caller's
+/// `Layout::bootstrap_dirs`, and the optional receiver marker. A fresh
+/// destination therefore works through this
 /// entry point without the caller pre-creating it, and `Layout::empty()` (no
 /// bootstrap directories, no receiver marker) is enough. `provision_layout`
 /// creates nothing INSIDE the root beyond the caller's own bootstrap
@@ -2225,8 +2222,9 @@ fn acquire_in_root_lock(
 ///
 /// 0. **The transport's host identity is prepared, and the crate ENFORCES
 ///    it** by calling [`Remote::prepare_identity`] in the preflight
-///    ([`DestinationOwnership::lock`] and
-///    [`DestinationOwnership::lock_with_in_root_lock`] for the owned paths,
+///    ([`DestinationOwnership::lock`],
+///    [`DestinationOwnership::lock_with_in_root_lock`], and
+///    [`DestinationOwnership::lock_remote`] for the owned paths,
 ///    [`sync`] for the unowned path) before the first remote request and before
 ///    the destination lock record is created. The default
 ///    is a no-op and [`crate::transport::LocalTransport`] does not override
@@ -2300,46 +2298,26 @@ fn acquire_in_root_lock(
 /// name-fidelity pass). For a path of depth D the run performs O(D) ancestry
 /// probes and O(D) ancestor-directory listings — `a_deep_chain_costs_linear_
 /// ancestry_probes` bounds that COUNT. The count is linear, but the WORK per
-/// probe is not, and the two destination kinds pay differently:
+/// probe is not:
 ///
-/// * **A LOCAL path-based destination** resolves the probed prefix
+/// * **A LOCAL path-based destination** resolves each probed prefix
 ///   component-wise (the preflight IS the confinement there, so no prefix is
-///   memoized), so probing the i-th prefix costs i path resolutions and a
-///   depth-D path costs O(D^2) path operations. The run pays that PER PATH,
-///   which makes the two shapes a checkpoint tool hits different by a whole
-///   factor of D. **One changed leaf:** the run probes the D ancestors once, so
-///   the OPERATION count is O(D^2); the WALL TIME is SUPER-LINEAR in D with a
-///   platform-dependent exponent (worse on macOS than on Linux, and the crate quotes
-///   no figures), so budget for WORSE than quadratic.
-///   That is the case the deep-chain test bounds, and it is NOT the case
-///   a fresh snapshot hits. **A FRESH destination:** all D entries are
-///   installed, and EACH install pays its own O(D^2) ancestry probe and listing,
-///   so the run is O(D^3) path operations — the worst shape of the three, and the
-///   one a checkpoint tool that recreates its destination per snapshot hits.
-///   `canonicalize_tree` is NOT the cost; the engine's per-path verification is. A checkpoint tool
-///   that creates a FRESH destination per snapshot is therefore CUBIC in depth,
-///   not the shape the single-changed-leaf measurement suggested; where it
-///   can, it should keep the destination incremental (one changed leaf) rather
-///   than recreate it. The bound the deep-chain test pins is the OPERATION
-///   count, not this wall time.
+///   memoized — see [`Applier::ancestry_dirs`]), so the work per probe grows
+///   with the prefix length and a depth-D path costs O(D^2) path operations.
+///   The run pays that PER PATH, so a FRESH destination that installs all D
+///   entries pays it D times. The bound the deep-chain test pins is the
+///   OPERATION count, not the wall time.
 /// * **A REMOTE ([`SshTransport`](crate::transport::SshTransport))
 ///   destination** turns each probe and each listing into exactly ONE ssh
 ///   round trip: the far side lstat's or lists the WHOLE path in one perl
 ///   command, so path depth costs bytes on the wire, not extra round trips.
-///   A depth-D path therefore costs O(D) ssh round trips — for the same
-///   one-changed-leaf chain, 5D+13 metadata probes plus 2D+3 listings (D = 100
-///   -> 716 round trips) — and O(D^2) bytes of path spelling. It is NOT O(D^2)
-///   round trips. A caller reasoning about a remote transfer should budget
-///   ~7 round trips per level of the deepest changed path, plus a constant for
-///   the manifest, lock, and verification passes.
+///   A depth-D path therefore costs O(D) ssh round trips and O(D^2) bytes of
+///   path spelling, not O(D^2) round trips.
 ///
 /// Fixing the local quadratic PER PATH would mean not re-probing a prefix the
 /// same operation already confirmed; that is deliberately not done for a
 /// path-based destination, where the per-mutation preflight is the confinement
-/// and a skipped probe would be an unverified mutation path. It would not by
-/// itself fix the fresh-destination CUBIC: that comes from paying the quadratic
-/// once per installed path, so the per-path fix is the prerequisite, not the
-/// whole answer.
+/// and a skipped probe would be an unverified mutation path.
 pub fn sync(
     direction: Direction,
     local_root: &Path,
@@ -2811,8 +2789,9 @@ impl DestinationOwnership {
     /// makes it destination RESIDUE: it is STRIPPED from the destination view
     /// the run judges and never transferred or destroyed, and its PARENT
     /// directory (if the lock created it) is refused removal under
-    /// [`Extraneous::Delete`] because it holds residue, reported as residue
-    /// rather than destroyed. An ADDRESSABLE caller-chosen spelling is NOT
+    /// [`Extraneous::Delete`] as a [`ConflictReason::ResidueBelow`] CONFLICT,
+    /// reported in `conflicts` rather than destroyed. An ADDRESSABLE
+    /// caller-chosen spelling is NOT
     /// residue: the record and any parent chain the lock created are ordinary
     /// destination-only content, reported as extraneous and removed by an
     /// [`Extraneous::Delete`] run, and a source entry at that path can replace
@@ -2998,9 +2977,7 @@ impl Prepared {
         // `a_push_token_is_refused_when_equal_content_hides_the_local_to_non_local_flip`.
         // Gating this comparison on `direction == Direction::Pull` leaves every
         // PULL test green and turns the PUSH twins RED; gating it on
-        // `Direction::Push` turns the PULL tests RED. Before the PUSH twins
-        // existed the Pull gate left the WHOLE suite green — only the PULL
-        // direction was pinned.
+        // `Direction::Push` turns the PULL tests RED.
         let remote_is_local = remote.is_local();
         if remote_is_local != self.remote_is_local {
             return Err(Error::preflight_kind(
@@ -3065,8 +3042,12 @@ fn describe_endpoint(identity: &Option<String>) -> String {
 /// Pin the local root, relate the two roots, refuse an unlockable destination
 /// (when the run REQUIRES the lock), prepare the transport identity, and read
 /// the strict source manifest — in that order, BEFORE any destination lock
-/// record is created or the destination is provisioned, so a refusal leaves no
-/// residue. The result is carried into [`sync`] so the run uses exactly the
+/// record is created or the destination is provisioned. A refusal therefore
+/// creates no LOCK RECORD and no destination entry; the transport's OWN
+/// preparation residue (the SSH mux directory, a pinned known-hosts file) is
+/// created before the strict source read, so a refusal after that point can
+/// leave it behind (see the module docs' write-footprint partition). The result
+/// is carried into [`sync`] so the run uses exactly the
 /// tree the plan was made against.
 /// ONE authority for the ownership token's TRANSPORT binding, called by EVERY
 /// minting path ([`DestinationOwnership::lock`],
@@ -3138,20 +3119,18 @@ fn prepare(
     let dest_root = dest_root_for(direction, &local.root_path, &transport_root).to_path_buf();
     let dest_is_local = dest_is_local_for(direction, remote.is_local());
     // (1) REFUSE an unlockable destination BEFORE preparing a transport
-    // identity or creating a lock record: a refusal must leave no residue, and
-    // the refusal is a pure decision that needs no transport. `lock` runs the
+    // identity or creating a lock record: the refusal is a pure decision that
+    // needs no transport. `lock` runs the
     // same check again inside `lock_destination`, which then acquires; the
     // UNOWNED path skips it here and takes no lock.
     if require_lock {
         destination_lock_record(dest_is_local, &dest_root)?;
     }
     // (2) Prepare the TRANSPORT's OWN identity before the first remote request
-    // of the run and before the destination lock record is created. This is
-    // what the documented API omitted: the SSH transport's `prepare_identity`
-    // creates its control-socket directory and pins the verified host key, and
-    // without it the first remote request failed with a misleading "host
-    // identity is not configured" (the identity WAS configured; it had not
-    // been prepared). `Remote::prepare_identity`'s default is a no-op and
+    // of the run and before the destination lock record is created. The SSH
+    // transport's `prepare_identity`
+    // creates its control-socket directory and pins the verified host key.
+    // `Remote::prepare_identity`'s default is a no-op and
     // `LocalTransport` does not override it, so a local destination is
     // unaffected. The failure is annotated so the diagnostic names the
     // PREPARATION stage rather than a bare transport error. A failure here has
@@ -3167,9 +3146,7 @@ fn prepare(
     // `source.manifest()` refuses an unrepresentable source entry (see
     // `crate::manifest::canonicalize_tree`) HERE — before the
     // destination lock
-    // record is created and before `run` provisions the destination root. The
-    // old order provisioned and locked first, so a run refused for its SOURCE
-    // had already created the destination root and the sibling lock record. A
+    // record is created and before `run` provisions the destination root. A
     // refusal creates no destination ROOT and no LOCK RECORD (the transport's
     // preparation residue may already exist — see the module docs'
     // write-footprint partition). The manifest is read once and handed to `run` as
@@ -3221,9 +3198,8 @@ impl OriginalMode {
 
 /// ONE legal state of a journaled path identity, carrying the data that state
 /// needs. The state a record is in is the ONLY thing that decides the journal's
-/// answers, so the combinations the old flat flag set could represent but this
-/// machinery cannot reach (`removed` AND `abandoned`, `final_applied` AND
-/// `removed`, …) are not representable at all.
+/// answers, so contradictory combinations (`removed` AND `abandoned`,
+/// `final_applied` AND `removed`, …) are not representable at all.
 ///
 /// `kind` is the kind of the identity the sync touched, so a restore chmod
 /// resolves the path with the right flags (`O_DIRECTORY` for a directory). It is
@@ -3632,8 +3608,7 @@ impl ModeJournal {
         // The transition table, expressed ONCE: every record that is already
         // first-touched (and not pending) re-decides the same two facts — the
         // intended mode, and whether it landed — so the arms below name only the
-        // `(kind, original, widened)` the identity already has. `landed` is the
-        // old `final_applied` bit and `intended` the old `final_mode`.
+        // `(kind, original, widened)` the identity already has.
         let decided = |kind: EntryKind, original: OriginalMode, widened: bool| {
             if landed {
                 if widened {
@@ -3958,9 +3933,8 @@ type DirListing = Vec<(Vec<u8>, EntryKind)>;
 ///
 /// `Rc::clone` here shares the listing (O(1), no entry copied), which is what
 /// makes a directory cost ONE enumeration per verify pass instead of one deep
-/// `Vec` clone per consultation. `Clone` on this type is the DEEP clone that
-/// the pre-fix consultation ran per call; it exists so a consumer that really
-/// needs an owned listing can ask for one, and it is TEST-ONLY instrumented
+/// `Vec` clone per consultation. `Clone` on this type is the DEEP clone, for a
+/// consumer that really needs an owned listing; it is TEST-ONLY instrumented
 /// (`listing_elements`) so this bound measures the WORK a cached
 /// consultation does, not only the number of calls it makes.
 #[derive(Debug)]
@@ -3989,12 +3963,11 @@ type CachedListing = std::result::Result<std::rc::Rc<Listing>, std::rc::Rc<Error
 /// TEST-ONLY instrumentation: the number of listing ELEMENTS materialized by
 /// the cached path of [`Applier::listing`] — i.e. the number of `(name, kind)`
 /// pairs (and their owned name bytes) COPIED while handing the run-scoped cache
-/// to a consumer. The fixed hand-out shares the `Rc`, so this is ZERO no matter
-/// how wide the directory is; the pre-fix hand-out deep-cloned the whole `Vec`
-/// once per consultation, so it grew with the directory width EVERY time. A
+/// to a consumer. The hand-out shares the `Rc`, so this is ZERO no matter
+/// how wide the directory is. A
 /// thread-local, so the parallel libtest threads do not share a count. This is
 /// the WORK bound the `listing_reads` CALL counter cannot express: the cache
-/// kept the call count O(1) while the clone kept the work O(entries).
+/// keeps the call count O(1) while a deep clone would make the work O(entries).
 #[cfg(test)]
 pub(crate) mod listing_elements {
     use std::cell::Cell;
@@ -4017,9 +3990,7 @@ pub(crate) mod listing_elements {
 /// single raw fetch). A thread-local, so the parallel libtest threads do not
 /// share a count. This bound uses it because the destination-level
 /// `Remote::list` count cannot see the defect: the run-scoped cache already
-/// makes the number of RAW fetches O(1) per directory, while pre-fix
-/// `remove_extraneous` still CONSUMED (cloned and scanned) the parent listing
-/// once PER ENTRY. This counter measures that per-entry consumption: it must not
+/// makes the number of RAW fetches O(1) per directory, so this counter must not
 /// grow with the number of extraneous entries in one directory.
 #[cfg(test)]
 pub(crate) mod listing_reads {
@@ -4162,8 +4133,10 @@ struct HeldLocks {
 
 /// The SOURCE manifest the run was planned against, read by the ENTRY POINT
 /// BEFORE the destination lock was taken and before the destination was
-/// provisioned, so a run refused for an unrepresentable SOURCE has created
-/// nothing. The run consumes it at the END against a re-read, which is the
+/// provisioned, so a run refused for an unrepresentable SOURCE has created no
+/// lock record and no destination entry (the transport's own preparation
+/// residue may already exist — see the module docs' write-footprint
+/// partition). The run consumes it at the END against a re-read, which is the
 /// crate's whole enforcement of the caller's source-quiescence obligation.
 struct SourcePlan(TreeMetadata);
 
@@ -4234,8 +4207,7 @@ fn run(
     // (a no-op for a transport that has none, and `LocalTransport` creates
     // its base the same way). This is what lets a fresh remote destination be
     // pushed to without the caller pre-creating it, matching "the crate
-    // enforces, never relies on the caller": without it the destination
-    // manifest read failed with `not a directory: <root>`. A PULL's
+    // enforces, never relies on the caller". A PULL's
     // destination is a `Side::Local`, unchanged: its root stays created
     // LAZILY by the first mutation, so a fully-refused pull creates nothing
     // through the ENGINE or the PLAIN lock path inside the root it judges. The
@@ -4544,7 +4516,8 @@ struct Applier<'a, 'b> {
     /// pending as well as every mode this sync changed (see [`ModeRecord`]).
     journal: ModeJournal,
     /// Paths already removed this run, so a descendant of a removed directory
-    /// is not removed again (ancestry via `Path`, never a literal separator).
+    /// is not removed again (ancestry over the manifest's `/`-separated
+    /// segments, never a literal separator).
     removed: BTreeSet<String>,
     /// Failures restoring a CLAIMED entry after a failed install (a
     /// claim-by-rename rollback that itself failed). Merged into the
@@ -4703,7 +4676,7 @@ enum VerifyPass {
 /// [`Applier::remove_extraneous`], is reachable only from a site holding a token
 /// [`Applier::verify`] returned, and the site that removes anything —
 /// [`Applier::run_steps`] — holds the token of the PRE-SETTLE pass. The ordering
-/// that used to rest on the line order of two statements is now a requirement of
+/// is a requirement of
 /// the removal call's TYPE. (A `PostSettle` pass returns a token too, because the
 /// signature is shared; [`Applier::settle`] discards it, and no removal follows.)
 struct PreSettleVerified(());
@@ -4712,13 +4685,11 @@ struct PreSettleVerified(());
 /// (surfaced as [`SyncReport::verify_failures`]), and the FIRST error the pass
 /// raised, which is the error the run fails with.
 ///
-/// The checks that make up a pass each used to repeat the same
-/// `failed.insert(path); first_error = first_error.or(Some(error))` pair. The
-/// methods below are that pair, named for the two cases a check can report: a
+/// The methods below are that pair, named for the two cases a check can report: a
 /// path WITH an error (a failed read, listing, or fidelity check) and a path
 /// WITHOUT one (an identity conflict already recorded in `self.conflicts`).
 /// Neither replaces an already-recorded first error: later failures in the same
-/// pass are subsumed by it, exactly as before.
+/// pass are subsumed by it.
 #[derive(Default)]
 struct PassReport {
     failed: BTreeSet<String>,
@@ -4847,7 +4818,7 @@ enum DeleteVerdict {
 /// preflight returns `Err` before an `Applier` exists and before the engine
 /// transfers or removes any entry. That bounds the ENGINE, not the
 /// preparation, locking, and provisioning that surround it: those are stated
-/// where they live in `src/sync/apply.rs`'s module docs, and this entry does
+/// in this module's docs, and this entry does
 /// not restate them.
 /// `SourcePlan::confirm`/`fail_run` may attach the source-quiescence condition
 /// to this chain's result afterwards, and `sync`'s far-side liveness check may
@@ -4913,7 +4884,7 @@ impl Reconciled {
     /// before an `Applier` exists and before the engine transfers or removes
     /// any entry. That bounds the ENGINE, not the preparation, locking, and
     /// provisioning that surround it: those are stated where they live in
-    /// `src/sync/apply.rs`'s module docs, and this entry does not restate them.
+    /// this module's docs, and this entry does not restate them.
     /// After this returns,
     /// `SourcePlan::confirm`/`fail_run` may attach the after-the-fact
     /// source-quiescence condition without re-entering the chain, while
@@ -4977,7 +4948,7 @@ impl Applier<'_, '_> {
         // before an `Applier` exists and before the engine transfers or removes
         // any entry. That bounds the ENGINE, not the preparation, locking, and
         // provisioning that surround it: those are stated where they live in
-        // `src/sync/apply.rs`'s module docs, and this entry does not restate
+        // this module's docs, and this entry does not restate
         // them. `fail_run` attaches the source-quiescence condition to this
         // result afterwards, and `sync`'s far-side liveness check may replace
         // a clean result with a transport failure.
@@ -5359,9 +5330,9 @@ impl Applier<'_, '_> {
             // taken when the directory held exactly the manifest-described
             // entries, and a concurrent writer may have added a child since.
             // `remove_subtree` therefore re-establishes the sanction against
-            // the LIVE listing ([`Applier::claim_child_is_addressed`]) before
+            // the LIVE listing ([`Applier::live_entry_is_addressed`]) before
             // it destroys anything under an `OwnClaim` directory — the
-            // ancestry test alone is exactly what let a stale claim delete a
+            // ancestry test alone would let a stale claim delete a
             // writer-created child.
             Sanction::OwnClaim(claim) => {
                 is_same_or_descendant(path, &manifest_spelling(&claim.rel))
@@ -5510,8 +5481,7 @@ impl Applier<'_, '_> {
         // (top-down), so guarding it once checks every prefix — and, because it
         // demands a final DIRECTORY, the deepest candidate itself. The loop
         // below performs no ancestry walk of its own, which is what removes the
-        // per-ancestor x per-prefix multiplication (a depth-D widen used to cost
-        // O(D^2) probes, and O(D^3) `openat`). Nothing is remembered across
+        // per-ancestor x per-prefix multiplication. Nothing is remembered across
         // operations: this fact lives for exactly this call.
         if let Some((_, _, deepest)) = candidates.last() {
             self.guard_destination(deepest, AncestorPolicy::MustExist, FinalPolicy::Directory)?;
@@ -5737,7 +5707,7 @@ impl Applier<'_, '_> {
         }
     }
 
-    /// THE removal implementation: remove `rel` (whose live kind is `kind`)
+    /// THE removal implementation: remove `rel`
     /// deepest-first, widening every directory it must unlink from and counting
     /// each mutation. Both the extraneous pass and every kind-changing claim
     /// (`drop_claim`, a failed install's `discard_partial`) call THIS, so there
@@ -6444,11 +6414,11 @@ impl Applier<'_, '_> {
     }
 
     /// Rename the claimed aside back to its original path, recording the
-    /// attempt first: a rename that fails may have moved the entry part-way, so
+    /// attempt first: a rename that REPORTS failure may still have LANDED, so
     /// the path is left INDETERMINATE. The caller then READS BACK the entry's
     /// location: the aside is reported as residue and as a restore failure only
-    /// when it is CONFIRMED to still hold the entry (see [`Applier::rollback_-
-    /// claim`]).
+    /// when it is CONFIRMED to still hold the entry (see
+    /// [`Applier::rollback_claim`]).
     fn rename_back(&mut self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         let path = manifest_spelling(to);
         self.guard_destination(from, AncestorPolicy::MustExist, FinalPolicy::Unresolved)?;
@@ -6674,7 +6644,7 @@ impl Applier<'_, '_> {
                 // non-file kind, so a source DIRECTORY, a source FILE over a
                 // destination directory, and a source SYMLINK over a
                 // destination directory all protect the destination subtree
-                // uniformly (previously only the first two remembered to).
+                // uniformly.
                 self.conflict(path, kind, policy, ConflictReason::AppendNotAFile);
                 continue;
             }
@@ -7044,8 +7014,7 @@ impl Applier<'_, '_> {
         // the write is retried against the bytes we just read), or the run
         // reports a `Diverged` conflict. The bound keeps a relentless writer
         // from spinning the run forever; an exhausted loop is a conflict, NEVER
-        // a silent write — the one outcome the old unconditional whole-file
-        // write produced.
+        // a silent write.
         const APPEND_RETRIES: usize = 8;
         for attempt in 0..=APPEND_RETRIES {
             match self.append_attempt(entry, dest_entry, rel, dest_kind, expected)? {
@@ -8477,9 +8446,7 @@ impl Applier<'_, '_> {
         listing_reads::bump();
         if let Some(cached) = self.listings.borrow().get(parent) {
             // SHARE the cached listing: `Rc::clone` copies no entry, so a
-            // directory with N entries costs O(1) per consultation, not the
-            // O(N) deep `Vec` clone (name bytes included) the pre-fix code
-            // ran here.
+            // directory with N entries costs O(1) per consultation.
             return cached.clone();
         }
         let fresh = self
@@ -9557,9 +9524,9 @@ impl Side<'_> {
         }
     }
 
-    /// Remove the entry at `rel` with the primitive for `kind`. The `kind` is
-    /// the LIVE kind the caller ([`Applier::remove_subtree`]) just read from the
-    /// destination object; the local arm honors it exactly rather than
+    /// Remove the FILE (or SYMLINK) at `rel`, classified by the caller's live
+    /// kind WITHOUT FOLLOWING a final-component symlink. The local arm honors
+    /// the live kind exactly rather than
     /// re-deriving a directory and walking it, so a leaf removal can never turn
     /// into the tree walk the removal authority gates.
     fn remove_file(&self, rel: &RootedRelativePath) -> Result<()> {
@@ -9571,8 +9538,8 @@ impl Side<'_> {
 
     /// Remove a FILE (or symlink) that IS the sync's own stranded claim-aside,
     /// through the sanctioned explicit-discard route. Used by
-    /// [`Applier::remove_subtree`] for the `OwnClaim` WALK ROOT only; the
-    /// children of a claim are ordinary content removed by [`Self::remove_file`].
+    /// [`Applier::remove_subtree`] for every file leaf of an `OwnClaim` walk
+    /// (each path in that walk lies under the residue root).
     fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
         match self {
             Side::Local(local) => local.remove_residue_file(rel),
@@ -9598,7 +9565,8 @@ impl Side<'_> {
 
     /// Remove the (already-emptied) DIRECTORY that IS the sync's own stranded
     /// claim-aside, through the sanctioned explicit-discard route. Used by
-    /// [`Applier::remove_subtree`] for the `OwnClaim` WALK ROOT only.
+    /// [`Applier::remove_subtree`] for every directory leaf of an `OwnClaim`
+    /// walk.
     fn remove_residue_dir(&self, rel: &RootedRelativePath) -> Result<()> {
         match self {
             Side::Local(local) => local.remove_residue_dir(rel),
@@ -10144,8 +10112,8 @@ impl LocalSide {
     }
 
     /// Remove a FILE (or symlink) that IS the sync's own stranded claim-aside,
-    /// through the residue-sanctioning primitive. Only
-    /// [`Applier::remove_subtree`]'s `OwnClaim` walk root reaches this.
+    /// through the residue-sanctioning primitive. Every file leaf of
+    /// [`Applier::remove_subtree`]'s `OwnClaim` walk reaches this.
     fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
         match crate::atomic::remove_claim_file_fd(self.root_dir()?, rel) {
             Ok(()) => Ok(()),
@@ -10327,11 +10295,9 @@ fn set_local_mode(
 /// `O_NOFOLLOW`, and an existing entry at the link path is unlinked first
 /// (never followed). The parent directory is synced so the new entry is
 /// durable.
+///
 /// The applier's local symlink goes through the ONE guarded atomic symlink
-/// authority (the second implementation of the lock-record guard): the raw
-/// `unlinkat`/`symlinkat` that
-/// used to live here was a consumer-reachable route to destroying the lock
-/// record and installing a link. `symlink_fd` ensures the parent, unlinks any
+/// authority: `symlink_fd` ensures the parent, unlinks any
 /// existing entry, creates the link, and fsyncs the parent — all guarded.
 #[cfg(unix)]
 fn symlink_local(
