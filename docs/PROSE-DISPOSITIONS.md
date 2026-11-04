@@ -181,3 +181,12 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/sync/apply.rs | `Applier` methods (report, mutation accounting, conflicts, deletion verdict, widen/guard, removal walk, claim/rollback/reconcile, transfer, append, finalize/restore, verify, listings, case probe) | kept-corrected | each method body and its callees; `CaseProbe`, `CaseSensitivity`, `delete_verdict`, `append_attempt`, `install_file` |
 | src/sync/apply.rs | free helpers (`aside_name`, manifest path helpers, error builders, `ReportClass`/`ReportClaims`/`ReportPartition`, `reserved_roots`, `is_guarded`, `ancestor_paths`, `normalize_root`, `refuse_overlapping_roots`, `Side`, `LocalSide`, `set_local_mode`, `symlink_local`) | kept-corrected | bodies and the `crate::atomic`/`platform` primitives they call |
 | src/sync/apply.rs | all inline comments | kept-corrected / deleted (historical and unverifiable clauses) | the enclosing function body |
+
+## Slice 5 — `src/sync/{mod,diff,residue}.rs`, `src/sync/apply/tests.rs` (change `rvuprtkp`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/sync/mod.rs | module doc + re-exports | kept-corrected | re-export list, `sync` |
+| src/sync/residue.rs | module doc, `Residue`, `ResidueAside::parse`, `detect`, `operation_lock`, `recover_to`, `discard` | kept-corrected | bodies, lock acquisition, `ReservedKind::{RecoverTargetOccupied,ResidueNotAnEntry}` |
+| src/sync/diff.rs | module doc, `diff_source_and_destination`, `apply_manifests`, `strip_reserved`, remote-manifest status parsing | kept-corrected (glued doc comment repaired) | `manifest_entry_equal`, `build_metadata`, `canonicalize_remote_entries_checked`, `ABSENT_ROOT_PREFIX`, `SCRIPT_DIE_PREFIXES`, `perl_could_not_start`, `TransportKind` |
+| src/sync/apply/tests.rs | test doc comments + assertion message strings | kept-corrected (report-lists comment scoped: four lists exclusive, `transient_dirs` holds widened `Same` dirs) | the tests' own assertions, `derive_report`, `ReportClass`, `journal.is_widened` |
