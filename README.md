@@ -8,6 +8,37 @@ Callers are other projects, mostly agent-written, and will not read the
 implementation before calling. So the crate enforces, and never relies on the
 caller.
 
+## Goals
+
+- **One shared implementation** of the parts several projects kept rewriting: a
+  rooted file store with atomic file replacement, a root that a symlink cannot
+  escape on Unix, advisory locks, checked ids and paths, a manifest describing a
+  tree, and a one-shot transport that copies that tree to another machine.
+- **Safe when misused.** A wrong call fails to compile or returns an error; it
+  does not quietly do the wrong thing.
+- **Small and exact.** The manifest records names, entry kinds, modes, file
+  contents and symlink targets, byte for byte. Nothing is normalised or guessed.
+- **Callable without reading the source.** The rules live in the types, the
+  errors and the tests, not in comments.
+- **Linux and macOS.** Windows is compiled and type-checked, but unverified: the
+  Windows replace is not atomic, and its path handling follows symlinks.
+
+## Non-goals
+
+- **Backups and checkpoints.** No history, versions, deduplication or retention.
+  A restore does not carry owners, timestamps, ACLs, extended attributes or
+  sparseness, and nothing reports that loss.
+- **Live sync.** No file watching, no continuous replication, no merging. A sync
+  is a single run, and it refuses overlapping source and destination roots.
+- **Extra metadata.** Nothing beyond name, kind, mode, content and symlink
+  target.
+- **Unusual entries.** No hard links (on a Unix source), devices, sockets or
+  FIFOs.
+- **Remote execution.** The SSH transport moves a store; it does not run
+  arbitrary commands.
+- **An application's model.** Deployment slots, retention policy and the rest of
+  a consumer's domain stay in that consumer.
+
 ## The constitution
 
 1. **The crate enforces; the caller is not trusted.** Make misuse unrepresentable
@@ -349,47 +380,6 @@ simplification; removing one means adding back the logic it removes.
   model.** *Buys:* a small manifest, and no extended-attribute, ACL, ownership,
   timestamp or sparseness machinery.
 
-## Design conflicts the `deploy` migration surfaced
-
-Three places where this crate's guarantees and a real consumer's design pulled apart.
-All three are CLOSED, and the decisions are binding.
-
-**(a) The sync lock is a SIBLING of the destination root, not the in-root layout
-lock.** Two records guard one destination — the sibling `.<name>.operation.lock`
-(outside the root) and the caller's in-root `Layout::lock` — so they are composed BY
-NAME rather than chosen: `DestinationOwnership::lock_with_in_root_lock` takes the
-sibling record first and then the in-root one (both NON-BLOCKING, so the canonical
-order cannot deadlock), and it requires the destination root to PRE-EXIST. The in-root
-record is destination RESIDUE when its spelling is one (`reserved::is_residue_path`: the
-application lock record and its aliases), and the run then strips it from the view it
-judges, never transfers it and never destroys it, reporting it in
-`SyncReport::residue`; an ADDRESSABLE caller-chosen spelling is not residue, so the record
-is ordinary destination-only content, reported extraneous and removable by an
-`Extraneous::Delete` run. A documented objection to composing them — "the record would
-create the destination root and enter the manifest the run is judging" — was false in
-its second half, which is why it was revisited.
-
-**(b) Ownership of a REMOTE destination is a persistent FAR-SIDE session.**
-`DestinationOwnership::lock_remote` + `Remote::lock_far_side`: a long-lived local
-`ssh` client whose remote process holds `flock(LOCK_EX|LOCK_NB)`, released when stdin
-reaches EOF, i.e. released on every exit path including a panic. It is NOT a lease —
-it cannot outlive its client. The trait's default REFUSES, so a transport that does
-not override it cannot own a remote destination, and the explicitly named weaker path
-is `DestinationOwnership::Unowned`. `SshTransport` overrides it (perl, because BSD has
-no `flock(1)`), and a contended acquisition returns the typed `LockContended`. A
-token is bound to the transport that minted it: direction, pinned local root, remote
-root spelling, endpoint identity, remote localness — each compared, each pinned by a
-test per direction.
-
-**(c) The fd-confined tree helpers are public.** `deploy` CALLS
-`copy_dir_recursive_fd` and `fsync_tree_recursive_fd` from its own store module and
-drives a staged publish through `with_operation_lock_sidecar`; `copy_tree_verbatim` is
-public for a live-base clone the migration needs but no consumer calls yet (no
-occurrence anywhere in the consumer tree `deploy`, at the revision
-`tests/consumer_fit.rs` names (`a76da6d4`) — a search of that tree, not a test here). A public name is justified by a CONSUMER's need — a
-current one or a stated, planned one — and never by this crate's own production; where
-the need is planned rather than present, the docs say which it is.
-
 ## The contract
 
 This crate is the store SUBSTRATE its consumers build stores on: atomic replace, root
@@ -509,3 +499,5 @@ available, while the `ssh_farside_*` suites drive the far-side protocol through 
 * **A weak path is reachable only through a name that states it.**
 * **Evidence is about a REVISION.** This crate's own docs, its consumers' trees and any
   cited specification drift; re-read before relying on one.
+* **A public item earns its place by a caller's need** — one that exists today, or
+  one that is stated and planned; never by this crate's own use alone.

@@ -278,3 +278,11 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | docs/HIDDEN-STATE-MACHINES.md | Host-identity preparation and pin cache | kept-corrected | `prepare_for_request`, `try_write_new` |
 
 Overruled finding (naming nit): "the ONE entry point" names the public `try_write_new` while the inner `try_write_new_with` is also public; the claim that exactly one path runs the runner without preparing was verified by the reviewer pair and the fix agent's call-site audit.
+
+## Post-sweep — README goals/non-goals (post v0.1.1)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| README.md | "Design conflicts the `deploy` migration surfaced" (a)(b)(c) | deleted — closed migration history; the record is `MIGRATION.md`, the rules are in `Rules for changing this crate` | `DestinationOwnership`, `Remote::lock_far_side`, `copy_dir_recursive_fd`, `copy_tree_verbatim` |
+| README.md | Goals / Non-goals | added (plain-language scope statement) | `manifest` scope docs, `atomic::COMPONENT_CONFINED`, sync disjointness, transport docs |
+| tests/consumer_fit.rs | header citation | corrected to the surviving README section | `copy_tree_verbatim`, `sync` |

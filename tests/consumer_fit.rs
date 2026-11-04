@@ -22,7 +22,7 @@
 //!   Measured at that revision: `deploy` contains ZERO occurrences of any of
 //!   them, so the pin is a promise not to drop the surface the planned migration
 //!   depends on, not an attestation of a call site that does not exist
-//!   (`README.md`, "Design conflicts the `deploy` migration surfaced" (c)).
+//!   (`README.md`, "Rules for changing this crate").
 //!
 //! Deleting an imported shape is a COMPILE failure here, which is the point;
 //! the named-only `id_newtype!` is a citation, not a compile pin. Each is cited
