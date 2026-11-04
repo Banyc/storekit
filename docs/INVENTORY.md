@@ -63,22 +63,28 @@ a permission error.
 
 ## remote-cli-read-ops
 
-**Goal.** `list` and `read-link` (and the descriptor-bound open/read helper if it is a
-script) are native and preferred.
+**Goal.** `list` and the descriptor-bound open/read helper (`verify_open_script`) are
+native and preferred. `read_link` is the POSIX `readlink` and `read` is `cat`, so
+neither is a script and neither moves.
 
-**Carrier.** Subcommands in the bin; switches in `SshTransport::list`, `read_link` and
-the verification-open call site; the existing near-side parsers are unchanged.
+**Carrier.** Subcommands in the bin; switches in `SshTransport::list` and the
+verification-open call site; the existing near-side parsers are unchanged.
 
 **Watch.** Names are RAW BYTES: the listing prints `kind\tmode\tsize\tname\0` with no
 UTF-8 conversion. `readdir` order is the filesystem's; the near-side sort is unchanged.
 An absent directory is an empty listing (exit 0); an unreadable one is an error, not an
 empty listing. `O_NOFOLLOW` must be preserved for the descriptor-bound helper, and a
-symlink there is `ELOOP`, never followed.
+symlink there is `ELOOP`, never followed. Its frame is `O\t<rawmode>\n<content>` for a
+regular file, `N\t<rawmode>` for anything else, and `E\t<errno>` for a failed
+open/fstat/read, with exit 0 in every case. The helper's `#[cfg(test)]` swap seam has no
+CLI equivalent: when that seam is installed the transport must use the script.
 
 **Acceptance.** Differential tests over: an empty directory, a file, a directory, a
 symlink, a FIFO, a dangling symlink, a non-UTF-8 name, a `chmod 400` directory, a
-missing directory; stdout bytes, stderr and exit match the script. The transport-level
-tests assert the CLI form is used when present and the script form when absent.
+missing directory; and for the helper a regular file (content and raw mode), a symlink
+(`ELOOP`), an absent path, a directory (`N`), and a FIFO (never blocks). Stdout bytes,
+stderr and exit match the script. The transport-level tests assert the CLI form is used
+when present and the script form when absent.
 
 ## remote-cli-write-ops
 
