@@ -287,3 +287,9 @@ Overruled finding (naming nit): "the ONE entry point" names the public `try_writ
 | README.md | Goals / Non-goals | added (plain-language scope statement) | `manifest` scope docs, `atomic::COMPONENT_CONFINED`, sync disjointness, transport docs |
 | tests/consumer_fit.rs | header citation | corrected to the surviving README section | `copy_tree_verbatim`, `sync` |
 | README.md | whole document | rewritten in plain prose: every section re-derived; same facts, identifiers and gate commands, no history or shouting | all sections as cited in the previous rows |
+| README.md | Platform, Destination provisioning, This is not a backup | dissolved: platform note into assumptions, gate detail into the gate, provisioning into "What is guaranteed", backup warning into "What is carried" | as cited in the section rows above |
+| docs/CONSISTENCY.md | whole document | rewritten in plain prose; same 13 pairs, 10 rules, 17 residuals | as cited in the previous rows |
+| docs/API-CONSTRAINTS.md | whole document | rewritten in plain prose; pair-less block and its machine-checked marker preserved verbatim | `PAIR-LESS-MUTATIONS`, `src/atomic/guard.rs` exemption list |
+| MIGRATION.md | 14 headings | dissolved into 3 sections with bold lead-ins; every module-map row, conflict decision, change id and test name kept | `deploy`, `ckpt`, change ids `vylurynk`/`rkqqztok`, commit `47e0e092` |
+| EXTRACTION.md | whole document | rewritten in plain prose; 8 adaptations and the slice table kept | slice table sources |
+| src/sync/apply.rs | `AppendTail` doc | corrected: dangling README citation removed | `EntryPolicy::AppendTail` |

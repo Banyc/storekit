@@ -196,10 +196,7 @@ from the snapshot ID's lexical order, or from a timestamp record the caller keep
 itself. The crate cannot rank two snapshots by time, and two snapshots that
 differ only in mtime compare `Same`.
 
-## This is not a backup or checkpoint format
-
-`storekit` moves a tree faithfully within the manifest model. It is not a backup
-or checkpoint format and cannot stand in for one.
+Two consequences follow, and they are why this is not a backup format:
 
 - A source containing a hard link (on a Unix source), an absolute symlink, or an
   escaping symlink cannot be snapshotted at all: the strict source manifest
@@ -297,15 +294,10 @@ checkpoint tool that recreates its destination per snapshot hits exactly that
 shape. `canonicalize_tree` itself is not the cost; the engine's per-path
 verification is. A descriptor-relative walk would lift this and is not built.
 
-## Destination provisioning
+## Assumptions the logic rests on
 
-A `PUSH` provisions its destination before reading the destination manifest: the
-destination root and the caller's `Layout::bootstrap_dirs` are created, so a fresh
-remote destination works without the caller pre-creating it and
-`Layout::empty()` is enough. A `PULL` into a local destination creates that root
-lazily, on the first mutation.
-
-## Platform
+Restrictions the crate does not enforce, because it cannot. Each buys a
+simplification; removing one means adding back the logic it removes.
 
 Linux and macOS are supported and exercised. The far side of a remote transfer
 may be GNU or BSD userland: the far-side suites build the command string and run
@@ -316,19 +308,6 @@ implementation type-checks but is not exercised, and is described as unverified.
 It is not only untested: some rules are Unix-only by construction, and each such
 claim says so where it is made (`atomic::COMPONENT_CONFINED`, the local walk's
 hard-link check).
-
-The Windows check compiles the whole target, tests included:
-`cargo check --all-targets --target x86_64-pc-windows-msvc`. A signature change
-to a Windows code path, production or test, therefore fails this gate instead of
-staying invisible until someone builds on Windows. The tests cannot execute on
-this host, so the reproductions that need a Unix filesystem primitive
-(`O_NOFOLLOW`, `flock`, `pipe`/`poll`, `symlink`, mode bits, `mkfifo`, raw fds)
-are `#[cfg(unix)]`; the rest of the suite is compiled for Windows.
-
-## Assumptions the logic rests on
-
-Restrictions the crate does not enforce, because it cannot. Each buys a
-simplification; removing one means adding back the logic it removes.
 
 - **Durability is a Linux claim.** `fsync` is the power-loss barrier on Linux.
   macOS's `fsync` does not flush the device write cache (this crate does not call
@@ -442,6 +421,12 @@ mutual exclusion, with a record never destroyed by adoption; validated ids and
 paths; manifest fidelity and wire injectivity; the ownership binding; and the
 typed error kinds.
 
+**Provisioning.** A `PUSH` provisions its destination before reading the
+destination manifest: the destination root and the caller's
+`Layout::bootstrap_dirs` are created, so a fresh remote destination works without
+the caller pre-creating it and `Layout::empty()` is enough. A `PULL` into a local
+destination creates that root lazily, on the first mutation.
+
 **Not promised.** Completeness of the symbol set: a mutating symbol nobody
 listed, a raw `syscall(SYS_…)`, an `extern "C"` declaration, a `windows_sys`
 creator, a proc-macro-generated call, third-party code. Keeping the funnel
@@ -499,6 +484,13 @@ module is invisible to both. `remote_lock`, which stands up a real `sshd` and is
 `#![cfg(unix)]` rather than Linux-only, is part of `cargo test` wherever one is
 available. The `ssh_farside_*` suites drive the far-side protocol through a `PATH`
 shim, not a real `ssh`.
+
+The Windows check compiles the whole target, tests included. A signature change
+to a Windows code path, production or test, therefore fails this gate instead of
+staying invisible until someone builds on Windows. The tests cannot execute on
+this host, so the reproductions that need a Unix filesystem primitive
+(`O_NOFOLLOW`, `flock`, `pipe`/`poll`, `symlink`, mode bits, `mkfifo`, raw fds)
+are `#[cfg(unix)]`; the rest of the suite is compiled for Windows.
 
 ## Rules for changing this crate
 

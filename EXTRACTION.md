@@ -1,41 +1,41 @@
 # storekit extraction
 
-**Historical**: how the crate was lifted out of `~/code/deploy`. `README.md` is the
-current contract, [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md) the constraints
-the public API now carries, and [`docs/CONSISTENCY.md`](docs/CONSISTENCY.md) the rules
-the work earned. Where a name below has since changed, the source is authoritative.
+**Historical.** This is how the crate was lifted out of `~/code/deploy`. `README.md` is
+the current contract, [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md) the
+constraints the public API now carries, and [`docs/CONSISTENCY.md`](docs/CONSISTENCY.md)
+the rules the work earned. Where a name below has since changed, the source is
+authoritative.
 
 `~/code/deploy` was the read-only source of truth. Each slice ported the named
-production code **and its tests**, applied the adaptations below, and had to pass the
-gate. Do not invent a new design where a faithful port exists: the value of this crate
-is the semantics already encoded in the source, and those live in the doc comments and
-the tests.
+production code and its tests, applied the adaptations below, and had to pass the gate.
+Do not invent a new design where a faithful port exists: the value of this crate is the
+semantics already encoded in the source, and those live in the doc comments and the
+tests.
 
 ## Adaptations (every slice)
 
 1. **Error type.** `crate::error::Error` is the crate's own. Every condition a caller
-   must branch on is a TYPED VALUE rather than message text (see
-   [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md) #4): the variants carry
-   `{ kind, message }`, the constructors are `*_kind(kind, msg)`, and the MESSAGE TEXT
-   is preserved verbatim so a text-matching caller keeps working. A
-   `crate::kernel::KernelError` variant does not exist here; if a ported file needs
-   one, that file is domain code and must be dropped.
-2. **Visibility.** An item is `pub` only if a CONSUMER needs it; `pub(crate)` is the
-   default answer for anything the crate's own paths can reach. A deletion justified
-   by *"the crate's own tests do not use it"* is not justified at all. The durable
-   guard is `tests/consumer_fit.rs`: it NAMES the call shapes a consumer's interface
-   requires, exercises them through the public API only, and fails to COMPILE if one
-   is removed or its signature changes — for a name a consumer CALLS today and for a
-   name the crate HOLDS for a planned consumer, which the guard's own header
-   distinguishes.
+   must branch on is a typed value rather than message text (see
+   [`docs/API-CONSTRAINTS.md`](docs/API-CONSTRAINTS.md), constraint 4): the variants
+   carry `{ kind, message }`, the constructors are `*_kind(kind, msg)`, and the message
+   text is preserved verbatim so a text-matching caller keeps working. A
+   `crate::kernel::KernelError` variant does not exist here; if a ported file needs one,
+   that file is domain code and must be dropped.
+2. **Visibility.** An item is `pub` only if a consumer needs it; `pub(crate)` is the
+   default answer for anything the crate's own paths can reach. A deletion justified by
+   "the crate's own tests do not use it" is not justified at all. The durable guard is
+   `tests/consumer_fit.rs`: it names the call shapes a consumer's interface requires,
+   exercises them through the public API only, and fails to compile if one is removed or
+   its signature changes — for a name a consumer calls today and for a name the crate
+   holds for a planned consumer, which the guard's own header distinguishes.
 3. **Test helpers.** `crate::testutil::{fixture_env, fixture_tmpdir, proptest_cases,
    slow_tests_enabled}` are `crate::test_support::{...}` here. Any other
    `crate::testutil::*` use means the test is domain-bound: drop it and record the drop.
 4. **No application domain.** Forbidden anywhere in this crate: `config`, `ledger`,
    `kernel`, `retention`, `deploy::*`, `remote::helper`, `remote::layout`,
    `store::local`, `identity::{ReleaseId, DeploymentId, …}`. Where a ported file depends
-   on one, apply that slice's **domain cut** — the cut must preserve the source's
-   behaviour with the domain value supplied by the CALLER, never deleted silently.
+   on one, apply that slice's domain cut. The cut must preserve the source's behaviour
+   with the domain value supplied by the caller, never delete it silently.
 5. **Doc comments are part of the port.** They carry the invariants and the rationale.
    Keep them; rewrite only intra-doc links that no longer resolve.
 6. **Dropped tests are reported, not stubbed.** A test needing a domain fixture is
@@ -43,10 +43,10 @@ the tests.
    assertion with a weaker one to keep a test compiling.
 7. **No new dependencies** without a reason in the report.
 8. **Windows.** The `#[cfg(windows)]` modules are required and part of the gate: a
-   Windows file and its TESTS must COMPILE. Gate a test that genuinely needs a unix
-   primitive with `#[cfg(unix)]` (and say what it needs); never gate a production
-   Windows file. The port's RUNTIME remains unverified, and the crate says so
-   wherever it matters.
+   Windows file and its tests must compile. Gate a test that genuinely needs a Unix
+   primitive with `#[cfg(unix)]` and say what it needs; never gate a production Windows
+   file. The port's runtime remains unverified, and the crate says so wherever it
+   matters.
 
 ## Slices
 
@@ -59,7 +59,7 @@ the tests.
 | transport | `src/remote/transport/**`, `runner/**`, `ssh/**` | the `Remote` trait, the local transport, ssh |
 | manifest | `src/remote/canonical/mod.rs` (tree half) | the two tree walks, assembly, the digest, the wire |
 | sync | *(new code)* | diff, apply, ownership, residue, the report |
-| — | `src/remote/canonical/materialize.rs` | NOT ported: a config-driven mapping/template materializer, i.e. consumer DOMAIN |
+| — | `src/remote/canonical/materialize.rs` | not ported: a config-driven mapping/template materializer, i.e. consumer domain |
 
 The `id` newtype macro names `serde` through the crate, so a call site needs no `serde`
 dependency of its own.

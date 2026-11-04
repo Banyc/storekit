@@ -1183,8 +1183,7 @@ pub enum EntryPolicy {
     /// far-side `O_APPEND` + `fsync` command or a local fd-confined
     /// `O_APPEND` open; it is NOT part of this crate. This warning is a
     /// documentation fix and deliberately does not change `AppendTail`'s
-    /// behaviour. Adding such a primitive is an owner decision — see the
-    /// README's "Design conflicts the `deploy` migration surfaced".)
+    /// behaviour. Adding such a primitive is an owner decision.)
     ///
     /// KNOWN COST: an append is O(TOTAL SIZE), not O(appended bytes). There is
     /// no [`Remote::append`](crate::transport::Remote) primitive, so the append
