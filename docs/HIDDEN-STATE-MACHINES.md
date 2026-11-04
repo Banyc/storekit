@@ -44,7 +44,7 @@ its entry corrected, in the round that lands it.
 | Claim, rollback, and residue reconciliation | TYPED |
 | Deletion-sanction state | TYPED |
 | AppendTail compare-and-append loop | TYPED — the attempt's verdict is `AppendAttempt::{Done, Changed}`; the retry bound is policy and the live destination is the filesystem's |
-| Case-sensitivity probe and fold gate | OPEN — `case-sensitivity` |
+| Case-sensitivity probe and fold gate | TYPED — `CaseSensitivity` is the three-state answer; a created `CaseProbe` carries both spellings |
 | Verification passes | TYPED |
 | Report partition | TYPED |
 | Lazy local root | TYPED |
