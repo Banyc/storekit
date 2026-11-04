@@ -199,3 +199,12 @@ Comments only; 44 sentences/clauses deleted, 30 claims corrected; both previousl
 | src/atomic/guard.rs | funnel/allow/deny prose and pins | kept-corrected | `clippy.toml`, `every_production_libc_reference_is_pinned`, `std_fs_name_mutation_counts_are_pinned`, `reconciled_denied_symbols`, `funnel_region_modules` |
 | src/atomic/guard.rs | AST-walk prose (`syn`, macro bodies, `#[path]`/`include!`) | kept-corrected | `parse_crate`, `macro_body_public_path_fns`, `is_test_only` |
 | src/atomic/guard.rs | reserved-spelling and `OwnedRoot::parse` claims; inline comments | kept-corrected | `refuse_reserved_mutation`, three minting constructors, `symlink_metadata`/`canonicalize` |
+
+## Slice 7 — `src/manifest/mod.rs` (change `wrzsmyrq`)
+
+| File | Section | Disposition | Symbols re-derived from |
+|---|---|---|---|
+| src/manifest/mod.rs | module docs: wire format, path limits, NFC, fidelity scope | kept-corrected | remote script, `validate_entry_path`, `mode_octal`, `verify_tree_metadata` |
+| src/manifest/mod.rs | containment / relative-target rule (the "complete list" framing deleted; shapes described, not enumerated) | kept-corrected | `walk_relative_symlink_target`, `SymlinkTargetRefusal`, `ContainmentViews::refuses`, `SymlinkContainmentIndex` |
+| src/manifest/mod.rs | `EntryAssembler`, `UnsupportedSink`, `CompleteListing`, `ShownPath`, post-pass | kept-corrected | `finish`, `require_parent_closed`, `CompleteListing::new` |
+| src/manifest/mod.rs | item docs + inline comments (canonicalize_tree_with, wire assembler, scripts) | kept-corrected | each item's body |
