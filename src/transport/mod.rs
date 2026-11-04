@@ -1,25 +1,23 @@
 //! The transport stack: connectivity to one server's remote root.
 //!
 //! The [`Remote`] trait plus the in-process [`LocalTransport`] lead this
-//! module; the production SSH transport over `ssh`/`scp`, host-identity
-//! verification and pinning (a strict known-hosts file or a pre-verified
-//! fingerprint, never trust-on-first-use), and the ONE bounded subprocess
-//! runner every ssh operation goes through live in the `ssh` submodule group.
+//! module; the production SSH transport over `ssh`, host-identity verification
+//! and pinning (a strict known-hosts file or a pre-verified fingerprint, never
+//! trust-on-first-use), and the ONE bounded subprocess runner every ssh
+//! operation goes through live in the `ssh` submodule group.
 //!
 //! Transport setup is split into two phases: [`Remote::prepare_identity`]
-//! (verify/pin the host key) runs before ANY remote request — including a dry
-//! run's status inspection — while [`Remote::provision_layout`] (create the
-//! deployment-directory layout) runs only behind the push engine's
-//! non-dry-run gate.
+//! (verify/pin the host key) runs before the run's first remote request, while
+//! [`Remote::provision_layout`] (create the deployment-directory layout) runs
+//! only from the sync engine's push path, on the remote destination.
 //!
 //! # Submodules
 //!
 //! * `runner` — the shared bounded child-runner: synchronized child
 //!   ownership, process-group termination, and mandatory wait/reap before
 //!   every returned outcome (used by [`LocalTransport::exec`]).
-//! * `scripted` — the deterministic fake exec the property tests inject
-//!   (test-only): scripted outcomes keyed by argv, no subprocess, no
-//!   wall-clock — the parallel-safety seam.
+//! * `scripted` — the deterministic fake exec (test-only): scripted outcomes
+//!   keyed by argv, no subprocess, no wall-clock.
 //! * `ssh` — the SSH transport group: the [`SshTransport`] itself plus
 //!   host-key verification (`ssh::hostkey`) and the bounded subprocess
 //!   runner (`ssh::runner`).
@@ -33,8 +31,8 @@
 //! never followed, with NO check-then-act window — the same guarantee the
 //! crate's fd-confined `Side::Local` destination gives. That includes the
 //! READS used as verification sources — `read`, `read_link`, and `metadata_opt`
-//! (and therefore `metadata`, `kind_opt`/`mode_opt` over a [`Remote`], and the
-//! [`Remote::exists`] default that delegates to `metadata_opt`) — so a
+//! (and therefore `metadata`, the applier's `kind_opt`/`mode_opt` built on it,
+//! and the [`Remote::exists`] default that delegates to `metadata_opt`) — so a
 //! content/kind/mode verdict can never be computed from an
 //! object outside the pinned root.
 //!
@@ -59,8 +57,8 @@
 //!
 //! The [`SshTransport`] far side is a shell script this crate may not change
 //! (the `ssh` submodule group), so it CANNOT give that guarantee on its own.
-//! There the applier's `sync` preflight is the guarantee: every destination
-//! mutation first verifies, with `lstat`, that every strict ancestor component
+//! There the applier's `guard_destination` preflight is the guarantee: every
+//! destination mutation first verifies, with `lstat`, that every strict ancestor component
 //! is a REAL directory, so a PRE-EXISTING symlink component is refused before
 //! the operation runs. A component SWAPPED between that preflight check and the
 //! operation remains a residual race — the same class as the already-documented
@@ -94,14 +92,18 @@ use walkdir::WalkDir;
 /// * [`Layout::bootstrap_dirs`] — the directories `provision_layout` creates
 ///   before the first mutation.
 /// * [`Layout::lock`] — the operation-lock record. Every sidecar-serialized
-///   mutation of THIS path (create-new, compare-and-delete, recover) runs
-///   under the flock on [`Layout::lock_sidecar`]. This is the IN-ROOT layout
+///   mutation of THIS path runs under the flock on [`Layout::lock_sidecar`]:
+///   create-new ([`Remote::try_write_new`], [`Remote::try_write_new_with`]),
+///   compare-and-delete ([`Remote::remove_file_if`]), and recovery
+///   ([`Remote::atomic_recover`] — remove the record if it still equals the
+///   observed bytes, then install the replacement). This is the IN-ROOT layout
 ///   lock. It is a DIFFERENT FILE from the sync's destination operation lock
 ///   ([`crate::sync::destination_lock_path`], a SIBLING of the destination
 ///   root), so the two locks DO NOT exclude each other: holding this one does
 ///   not exclude a [`crate::sync::sync`], and a sync holding its own record
-///   does not exclude a holder of this one. A caller that wants both must take
-///   both; neither path composes the other.
+///   does not exclude a holder of this one. The crate's composed ownership
+///   form ([`crate::sync::DestinationOwnership::lock_with_in_root_lock`]) takes
+///   BOTH records, the sibling record first.
 /// * [`Layout::lock_sidecar`] — the flock mutex file serializing mutations of
 ///   [`Layout::lock`]. Created once durably and never removed, so every
 ///   participant flocks the same inode. A caller that must hold this critical
@@ -192,16 +194,6 @@ impl std::fmt::Display for ReceiverId {
     }
 }
 
-/// The remote-state protocol version. Bumped 1 -> 2 when the remote
-/// generation record (`generations/<gen>/assignment.json`) gained the OWNER
-/// MARKER (`application`/`slot`): a protocol-1 client would parse a
-/// protocol-2 record WITHOUT the owner fields (serde ignores unknown
-/// fields) and drive state whose ownership it cannot verify, so the
-/// handshake must refuse a version mismatch in either direction (an old
-/// client can never drive a state directory written by a newer one, and
-/// vice versa). The protocol-2 read path additionally fails closed on a
-/// record WITHOUT the owner marker (a required-field parse failure — a
-/// legacy/transplanted record is never read as a valid deployment).
 pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug)]
@@ -224,29 +216,25 @@ pub struct RemoteMeta {
 
 /// The typed cause of an [`ExecOutcome`] that carries the runner's `-1`
 /// sentinel rather than a collected exit status — the outcome shape is
-/// `exit_code == -1` either way, so the cause must be explicit. Bounding the
-/// post-exit output drain made `-1` mean TWO different things, and a consumer
-/// (and the manifest classifier) has to tell "the deadline killed a RUNNING
-/// command" from "the command ran and exited, and only its bounded output
-/// drain gave up".
+/// `exit_code == -1` either way, so the cause must be explicit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeoutCause {
     /// The deadline fired while the command's child was still running: it was
-    /// killed and reaped, so no exit status exists.
+    /// killed and reaped, so no exit status exists. This is the ONE cause
+    /// [`Exec for ChildRunner`] reports.
     CommandStillRunning,
-    /// The command RAN and EXITED (its child was reaped and its exit status
-    /// WAS collected), but a process that outlived the child still held a
-    /// pipe open, so the bounded post-exit output drain gave up and the
-    /// collected status could not be reported — the visible `exit_code` is
-    /// the `-1` sentinel, not a status.
+    /// The command RAN and EXITED, but the bounded post-exit output drain gave
+    /// up, so the collected status could not be reported and the visible
+    /// `exit_code` is the `-1` sentinel, not a status.
     ///
     /// The bound the drain gave up at is the runner's POST-EXIT DRAIN bound
-    /// (the internal `KILL_REAP_BOUND` / `RunnerConfig::reap_bound`), which is
+    /// (the internal `KILL_REAP_BOUND` / [`RunnerConfig::reap_bound`]), which is
     /// INDEPENDENT of the caller's deadline: a command that exits early and
-    /// leaves a pipe-holding process produces this cause at the drain bound
-    /// even though the deadline was never reached. It therefore does NOT claim
-    /// that a deadline was outlasted. It is NOT the transport-before-command
-    /// layer — the command started and finished.
+    /// leaves a pipe-holding process reaches that bound even though the
+    /// deadline was never reached. It therefore does NOT claim that a deadline
+    /// was outlasted. [`Exec for ChildRunner`] surfaces a drain failure as an
+    /// ERROR instead, so a consumer must not assume this crate's local runner
+    /// emits this cause.
     OutputDrainGaveUp,
 }
 
@@ -257,14 +245,10 @@ pub struct ExecOutcome {
     pub stderr: String,
     /// `Some` when the runner reported its `-1` sentinel rather than a
     /// collected exit status: the typed cause says WHICH case, so a consumer
-    /// never has to infer it. The two causes are
-    /// [`TimeoutCause::CommandStillRunning`] (the deadline killed a running
-    /// command) and [`TimeoutCause::OutputDrainGaveUp`] (the command ran and
-    /// exited but its bounded post-exit drain gave up; the status was
-    /// collected and then discarded, so it is not reported). `None` for a
-    /// normally exited command. A signal-killed child also reports
-    /// `exit_code == -1` with `None`, so a consumer must NOT infer "deadline"
-    /// — or any other cause — from `-1` alone.
+    /// never has to infer it. `None` for a normally exited command. A
+    /// signal-killed child also reports `exit_code == -1` with `None`, so a
+    /// consumer must NOT infer "deadline" — or any other cause — from `-1`
+    /// alone.
     pub timeout_cause: Option<TimeoutCause>,
 }
 
@@ -277,12 +261,10 @@ impl ExecOutcome {
 /// THE command-execution seam behind [`LocalTransport::exec`]. Production
 /// uses [`ChildRunner`] (the bounded real runner: spawn into an own process
 /// group, bounded wait, group termination, mandatory reap before every
-/// outcome); the deterministic deployment/state-machine properties inject a
-/// scripted fake (`ScriptedExec`, test-only: scripted outcomes keyed by argv
-/// — no subprocess, no wall-clock). The seam is what makes the property
-/// suites parallel-safe: the deterministic tests exercise the SAME logic
-/// branches (verification success/failure, activation, compensation) without
-/// spawning real processes or contending for the pid space.
+/// outcome); the test-only `scripted` submodule supplies a deterministic fake
+/// implementing the same trait (scripted outcomes keyed by argv — no
+/// subprocess, no wall-clock) for a transport built with
+/// [`LocalTransport::with_exec`].
 pub trait Exec: Send + Sync {
     /// Execute `argv` (no shell) bounded by `timeout`, returning the
     /// outcome. A conforming implementation never leaves a live process
@@ -409,10 +391,13 @@ pub trait FarSideLockSession: Send {
 
 /// Filesystem + execution surface for one server's remote root.
 ///
-/// Every path a transport operation receives is a validated
+/// Every DESTINATION path a transport operation receives is a validated
 /// [`RootedRelativePath`]: relative to the deployment root, never absolute,
 /// never traversal-bearing — so `root.join(rel)` inside a transport is safe
-/// by construction and a caller can never escape the deployment root.
+/// by construction and a caller can never escape the deployment root. (Two
+/// arguments are deliberately NOT rooted relative paths: the [`Remote::symlink`]
+/// link TARGET, which legitimately traverses up to an object store, and the
+/// absolute FAR-SIDE record path of [`Remote::lock_far_side`].)
 pub trait Remote {
     fn root(&self) -> &Path;
     /// Whether `root()` names a path on THIS host (a [`LocalTransport`]) or
@@ -442,14 +427,15 @@ pub trait Remote {
     ///
     /// `None` means the transport cannot state an endpoint identity. It is the
     /// DEFAULT so third-party implementations keep compiling, and it is SAFE
-    /// for read-only use: a `None` identity still compares equal to another
-    /// `None`, so a token minted through [`Remote::lock_far_side`]'s
-    /// local-destination sibling is not silently strengthened. It is NOT safe
-    /// to MINT a remote ownership token from: see
+    /// for a LOCAL destination: a `None` identity still compares equal to
+    /// another `None`, so a token minted for a local destination (where the
+    /// transport is local and states no identity) is not silently weakened.
+    /// It is NOT safe to MINT a remote ownership token from: see
     /// [`Remote::lock_far_side`] and
     /// [`crate::sync::DestinationOwnership::lock_remote`], which REFUSE a
-    /// `None` identity rather than hand out an unbound token. A transport that
-    /// wants remote ownership MUST override this.
+    /// non-local transport with a `None` identity rather than hand out an
+    /// unbound token. A transport that wants remote ownership MUST override
+    /// this.
     fn endpoint_identity(&self) -> Option<String> {
         None
     }
@@ -457,12 +443,10 @@ pub trait Remote {
     ///
     /// MEMORY BOUND: the entire entry is materialized as one `Vec<u8>` (and the
     /// caller holds it, alongside any copy the sync makes), so peak RSS tracks the
-    /// LARGEST single entry — for BOTH snapshot and restore — and an entry near the
-    /// process's memory budget cannot be transferred at all.
-    /// There is no streaming read. Keep the largest entry under the process's
-    /// memory budget, or move large blobs outside the synced tree and ship them
-    /// with a tool that streams; a streaming transport API is a deliberate
-    /// future direction, not implemented here.
+    /// LARGEST single entry and an entry near the process's memory budget cannot
+    /// be transferred at all. There is no streaming read. Keep the largest entry
+    /// under the process's memory budget, or move large blobs outside the synced
+    /// tree and ship them with a tool that streams.
     fn read(&self, rel: &RootedRelativePath) -> Result<Vec<u8>>;
     /// Write `data` to `rel` with the final `mode`, creating or replacing the
     /// entry.
@@ -482,8 +466,8 @@ pub trait Remote {
     ///   the same shape — `mktemp` temp in the destination's own directory,
     ///   the payload on STDIN into it, the final mode, a perl `fsync(2)` of the
     ///   temp, a perl `rename(2)` into place, then a perl `fsync(2)` of the
-    ///   parent directory — so a failed upload can no longer truncate or
-    ///   destroy the entry it was replacing.
+    ///   parent directory — so a failed upload cannot truncate or destroy the
+    ///   entry it was replacing.
     /// * the Windows local port uses a path-based, NON-atomic replace (no
     ///   directory fsync; the target is removed before the rename). That is
     ///   the ONE destination kind this crate cannot make atomic; the port
@@ -507,8 +491,7 @@ pub trait Remote {
     /// min_rate, command_deadline)`), while [`LocalTransport`] has NEITHER a
     /// deadline NOR streaming. Keep the largest entry under the process's
     /// memory budget, or move large blobs outside the synced tree and ship them
-    /// with a tool that streams; a streaming transport API is a deliberate
-    /// future direction, and adding one would be a transport-layer redesign.
+    /// with a tool that streams.
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()>;
     /// Atomically create `rel` with `data` only if it does not already exist,
     /// and make the install DURABLE before returning: the create-new
@@ -539,8 +522,7 @@ pub trait Remote {
     fn try_write_new(&self, rel: &RootedRelativePath, data: &[u8]) -> Result<CreateNewVerdict>;
     /// [`Remote::try_write_new`] with a CALLER-CHOSEN content equivalence for
     /// the EEXIST verification: `Semantic` (JSON parse-equal, byte-exact
-    /// fallback) is used by the release-file publisher whose idempotent
-    /// re-publication legitimately re-serializes the same contract with
+    /// fallback) accepts a re-serialization of the same JSON contract with
     /// different key order/whitespace. Transports whose centralized
     /// verification can apply the equivalence directly (LocalTransport,
     /// SshTransport) override this; the default performs the byte-exact
@@ -581,10 +563,8 @@ pub trait Remote {
     fn create_dir(&self, rel: &RootedRelativePath) -> Result<()>;
     fn create_dir_all(&self, rel: &RootedRelativePath) -> Result<()>;
     /// Apply a permission mode to an existing remote entry (file or directory).
-    /// Uploads must preserve the canonical tree's modes exactly, or the
-    /// post-upload integrity re-hash diverges on hosts with a permissive umask
-    /// (a bare `mkdir`/`cat` inherits the remote umask, so modes must be
-    /// applied explicitly).
+    /// A bare `mkdir`/`cat` inherits the remote umask, so the canonical tree's
+    /// modes must be applied explicitly.
     fn set_mode(&self, rel: &RootedRelativePath, mode: u32) -> Result<()>;
     fn list(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>>;
     fn rename(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()>;
@@ -600,9 +580,8 @@ pub trait Remote {
     }
     /// Create a symlink at `link` (a rooted relative path) pointing at
     /// `target`. `target` is a LINK TARGET, relative to the link's own
-    /// directory — it legitimately traverses up to the object store
-    /// (`../../objects/...`), so it is a plain `&Path`, never a
-    /// [`RootedRelativePath`].
+    /// directory — it legitimately traverses upward (`../../objects/...`), so
+    /// it is a plain `&Path`, never a [`RootedRelativePath`].
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()>;
     /// Read the target of the symlink at `rel`. The returned target is a
     /// LINK TARGET (relative to the link's directory, legitimately
@@ -659,10 +638,8 @@ pub trait Remote {
             )))
         }
     }
-    /// Recursively copy the tree at `src` to `dest` — the per-file dedup's
-    /// staging base (the previous tree is copied into the staging dir, then
-    /// only the changed files are uploaded). `dest` must not already exist
-    /// (the caller removes a stale staging dir first); its parent is
+    /// Recursively copy the tree at `src` to `dest`. `dest` must not already
+    /// exist (the caller removes a stale destination first); its parent is
     /// created.
     ///
     /// FIDELITY IS NOT UNIFORM: the two realizations of this ONE operation
@@ -695,42 +672,37 @@ pub trait Remote {
         copy_tree_walk(self, src, dest, &mut pending)?;
         pending.finalize(self)
     }
-    /// Recursively fsync every file and directory under `rel` (the staged
-    /// release bundle), making the WHOLE tree durable before the atomic
-    /// install rename — a crash after the fsync but before the rename loses
-    /// at most the disposable staging dir, never a partial final release
-    /// directory. The DEFAULT is a no-op (test wrappers that delegate to an
-    /// inner transport inherit the inner's implementation); the production
-    /// transports ([`LocalTransport`], [`SshTransport`]) realize it for
-    /// real. STATED RESIDUAL (API constraint #8): the reach of the no-op
-    /// default is any `Remote` implementation that neither overrides this nor
-    /// delegates to one that does, so a PRODUCTION transport that omits the
-    /// override makes nothing durable SILENTLY; a caller that needs durability
-    /// from a transport it did not write must confirm the override.
+    /// Recursively fsync every file and directory under `rel`, making the
+    /// WHOLE tree durable before a caller's atomic install rename. The DEFAULT
+    /// is a no-op (test wrappers that delegate to an inner transport inherit
+    /// the inner's implementation); the production transports
+    /// ([`LocalTransport`], [`SshTransport`]) realize it for real. STATED
+    /// RESIDUAL (API constraint #8): the reach of the no-op default is any
+    /// `Remote` implementation that neither overrides this nor delegates to one
+    /// that does, so a PRODUCTION transport that omits the override makes
+    /// nothing durable SILENTLY; a caller that needs durability from a
+    /// transport it did not write must confirm the override.
     ///
     /// MAKING A FRESHLY PUSHED SUBTREE DURABLE takes TWO calls on the PARENT
     /// transport: `fsync_tree(<child>)` makes everything UNDER the child
     /// durable (including the child directory itself), and
     /// `fsync_parent(<child>)` makes the PARENT directory entry that names the
-    /// child durable. A per-subtree transport cannot perform the second call
-    /// on its own root, because the PUBLIC constructor refuses the empty path and the
-    /// only empty value the crate mints names its own owned root, so the transport
-    /// rooted AT the child cannot name the child to fsync the grandparent. The recipe is therefore:
-    /// `parent.fsync_tree(child)` then `parent.fsync_parent(child)`, both on
-    /// the transport rooted at the child's PARENT.
+    /// child durable. A transport rooted AT the child cannot name the child
+    /// (the public constructor refuses the empty path and a root-relative path
+    /// has no `..`), so it cannot fsync the grandparent. The recipe is
+    /// therefore: `parent.fsync_tree(child)` then `parent.fsync_parent(child)`,
+    /// both on the transport rooted at the child's PARENT.
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
         let _ = rel;
         Ok(())
     }
     /// Fsync the PARENT DIRECTORY of `rel` so a rename/removal/creation
     /// inside it survives power loss (on Linux — see the README's durability
-    /// assumption) — the durability commit point of every
-    /// atomic mutation (the staged-publish renames, the `current` symlink
-    /// swap, the record replaces): a mutation's success is reported ONLY
-    /// after this succeeds. FAIL-CLOSED: a failed open OR a failed fsync is
-    /// a propagated `Err` (never a silent success — the directory entry's
-    /// durability is unconfirmed). The DEFAULT is a no-op (test wrappers
-    /// that delegate to an inner transport inherit the inner's
+    /// assumption) — a caller's durability commit point: a mutation's success
+    /// is reported ONLY after this succeeds. FAIL-CLOSED: a failed open OR a
+    /// failed fsync is a propagated `Err` (never a silent success — the
+    /// directory entry's durability is unconfirmed). The DEFAULT is a no-op
+    /// (test wrappers that delegate to an inner transport inherit the inner's
     /// implementation); the production transports ([`LocalTransport`],
     /// [`SshTransport`]) realize it for real. STATED RESIDUAL (API constraint
     /// #8): as for [`Remote::fsync_tree`], the reach of the no-op default is
@@ -745,15 +717,33 @@ pub trait Remote {
         Ok(())
     }
     /// Atomically remove `rel` ONLY IF its content is byte-identical to
-    /// `expected` — the compare-and-delete primitive that makes stale
-    /// releases and expired-lease breaks safe. Returns the TYPED verdict
+    /// `expected` — the compare-and-delete primitive that makes a stale
+    /// release or a lock break safe. Returns the TYPED verdict
     /// ([`RemoveIfVerdict`]); every transport failure propagates as `Err`
     /// (never a fabricated verdict, never a silent no-op). The production
-    /// transports ([`LocalTransport`], [`SshTransport`]) realize it
-    /// ATOMICALLY: the entry is CLAIMED by an atomic rename to a unique
-    /// same-directory temp (only one contender can win), verified against
-    /// `expected`, and either deleted (match) or RESTORED no-replace
+    /// transports ([`LocalTransport`], [`SshTransport`]) pick ONE of TWO
+    /// routes per call, from the mutation's OWN `OwnedLockRecord` scope and —
+    /// in the LOCAL override only — the calling thread's held bit: its route
+    /// is `RemoveIfRoute::Serialized` iff
+    /// `guarded.is_owned_lock_record() || sidecar_held()`, and
+    /// `RemoveIfRoute::Claim` otherwise. The read-compare-unlink therefore
+    /// runs SERIALIZED under the layout's sidecar `flock`
+    /// (`RemoveIfRoute::Serialized` locally, `remove_file_if_sidecar_cmd`
+    /// far-side) for the ONE lock record the layout OWNS (see below) AND for
+    /// ANY name whose mutation this thread performs while it holds that
+    /// sidecar: a DIRECT read, compare, and unlink with the entry continuously
+    /// visible, so a mismatch leaves it — inode included — untouched
+    /// (`SshTransport`'s predicate is the byte-exact ownership alone: the owned
+    /// record takes the far-side sidecar command, every other name the claim
+    /// script). A name OUTSIDE that section — not the owned lock record, and
+    /// the sidecar not held by this thread — is CLAIMED by an atomic rename to
+    /// a unique same-directory temp (only one contender can win), verified
+    /// against `expected`, and either deleted (match) or RESTORED no-replace
     /// (mismatch — a successor's lock is never removed, never replaced).
+    /// Claiming is never applied to the owned lock record:
+    /// its no-replace `hard_link` restore re-publishes a NEW inode for the
+    /// same path and splits the holder, which is exactly what the sidecar
+    /// route exists to prevent.
     /// The DEFAULT implementation is the NON-ATOMIC read-compare-remove
     /// fallback: adequate for single-process test wrappers that never race
     /// the lock, and only those; production must override it. STATED RESIDUAL
@@ -809,12 +799,9 @@ pub trait Remote {
     /// branches on `Ok(None)` versus `Err`.
     ///
     /// This is a NAMED weak path, not a hidden one (API constraint #8, verdict
-    /// N): it exists because it is part of the INTERFACE this crate was
-    /// extracted from — a consumer's transport trait declares it and its
-    /// production code calls it (see `docs/CONSISTENCY.md`, axis M). A consumer
-    /// writing `matches!(metadata_opt(..), Ok(Some(_)))` by hand is no safer,
-    /// only more verbose, and can get the conflation wrong the same way, so the
-    /// honest contract is to name the weakness at the name.
+    /// N). A caller writing `matches!(metadata_opt(..), Ok(Some(_)))` by hand
+    /// is no safer, only more verbose, and can get the conflation wrong the same
+    /// way, so the honest contract is to name the weakness at the name.
     fn exists(&self, rel: &RootedRelativePath) -> bool {
         matches!(self.metadata_opt(rel), Ok(Some(_)))
     }
@@ -825,17 +812,13 @@ pub trait Remote {
     /// is deliberately unconstrained: it does NOT take the destination's
     /// operation lock, does NOT verify or confine the paths the command
     /// touches, does NOT apply the crate's own operation protocol, and returns
-    /// the raw outcome. Rule 9's framings (one quoted word per operand, `--`
-    /// before a value that may start with `-`, wire records delimited by a byte
-    /// a name cannot contain) are applied to the crate's OWN scripts, not to
-    /// arbitrary caller `argv`; the implementations pass each token as ONE
-    /// argument with no shell re-splitting, but a caller that interpolates
-    /// untrusted data into `argv` still owns its framing, and a caller that
-    /// runs a destructive command owns its effect. The reach is any public
-    /// caller (and every [`Remote`] default that shells out, such as
-    /// [`Remote::remove_dir`]), and it cannot be closed without removing the
-    /// seam that those defaults and the test transports are built on; it is
-    /// therefore stated here, where a consumer reads it.
+    /// the raw outcome. The implementations pass each token as ONE argument with
+    /// no shell re-splitting, but a caller that interpolates untrusted data into
+    /// `argv` still owns its framing, and a caller that runs a destructive
+    /// command owns its effect. The reach is any public caller (and every
+    /// [`Remote`] default that shells out, such as [`Remote::remove_dir`]), and
+    /// it cannot be closed without removing the seam that those defaults are
+    /// built on; it is therefore stated here, where a consumer reads it.
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
     /// Total and available bytes on the filesystem backing the remote root.
     /// `total` is the filesystem's full size; `available` is the free space a
@@ -884,10 +867,9 @@ pub trait Remote {
     /// Atomic recover of the operation lock: remove `rel` iff it equals
     /// `observed`, then install `new_data`, all while holding the sidecar
     /// mutex exclusively. Returns `Ok(Some(()))` on success, `Ok(None)` if
-    /// not implemented (caller falls back to helper-layer flock), `Err` on
-    /// mismatch/absent/contended/transport failure. Object-safe so
-    /// `RemoteHelper` can call it via `&dyn Remote` without knowing the
-    /// transport.
+    /// not implemented, `Err` on mismatch/absent/contended/transport failure.
+    /// Object-safe, so a helper can call it through `&dyn Remote` without
+    /// knowing the transport.
     fn atomic_recover(
         &self,
         rel: &RootedRelativePath,
@@ -898,10 +880,8 @@ pub trait Remote {
         Ok(None)
     }
 
-    /// Prepare the host identity (verify/pin the host key) before ANY remote
-    /// request, including read-only status inspection in a dry run. A dry run
-    /// still connects over the transport to inspect status, so the identity
-    /// must be prepared first. Construction is side-effect-free; identity
+    /// Prepare the host identity (verify/pin the host key) before the run's
+    /// first remote request: construction is side-effect-free, and identity
     /// preparation happens before the first request that needs to connect.
     /// Default: no-op (transports without a host-identity concept, like
     /// `LocalTransport`).
@@ -911,17 +891,15 @@ pub trait Remote {
     }
 
     /// Create the deployment-directory layout before the first mutation.
-    /// Construction is side-effect-free; layout provisioning happens only after
-    /// the push engine's non-dry-run gate. The DEFAULT is a no-op (the trait
-    /// method has no access to a [`Layout`]); the transports that override it
-    /// ([`LocalTransport`], [`SshTransport`]) create the destination ROOT
-    /// ITSELF, the caller's bootstrap directories, AND, when
-    /// [`Layout::receiver_marker`] is `Some`, the immutable receiver-id marker
-    /// (created ONCE at provisioning and never changed). Creating the ROOT is
-    /// what makes a FRESH destination usable: the push entry points call this
-    /// before reading the destination manifest, and `LocalTransport` already
-    /// created its base while `SshTransport` used to omit the root (so the same
-    /// consumer call worked locally and failed only on the remote path).
+    /// Construction is side-effect-free; layout provisioning happens only on the
+    /// sync engine's push path, for a remote destination, before its manifest is
+    /// read. The DEFAULT is a no-op (the trait method has no access to a
+    /// [`Layout`]); the transports that override it ([`LocalTransport`],
+    /// [`SshTransport`]) create the destination ROOT ITSELF, the caller's
+    /// bootstrap directories, AND, when [`Layout::receiver_marker`] is `Some`,
+    /// the immutable receiver-id marker (created ONCE at provisioning and never
+    /// changed). Creating the ROOT is what makes a FRESH destination usable:
+    /// the push path calls this before reading the destination manifest.
     fn provision_layout(&self) -> Result<()> {
         Ok(())
     }
@@ -970,11 +948,11 @@ impl PendingFinalModes {
 /// caller's phase 2.
 ///
 /// The walk keeps an explicit heap `Vec` of frames instead of recursing one
-/// Rust frame per directory level: a deep tree used to exhaust the C stack,
-/// and Rust's stack-overflow handler ABORTS the host process — a library
+/// Rust frame per directory level: a deep tree would otherwise exhaust the C
+/// stack, and Rust's stack-overflow handler ABORTS the host process — a library
 /// must surface a clean `Err` instead. Each frame holds the directory's
 /// `(src, dest)` and the entries [`Remote::list`] returned, so the visit order
-/// is exactly the recursion's depth-first order.
+/// is exactly a recursion's depth-first order.
 fn copy_tree_walk<R: Remote + ?Sized>(
     remote: &R,
     src: &RootedRelativePath,
@@ -1073,9 +1051,9 @@ impl MarkerState {
         // adoption exists, so an operator does not have to read this source to
         // diagnose it.
         let trimmed = s.trim();
-        // The DISTINCTION the doctrine names: a marker in the SOURCE TOOL's
-        // legacy `recv-<uuid-v7>` format is a recognizable migration situation,
-        // while arbitrary garbage is a corrupted/foreign file. The message names
+        // The DISTINCTION the marker kinds name: a marker in the legacy
+        // `recv-<uuid-v7>` format is a recognizable migration situation, while
+        // arbitrary garbage is a corrupted/foreign file. The message names
         // both causes; the KIND says which one this content is, so an operator
         // does not have to read the text to know whether to migrate or
         // investigate.
@@ -1138,7 +1116,7 @@ pub(crate) fn read_receiver_id<R: Remote + ?Sized>(
     MarkerState::probe(remote, marker)?.require(remote, marker)
 }
 
-/// Whether `content` has the SOURCE TOOL's legacy receiver-marker shape:
+/// Whether `content` has the legacy `recv-<uuid-v7>` receiver-marker shape:
 /// `recv-` followed by a dashed UUID (`8-4-4-4-12` lowercase hex). This is a
 /// CONSERVATIVE shape test, not a UUID validator: it exists only to tell a
 /// recognizable legacy marker from an arbitrary corrupted/foreign file, and a
@@ -1196,8 +1174,8 @@ pub(crate) fn provision_receiver_id<R: Remote + ?Sized>(
 /// True when `p` has at least one NORMAL path component below the root —
 /// i.e. `p` is not the filesystem root (nor a root-with-only-dots form that
 /// normalizes to it, like `//` or `/./`). A transport must never operate on
-/// `/`: deployment cleanup (rotation/retention deleting stale generations,
-/// the GC sweep) would otherwise run against system-level directories.
+/// `/`: a deployment root at the filesystem root would make every confined
+/// operation (and any recursive removal) run against system-level directories.
 pub(crate) fn has_normal_component_below_root(p: &Path) -> bool {
     p.components()
         .any(|c| matches!(c, std::path::Component::Normal(_)))
@@ -1214,11 +1192,21 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 }
 
 /// The canonical FINAL MODE for immutable records installed through
-/// [`Remote::try_write_new`]: the same `0o644` every sibling JSON record is
-/// written with (the inventory, transactions, and the force-path lock rewrite
-/// all use `Remote::write(..., 0o644)`). The published inode must carry THIS
-/// mode — never the process umask the temp was created with — or the record's
-/// permissions would silently depend on the caller's umask.
+/// [`Remote::try_write_new`]: `0o644`, the mode the records on THAT path
+/// carry — the deploy dir's receiver-id marker ([`provision_receiver_id`]), the
+/// operation-lock sidecar mutex file (local
+/// [`ensure_operation_lock_sidecar_durable`], remote
+/// `SshTransport::try_write_new_sidecar_cmd`), and a [`Claimed`] record
+/// restored after a failed compare. It is NOT the mode of every immutable
+/// record this crate writes: the lock record itself is PRIVATE (`0o600`),
+/// requested at creation and re-applied on every acquisition by
+/// [`crate::lock::FileLock::acquire`] — the mode pinned by `crate::lock`'s
+/// `the_lock_record_is_private` test — and the pinned known-hosts file is
+/// `0o600` as well (the chmod at the end of
+/// `crate::transport::ssh::hostkey`'s pin writer). Neither is created through
+/// `try_write_new`, so neither is scoped by this constant. The published inode
+/// must carry THIS mode — never the process umask the temp was created with —
+/// or the record's permissions would silently depend on the caller's umask.
 pub(crate) const IMMUTABLE_RECORD_MODE: u32 = 0o644;
 
 /// How long a contender waits for the operation-scoped sidecar mutex before
@@ -1381,8 +1369,7 @@ pub fn with_operation_lock_sidecar<R>(
 
 /// The answer to ONE sidecar acquisition attempt: the critical section is a
 /// VALUE the caller holds, so "did I acquire it?" and "is this call nested?"
-/// are decided once, at acquisition, instead of being re-read from an ambient
-/// depth at every mutation.
+/// are decided once, at acquisition.
 pub(crate) enum SidecarScope {
     /// This call ACQUIRED the sidecar: the hold owns the read-only descriptor
     /// the `flock` is attached to and releases it (clearing the thread-local
@@ -1451,9 +1438,8 @@ pub(crate) fn acquire_sidecar(base: &Path, sidecar: &RootedRelativePath) -> Resu
         std::thread::sleep,
     )?;
     // The held bit is raised only once the `flock` is held, and the RAII hold
-    // clears it again on EVERY exit path (a previous manual release left it
-    // raised after a caught panic, so a later call on the SAME thread would
-    // have skipped the lock while another holder was live).
+    // clears it again on EVERY exit path, including a panic unwinding through
+    // the caller's work.
     SIDECAR_HELD.with(|c| c.set(true));
     Ok(SidecarScope::Owned(SidecarHold { file }))
 }
@@ -1564,8 +1550,8 @@ pub enum CreateNewVerdict {
     /// parent-directory-fsync'd directory entry all hold.
     Created,
     /// The destination already existed and VERIFIED as an identical entry:
-    /// the `lstat` succeeded, the entry is a REGULAR FILE, its mode matched
-    /// EXACTLY, and its content matched per the caller's requested
+    /// the `O_NOFOLLOW` open succeeded, the entry is a REGULAR FILE, its mode
+    /// matched EXACTLY, and its content matched per the caller's requested
     /// equivalence — the identical retry converges, no error, no replace.
     AlreadyPresent,
     /// The destination already existed but did NOT verify as an identical
@@ -1579,9 +1565,9 @@ pub enum CreateNewVerdict {
 }
 
 /// The seven stages of the canonical create-new sequence — the crash/failure
-/// model's injection points. Test-only in practice (the proptest arms exactly
-/// one stage), but plain `pub(crate)` so the primitive can consult it in both
-/// build profiles.
+/// model's injection points. Test-only (a `CreateNewFault` is armed only by a
+/// test), but plain `pub(crate)` so the primitive can consult it in both build
+/// profiles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CreateNewStep {
     CreateTemp,
@@ -1626,9 +1612,9 @@ impl CreateNewFault {
 }
 
 /// The ONE construction of a one-shot stage-fault error — the text every
-/// injected [`CreateNewStep`] propagates. The stage is spelled by the enum's
-/// own `Debug`, so the message set is the stage set and no site can invent a
-/// fourth spelling.
+/// injected [`CreateNewStep`] fault propagates. The stage is spelled by the
+/// enum's own `Debug`, so the message set is the stage set and no site can
+/// invent a second spelling.
 fn create_new_stage_fault(step: CreateNewStep) -> Error {
     Error::transport(format!(
         "test fault: create-new step {step:?} forced to fail (once)"
@@ -1642,14 +1628,13 @@ fn create_new_stage_fault(step: CreateNewStep) -> Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentEquivalence {
     /// Byte-exact: the existing entry's bytes must equal the intended bytes.
-    /// Every immutable record's identical retry (markers, locks, the protocol
-    /// marker, assignment records) converges under this relation.
+    /// Every immutable record's identical retry (markers, locks) converges
+    /// under this relation.
     Exact,
     /// Semantic: JSON parse-equal (object key order and whitespace are not
     /// part of the contract), falling back to byte-exact when either side is
-    /// not JSON. Used by the release-file publisher whose idempotent
-    /// re-publication legitimately re-serializes the same contract with
-    /// different key order/whitespace.
+    /// not JSON, so an idempotent re-publication that re-serializes the same
+    /// JSON contract with different key order/whitespace still converges.
     Semantic,
 }
 
@@ -1773,8 +1758,7 @@ struct CreateNewTemp {
     /// The create-time handle, `Some` until the fsync stage completes: the
     /// WRITE and the FSYNC address the inode `create_new` created, never a
     /// name a concurrent actor could have re-spelled. The CHMOD stays the
-    /// crate's ONE path-based mode authority ([`crate::platform::chmod`]),
-    /// exactly as it was.
+    /// crate's ONE path-based mode authority ([`crate::platform::chmod`]).
     file: Option<std::fs::File>,
 }
 
@@ -1886,10 +1870,9 @@ impl Drop for CreateNewTemp {
     /// The ONE structural cleanup: a temp that never reached the commit point
     /// is unlinked here, so every `?`, every injected pre-publish fault, and a
     /// plain drop clean up without an unlink at the exit site. Best-effort — a
-    /// cleanup failure is ignored exactly as the hand-written cleanups ignored
-    /// it, and a leftover temp is recognized residue, never a record. The
-    /// commit point takes the name out, so this can never unlink a name after
-    /// a publish.
+    /// cleanup failure is ignored, and a leftover temp is recognized residue,
+    /// never a record. The commit point takes the name out, so this can never
+    /// unlink a name after a publish.
     #[allow(clippy::disallowed_methods)]
     fn drop(&mut self) {
         drop(self.file.take());
@@ -1900,10 +1883,9 @@ impl Drop for CreateNewTemp {
 }
 
 /// THE ONE CANONICAL CREATE-NEW PRIMITIVE — the durable install protocol for
-/// immutable records (commit markers, locks, the protocol marker, assignment
-/// and release records). Realized by [`LocalTransport::try_write_new`] on
-/// this host and by the `SshTransport` remote script (`write_new_cmd`) with
-/// the IDENTICAL seven-step sequence:
+/// immutable records (markers, locks). Realized by
+/// [`LocalTransport::try_write_new`] on this host and by the `SshTransport`
+/// remote script (`write_new_cmd`) with the IDENTICAL seven-step sequence:
 ///
 /// 1. **create temp** — a unique, dot-prefixed temp name INSIDE the
 ///    destination directory (so the no-replace publish is atomic within the
@@ -1919,9 +1901,9 @@ impl Drop for CreateNewTemp {
 /// 6. **unlink temp** — the temp name is released (best-effort cleanup — a
 ///    failure there never turns a committed install into an error; the
 ///    ERROR path propagates the REAL failure);
-/// 7. **parent-directory fsync** — the PARENT DIRECTORY is fsync'd (the step
-///    the old code claimed but never performed) so the directory entry is
-///    durable; a FAILED parent fsync is a propagated error.
+/// 7. **parent-directory fsync** — the PARENT DIRECTORY is fsync'd so the
+///    directory entry is durable; a FAILED parent fsync is a propagated
+///    error.
 ///
 /// Steps 1-4 hold the temp as the LINEAR [`CreateNewTemp`], so a
 /// pre-publish exit — each `?` and each injected [`CreateNewStep`] fault —
@@ -1996,8 +1978,8 @@ pub(crate) fn durable_create_new(
     // 5. no-replace publish — link(2) fails with EEXIST when a concurrent
     //    writer won; the winner is NEVER replaced. On EEXIST the existing
     //    entry is VERIFIED (verify-on-retry) through THE ONE CENTRALIZED
-    //    lstat-based verification ([`verify_existing`] — a regular file with
-    //    the EXACT required mode and the caller's accepted content
+    //    descriptor-bound verification ([`verify_existing`] — a regular file
+    //    with the EXACT required mode and the caller's accepted content
     //    equivalence → AlreadyPresent, the identical retry converges; every
     //    other outcome → Conflict carrying the TYPED reason). The publish is
     //    the COMMIT: the temp name is gone when it returns, whatever the
@@ -2035,20 +2017,16 @@ pub(crate) fn durable_create_new(
     //    (structurally for every pre-publish exit, explicitly and
     //    best-effort for the commit). The stage keeps its SEAM: the one-shot
     //    `Unlink` fault fires HERE, after the commit and before the parent
-    //    fsync, exactly where the hand-written sequence propagated it — so the
-    //    faulted attempt still reports an `Err` over a COMMITTED destination.
-    //    What changed is only that the temp it used to leave beside the
-    //    destination is now already gone: the state the seam manufactured is
-    //    unrepresentable, not merely unobserved.
+    //    fsync, so the faulted attempt still reports an `Err` over a COMMITTED
+    //    destination and leaves no temp beside it.
     if fail(CreateNewStep::Unlink) {
         return Err(create_new_stage_fault(CreateNewStep::Unlink));
     }
-    // 7. parent-directory fsync — the step the old code CLAIMED but never
-    //    performed: fsync the PARENT DIRECTORY so the published directory
-    //    entry survives a crash. FAIL-CLOSED: a failed open OR a failed
-    //    fsync is a propagated error (never swallowed). Runs for a Created
-    //    install AND for an AlreadyPresent retry (the convergent entry is
-    //    made durable too); a Conflict's entry is not ours to bless — it is
+    // 7. parent-directory fsync — fsync the PARENT DIRECTORY so the published
+    //    directory entry survives a crash. FAIL-CLOSED: a failed open OR a
+    //    failed fsync is a propagated error (never swallowed). Runs for a
+    //    Created install AND for an AlreadyPresent retry (the convergent entry
+    //    is made durable too); a Conflict's entry is not ours to bless — it is
     //    only ever read, never modified.
     if matches!(
         verdict,
@@ -2439,7 +2417,7 @@ pub(crate) fn verified_to_verdict(v: VerifiedExisting) -> CreateNewVerdict {
 }
 
 /// A transport that operates on a local directory, executing commands on the
-/// host. It mirrors the SSH remote layout exactly.
+/// host.
 pub struct LocalTransport {
     base: PathBuf,
     /// The caller-supplied deployment layout: the bootstrap directories
@@ -2458,8 +2436,9 @@ pub struct LocalTransport {
     /// to the mandatory reap, terminates the whole process GROUP on timeout
     /// (TERM, grace, KILL), and returns every outcome — success, timeout,
     /// error — only after the child was reaped; a timeout-kill failure is an
-    /// error, never a successful timeout outcome); the deterministic
-    /// properties inject a scripted fake (no subprocess, no wall-clock).
+    /// error, never a successful timeout outcome); an injected [`Exec`] (the
+    /// test-only `scripted` fake) has the same trait surface and spawns no
+    /// process.
     exec: Box<dyn Exec>,
 }
 
@@ -2469,13 +2448,12 @@ impl LocalTransport {
     /// ENTIRE environment. Construction
     /// is side-effect-free: no directories are created and nothing is
     /// touched on disk. Call [`Remote::provision_layout`] to create the
-    /// deployment layout before the first mutation (the push engine does
-    /// this behind its non-dry-run gate).
+    /// deployment layout before the first mutation.
     ///
     /// The FILESYSTEM ROOT is refused (defense in depth): a transport rooted
-    /// at `/` would make the deployment cleanup operate on the system root,
-    /// so the base must have at least one normal path component below the
-    /// root.
+    /// at `/` would make a confined operation (and any recursive removal)
+    /// operate on the system root, so the base must have at least one normal
+    /// path component below the root.
     pub fn new(env: &SysEnv, base: PathBuf, layout: Layout) -> Result<Self> {
         let runner_base = base.clone();
         Self::with_exec(
@@ -2488,10 +2466,10 @@ impl LocalTransport {
 
     /// Build a transport whose `exec` calls are handled by `exec` instead of
     /// the production [`ChildRunner`]. Construction stays side-effect-free
-    /// (no directories created, nothing spawned). Test-support seam: the
-    /// deterministic properties inject a scripted fake so the push LOGIC
-    /// (verification/activation outcomes) is exercised without spawning real
-    /// processes.
+    /// (no directories created, nothing spawned). Test-support seam: a
+    /// transport can be built with an injected [`Exec`] (the test-only
+    /// `scripted` fake implements it), so a caller exercises the push logic
+    /// without spawning real processes.
     pub fn with_exec(
         env: &SysEnv,
         base: PathBuf,
@@ -2599,14 +2577,12 @@ impl LocalTransport {
         // the same directory, fsynced, then renamed into place, then the
         // parent directory fsynced — the replace has TWO commit points and a
         // failure BEFORE the rename leaves the PREVIOUS content untouched and
-        // unlinks the temp (see [`crate::atomic::write_atomic_replace`]). The
-        // old path here (`atomic::write_file_fd`) opened the destination
-        // `O_WRONLY|O_CREAT|O_TRUNC` and did ONE `write` with no temp, no
-        // rename and no fsync, so a push into a LOCAL destination could leave
-        // the entry torn and truncated. A post-rename parent-fsync failure is
-        // EXPLICIT (`ReplacedDurabilityUnknown`): the content is visible but
-        // its durability is unconfirmed, and the caller must not read that as
-        // a clean success.
+        // unlinks the temp (see
+        // [`crate::atomic::write_atomic_replace_fd_under_existing_parent`]). A
+        // post-rename parent-fsync failure is EXPLICIT
+        // (`ReplacedDurabilityUnknown`): the content is visible but its
+        // durability is unconfirmed, and the caller must not read that as a
+        // clean success.
         match crate::atomic::write_atomic_replace_fd_under_existing_parent(
             &root,
             rel,
@@ -2678,8 +2654,7 @@ impl LocalTransport {
         })?;
         // Open the final component `O_NOFOLLOW` AND `O_NONBLOCK`, then
         // classify the OPENED inode. `open(2)` of a FIFO read-only BLOCKS
-        // until a writer appears, so a bare `O_RDONLY` here hung forever on
-        // one FIFO in the store; `O_NONBLOCK` (a no-op for a regular file or
+        // until a writer appears; `O_NONBLOCK` (a no-op for a regular file or
         // a directory) makes the open return immediately. Only a regular file
         // or a directory is chmodded: a special file (a FIFO, socket, or
         // device) is REFUSED, exactly as the crate refuses one everywhere
@@ -2717,9 +2692,8 @@ impl LocalTransport {
                 from.display()
             ))
         })?;
-        // The destination parent must exist (the old path-based rename created
-        // it, best-effort); creating it here is component-wise with
-        // `O_NOFOLLOW`.
+        // The destination parent must exist before the rename; creating it
+        // here is component-wise with `O_NOFOLLOW`.
         self.ensure_dir_confined(&root, to)?;
         crate::atomic::renameat_paths(&root, from, to).map_err(|e| {
             Error::transport(format!(
@@ -2735,8 +2709,7 @@ impl LocalTransport {
         // The whole symlink (ensure parent, unlink any existing entry,
         // symlinkat, fsync parent) is issued by the ONE guarded atomic
         // authority, so a link spelled as the lock record cannot unlink the
-        // record and install a link. There is NO raw `libc::unlinkat` /
-        // `libc::symlinkat` left here.
+        // record and install a link.
         let root = self.root_dir(true)?.ok_or_else(|| {
             Error::transport(format!(
                 "symlink {}: the destination root is unavailable",
@@ -2769,8 +2742,8 @@ impl LocalTransport {
                     libc::O_RDONLY | libc::O_NONBLOCK,
                     0,
                 ) {
-                    // A missing entry OR a missing parent component is the
-                    // old path-based `remove_file`'s tolerated `NotFound`.
+                    // A missing entry OR a missing parent component is a
+                    // tolerated `NotFound`.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     _ => Err(Error::transport(format!(
                         "remove {}: {error}",
@@ -2927,8 +2900,8 @@ impl LocalTransport {
     /// opened and its link is never followed, so this is a pure, side-effect-free
     /// stat that cannot be redirected outside the pinned root by a symlink at any
     /// component. A missing final component OR a missing parent component is
-    /// ABSENCE (`Ok(None)`), exactly matching the path-based
-    /// `symlink_metadata` it replaces; every other filesystem error propagates.
+    /// ABSENCE (`Ok(None)`), matching the path-based `symlink_metadata`; every
+    /// other filesystem error propagates.
     #[cfg(unix)]
     fn confined_lstat(
         &self,
@@ -2995,8 +2968,8 @@ impl LocalTransport {
     /// EVERY path on the Windows port.
     fn list_path_based(&self, rel: &RootedRelativePath) -> Result<Vec<RemoteEntry>> {
         let dir = join(&self.base, rel);
-        // An unprovisioned remote root has no directories yet; report an empty
-        // listing rather than erroring so read-only inspection stays valid.
+        // An unprovisioned deployment root has no directories yet; report an
+        // empty listing rather than erroring so read-only inspection stays valid.
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3151,8 +3124,8 @@ impl Remote for LocalTransport {
     /// The sanctioned explicit-discard route for a LOCAL destination: the
     /// sync's own claim-aside (a residue spelling) is removed through the
     /// residue-sanctioning atomic primitive. Without this override the ordinary
-    /// `remove_file` would refuse the strand once the residue authority joined
-    /// the ONE gate, breaking the engine's own `drop_claim`.
+    /// `remove_file` would refuse the strand, breaking the engine's own
+    /// `drop_claim`.
     fn remove_residue_file(&self, rel: &RootedRelativePath) -> Result<()> {
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("remove residue {}: {e}", rel.display())))?;
@@ -3194,13 +3167,10 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn write(&self, rel: &RootedRelativePath, data: &[u8], mode: u32) -> Result<()> {
-        // The SAME shape as the Unix arm, and the SAME primitive: the Windows
-        // port has `write_atomic_replace_fd_under_existing_parent` too, and this
-        // used to call `write_file_fd` — which on this port is `std::fs::write`,
-        // a create-or-truncate with no temp and no rename, so a push into a local
-        // destination could leave the entry torn and truncated. The Windows
+        // The SAME shape as the Unix arm, and the SAME primitive: this port has
+        // `write_atomic_replace_fd_under_existing_parent` too. The Windows
         // replace is the crate's ONE non-atomic one (the target is removed before
-        // the rename), but it IS a replace, and that is what the docs describe.
+        // the rename), but it IS a replace.
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("write {}: {e}", rel.display())))?;
         if let Some(parent) = rel.parent()
@@ -3236,9 +3206,7 @@ impl Remote for LocalTransport {
     }
 
     fn create_dir(&self, rel: &RootedRelativePath) -> Result<()> {
-        // Now a guarded atomic operation on BOTH platforms (the Unix body used
-        // to be a path-based `std::fs::create_dir` that bypassed both the
-        // confinement and the lock-record guard).
+        // A guarded atomic operation on BOTH platforms.
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))?;
         crate::atomic::create_dir_fd(&root, rel)
@@ -3384,11 +3352,9 @@ impl Remote for LocalTransport {
 
     #[cfg(not(unix))]
     fn remove_dir_all(&self, rel: &RootedRelativePath) -> Result<()> {
-        // The Windows atomic guard (`refuse_lock_record_in_tree`) is now
-        // reached through the funnel instead of being bypassed by a direct
-        // `std::fs::remove_dir_all`. The funnel's own walk is iterative on
-        // Windows (std), so the deep-tree guarantee is unchanged. A missing
-        // entry is the idempotent no-op it always was.
+        // A guarded atomic removal: the funnel refuses a lock record in the
+        // tree, and its own walk is iterative on Windows (std), so a deep tree
+        // cannot exhaust the stack. A confirmed absence is the tolerated no-op.
         let root = crate::atomic::RootDir::open(&self.base)
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", rel.display())))?;
         match crate::atomic::remove_dir_all_fd(&root, rel) {
@@ -3495,8 +3461,9 @@ impl Remote for LocalTransport {
         }
         // THE command-execution seam: production is the bounded child-runner
         // (spawn into an OWN process group, bounded wait, group termination,
-        // mandatory reap before any outcome escapes); the deterministic
-        // properties inject a scripted fake — same trait surface, no process.
+        // mandatory reap before any outcome escapes); an injected [`Exec`]
+        // (the test-only `scripted` fake) has the same trait surface and spawns
+        // no process.
         self.exec.exec(argv, timeout)
     }
 
@@ -3536,9 +3503,9 @@ impl LocalTransport {
     /// present, through the guard's owned-lock-record constructor. It refuses
     /// every lock-record spelling EXCEPT the single layout lock the protocol
     /// OWNS, decided by IDENTITY (the layout lock's resolved device/inode) and
-    /// not by a spelling fold, so a future `*_if`-style primitive cannot
-    /// repeat the same hole: it either mints a capability (which runs the guard)
-    /// or cannot call a mutation worker, whose argument is that capability.
+    /// not by a spelling fold, so a lock-record primitive cannot reach a
+    /// mutation worker without either minting a capability (which runs the
+    /// guard) or holding one.
     fn guarded_mutation_target<'a>(
         &self,
         rel: &'a RootedRelativePath,
@@ -3585,9 +3552,9 @@ impl LocalTransport {
 ///
 /// The route is a VALUE chosen ONCE by the caller
 /// ([`LocalTransport::remove_file_if`]) from the mutation's OWNERSHIP and the
-/// thread's held bit, never an ambient thread-local read re-taken inside the
-/// worker: a serialized mutation says so by carrying its [`SidecarScope`], and
-/// a mutation with no serialization says so by being [`RemoveIfRoute::Claim`].
+/// thread's held bit: a serialized mutation says so by carrying its
+/// [`SidecarScope`], and a mutation with no serialization says so by being
+/// [`RemoveIfRoute::Claim`].
 pub(crate) enum RemoveIfRoute {
     /// The sidecar critical section is held (acquired by this call, or already
     /// held by this thread): the record stays CONTINUOUSLY VISIBLE, so a direct
@@ -3659,9 +3626,9 @@ impl RemoveIfRoute {
 ///
 /// The aside is OWNED by this value: [`Drop`] discards it best-effort, so the
 /// delete path, the restore path, and the read-error path all clean up exactly
-/// once. The ONE deliberate exception is [`Claimed::restore`]'s destructive
-/// edge: the aside is still discarded there, and after a mismatch the moved
-/// claim was the record's only copy.
+/// once. [`Claimed::restore`] is the destructive edge: it re-publishes the
+/// moved bytes no-replace, and after a mismatch the moved claim was the
+/// record's only copy.
 pub(crate) struct Claimed {
     /// The claimed sibling name, inside the destination's parent directory.
     aside: PathBuf,
@@ -3754,8 +3721,7 @@ impl Claimed {
     ///
     /// DELIBERATE DESTRUCTIVE EDGE: a transport FAILURE on the no-replace
     /// restore propagates EXPLICITLY, and the moved claim — discarded by the
-    /// `Drop` on the way out — was the only copy of the record. The slot is not
-    /// blocked (the lease is the backstop).
+    /// `Drop` on the way out — was the only copy of the record.
     fn restore(
         self,
         base: &Path,
@@ -3782,9 +3748,8 @@ impl Drop for Claimed {
     /// Best-effort unlink of the claimed aside: the ONE discard site, shared by
     /// the delete path, the restore path (Created, AlreadyPresent, Conflict,
     /// and the deliberate failed-restore edge), and the read-error path. A
-    /// failure is ignored exactly as the hand-written temp cleanups ignored it;
-    /// the claim temp is a recognized residue, so a crashed strand is
-    /// recoverable and can never be a lock record.
+    /// failure is ignored; the claim temp is a recognized residue, so a crashed
+    /// strand is recoverable and can never be a lock record.
     #[allow(clippy::disallowed_methods)]
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.aside);
@@ -3819,9 +3784,7 @@ mod tests {
     /// [`Exec for ChildRunner`] (driven here through the REAL
     /// [`LocalTransport::exec`] entry point, i.e. the production
     /// [`ChildRunner`] the transport builds) must report `-1` WITH the typed
-    /// [`TimeoutCause::CommandStillRunning`] cause. The mapping used to be
-    /// unpinned: inverting it (or dropping the cause) left the suite green
-    /// because no test ever asserted a producer's `Some(_)` cause. The local
+    /// [`TimeoutCause::CommandStillRunning`] cause. The local
     /// runner's post-exit drain failure is an ERROR, not an outcome, so
     /// `CommandStillRunning` is the ONLY cause this producer can emit.
     #[cfg(unix)]
@@ -3850,13 +3813,11 @@ mod tests {
     }
 
     /// A directory holding a name that is not valid
-    /// UTF-8 must make `list` an ERROR, never a lossy `Ok`. Pre-fix
-    /// `file_name().to_string_lossy()` mapped every non-UTF-8 name to U+FFFD,
-    /// so two distinct on-disk names became one indistinguishable
-    /// `RemoteEntry.name`; the byte-exact listing comparison then matched an
-    /// intended entry while the destination held an extra, unaddressable one
-    /// and `canonicalize_tree` refused the tree the run claimed to have
-    /// produced.
+    /// UTF-8 must make `list` an ERROR, never a lossy `Ok`: two distinct
+    /// on-disk names that both decode to U+FFFD would otherwise become one
+    /// indistinguishable `RemoteEntry.name`, and the byte-exact listing
+    /// comparison would match an intended entry while the destination held an
+    /// extra, unaddressable one.
     ///
     /// PLATFORM: a non-UTF-8 name cannot be created on APFS, so this SKIPS on
     /// macOS (announcing `STOREKIT_SKIP`); the reproduction requires a
@@ -3900,7 +3861,7 @@ mod tests {
     }
 
     /// Control for the refusal above: an ordinary UTF-8 directory still lists
-    /// faithfully (the fail-closed change must not refuse valid names).
+    /// faithfully (a fail-closed listing must not refuse valid names).
     #[test]
     fn local_list_still_lists_ordinary_names() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -3923,8 +3884,7 @@ mod tests {
     /// The LOCAL `read_link` is raw — a target
     /// that leads and/or trails with whitespace comes back verbatim. The SSH
     /// side must match these exact bytes (see `parse_readlink_output_strips_`
-    /// `exactly_one_newline` in the ssh suite); the pre-fix `.trim()` there
-    /// returned `"x"` for this local `"x "`.
+    /// `exactly_one_newline` in the ssh suite).
     // unix-only: builds a symlink fixture with symlink(2).
     #[cfg(unix)]
     #[test]
@@ -3946,14 +3906,9 @@ mod tests {
         }
     }
 
-    /// The transport's symlink CANNOT destroy the lock record. Pre-fix
-    /// `symlink_confined` removed any existing entry at the link path with a
-    /// raw `unlinkat` and installed a symlink, so a caller could acquire the
-    /// lock, symlink OVER the record, and acquire a SECOND lock with a
-    /// different inode. Now the transport routes through the guarded
-    /// `atomic::symlink_fd`, so the operation is refused and the record (and
-    /// its inode) is untouched. PRE-FIX MESSAGE: the call returned `Ok(())`,
-    /// the record was gone, and a second `FileLock::acquire` SUCCEEDED.
+    /// The transport's symlink CANNOT destroy the lock record: the transport
+    /// routes through the guarded `atomic::symlink_fd`, so a symlink over the
+    /// record is refused and the record (and its inode) is untouched.
     #[cfg(unix)]
     #[test]
     fn symlink_over_the_lock_record_is_refused_and_leaves_the_record_intact() {
@@ -4065,13 +4020,11 @@ mod tests {
         read_receiver_id(&t3, &marker).expect_err("a malformed marker fails closed");
     }
 
-    /// A marker in the SOURCE TOOL's legacy format (`recv-<uuid-v7>`, written
-    /// by `~/code/deploy`'s `ids.rs` before this crate's 40-hex format) fails
-    /// closed, and the error is ACTIONABLE: it names the condition (not a
-    /// 40-hex receiver id) and the likely cause (a marker that predates this
-    /// crate's format), so an operator hitting it during a migration can
-    /// diagnose it without reading this crate's source. The error class is
-    /// unchanged (`transport`).
+    /// A marker in the legacy `recv-<uuid-v7>` format fails closed, and the
+    /// error is ACTIONABLE: it names the condition (not a 40-hex receiver id)
+    /// and the likely cause (a marker that predates this crate's format), so an
+    /// operator hitting it during a migration can diagnose it without reading
+    /// this crate's source. The error class stays `transport`.
     #[test]
     fn a_legacy_recv_marker_fails_closed_with_an_actionable_error() {
         let dir = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
@@ -4102,9 +4055,9 @@ mod tests {
             msg.contains("predates this crate") && msg.contains("recv-<uuid-v7>"),
             "the error must name the likely legacy cause, got: {msg}"
         );
-        // THE TYPED DISTINCTION the doctrine names: this marker is the LEGACY
-        // shape, not an arbitrary corruption — a caller branches on the kind,
-        // not on the message.
+        // THE TYPED DISTINCTION the marker kinds name: this marker is the
+        // LEGACY shape, not an arbitrary corruption — a caller branches on the
+        // kind, not on the message.
         assert_eq!(
             err.transport_reason(),
             Some(TransportKind::ReceiverIdMarkerLegacyFormat),
@@ -4274,9 +4227,8 @@ mod tests {
     /// The PRODUCERS of [`OpenedExisting`] classify the opened inode
     /// THEMSELVES: `Regular` is constructible ONLY after the producer proved
     /// the opened inode regular, and every other shape maps to its own typed
-    /// arm — the same [`VerifiedExisting`] classes the ladder has always
-    /// produced. The cross-product oracle in the ssh tests pins the LADDER;
-    /// this pins the observations that feed it.
+    /// arm. The cross-product oracle in the ssh tests pins the LADDER; this pins
+    /// the observations that feed it.
     #[cfg(unix)]
     #[test]
     fn opened_existing_producers_classify_their_observations() {
@@ -4794,13 +4746,12 @@ mod tests {
         );
     }
 
-    /// The READS the applier verifies against are descriptor-relative
-    /// too. Pre-fix `read`, `read_link`, `exists`, and `metadata_opt` were
-    /// PATH-based (`std::fs::read`/`read_link`/`exists`/`symlink_metadata`), so a
-    /// symlink injected at a PARENT component made them FOLLOW it: a content
-    /// hash — and therefore an `applied` verdict — could be computed from an
-    /// object OUTSIDE the pinned root. Each must now refuse a symlinked parent,
-    /// and the outside bytes must never be returned.
+    /// The READS the applier verifies against are descriptor-relative too: a
+    /// PATH-based `read`, `read_link`, `exists`, or `metadata_opt` would FOLLOW
+    /// a symlink injected at a PARENT component, and a content hash — and
+    /// therefore an `applied` verdict — could be computed from an object
+    /// OUTSIDE the pinned root. Each must refuse a symlinked parent, and the
+    /// outside bytes must never be returned.
     #[cfg(unix)]
     #[test]
     fn local_transport_refuses_a_parent_component_symlink_for_every_read() {
@@ -4856,12 +4807,11 @@ mod tests {
         );
     }
 
-    /// The busy-writer TOCTOU class check, re-run against the confinement fix: a
-    /// writer thread continuously swaps the `d` component between a real
-    /// directory and a symlink to an outside tree while the main thread issues
-    /// every guarded operation. No write may land outside the root and no read
-    /// may return outside content, whatever order the swap and the syscall
-    /// interleave in.
+    /// The busy-writer TOCTOU class check: a writer thread continuously swaps
+    /// the `d` component between a real directory and a symlink to an outside
+    /// tree while the main thread issues every guarded operation. No write may
+    /// land outside the root and no read may return outside content, whatever
+    /// order the swap and the syscall interleave in.
     #[cfg(unix)]
     #[test]
     fn a_busy_component_swapper_never_redirects_a_confinement_guarded_operation() {
@@ -5034,17 +4984,13 @@ mod tests {
         );
     }
 
-    /// The sanctioned lock protocol may break EXACTLY the record it OWNS.
-    /// `remove_file_if` used to route through the sidecar only for the
-    /// byte-exact layout lock and to fall back to the claim-by-rename path for
-    /// every other spelling, so a caller could claim away `operation.lock` or
-    /// `snapshots/.001.operation.lock`: the claim RENAMED the live record away
-    /// and (on a mismatch) re-published it via `hard_link` under a NEW inode,
-    /// splitting the holder. Each row below holds a `FileLock`, calls
-    /// `remove_file_if`, and asserts the record's INODE is unchanged and a
-    /// second `FileLock` is REFUSED. Pre-fix the inode assertion is the
-    /// two-holder reproduction: the record is re-created under a fresh inode,
-    /// or (on a byte-identical expectation) removed outright.
+    /// The sanctioned lock protocol may break EXACTLY the record it OWNS:
+    /// every other lock-record spelling is refused before any mutation, because
+    /// the claim-by-rename path would RENAME the live record away and (on a
+    /// mismatch) re-publish it via `hard_link` under a NEW inode, splitting the
+    /// holder. Each row below holds a `FileLock`, calls `remove_file_if`, and
+    /// asserts the record's INODE is unchanged and a second `FileLock` is
+    /// REFUSED.
     #[cfg(unix)]
     #[test]
     fn remove_file_if_refuses_a_lock_record_it_does_not_own() {
@@ -5093,9 +5039,8 @@ mod tests {
     }
 
     /// The sibling primitive: `try_write_new` shares the same guard gate, so it
-    /// also refuses a lock record the layout does not own. Pre-fix it went
-    /// straight to `durable_create_new`; the refusal keeps the protocol's reach
-    /// at ONE record.
+    /// also refuses a lock record the layout does not own, keeping the
+    /// protocol's reach at ONE record.
     #[cfg(unix)]
     #[test]
     fn try_write_new_refuses_a_lock_record_it_does_not_own() {
@@ -5138,9 +5083,7 @@ mod tests {
     /// * Where it is a DISTINCT entry (any case-sensitive filesystem), the
     ///   mutation is REFUSED before anything runs, the owned record's inode is
     ///   unchanged, a second holder is refused, and the legitimate break of the
-    ///   OWNED spelling still works. Pre-fix the fold granted ownership to the
-    ///   distinct entry; `remove_file_if_grants_ownership_only_to_the_owned_inode`
-    ///   additionally makes that distinct entry a live second holder.
+    ///   OWNED spelling still works.
     #[cfg(unix)]
     #[test]
     fn remove_file_if_decides_the_owned_record_by_identity_not_by_a_fold() {
@@ -5221,11 +5164,6 @@ mod tests {
     /// second holder, then assert `remove_file_if` is REFUSED and neither entry's
     /// inode moves. For an alias that resolves to the owned record's OWN inode
     /// (macOS case aliases), assert the sidecar route still authorizes the break.
-    ///
-    /// Pre-fix, the fold granted ownership to every row, so the sidecar/claim
-    /// route removed the DISTINCT alias entry — freeing the second holder's inode
-    /// and admitting a third acquisition. Every assertion below fails pre-fix on
-    /// macOS (trailing dot/space) and Linux (case and trailing dot/space alike).
     #[cfg(unix)]
     #[test]
     fn remove_file_if_grants_ownership_only_to_the_owned_inode() {
@@ -5362,8 +5300,7 @@ mod tests {
     /// the sidecar is SERIALIZED (a direct read-compare-unlink, so a mismatch
     /// leaves the record's inode untouched), and the SAME call with no sidecar
     /// held is CLAIMED (the atomic rename-claim, which restores the winner under
-    /// a NEW inode). Pre-fix the worker re-read the ambient depth itself; the
-    /// selection is now carried on `RemoveIfRoute`.
+    /// a NEW inode). The route is carried on `RemoveIfRoute`.
     #[cfg(unix)]
     #[test]
     fn remove_file_if_is_serialized_under_the_sidecar_and_claimed_outside_it() {
@@ -5514,19 +5451,11 @@ mod tests {
     /// temp's `Drop` unlinks it on every exit before the publish, and the
     /// publish releases the temp name itself.
     ///
-    /// MEASURED ON THE HAND-WRITTEN SEQUENCE THIS REPLACES: FIVE of the six
-    /// stages failed this assertion. `Write`, `Chmod`, `FileFsync`, and
-    /// `Publish` returned through an early `Err` with the created temp still in
-    /// the destination directory, and `Unlink` (the cleanup step's OWN seam)
-    /// propagated after the link with the temp left beside the committed
-    /// destination. Only `CreateTemp` was clean, because it fails before the
-    /// temp exists.
-    ///
     /// The `Unlink` seam is POST-COMMIT (the `link(2)` already installed the
-    /// record, exactly as before): it must still propagate the fault, and the
-    /// committed destination must survive it byte- and mode-exact. Every
-    /// earlier stage never reaches the link, so its destination directory must
-    /// be EMPTY — no destination and no temp under ANY spelling.
+    /// record): it must still propagate the fault, and the committed destination
+    /// must survive it byte- and mode-exact. Every earlier stage never reaches
+    /// the link, so its destination directory must be EMPTY — no destination and
+    /// no temp under ANY spelling.
     ///
     /// The leak check is a SHAPE check, not a literal path comparison:
     /// [`crate::atomic::temp_name_for`] mints a FRESH process-counter value on
@@ -5997,8 +5926,7 @@ mod tests {
     ///   the AlreadyPresent branch; a fresh directory read still sees the
     ///   entry);
     /// * `Conflict` for DIFFERENT BYTES and for a MODE MISMATCH over identical
-    ///   bytes (the spec: "a mode mismatch must remain Conflict") — the
-    ///   winner is never replaced or modified;
+    ///   bytes — the winner is never replaced or modified;
     /// * published-before-parent-sync: an existing entry whose parent was
     ///   never synced is verified as `AlreadyPresent` (bytes+mode match) and
     ///   the retry establishes the parent durability;
@@ -6762,18 +6690,16 @@ mod tests {
     ///
     /// WHICH IS WHICH:
     /// * `copy_tree_*_carries_special_mode_bits` are BEHAVIOUR pins of the
-    ///   CARRIED set: they pin ALREADY-CORRECT behaviour (so they cannot fail
-    ///   pre-fix either) and protect against a FUTURE regression that starts
+    ///   CARRIED set: they protect against a FUTURE regression that starts
     ///   dropping something currently kept.
     /// * `copy_tree_default_walk_drops_*` and `copy_tree_ssh_cp_a_*` are
     ///   CHARACTERIZATION tests of a DOCUMENTED LIMITATION: they pin the
-    ///   current behaviour of an intentional omission and so cannot fail
-    ///   pre-fix either; a later change that starts carrying (or refuses to
-    ///   carry) one of these must be an explicit, test-visible act. Each
-    ///   announces a `STOREKIT_SKIP` with its reason when the
-    ///   filesystem/tool cannot set up the fixture (xattrs, a foreign gid),
-    ///   rather than failing the suite on an environment that cannot support
-    ///   it.
+    ///   current behaviour of an intentional omission, so a later change that
+    ///   starts carrying (or refuses to carry) one of these must be an
+    ///   explicit, test-visible act. Each announces a `STOREKIT_SKIP` with its
+    ///   reason when the filesystem/tool cannot set up the fixture (xattrs, a
+    ///   foreign gid), rather than failing the suite on an environment that
+    ///   cannot support it.
     #[cfg(unix)]
     mod fidelity {
         use super::*;
@@ -7086,9 +7012,8 @@ exec /bin/sh -c "$last"
         }
 
         /// CHARACTERIZATION (not-carried half, local): the DEFAULT
-        /// list/read/write walk documents that it DROPS xattrs and ownership.
-        /// Cannot fail pre-fix — the behaviour already exists — so it exists
-        /// to make a later change to the limitation deliberate and visible.
+        /// list/read/write walk documents that it DROPS xattrs and ownership,
+        /// so a later change to the limitation is deliberate and visible.
         #[test]
         fn copy_tree_default_walk_drops_xattrs_and_ownership() {
             let dir =
@@ -7145,7 +7070,7 @@ exec /bin/sh -c "$last"
 
         /// CHARACTERIZATION (divergence): the `cp -a` override documents the
         /// OPPOSITE of the default walk for xattrs and reproduces the source
-        /// gid when the caller may set it. Cannot fail pre-fix.
+        /// gid when the caller may set it.
         #[test]
         fn copy_tree_ssh_cp_a_preserves_xattrs_and_gid() {
             let h = SshHarness::new();
