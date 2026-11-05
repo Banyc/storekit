@@ -1287,6 +1287,14 @@ mod runner_property_tests {
             crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
         let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::new());
         let t = transport_for(kind, &fingerprint, runner, cache.path(), &env);
+        // The upload path now consults the far-side decision and would issue
+        // the probe FIRST, so the checked spawn would be the probe rather than
+        // the upload. This property is about ONE operation's deadline
+        // lifecycle, so the decision is pinned (the probe itself is covered by
+        // `tests/remote_cli_*`).
+        if kind == OpKind::Upload {
+            t.set_test_far_side(crate::transport::ssh::FarSide::Scripts);
+        }
 
         let outcome = match kind {
             OpKind::Remote => match t.run_remote("printf ok") {

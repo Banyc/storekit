@@ -80,6 +80,11 @@ mod ssh;
 pub use crate::relpath::RootedRelativePath;
 pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
 pub use ssh::SshTransport;
+/// The far-side payload-writer protocol's reserved statuses, re-exported for
+/// the `storekit-remote` binary: the no-clobber conflict verdict, the
+/// pre-install failure, and the post-rename durability-unknown status. ONE
+/// definition each, shared by the transport scripts and the CLI.
+pub use ssh::{SSH_TWRITE_CONFLICT_EXIT, SSH_TWRITE_PREINSTALL_EXIT, SSH_UPLOAD_POST_RENAME_EXIT};
 
 use crate::env::SysEnv;
 use crate::error::{Error, PreflightKind, Result, TransportKind};

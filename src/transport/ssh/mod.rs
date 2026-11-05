@@ -1278,6 +1278,18 @@ impl SshTransport {
         self.classify_far_side_probe(&out)
     }
 
+    /// TEST-ONLY: pin the far-side decision so a test can drive ONE operation
+    /// without the probe's extra spawn (the deadline/lifecycle properties are
+    /// about that one operation). Production builds contain no such seam: the
+    /// decision is only ever made by [`Self::probe_far_side`].
+    #[cfg(all(test, unix))]
+    fn set_test_far_side(&self, mode: FarSide) {
+        *self
+            .far_side
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mode);
+    }
+
     /// Classify the probe's collected output — the ONLY place a far side is
     /// declared absent or compatible:
     ///
@@ -1462,6 +1474,13 @@ impl SshTransport {
     /// to stderr naming the remote path, the payload size, and the elapsed
     /// time — so a stalled or slow push can be attributed to the exact file
     /// being transferred.
+    ///
+    /// CLI-FIRST: a far side with a compatible `storekit-remote` runs its
+    /// native `publish` subcommand instead of this script (decided ONCE by the
+    /// transport's probe, through [`Self::far_command`]). Both forms take the
+    /// payload on STDIN, use the same temp/destination, the same
+    /// length-before-install guard, and the same two commit points, so the
+    /// caller and the size-aware deadline below are unchanged.
     pub(crate) fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
         self.prepare_for_request()?;
         let remote_path = self.root.join(rel);
@@ -1554,7 +1573,14 @@ impl SshTransport {
             fsync_dir = PERL_FSYNC_DIR,
             post_rename = SSH_UPLOAD_POST_RENAME_EXIT,
         );
-        let argv = self.ssh_command_argv(&script)?;
+        // The far side runs the native `publish` subcommand when it carries a
+        // compatible `storekit-remote` (decided ONCE by the transport's probe)
+        // and this script otherwise. Both forms take the payload on STDIN, name
+        // the same temp/destination, and report the same commit points, so the
+        // caller cannot tell them apart.
+        let cli_argv = self.publish_cli_argv(&remote_path_str, mode, data.len() as u64);
+        let command = self.far_command(script, &cli_argv)?;
+        let argv = self.ssh_command_argv(&command)?;
         // Size-aware deadline: a large upload over a slow link must not be
         // killed by the fixed command timeout mid-transfer (a truncated
         // object would fail its post-upload integrity re-hash). The bound
@@ -1608,6 +1634,21 @@ impl SshTransport {
         // script, so no separate chmod round trip (and no window where the
         // published entry carries the temp's private mode) is needed.
         Ok(())
+    }
+
+    /// The CLI form of [`Self::upload_bytes`]'s payload writer:
+    /// `storekit-remote publish <path> <octal mode> <decimal len>`. The path is
+    /// the SAME absolute `root.join(rel)` the script is given, the mode is the
+    /// octal spelling `chmod` accepts (so `0` keeps the temp's private mode),
+    /// and the length is the payload size the CLI verifies after STDIN EOF.
+    fn publish_cli_argv(&self, remote_path_str: &str, mode: u32, expected_len: u64) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "publish".to_string(),
+            remote_path_str.to_string(),
+            format!("{:o}", mode & 0o7777),
+            expected_len.to_string(),
+        ]
     }
 
     /// Read a file's bytes from the remote. The deadline is SIZE-AWARE,
@@ -2053,6 +2094,13 @@ impl SshTransport {
     // ([`PERL_VERIFY_LEN`]) BEFORE the publish, so a mid-transfer connection
     // loss that makes `cat` see a clean, short EOF can never `link(2)` a
     // truncated record into an immutable slot.
+    //
+    // CLI-FIRST: [`SshTransport::try_write_new_with`] goes through
+    // [`SshTransport::far_command`], so a compatible far side runs
+    // [`SshTransport::write_new_cli_argv`] (`write-new`) instead of this script;
+    // this perl form runs only when the CLI is absent or incompatible. Both
+    // forms have the same ordering, the same no-clobber install, and the same
+    // reserved statuses.
     fn write_new_cmd(root: &Path, rel: &Path, mode: u32, expected_len: u64) -> String {
         let remote_path = root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
@@ -2127,6 +2175,20 @@ impl SshTransport {
         )
     }
 
+    /// The CLI form of [`Self::write_new_cmd`]: `storekit-remote write-new <path>
+    /// <octal mode> <decimal len>`. The path is the SAME absolute
+    /// `root.join(rel)` the script is given; the mode and length are its argv
+    /// tokens (never the payload).
+    fn write_new_cli_argv(&self, rel: &Path, mode: u32, expected_len: u64) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "write-new".to_string(),
+            self.root.join(rel).to_string_lossy().into_owned(),
+            format!("{:o}", mode & 0o7777),
+            expected_len.to_string(),
+        ]
+    }
+
     /// Build the perl-native command for the operation-lock `try_write_new`:
     /// the ENTIRE seven-step durable create is performed inside the SAME Perl
     /// process that owns the sidecar `flock`. The sidecar is created
@@ -2155,6 +2217,13 @@ impl SshTransport {
     /// verifies `length($data)` against it BEFORE creating the temp, so a
     /// mid-transfer connection loss (a clean, short EOF on stdin) can never
     /// `link(2)` a truncated record into the lock slot.
+    ///
+    /// CLI-FIRST: [`SshTransport::try_write_new_with`] goes through
+    /// [`SshTransport::far_command`], so a compatible far side runs
+    /// [`SshTransport::sidecar_publish_cli_argv`] (`sidecar-publish`) instead,
+    /// and this perl form runs only when the CLI is absent or incompatible. The
+    /// CLI creates the sidecar first, holds the same exclusive non-blocking
+    /// flock across the write, and reports the same statuses.
     fn try_write_new_sidecar_cmd(&self, rel: &Path, mode: u32, expected_len: u64) -> String {
         let sidecar = self
             .root
@@ -2184,6 +2253,28 @@ impl SshTransport {
             preinst = SSH_TWRITE_PREINSTALL_EXIT,
             prelude = prelude,
         )
+    }
+
+    /// The CLI form of [`Self::try_write_new_sidecar_cmd`]:
+    /// `storekit-remote sidecar-publish <sidecar> <lock> <octal mode> <decimal
+    /// len>`. The two absolute paths are the SAME `root.join(...)` spellings the
+    /// script receives, so the CLI locks, writes and installs exactly where the
+    /// script would.
+    fn sidecar_publish_cli_argv(&self, rel: &Path, mode: u32, expected_len: u64) -> Vec<String> {
+        let sidecar = self
+            .root
+            .join(&self.layout.lock_sidecar)
+            .to_string_lossy()
+            .into_owned();
+        let lock = self.root.join(rel).to_string_lossy().into_owned();
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "sidecar-publish".to_string(),
+            sidecar,
+            lock,
+            format!("{:o}", mode & 0o7777),
+            expected_len.to_string(),
+        ]
     }
 
     /// Build the remote `list` script for `rel`. It is ONE perl one-liner —
@@ -3377,7 +3468,7 @@ impl Remote for SshTransport {
         // spelling (the far side cannot be stat'ed from here).
         let owned = crate::atomic::OwnedLockRecord::remote(&self.layout);
         let guarded = crate::atomic::GuardedRel::new_for_owned_lock_record(rel.as_path(), &owned)?;
-        let cmd = if guarded.is_owned_lock_record() {
+        let script = if guarded.is_owned_lock_record() {
             self.try_write_new_sidecar_cmd(rel.as_path(), IMMUTABLE_RECORD_MODE, expected_len)
         } else {
             Self::write_new_cmd(
@@ -3387,6 +3478,17 @@ impl Remote for SshTransport {
                 expected_len,
             )
         };
+        // The far side runs `write-new` (or `sidecar-publish` for the owned
+        // lock record) when it carries a compatible `storekit-remote`, and the
+        // perl script otherwise. Both forms take the payload on STDIN, apply the
+        // SAME temp/mode/fsync/install ordering, and report the same reserved
+        // statuses, so the verdict classification below is unchanged.
+        let cli_argv = if guarded.is_owned_lock_record() {
+            self.sidecar_publish_cli_argv(rel.as_path(), IMMUTABLE_RECORD_MODE, expected_len)
+        } else {
+            self.write_new_cli_argv(rel.as_path(), IMMUTABLE_RECORD_MODE, expected_len)
+        };
+        let cmd = self.far_command(script, &cli_argv)?;
         let argv = self.ssh_command_argv(&cmd)?;
         // The payload travels through the runner's STDIN — never through the
         // command string (see `write_new_cmd`): the raw `data` bytes are
@@ -8571,6 +8673,10 @@ exec /bin/mv "$@"
             );
             let t = fake.transport(&cache, &env);
             t.prepare_identity().unwrap();
+            // The write consults the far-side decision; pin it to the script so
+            // this argv-order assertion still sees the write invocation FIRST
+            // (the probe's own command is asserted by `tests/remote_cli_*`).
+            t.set_test_far_side(crate::transport::ssh::FarSide::Scripts);
 
             let rel = RootedRelativePath::parse(Path::new("state/record.bin")).unwrap();
             let verdict = t
@@ -9085,6 +9191,10 @@ exec /bin/mv "$@"
             );
             let t = fake.transport(&cache, &env);
             t.prepare_identity().unwrap();
+            // Pin the far side to the scripts: this property counts the write
+            // and the perl verify helper, and a probe spawn would perturb the
+            // expected totals.
+            t.set_test_far_side(crate::transport::ssh::FarSide::Scripts);
 
             let required = IMMUTABLE_RECORD_MODE & 0o7777;
             let wrong_mode = if required == 0o600 { 0o640 } else { 0o600 };

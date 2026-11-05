@@ -2644,10 +2644,16 @@ mod tests {
             // `O_NOFOLLOW | O_NONBLOCK` read-only open (neither bit can ADOPT a
             // name; `clippy.toml` names `custom_flags` itself and the call
             // carries the documented item-level allow), plus the C library's
-            // `strerror` for the errno TEXT the perl scripts print.
+            // `strerror` for the errno TEXT the perl scripts print. The writers'
+            // `fsync_object` reuses the same `O_NONBLOCK` read-only open, and
+            // the sidecar `flock` is the same exclusive non-blocking lock the
+            // perl prelude takes.
             ("src/bin/storekit-remote.rs", "libc::O_NOFOLLOW", 1),
-            ("src/bin/storekit-remote.rs", "libc::O_NONBLOCK", 1),
+            ("src/bin/storekit-remote.rs", "libc::O_NONBLOCK", 2),
             ("src/bin/storekit-remote.rs", "libc::strerror", 1),
+            ("src/bin/storekit-remote.rs", "libc::flock", 1),
+            ("src/bin/storekit-remote.rs", "libc::LOCK_EX", 1),
+            ("src/bin/storekit-remote.rs", "libc::LOCK_NB", 1),
             ("src/lock/unix.rs", "libc::EAGAIN", 1),
             ("src/lock/unix.rs", "libc::ELOOP", 1),
             ("src/lock/unix.rs", "libc::EWOULDBLOCK", 2),
@@ -2892,7 +2898,18 @@ mod tests {
             ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
             // The far-side executable's `verify-open`: a READ-ONLY open
             // forwarding `O_NOFOLLOW | O_NONBLOCK` only.
-            ("src/bin/storekit-remote.rs", "OpenOptions::custom_flags", 1),
+            ("src/bin/storekit-remote.rs", "OpenOptions::custom_flags", 2),
+            // The far-side payload writers: the same temp/mode/fsync/rename/
+            // link sequence the perl scripts perform, on the far-side paths the
+            // transport hands them (the temp name comes from
+            // `atomic::temp_name_for`).
+            ("src/bin/storekit-remote.rs", "create_dir_all", 3),
+            ("src/bin/storekit-remote.rs", "set_permissions", 4),
+            ("src/bin/storekit-remote.rs", "OpenOptions::create_new", 1),
+            ("src/bin/storekit-remote.rs", "OpenOptions::create", 1),
+            ("src/bin/storekit-remote.rs", "remove_file", 1),
+            ("src/bin/storekit-remote.rs", "rename", 1),
+            ("src/bin/storekit-remote.rs", "hard_link", 2),
             ("src/atomic/unix.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/windows.rs", "OpenOptions::custom_flags", 1),
             ("src/lock/unix.rs", "OpenOptions::custom_flags", 1),

@@ -704,11 +704,28 @@ fn verify_open_uses_the_cli_when_present() {
         !log.iter().any(|line| line.contains("O_NOFOLLOW")),
         "the perl descriptor-bound helper must not run when the CLI is present: {log:?}"
     );
-    // The WRITE step is a future item and must still be the perl script.
+    // The WRITE step now uses the CLI too (remote-cli-write-ops): the
+    // no-clobber install is the native `write-new` subcommand, exactly.
+    let write_len = b"intended-bytes".len().to_string();
+    let write_command =
+        expected_cli_command(&["storekit-remote", "write-new", &abs, "644", &write_len]);
     assert!(
-        log.iter()
-            .any(|line| line.contains("perl") && line != verify[0]),
-        "the write step must still run its perl script: {log:?}"
+        log.iter().any(|line| line == &write_command),
+        "the write step must run the CLI write-new form {write_command:?}: {log:?}"
+    );
+    // The create-new WRITE and its verification are both native now; the only
+    // operation still on the perl path is the convergent retry's parent
+    // directory fsync, which belongs to the future `remote-cli-fsync-ops` item.
+    let remaining_perl: Vec<&String> = log.iter().filter(|line| line.contains("perl")).collect();
+    assert_eq!(
+        remaining_perl.len(),
+        1,
+        "only the not-yet-native parent fsync may run perl: {log:?}"
+    );
+    assert!(
+        remaining_perl[0].contains("STOREKIT_TEST_FSYNC_DIR"),
+        "the remaining perl command must be the parent-directory fsync: {:?}",
+        remaining_perl[0]
     );
     assert_eq!(
         log.iter()
