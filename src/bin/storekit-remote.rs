@@ -19,10 +19,15 @@
 //! framed `P`/`A`/`E` frames), `list` (the NUL-framed
 //! `kind\tmode\tsize\tname` records, plus perl's `die` message and `die`
 //! status on a real failure), `verify-open` (the descriptor-bound
-//! `O`/`N`/`E` frame), and the three payload writers `publish` (atomic
+//! `O`/`N`/`E` frame), the three payload writers `publish` (atomic
 //! replacement: temp + mode + file fsync + `rename(2)` + parent fsync),
 //! `write-new` (no-clobber install by `link(2)`) and `sidecar-publish` (the
-//! lock-record install under the sidecar's `flock`).
+//! lock-record install under the sidecar's `flock`), and the durability and
+//! residue operations: `fsync-file`/`fsync-dir` (the perl fsync primitive),
+//! `fsync-tree` (the `find -depth` walk), `rename` (parent + `rename(2)`), and
+//! `remove-file-if`/`remove-file-if-sidecar` (compare-and-delete, the second
+//! under the sidecar's `flock`), whose one-byte `R`/`M`/`A` frame is match,
+//! mismatch and absent.
 //!
 //! The payload is NEVER an argv token: every writer reads its raw bytes from
 //! STDIN, exactly as the transport pipes them, so arbitrary bytes round-trip.
@@ -100,6 +105,42 @@ fn main() -> std::process::ExitCode {
     if subcommand == OsStr::new("sidecar-publish") {
         return match four_operands("sidecar-publish", &mut args) {
             Ok((sidecar, lock, mode, len)) => sidecar_publish(&sidecar, &lock, mode, len),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("fsync-file") {
+        return match one_operand("fsync-file", &mut args) {
+            Ok(path) => fsync_primitive(&path),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("fsync-dir") {
+        return match one_operand("fsync-dir", &mut args) {
+            Ok(path) => fsync_primitive(&path),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("fsync-tree") {
+        return match one_operand("fsync-tree", &mut args) {
+            Ok(path) => fsync_tree(&path),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("rename") {
+        return match two_operands("rename", &mut args) {
+            Ok((from, to)) => rename(&from, &to),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("remove-file-if") {
+        return match two_operands("remove-file-if", &mut args) {
+            Ok((path, expected)) => remove_file_if(&path, &expected),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("remove-file-if-sidecar") {
+        return match three_operands_raw("remove-file-if-sidecar", &mut args) {
+            Ok((sidecar, lock, expected)) => remove_file_if_sidecar(&sidecar, &lock, &expected),
             Err(code) => code,
         };
     }
@@ -198,6 +239,42 @@ fn one_operand<I: Iterator<Item = std::ffi::OsString>>(
         return Err(usage(&format!("`{name}` requires exactly one path")));
     }
     Ok(path)
+}
+
+/// The TWO operands `rename` and `remove-file-if` take, in order. Like
+/// [`one_operand`], there is no option parsing: a leading `-` is an operand.
+#[cfg(unix)]
+fn two_operands<I: Iterator<Item = std::ffi::OsString>>(
+    name: &str,
+    args: &mut I,
+) -> Result<(std::ffi::OsString, std::ffi::OsString), std::process::ExitCode> {
+    let first = args
+        .next()
+        .ok_or_else(|| usage(&format!("`{name}` requires exactly two operands")))?;
+    let second = args
+        .next()
+        .ok_or_else(|| usage(&format!("`{name}` requires exactly two operands")))?;
+    if args.next().is_some() {
+        return Err(usage(&format!("`{name}` requires exactly two operands")));
+    }
+    Ok((first, second))
+}
+
+/// The THREE unparsed operands `remove-file-if-sidecar` takes (`<sidecar>
+/// <lock> <expected>`), in order.
+#[cfg(unix)]
+fn three_operands_raw<I: Iterator<Item = std::ffi::OsString>>(
+    name: &str,
+    args: &mut I,
+) -> Result<(std::ffi::OsString, std::ffi::OsString, std::ffi::OsString), std::process::ExitCode> {
+    let problem = || usage(&format!("`{name}` requires exactly three operands"));
+    let first = args.next().ok_or_else(problem)?;
+    let second = args.next().ok_or_else(problem)?;
+    let third = args.next().ok_or_else(problem)?;
+    if args.next().is_some() {
+        return Err(problem());
+    }
+    Ok((first, second, third))
 }
 
 /// The `protocol` subcommand's whole stdout: the shared token and one LF.
@@ -831,6 +908,341 @@ fn sidecar_publish(
     }
 }
 
+/// The `fsync-file` / `fsync-dir` subcommands: the transport's perl fsync
+/// primitive (`PERL_FSYNC_FILE` / `PERL_FSYNC_DIR`) as a native sequence.
+///
+/// The two subcommands run the IDENTICAL sequence — the scripts differ only in
+/// the trailing test-hook COMMENT — so the classification and the diagnostics
+/// live in one place ([`fsync_object`]): open `O_RDONLY | O_NONBLOCK` (so a
+/// FIFO with no writer cannot block the open), `fstat` that same descriptor,
+/// accept ONLY a regular file or a directory, then `fsync(2)`.
+///
+/// The failure bytes and the exit status are perl's `die`: `<what> <path>:
+/// <strerror> at -e line 1.` on stderr, exiting with `$!` when it is nonzero and
+/// 255 otherwise. For a failed `sysopen`/`stat`/`sync` the errno IS the failure's
+/// ([`fsync_object`] returns it, so the status is the real one), and for the
+/// non-regular refusal it is the errno perl's own handle setup left behind —
+/// see [`perl_handle_setup_errno`], which reproduces it rather than guessing.
+#[cfg(unix)]
+fn fsync_primitive(path: &std::ffi::OsStr) -> std::process::ExitCode {
+    match fsync_object(std::path::Path::new(path)) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err((errno, message)) => script_die(&message, errno),
+    }
+}
+
+/// The `fsync-tree` subcommand: the transport's `find -depth … -exec … +` walk
+/// as a native recursion.
+///
+/// Every entry BELOW `path` is visited before `path` itself (children before
+/// parents), so a staged bundle is durable deepest-first. Only DIRECTORIES and
+/// REGULAR FILES are fsynced: a symlink and every other entry are SKIPPED —
+/// their durability is their directory entry, which the parent's own fsync
+/// covers — so a FIFO is never opened and a dangling symlink is never a
+/// failure. The FIRST failing entry fails the whole walk.
+///
+/// The failure shapes are the script's two: a failing fsync prints the perl
+/// primitive's `die` bytes and the command exits 1 (the script's `sh -c '… ||
+/// exit 1'` wrapper collapses the primitive's status and `find` reports 1); an
+/// entry the walk cannot even read is the script's `find` diagnostic with the
+/// same status 1. `find`'s own wording is userland-specific (GNU quotes the
+/// path, BSD does not), so that diagnostic states the path and the errno
+/// itself rather than pretending to be one particular `find`.
+#[cfg(unix)]
+fn fsync_tree(path: &std::ffi::OsStr) -> std::process::ExitCode {
+    match fsync_tree_entry(std::path::Path::new(path)) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// One entry of the [`fsync_tree`] walk: recurse into a directory's children
+/// first, then fsync the entry itself.
+#[cfg(unix)]
+fn fsync_tree_entry(path: &std::path::Path) -> Result<(), std::process::ExitCode> {
+    use std::io::Write;
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => return Err(walk_failure(path, &error)),
+    };
+    if meta.is_dir() {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => return Err(walk_failure(path, &error)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => return Err(walk_failure(path, &error)),
+            };
+            fsync_tree_entry(&entry.path())?;
+        }
+    } else if !meta.is_file() {
+        // SKIPPED: a symlink (never followed, and `-type` does not follow one
+        // either) and every special entry. Their directory entry is durable
+        // with their parent's fsync, and a FIFO must never be opened.
+        return Ok(());
+    }
+    match fsync_object(path) {
+        Ok(()) => Ok(()),
+        Err((_errno, message)) => {
+            let _ = std::io::stderr().lock().write_all(&message);
+            Err(std::process::ExitCode::from(
+                SSH_TWRITE_PREINSTALL_EXIT as u8,
+            ))
+        }
+    }
+}
+
+/// The `fsync-tree` walk's own failure (an entry the walk cannot `lstat` or
+/// `readdir`): the diagnostic names the path and the errno, and the status is
+/// the one the script's `find` exits with. See [`fsync_tree`] for why the
+/// wording is not `find`'s.
+#[cfg(unix)]
+fn walk_failure(path: &std::path::Path, error: &std::io::Error) -> std::process::ExitCode {
+    use std::io::Write;
+
+    let mut message = b"storekit-remote: fsync-tree: ".to_vec();
+    message.extend_from_slice(path_bytes(path));
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(&errno_text(error.raw_os_error()));
+    message.push(b'\n');
+    let _ = std::io::stderr().lock().write_all(&message);
+    std::process::ExitCode::from(SSH_TWRITE_PREINSTALL_EXIT as u8)
+}
+
+/// The `rename` subcommand: the transport's `mkdir -p <parent> && perl -e
+/// 'rename(…)'` chain.
+///
+/// The target's PARENT is created first (so a rename into a fresh directory
+/// works), then `rename(2)` runs: ATOMIC, and it replaces an existing
+/// NON-DIRECTORY target (a regular file, a symlink — its own entry, never the
+/// link's target) while a DIRECTORY target is refused instead of being moved
+/// into. The failure text is the script's perl `die` (`rename <from> -> <to>:
+/// <strerror> at -e line 1.`) and its status is that `die`'s.
+///
+/// A failing `mkdir -p` is the script's OTHER failure shape — a shell
+/// coreutil's diagnostic with status 1 — so the CLI reports the parent it could
+/// not create and exits 1 (the status `mkdir` exits with).
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn rename(from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::process::ExitCode {
+    let parent = parent_of(to);
+    if let Err(error) = std::fs::create_dir_all(&parent) {
+        return pre_install_failure(&format!(
+            "rename: creating {} failed: {error}",
+            parent.display()
+        ));
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let errno = error.raw_os_error();
+            let mut message = b"rename ".to_vec();
+            message.extend_from_slice(path_bytes(std::path::Path::new(from)));
+            message.extend_from_slice(b" -> ");
+            message.extend_from_slice(path_bytes(std::path::Path::new(to)));
+            message.extend_from_slice(b": ");
+            message.extend_from_slice(&errno_text(errno));
+            message.extend_from_slice(b" at -e line 1.\n");
+            script_die(&message, errno)
+        }
+    }
+}
+
+/// The `remove-file-if` subcommand: the transport's `remove_file_if_cmd`
+/// compare-and-delete.
+///
+/// The entry is CLAIMED with `rename(2)` to a UNIQUE, same-directory, BOUNDED
+/// temp (created `O_EXCL` first and then removed, exactly as the script's
+/// `mktemp` + `rm -f` claims the name, so no existing entry is ever adopted),
+/// the CLAIMED bytes are compared, and exactly ONE one-byte verdict frame is
+/// printed — the only channel: `R` (claimed and removed), `M` (mismatch; the
+/// claim is re-published NO-REPLACE with `link(2)` and then discarded, so a
+/// concurrent install is never replaced and a failed restore still leaves its
+/// content), or `A` (the claim found nothing, i.e. the entry was absent).
+/// `M` and `A` follow the script's own tests, including their fail-open reading
+/// of a failed existence check as absence.
+///
+/// A failing `mkdir -p`/`mktemp` is the script's coreutil failure shape: the CLI
+/// names the step it could not do and exits 1, the status both coreutils use.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn remove_file_if(path: &std::ffi::OsStr, expected: &std::ffi::OsStr) -> std::process::ExitCode {
+    use std::os::unix::ffi::OsStrExt;
+
+    let expected = expected.as_bytes();
+    let parent = parent_of(path);
+    if let Err(error) = std::fs::create_dir_all(&parent) {
+        return pre_install_failure(&format!(
+            "remove-file-if: creating {} failed: {error}",
+            parent.display()
+        ));
+    }
+    let claim = match create_private_temp(path) {
+        Ok((claim, file)) => {
+            // The script's `mktemp` creates the name and `rm -f` frees it again
+            // so the CLAIM is the `mv`; the created file only reserves a unique
+            // spelling, exactly as `mktemp` does.
+            drop(file);
+            remove_temp(&claim);
+            claim
+        }
+        Err(error) => {
+            return pre_install_failure(&format!(
+                "remove-file-if: creating a claim temp failed: {error}"
+            ));
+        }
+    };
+    if std::fs::rename(path, &claim).is_err() {
+        // The script's `mv` failed: the entry is either still there (someone
+        // else published again, or the claim is not ours to take) or gone.
+        if std::fs::symlink_metadata(path).is_ok() {
+            return verdict_frame(b"M");
+        }
+        return verdict_frame(b"A");
+    }
+    // The comparison is against the CLAIMED inode, so a concurrent installer
+    // that re-creates the path cannot change what is being compared.
+    let matched = std::fs::read(&claim)
+        .map(|content| content == expected)
+        .unwrap_or(false);
+    if matched {
+        remove_temp(&claim);
+        return verdict_frame(b"R");
+    }
+    // RESTORE no-replace: `link(2)` fails with EEXIST when the path already
+    // holds a concurrent install, so the winner is never replaced; the claim is
+    // discarded either way, exactly as the script's `ln` + `rm -f` do.
+    let _ = std::fs::hard_link(&claim, path);
+    remove_temp(&claim);
+    verdict_frame(b"M")
+}
+
+/// The `remove-file-if-sidecar` subcommand: the transport's
+/// `remove_file_if_sidecar_cmd` compare-and-delete under the sidecar's `flock`.
+///
+/// The sidecar file exists FIRST (`mkdir -p` of its parent, `touch`, `chmod
+/// 644`), then the CLI opens it and takes the same exclusive NON-BLOCKING
+/// `flock` [`sidecar_publish`] takes (`EINTR` retries, `EAGAIN`/`EWOULDBLOCK`
+/// waits against a 2-second monotonic deadline, any other errno fails, a
+/// deadline expiry is the contention refusal). Under that lock the lock record
+/// is read and compared with `<expected>`: equal ⇒ unlink and answer `R`,
+/// different (or unreadable) ⇒ `M` without touching it, absent ⇒ `A`. The
+/// frame is one byte with no newline, exactly as the script's `print`.
+///
+/// Every failure is the script's own perl `die`, at ITS line: the records the
+/// helper opens sit on the multiline program, so the location suffixes are
+/// `-e line 3` (the sidecar open), `-e line 11` (a failed flock), `-e line 19`
+/// (contention) and `-e line 26` (the unlink).
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn remove_file_if_sidecar(
+    sidecar: &std::ffi::OsStr,
+    lock: &std::ffi::OsStr,
+    expected: &std::ffi::OsStr,
+) -> std::process::ExitCode {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let expected = expected.as_bytes();
+    let sidecar_path = std::path::Path::new(sidecar);
+    let lock_path = std::path::Path::new(lock);
+    let parent = parent_of(sidecar);
+    if let Err(error) = std::fs::create_dir_all(&parent) {
+        return pre_install_failure(&format!(
+            "remove-file-if-sidecar: creating {} failed: {error}",
+            parent.display()
+        ));
+    }
+    // `touch`: create an absent sidecar, leave an existing one's content alone.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(sidecar_path)
+    {
+        Ok(_) => {}
+        Err(error) => {
+            return pre_install_failure(&format!(
+                "remove-file-if-sidecar: creating {} failed: {error}",
+                sidecar_path.display()
+            ));
+        }
+    }
+    if let Err(error) =
+        std::fs::set_permissions(sidecar_path, std::fs::Permissions::from_mode(0o644))
+    {
+        return pre_install_failure(&format!(
+            "remove-file-if-sidecar: chmod of {} failed: {error}",
+            sidecar_path.display()
+        ));
+    }
+    let sidecar_file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sidecar_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let errno = error.raw_os_error();
+            let mut message = b"open sidecar: ".to_vec();
+            message.extend_from_slice(&errno_text(errno));
+            message.extend_from_slice(b" at -e line 3.\n");
+            return script_die(&message, errno);
+        }
+    };
+    if let Err(failure) = flock_exclusive(sidecar_file.as_raw_fd()) {
+        return match failure {
+            FlockFailure::Failed(errno) => {
+                let mut message = b"sidecar flock failed: ".to_vec();
+                message.extend_from_slice(&errno_text(Some(errno)));
+                message.extend_from_slice(b" at -e line 11.\n");
+                script_die(&message, Some(errno))
+            }
+            FlockFailure::Contended(errno) => {
+                script_die(b"sidecar contended at -e line 19.\n", errno)
+            }
+        };
+    }
+    // `! -e $lock && ! -l $lock`, i.e. `lstat` and not `stat`: a DANGLING
+    // symlink is present (and is then read through, as the script's `open`
+    // follows it).
+    if std::fs::symlink_metadata(lock_path).is_err() {
+        return verdict_frame(b"A");
+    }
+    let matched = std::fs::read(lock_path)
+        .map(|content| content == expected)
+        .unwrap_or(false);
+    if !matched {
+        return verdict_frame(b"M");
+    }
+    if let Err(error) = std::fs::remove_file(lock_path) {
+        let errno = error.raw_os_error();
+        let mut message = b"unlink: ".to_vec();
+        message.extend_from_slice(&errno_text(errno));
+        message.extend_from_slice(b" at -e line 26.\n");
+        return script_die(&message, errno);
+    }
+    verdict_frame(b"R")
+}
+
+/// Print the ONE verdict frame the transport's parser reads. It is the script's
+/// `printf 'R'` / perl `print "M"`: the byte alone, no newline, flushed before
+/// exit.
+#[cfg(unix)]
+fn verdict_frame(frame: &[u8]) -> std::process::ExitCode {
+    use std::io::Write;
+
+    let mut out = std::io::stdout().lock();
+    match out.write_all(frame).and_then(|()| out.flush()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => fail(&format!("writing the verdict frame failed: {error}")),
+    }
+}
+
 /// The parent directory a writer's `mkdir -p` targets — `path.parent()`, or
 /// `.` when the path has no parent component, exactly as the transport's
 /// scripts compute it.
@@ -960,7 +1372,7 @@ fn fsync_object(path: &std::path::Path) -> Result<(), (Option<i32>, Vec<u8>)> {
         let mut message = b"fsync-refuse ".to_vec();
         message.extend_from_slice(path_bytes(path));
         message.extend_from_slice(b": not a regular file or directory at -e line 1.\n");
-        return Err((None, message));
+        return Err((perl_handle_setup_errno(&file), message));
     }
     match file.sync_all() {
         Ok(()) => Ok(()),
@@ -979,6 +1391,43 @@ fn fsync_message(what: &[u8], path: &std::path::Path, error: &std::io::Error) ->
     message.extend_from_slice(&errno_text(error.raw_os_error()));
     message.extend_from_slice(b" at -e line 1.\n");
     message
+}
+
+/// The `$!` perl's `sysopen` leaves on the descriptor when the fsync primitive's
+/// REFUSAL fires, which the script's `die` therefore exits with.
+///
+/// A successful `sysopen` still lays a buffered handle over the descriptor, and
+/// that setup probes it with `isatty` and then `lseek`; neither probe's failure
+/// is cleared, so the LAST failure's errno is what `$!` holds when the refusal
+/// `die` runs and perl's exit-status rule reads it. Reproduced with the SAME two
+/// calls on the SAME descriptor instead of a table of file types, so the result
+/// is the platform's own answer: a FIFO or a tty leaves ESPIPE (the `lseek`
+/// failure, 29 on Linux and macOS), a character device leaves ENOTTY (the
+/// `isatty` failure, 25) where `lseek` succeeds, and only a probe pair that both
+/// SUCCEED leaves no errno — the `die` rule's 255. A probe that succeeds leaves
+/// `$!` untouched, exactly as it does in perl, which is why the sequence (not a
+/// single call) is reproduced.
+///
+/// This is reached ONLY for an already-OPENED descriptor whose kind was
+/// classified, so a real open/stat/fsync failure — which does carry a genuine
+/// errno — never goes through it.
+#[cfg(unix)]
+fn perl_handle_setup_errno(file: &std::fs::File) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let mut errno = None;
+    // SAFETY: `fd` is open for the whole call and `isatty` neither retains nor
+    // closes it.
+    if unsafe { libc::isatty(fd) } == 0 {
+        errno = std::io::Error::last_os_error().raw_os_error();
+    }
+    // SAFETY: as above; `lseek` on an already-open descriptor neither retains
+    // nor closes it, and `SEEK_CUR` with a zero offset changes nothing.
+    if unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) } < 0 {
+        errno = std::io::Error::last_os_error().raw_os_error();
+    }
+    errno
 }
 
 /// The raw bytes of a path, for the byte-exact diagnostics above.
@@ -1060,7 +1509,7 @@ fn flock_exclusive(fd: std::os::unix::io::RawFd) -> Result<(), FlockFailure> {
 #[cfg(unix)]
 fn usage(problem: &str) -> std::process::ExitCode {
     fail(&format!(
-        "{problem}\nusage: storekit-remote protocol\n       storekit-remote lstat <path>\n       storekit-remote list <path>\n       storekit-remote verify-open <path>\n       storekit-remote publish <path> <mode> <len>\n       storekit-remote write-new <path> <mode> <len>\n       storekit-remote sidecar-publish <sidecar> <lock> <mode> <len>"
+        "{problem}\nusage: storekit-remote protocol\n       storekit-remote lstat <path>\n       storekit-remote list <path>\n       storekit-remote verify-open <path>\n       storekit-remote publish <path> <mode> <len>\n       storekit-remote write-new <path> <mode> <len>\n       storekit-remote sidecar-publish <sidecar> <lock> <mode> <len>\n       storekit-remote fsync-file <path>\n       storekit-remote fsync-dir <path>\n       storekit-remote fsync-tree <path>\n       storekit-remote rename <from> <to>\n       storekit-remote remove-file-if <path> <expected>\n       storekit-remote remove-file-if-sidecar <sidecar> <lock> <expected>"
     ))
 }
 

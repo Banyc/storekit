@@ -2647,13 +2647,19 @@ mod tests {
             // `strerror` for the errno TEXT the perl scripts print. The writers'
             // `fsync_object` reuses the same `O_NONBLOCK` read-only open, and
             // the sidecar `flock` is the same exclusive non-blocking lock the
-            // perl prelude takes.
+            // perl prelude takes. `isatty`/`lseek`/`SEEK_CUR` are the two
+            // non-mutating probes `perl_handle_setup_errno` runs on an ALREADY
+            // OPENED, read-only descriptor to reproduce the `$!` perl's own
+            // `sysopen` leaves for the fsync primitive's refusal `die`.
             ("src/bin/storekit-remote.rs", "libc::O_NOFOLLOW", 1),
             ("src/bin/storekit-remote.rs", "libc::O_NONBLOCK", 2),
             ("src/bin/storekit-remote.rs", "libc::strerror", 1),
             ("src/bin/storekit-remote.rs", "libc::flock", 1),
             ("src/bin/storekit-remote.rs", "libc::LOCK_EX", 1),
             ("src/bin/storekit-remote.rs", "libc::LOCK_NB", 1),
+            ("src/bin/storekit-remote.rs", "libc::isatty", 1),
+            ("src/bin/storekit-remote.rs", "libc::lseek", 1),
+            ("src/bin/storekit-remote.rs", "libc::SEEK_CUR", 1),
             ("src/lock/unix.rs", "libc::EAGAIN", 1),
             ("src/lock/unix.rs", "libc::ELOOP", 1),
             ("src/lock/unix.rs", "libc::EWOULDBLOCK", 2),
@@ -2899,17 +2905,19 @@ mod tests {
             // The far-side executable's `verify-open`: a READ-ONLY open
             // forwarding `O_NOFOLLOW | O_NONBLOCK` only.
             ("src/bin/storekit-remote.rs", "OpenOptions::custom_flags", 2),
-            // The far-side payload writers: the same temp/mode/fsync/rename/
-            // link sequence the perl scripts perform, on the far-side paths the
-            // transport hands them (the temp name comes from
-            // `atomic::temp_name_for`).
-            ("src/bin/storekit-remote.rs", "create_dir_all", 3),
-            ("src/bin/storekit-remote.rs", "set_permissions", 4),
+            // The far-side payload writers AND the fsync/rename/compare-and-
+            // delete operations: the same temp/mode/fsync/rename/link sequence
+            // the perl scripts perform, on the far-side paths the transport
+            // hands them (the temp name comes from
+            // `atomic::temp_name_for`). The claim's `mktemp`+`rm -f` reserve-\n            // and-release is one `OpenOptions::create_new` plus one
+            // `remove_file`; the restore is the no-replace `hard_link`.
+            ("src/bin/storekit-remote.rs", "create_dir_all", 6),
+            ("src/bin/storekit-remote.rs", "set_permissions", 5),
             ("src/bin/storekit-remote.rs", "OpenOptions::create_new", 1),
-            ("src/bin/storekit-remote.rs", "OpenOptions::create", 1),
-            ("src/bin/storekit-remote.rs", "remove_file", 1),
-            ("src/bin/storekit-remote.rs", "rename", 1),
-            ("src/bin/storekit-remote.rs", "hard_link", 2),
+            ("src/bin/storekit-remote.rs", "OpenOptions::create", 2),
+            ("src/bin/storekit-remote.rs", "remove_file", 2),
+            ("src/bin/storekit-remote.rs", "rename", 3),
+            ("src/bin/storekit-remote.rs", "hard_link", 3),
             ("src/atomic/unix.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/windows.rs", "OpenOptions::custom_flags", 1),
             ("src/lock/unix.rs", "OpenOptions::custom_flags", 1),

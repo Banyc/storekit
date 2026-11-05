@@ -1394,6 +1394,21 @@ impl SshTransport {
         )
     }
 
+    /// The CLI form of [`Self::rename_cmd`]: `storekit-remote rename <from>
+    /// <to>`. Both paths are the SAME absolute `root.join(...)` spellings the
+    /// script is given, so the two forms address the same entries and create
+    /// the same parent directory. The CLI reproduces the script's `rename(2)`
+    /// semantics AND its `die` diagnostic (`rename <from> -> <to>: <err>` plus
+    /// perl's location suffix, exiting with the errno).
+    fn rename_cli_argv(root: &Path, from: &Path, to: &Path) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "rename".to_string(),
+            root.join(from).to_string_lossy().into_owned(),
+            root.join(to).to_string_lossy().into_owned(),
+        ]
+    }
+
     /// Build the remote command that fsyncs `root.join(rel)` and every entry
     /// BELOW it, children before parents, so a staged bundle is durable before
     /// the atomic install rename. The primitive is the portable perl
@@ -1439,6 +1454,19 @@ impl SshTransport {
         ])
     }
 
+    /// The CLI form of [`Self::fsync_tree_cmd`]: `storekit-remote fsync-tree
+    /// <path>`. The path is the SAME absolute `root.join(rel)` the `find` walk
+    /// starts from, and the CLI walks it in the same order (children before
+    /// parents, only directories and regular files, symlinks and every other
+    /// entry skipped) and fails on the first failing entry.
+    fn fsync_tree_cli_argv(&self, rel: &Path) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "fsync-tree".to_string(),
+            self.root.join(rel).to_string_lossy().into_owned(),
+        ]
+    }
+
     /// Build the remote command that fsyncs the PARENT directory of
     /// `root.join(rel)` — the directory whose entry the mutation just changed.
     /// See [`PERL_FSYNC_DIR`] for why `sync <dir>` cannot be used.
@@ -1452,6 +1480,23 @@ impl SshTransport {
             "perl -e '{PERL_FSYNC_DIR}' -- {parent}",
             parent = shell_quote(&parent)
         )
+    }
+
+    /// The CLI form of [`Self::fsync_parent_cmd`]: `storekit-remote fsync-dir
+    /// <parent>`. The directory is the SAME parent the script computes from
+    /// `root.join(rel)`, so both forms fsync the directory whose entry the
+    /// mutation changed.
+    fn fsync_parent_cli_argv(&self, rel: &Path) -> Vec<String> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        let parent = Path::new(&p)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "fsync-dir".to_string(),
+            parent,
+        ]
     }
 
     /// Build a remote shell command string from an `argv`, quoting every
@@ -1951,6 +1996,26 @@ if ($content eq $exp) {{ unlink $lock or die \"unlink: $!\"; print \"R\"; }} els
     )
 }
 
+/// The CLI form of [`remove_file_if_sidecar_cmd`]: `storekit-remote
+/// remove-file-if-sidecar <sidecar> <lock> <expected>`. The two absolute paths
+/// are the SAME `root.join(...)` spellings the script receives, and `expected`
+/// is the same content string, so the CLI locks, reads and unlinks exactly what
+/// the script would, and prints the same one-byte `R`/`M`/`A` frame.
+fn remove_file_if_sidecar_cli_argv(
+    root: &Path,
+    sidecar_rel: &RootedRelativePath,
+    lock_rel: &RootedRelativePath,
+    expected: &str,
+) -> Vec<String> {
+    vec![
+        STOREKIT_REMOTE_PROGRAM.to_string(),
+        "remove-file-if-sidecar".to_string(),
+        root.join(sidecar_rel).to_string_lossy().into_owned(),
+        root.join(lock_rel).to_string_lossy().into_owned(),
+        expected.to_string(),
+    ]
+}
+
 /// Build the perl script for atomic recover under the sidecar: open the
 /// sidecar, flock exclusively with bounded retry, then read the lock file,
 /// compare to `observed`, unlink if match, then install `new_data` via a
@@ -2392,6 +2457,21 @@ printf \"%s\\t%x\\t%s\\t%s\\0\", $t, $s[2] & 0xffff, $s[7], $n; }}' -- {p}"
             d = shell_quote(&remote_path_str),
             exp = shell_quote(&expected_str),
         )
+    }
+
+    /// The CLI form of [`Self::remove_file_if_cmd`]: `storekit-remote
+    /// remove-file-if <path> <expected>`. The path is the SAME absolute
+    /// `root.join(rel)` the script is given, and `expected` is the SAME content
+    /// string the script hands `printf`/`cmp`, so both forms claim the same
+    /// entry and compare the same bytes. The CLI's single stdout frame (`R`,
+    /// `M` or `A`, no newline) is the script's.
+    fn remove_file_if_cli_argv(root: &Path, rel: &Path, expected: &str) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "remove-file-if".to_string(),
+            root.join(rel).to_string_lossy().into_owned(),
+            expected.to_string(),
+        ]
     }
 
     /// Build the remote framed `lstat` helper for `rel`: ONE remote exec
@@ -3113,11 +3193,17 @@ impl Remote for SshTransport {
         // a residue spelling are refused at either end.
         crate::atomic::refuse_reserved_mutation(from.as_path(), crate::atomic::Sanction::None)?;
         crate::atomic::refuse_reserved_mutation(to.as_path(), crate::atomic::Sanction::None)?;
-        self.run_remote_ok(&SshTransport::rename_cmd(
-            &self.root,
-            from.as_path(),
-            to.as_path(),
-        ))
+        // The CLI's `rename` when the far side carries a compatible
+        // `storekit-remote` (decided once by the transport's probe), the perl
+        // `rename(2)` script otherwise; both create the target's parent and then
+        // perform the SAME `rename(2)`, so the CLI never moves into a directory
+        // target and never replaces a directory with a non-directory.
+        let cli_argv = Self::rename_cli_argv(&self.root, from.as_path(), to.as_path());
+        let command = self.far_command(
+            SshTransport::rename_cmd(&self.root, from.as_path(), to.as_path()),
+            &cli_argv,
+        )?;
+        self.run_remote_ok(&command)
     }
 
     /// The sanctioned residue-movement rename for the sync's OWN claim-aside
@@ -3126,29 +3212,39 @@ impl Remote for SshTransport {
     fn rename_aside(&self, from: &RootedRelativePath, to: &RootedRelativePath) -> Result<()> {
         crate::atomic::refuse_reserved_mutation(from.as_path(), crate::atomic::Sanction::Residue)?;
         crate::atomic::refuse_reserved_mutation(to.as_path(), crate::atomic::Sanction::Residue)?;
-        self.run_remote_ok(&SshTransport::rename_cmd(
-            &self.root,
-            from.as_path(),
-            to.as_path(),
-        ))
+        // Same two forms as [`Remote::rename`]; the aside route differs only in
+        // which names the authority admits.
+        let cli_argv = Self::rename_cli_argv(&self.root, from.as_path(), to.as_path());
+        let command = self.far_command(
+            SshTransport::rename_cmd(&self.root, from.as_path(), to.as_path()),
+            &cli_argv,
+        )?;
+        self.run_remote_ok(&command)
     }
 
     fn fsync_tree(&self, rel: &RootedRelativePath) -> Result<()> {
-        // `find -depth` visits entries DEEPEST-FIRST (children before
-        // parents), so each entry is fsynced before its parent — the whole
-        // staged bundle is durable before the atomic install rename. The fsync
-        // itself is the portable perl primitive (see [`PERL_FSYNC_DIR`]);
-        // `sync <path>` is GNU-only and a NO-OP on BSD/macOS.
-        let cmd = Self::fsync_tree_cmd(&self.root, rel.as_path());
-        self.run_remote_ok(&cmd)
+        // The walk visits entries DEEPEST-FIRST (children before parents), so
+        // each entry is fsynced before its parent — the whole staged bundle is
+        // durable before the atomic install rename. The primitive is the
+        // portable perl ([`PERL_FSYNC_DIR`]) because `sync <path>` is GNU-only
+        // and a NO-OP on BSD/macOS; the CLI's `fsync-tree` subcommand walks the
+        // same tree in the same order when the far side has a compatible
+        // `storekit-remote`, and fails on the same first failing entry.
+        let cli_argv = self.fsync_tree_cli_argv(rel.as_path());
+        let command =
+            self.far_command(Self::fsync_tree_cmd(&self.root, rel.as_path()), &cli_argv)?;
+        self.run_remote_ok(&command)
     }
 
     fn fsync_parent(&self, rel: &RootedRelativePath) -> Result<()> {
         // FAIL-CLOSED: the parent-directory fsync is the portable perl
         // primitive (see [`PERL_FSYNC_DIR`]) and a failed fsync is a propagated
-        // error (the mutation's durability is unconfirmed).
-        let cmd = Self::fsync_parent_cmd(&self.root, rel.as_path());
-        self.run_remote_ok(&cmd)
+        // error (the mutation's durability is unconfirmed). The CLI's
+        // `fsync-dir` subcommand runs the same primitive.
+        let cli_argv = self.fsync_parent_cli_argv(rel.as_path());
+        let command =
+            self.far_command(Self::fsync_parent_cmd(&self.root, rel.as_path()), &cli_argv)?;
+        self.run_remote_ok(&command)
     }
 
     fn symlink(&self, target: &Path, link: &RootedRelativePath) -> Result<()> {
@@ -3234,16 +3330,33 @@ impl Remote for SshTransport {
                 "ssh remove_file_if: the expected content is not valid UTF-8 and cannot be compared byte-exactly over the remote shell; refusing rather than comparing a lossy rendering",
             )
         })?;
-        let cmd = if guarded.is_owned_lock_record() {
-            remove_file_if_sidecar_cmd(
-                &self.root,
-                &self.layout.lock_sidecar,
-                &self.layout.lock,
-                expected,
+        let (script, cli_argv) = if guarded.is_owned_lock_record() {
+            (
+                remove_file_if_sidecar_cmd(
+                    &self.root,
+                    &self.layout.lock_sidecar,
+                    &self.layout.lock,
+                    expected,
+                ),
+                remove_file_if_sidecar_cli_argv(
+                    &self.root,
+                    &self.layout.lock_sidecar,
+                    &self.layout.lock,
+                    expected,
+                ),
             )
         } else {
-            Self::remove_file_if_cmd(&self.root, rel.as_path(), expected)
+            (
+                Self::remove_file_if_cmd(&self.root, rel.as_path(), expected),
+                Self::remove_file_if_cli_argv(&self.root, rel.as_path(), expected),
+            )
         };
+        // The CLI form when the far side carries a compatible
+        // `storekit-remote` (decided once by the transport's probe), the perl
+        // form otherwise. Both claim with a unique same-directory temp, compare
+        // the claimed bytes, and answer with the SAME one-byte verdict frame, so
+        // the near-side parser below is unchanged.
+        let cmd = self.far_command(script, &cli_argv)?;
         let out = self.run_remote(&cmd)?;
         if !out.status.success() {
             return Err(Error::transport(format!(

@@ -66,13 +66,15 @@
 #     relaxed for exactly this descriptor-bound sequence, the way
 #     `platform::chmod` relaxes `set_permissions`. It is a PRODUCTION item
 #     (`#[cfg(test)]` is on the `swap` PARAMETER only).
-#   * the far-side executable's payload writers in `src/bin/storekit-remote.rs`
-#     — `publish`, `write_new`, `sidecar_publish`, `create_private_temp`,
-#     `remove_temp`, and `fsync_object`. The binary is a SEPARATE crate target
-#     (its root does not carry the crate's `#![deny]`), and these calls mutate
-#     only the far-side paths the transport hands it: they are the CLI form of
-#     the perl scripts that already perform the same temp/mode/fsync/rename/
-#     link sequence, and the temp name comes from `atomic::temp_name_for`. The
+#   * the far-side executable's payload writers and fsync/rename/
+#     compare-and-delete operations in `src/bin/storekit-remote.rs` —
+#     `publish`, `write_new`, `sidecar_publish`, `rename`, `remove_file_if`,
+#     `remove_file_if_sidecar`, `create_private_temp`, `remove_temp`, and
+#     `fsync_object`. The binary is a SEPARATE crate target (its root does not
+#     carry the crate's `#![deny]`), and these calls mutate only the far-side
+#     paths the transport hands it: they are the CLI form of the perl scripts
+#     that already perform the same temp/mode/fsync/rename/link/claim
+#     sequence, and the temp name comes from `atomic::temp_name_for`. The
 #     `fsync_object` `custom_flags` is `O_NONBLOCK` on a READ-ONLY open, which
 #     adopts no name. Their per-file `libc` / `std::fs` mutation counts are in
 #     the guard's pins like every other file.
