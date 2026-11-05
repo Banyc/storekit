@@ -29,7 +29,7 @@
 //! under the sidecar's `flock`), whose one-byte `R`/`M`/`A` frame is match,
 //! mismatch and absent, `manifest` (the recursive sync tree walk), whose
 //! tab-delimited records, refusals and exit statuses are
-//! [`storekit::manifest::remote_tree_verify_script`]'s byte for byte, and `lock`
+//! the perl far-side script's byte for byte, and `lock`
 //! (the long-lived far-side operation-lock HOLDER), whose `LOCKOK` readiness
 //! line, reserved exit codes and anchored diagnostics are the transport's.
 //!
@@ -469,7 +469,7 @@ fn list_failure(what: &[u8], path: &[u8], errno: Option<i32>) -> std::process::E
 }
 
 /// The `manifest` subcommand: the recursive tree walk of
-/// [`storekit::manifest::remote_tree_verify_script`] as a native recursion,
+/// the perl far-side script as a native recursion,
 /// byte-identical to it.
 ///
 /// It prints one `\n`-terminated line per entry, `path<TAB>type<TAB>mode_hex

@@ -2057,7 +2057,7 @@ fn canonicalize_tree_with<S: UnsupportedSink>(
 /// non-zero exit into an error that carries this stderr, so a tree that
 /// cannot cross the wire faithfully is refused where the raw bytes are
 /// still visible rather than silently mis-described.
-pub fn remote_tree_verify_script() -> &'static str {
+pub(crate) fn remote_tree_verify_script() -> &'static str {
     r#"use Digest::SHA qw(sha256_hex);
 use Unicode::Normalize qw(NFC);
 my $root=$ARGV[0];
@@ -2201,7 +2201,7 @@ impl<'a> CompleteListing<'a> {
 }
 
 /// Assemble canonical tree metadata from the remote verification script's
-/// output ([`remote_tree_verify_script`]), applying the SAME validations the
+/// output (the far-side manifest walk), applying the SAME validations the
 /// local canonicalizer applies ([`canonicalize_tree`]): already-NFC/UTF-8
 /// names (a non-NFC name is refused, never normalized),
 /// NUL/traversal/absolute/duplicate path rejection, hardlink rejection (which
@@ -2234,7 +2234,7 @@ impl<'a> CompleteListing<'a> {
 /// itself reached through a symlink.
 ///
 /// `output` must come from a walk that actually enumerated the whole tree:
-/// [`remote_tree_verify_script`] exits non-zero for an absent, non-directory,
+/// the far-side manifest walk exits non-zero for an absent, non-directory,
 /// or unreadable root, and the caller must refuse that exit rather than
 /// assemble the short or empty listing. Only a complete walk — including an
 /// existing empty directory, whose empty stdout is the empty manifest — may

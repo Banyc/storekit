@@ -1,7 +1,7 @@
 //! The far-side CLI's recursive sync manifest walk (`remote-cli-manifest`):
 //! `storekit-remote manifest <root>` runs through `SshTransport` when the far
-//! side has a compatible binary, and the existing `perl -e
-//! <remote_tree_verify_script> <root>` command runs when it does not.
+//! side has a compatible binary, and the transport's perl argv runs when it
+//! does not.
 //!
 //! TWO KINDS OF TEST, both in this file:
 //!
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use storekit::env::SysEnv;
-use storekit::transport::{Layout, SshTransport};
+use storekit::transport::{Layout, Remote, SshTransport};
 
 /// The environment variable the shim reads to find its "remote working
 /// directory" (the directory a remote login shell would start in).
@@ -915,15 +915,13 @@ fn manifest_falls_back_to_the_script_when_absent() {
     let log = h.log();
     assert_eq!(log.len(), 2, "probe + one op, got {log:?}");
     assert_eq!(log[0], "bash -c 'storekit-remote protocol'");
+    let expected = transport
+        .manifest_argv(&h.root)
+        .expect("the transport's fallback argv");
     assert_eq!(
         log[1],
-        expected_exec_command(&[
-            "perl".to_string(),
-            "-e".to_string(),
-            storekit::manifest::remote_tree_verify_script().to_string(),
-            h.root.display().to_string(),
-        ]),
-        "the fallback must run the existing perl manifest script, exactly"
+        expected_exec_command(&expected),
+        "the fallback must run the transport's perl manifest argv, exactly"
     );
 }
 

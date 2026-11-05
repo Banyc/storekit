@@ -443,7 +443,7 @@ pub trait Remote {
     /// counterpart are the callers).
     ///
     /// The DEFAULT is the crate's existing `perl -e <script> <root>` form
-    /// ([`crate::manifest::remote_tree_verify_script`]), so a transport that
+    /// (the perl verification script), so a transport that
     /// does not override it — [`LocalTransport`], whose manifests never reach
     /// this method because the sync layer branches on [`Remote::is_local`]
     /// first, and every test double — runs exactly today's command. Only

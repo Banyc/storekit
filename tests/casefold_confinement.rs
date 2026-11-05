@@ -30,9 +30,7 @@
 #![cfg(unix)]
 
 use storekit::env::SysEnv;
-use storekit::manifest::{
-    canonicalize_remote_entries_checked, canonicalize_tree, remote_tree_verify_script,
-};
+use storekit::manifest::{canonicalize_remote_entries_checked, canonicalize_tree};
 use storekit::sync::{
     DestinationOwnership, Direction, Exclusions, Extraneous, Policy, ReplaceAll, SyncError,
     SyncOptions, SyncResult, sync,
@@ -62,11 +60,14 @@ fn owned_push(
     }
 }
 
-/// Run the production remote manifest script and return its raw listing.
+/// Run the production remote manifest command and return its raw listing.
 fn remote_listing(root: &std::path::Path) -> String {
-    let out = std::process::Command::new("perl")
-        .args(["-e", remote_tree_verify_script()])
-        .arg(root)
+    let env = SysEnv::from_process();
+    let transport = LocalTransport::new(&env, root.to_path_buf(), Layout::empty())
+        .expect("a local transport rooted at the fixture");
+    let argv = transport.manifest_argv(root).expect("the script argv");
+    let out = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
         .output()
         .expect("perl must run");
     assert!(

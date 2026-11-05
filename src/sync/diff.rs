@@ -18,8 +18,7 @@
 //! canonicalized directly; a genuinely remote one is hashed ON THE FAR SIDE by
 //! the transport's manifest command — `storekit-remote manifest <root>` when
 //! the transport's ONE probe found a compatible far-side CLI, otherwise the
-//! perl verification script
-//! ([`crate::manifest::remote_tree_verify_script`]) — run through
+//! perl verification script — run through
 //! [`Remote::exec`], and the printed per-entry hashes are assembled with
 //! [`crate::manifest::canonicalize_remote_entries_checked`], so only hashes
 //! cross the link — never the tree bytes.
@@ -145,8 +144,7 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 ///   subprocess, no bytes over any link;
 /// * a genuinely REMOTE one is hashed on the far side by
 ///   [`Remote::manifest_argv`] — the far-side CLI form when the transport's
-///   probe chose it, otherwise
-///   [`crate::manifest::remote_tree_verify_script`] — and only the per-entry
+///   probe chose it, otherwise the perl script — and only the per-entry
 ///   hashes come back.
 ///
 /// A remote whose manifest command fails — most importantly a host with no
@@ -784,7 +782,7 @@ fn transport_marker_at_line_start(stderr: &str) -> bool {
 }
 
 /// The far-side script's ABSENT-ROOT diagnostic, at the START of a stderr line
-/// (see [`crate::manifest::remote_tree_verify_script`]). Distinct from
+/// (see the far-side manifest walk). Distinct from
 /// [`SCRIPT_DIE_PREFIXES`]'s `not a directory: ` on purpose: the first is the
 /// typed [`crate::Error::NotFound`] condition, the second is a root that
 /// exists but cannot be described.
@@ -792,7 +790,7 @@ const ABSENT_ROOT_PREFIX: &str = "absent: ";
 
 /// The far-side manifest script's own closed `die` vocabulary. Every entry is
 /// the literal start of a stderr line the script writes before exiting
-/// non-zero (see [`crate::manifest::remote_tree_verify_script`]); the
+/// non-zero (see the far-side manifest walk); the
 /// vocabulary is closed because the script has exactly one `die` per
 /// condition and nothing else writes its stderr.
 const SCRIPT_DIE_PREFIXES: &[&str] = &[
