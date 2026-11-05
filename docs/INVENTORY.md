@@ -25,7 +25,7 @@ requirement of the CLI path), and no removal of any script.
 | Item | Status |
 |---|---|
 | `remote-cli-probe` | DONE — change `zusosvmn` (`f4645d7e`) |
-| `remote-cli-read-ops` | OPEN |
+| `remote-cli-read-ops` | DONE — change `zwwtxknu` (`e5c7a45f`) |
 | `remote-cli-write-ops` | OPEN |
 | `remote-cli-fsync-ops` | OPEN |
 | `remote-cli-lock` | OPEN |
