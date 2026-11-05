@@ -29,7 +29,7 @@ requirement of the CLI path), and no removal of any script.
 | `remote-cli-write-ops` | DONE — change `tkkvxwnw` (`ec33f629`) |
 | `remote-cli-fsync-ops` | DONE — change `vwurprlv` (`1ace948a`) |
 | `remote-cli-lock` | DONE — change `ksltvpwu` (`055a3313`) |
-| `remote-cli-manifest` | OPEN |
+| `remote-cli-manifest` | DONE — change `rotrsrtk` (`24c8a83a`) |
 
 ## remote-cli-probe
 
