@@ -437,6 +437,35 @@ pub trait Remote {
     /// default): a new remote transport that forgets is a compile error, not
     /// a silent local-verification bug.
     fn is_local(&self) -> bool;
+    /// The argv that runs the FAR-SIDE recursive tree-verification walk over
+    /// `root`: the command whose stdout [`crate::manifest::canonicalize_remote_entries_checked`]
+    /// assembles ([`crate::sync::diff::remote_manifest`] and its destination
+    /// counterpart are the callers).
+    ///
+    /// The DEFAULT is the crate's existing `perl -e <script> <root>` form
+    /// ([`crate::manifest::remote_tree_verify_script`]), so a transport that
+    /// does not override it — [`LocalTransport`], whose manifests never reach
+    /// this method because the sync layer branches on [`Remote::is_local`]
+    /// first, and every test double — runs exactly today's command. Only
+    /// [`SshTransport`] overrides it, to choose between the script and the
+    /// `storekit-remote manifest <root>` argv from its ONE cached far-side
+    /// probe: the binary is preferred when the probe found a compatible one,
+    /// the script otherwise. There is no second filter and no retry: the probe
+    /// decides once, and a CLI that fails is an error, never a reason to re-run
+    /// the script.
+    ///
+    /// The returned argv is handed to [`Remote::exec`] unchanged, so both forms
+    /// share its quoting and framing; the two forms are byte-identical in
+    /// stdout, stderr and exit status, which is what lets the caller parse one
+    /// wire format.
+    fn manifest_argv(&self, root: &Path) -> Result<Vec<String>> {
+        Ok(vec![
+            "perl".to_string(),
+            "-e".to_string(),
+            crate::manifest::remote_tree_verify_script().to_string(),
+            root.to_string_lossy().into_owned(),
+        ])
+    }
     /// A STABLE string identifying the transport's ENDPOINT — the host, port,
     /// and account the transport connects to — NOT the path. The path is
     /// compared separately ([`Remote::root`]); this is the other half of the

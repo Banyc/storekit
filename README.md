@@ -379,8 +379,24 @@ hard-link check).
 - **The destination filesystem renames atomically within a directory.** An entry
   can be moved aside and published by rename, so a replacement never passes
   through a state with neither the old nor the new content.
-- **The far side provides a POSIX shell and `perl`.** One script per operation,
-  with no binary agent to deploy or version on the far side.
+- **The far side provides a POSIX shell, and every remote operation has a
+  shell/perl script that stays in the tree as the no-CLI path.** A far side with
+  no `storekit-remote` runs exactly the scripts this crate always ran; `perl`
+  and the shell are never a requirement of the CLI path. Build the CLI with
+  `cargo install --path . --bin storekit-remote` from a checkout, or from a
+  released tag with the equivalent `cargo install --git … --tag <tag> --bin
+  storekit-remote`, and put it on the far-side account's `PATH`.
+- **A compatible far-side CLI is preferred, and the decision is made once.** The
+  transport runs `storekit-remote protocol` once per transport instance; only
+  exit 0 with exactly `storekit-remote-protocol 1` selects the CLI, so the token
+  — not the binary's name — is the compatibility contract. 126/127 (no
+  executable) and a wrong token select the scripts; any other status, ssh's own
+  255 included, fails the run rather than silently downgrading it. The chosen
+  form then runs every operation for the transport's lifetime: a CLI that is
+  present but fails is an error, never a retry with the script. A local
+  transport never probes. Each CLI subcommand reproduces its script's stdout
+  bytes, stderr bytes and exit status, because the near side parses one wire
+  format.
 - **The far side's userland is GNU or BSD.** Portability is a tested property of
   the scripts instead of a runtime negotiation.
 - **The process's descriptor limit exceeds the tree's depth.** A walk holds one

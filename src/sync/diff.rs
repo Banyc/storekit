@@ -16,8 +16,10 @@
 //! filesystem probe of the root path (a probe would silently hash a
 //! same-named local directory in place of the remote tree). A local remote is
 //! canonicalized directly; a genuinely remote one is hashed ON THE FAR SIDE by
-//! the perl verification script
-//! ([`crate::manifest::remote_tree_verify_script`]) run through
+//! the transport's manifest command — `storekit-remote manifest <root>` when
+//! the transport's ONE probe found a compatible far-side CLI, otherwise the
+//! perl verification script
+//! ([`crate::manifest::remote_tree_verify_script`]) — run through
 //! [`Remote::exec`], and the printed per-entry hashes are assembled with
 //! [`crate::manifest::canonicalize_remote_entries_checked`], so only hashes
 //! cross the link — never the tree bytes.
@@ -46,7 +48,7 @@ use crate::manifest::{
     DestinationTree, ExclusionSet, TreeEntry, TreeMetadata,
     canonicalize_remote_entries_checked_omitting,
     canonicalize_remote_entries_destination_checked_omitting, canonicalize_tree,
-    canonicalize_tree_destination, canonicalize_tree_omitting, remote_tree_verify_script,
+    canonicalize_tree_destination, canonicalize_tree_omitting,
 };
 use crate::sync::Exclusions;
 use crate::transport::{ExecOutcome, Remote, TimeoutCause};
@@ -142,10 +144,13 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// * a LOCAL remote is canonicalized in-process at `remote.root()` — no
 ///   subprocess, no bytes over any link;
 /// * a genuinely REMOTE one is hashed on the far side by
-///   [`remote_tree_verify_script`] and only the per-entry hashes come back.
+///   [`Remote::manifest_argv`] — the far-side CLI form when the transport's
+///   probe chose it, otherwise
+///   [`crate::manifest::remote_tree_verify_script`] — and only the per-entry
+///   hashes come back.
 ///
-/// A remote whose hashing script fails — most importantly a host with no
-/// `perl`, which the script's `perl -e` invocation reports as a non-zero exit
+/// A remote whose manifest command fails — most importantly a host with no
+/// `perl` and no compatible `storekit-remote`, which reports a non-zero exit
 /// or a transport error — is an ERROR, never an empty manifest. An empty
 /// manifest would read as "the remote tree is empty" and drive a transfer
 /// that deletes or rewrites a tree the far side never described. For the same
@@ -182,14 +187,18 @@ pub fn local_manifest(root: &Path) -> Result<TreeMetadata> {
 /// transport can read the remote tree at all. The call is idempotent.
 ///
 /// A non-zero exit is classified by LAYER ([`remote_manifest_failure`]): the
-/// remote command is `ssh … exec -- perl -e <script> <root>`. `ssh` reserves
+/// remote command is `ssh … exec -- perl -e <script> <root>`, or — when
+/// `SshTransport`'s one probe chose it — `ssh … exec -- storekit-remote
+/// manifest <root>`, which reproduces that script's stdout bytes, stderr and
+/// exit statuses exactly. `ssh` reserves
 /// exit status 255 for its OWN failures, but a far-side `perl` `die` ALSO
 /// exits 255: perl exits 255 when `$!` is 0, and the crate's own script
 /// reaches that arm for a NON-NFC entry name and for a name (or symlink
 /// target) whose diagnostic is hex-encoded. An ABSENT root
 /// and a root that is not a directory both exit 2 instead: `perl -e`'s module
 /// loading leaves `$!` = ENOENT, so the script's `absent:` / `not a
-/// directory:` `die` propagates 2. They are told apart by the DIAGNOSTIC, not
+/// directory:` `die` propagates 2 (the CLI reproduces that value). They are
+/// told apart by the DIAGNOSTIC, not
 /// the status: `absent:` maps to [`Error::NotFound`] and `not a directory:`
 /// stays a script failure. Exit 255 alone therefore establishes nothing. The
 /// layer is attributed only from evidence the classifier reads — the typed
@@ -252,12 +261,12 @@ pub(crate) fn remote_manifest_omitting(
             ))),
         };
     }
-    let argv = vec![
-        "perl".to_string(),
-        "-e".to_string(),
-        remote_tree_verify_script().to_string(),
-        root.to_string_lossy().into_owned(),
-    ];
+    // The command is the transport's: `SshTransport` picks the
+    // `storekit-remote manifest <root>` argv when its ONE probe found a
+    // compatible CLI, and the original `perl -e <script> <root>` argv
+    // otherwise. The default (every other transport) IS the script form, so
+    // this call site has no second filter and no retry.
+    let argv = remote.manifest_argv(root)?;
     let out = remote.exec(&argv, REMOTE_MANIFEST_TIMEOUT)?;
     if !out.success() {
         return Err(remote_manifest_failure(root, &out));
@@ -342,12 +351,10 @@ pub(crate) fn remote_destination_manifest_omitting(
             ))),
         };
     }
-    let argv = vec![
-        "perl".to_string(),
-        "-e".to_string(),
-        remote_tree_verify_script().to_string(),
-        root.to_string_lossy().into_owned(),
-    ];
+    // Same far-side command choice as the SOURCE producer: `manifest_argv`
+    // carries the script form as its default and the CLI form only when
+    // `SshTransport`'s probe chose it.
+    let argv = remote.manifest_argv(root)?;
     let out = remote.exec(&argv, REMOTE_MANIFEST_TIMEOUT)?;
     if !out.success() {
         return Err(remote_manifest_failure(root, &out));
@@ -893,6 +900,7 @@ mod tests {
     #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::env::SysEnv;
+    use crate::manifest::remote_tree_verify_script;
     use crate::test_support::{announce_skip, fixture_tmpdir};
     use crate::transport::{
         CreateNewVerdict, FsBytes, Layout, LocalTransport, RemoteEntry, RemoteMeta,

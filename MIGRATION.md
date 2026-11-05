@@ -105,6 +105,21 @@ record created through its own `FileLock::acquire` call sites carries the header
 the first acquisition after the upgrade. It is listed here because it is the one change
 in this migration that turns a previously accepted on-disk state into a refusal.
 
+**The far-side CLI (optional).** A push needs no binary on the far side: every remote
+operation keeps the shell/perl script the transport ran before, and the scripts remain
+the no-CLI path (`perl` and the shell are never a requirement of the other path). When
+`storekit-remote` is on the far-side account's `PATH` at a compatible protocol, the
+transport prefers it. Install it with `cargo install --path . --bin storekit-remote`
+from a checkout, or from a released tag with `cargo install --git … --tag <tag> --bin
+storekit-remote`. The gate is `storekit-remote protocol`: it must exit 0 with exactly
+`storekit-remote-protocol 1`. The transport probes once per transport instance and
+caches the answer — 126/127 (no executable) and a wrong token select the scripts, any
+other status (including ssh's own 255) fails the run instead of silently downgrading
+it, and once the CLI is chosen a failing CLI command is an error, never a retry with
+the script. Each subcommand reproduces its script's stdout bytes, stderr bytes and exit
+status, so `deploy` needs no code change: the near side parses one wire format either
+way, and a far side without the binary behaves exactly as before.
+
 **The one real data migration: the receiver marker.** `deploy` stores
 `recv-<uuid-v7>` at `<deploy_dir>/receiver-uuid`. The crate requires 40 lowercase hex
 and fails closed on anything else, with no adoption path, so without this step every

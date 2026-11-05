@@ -27,9 +27,11 @@
 //! `fsync-tree` (the `find -depth` walk), `rename` (parent + `rename(2)`), and
 //! `remove-file-if`/`remove-file-if-sidecar` (compare-and-delete, the second
 //! under the sidecar's `flock`), whose one-byte `R`/`M`/`A` frame is match,
-//! mismatch and absent, and `lock` (the long-lived far-side operation-lock
-//! HOLDER), whose `LOCKOK` readiness line, reserved exit codes and anchored
-//! diagnostics are the transport's.
+//! mismatch and absent, `manifest` (the recursive sync tree walk), whose
+//! tab-delimited records, refusals and exit statuses are
+//! [`storekit::manifest::remote_tree_verify_script`]'s byte for byte, and `lock`
+//! (the long-lived far-side operation-lock HOLDER), whose `LOCKOK` readiness
+//! line, reserved exit codes and anchored diagnostics are the transport's.
 //!
 //! `lock` is the ONE long-lived subcommand: it prints its readiness line, then
 //! blocks reading STDIN until EOF while it KEEPS the `flock`, exactly as the
@@ -88,6 +90,12 @@ fn main() -> std::process::ExitCode {
     if subcommand == OsStr::new("list") {
         return match one_operand("list", &mut args) {
             Ok(path) => list(&path),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("manifest") {
+        return match one_operand("manifest", &mut args) {
+            Ok(root) => manifest(&root),
             Err(code) => code,
         };
     }
@@ -458,6 +466,554 @@ fn list_failure(what: &[u8], path: &[u8], errno: Option<i32>) -> std::process::E
     // contract the transport must not be able to tell apart.
     message.extend_from_slice(b" at -e line 1.\n");
     script_die(&message, errno)
+}
+
+/// The `manifest` subcommand: the recursive tree walk of
+/// [`storekit::manifest::remote_tree_verify_script`] as a native recursion,
+/// byte-identical to it.
+///
+/// It prints one `\n`-terminated line per entry, `path<TAB>type<TAB>mode_hex
+/// <TAB>nlink<TAB>content_sha256<TAB>symlink_target`, in `readdir` order and
+/// depth-first (an entry before the entries inside it), where `type` is `f`,
+/// `d`, `l` (a symlink, never followed) or `o` (any other kind, whose hash and
+/// target are empty), `mode_hex` is `st_mode & 07777` in lowercase hex, and
+/// `content_sha256` hashes the file's bytes or the symlink's RAW target. The
+/// near-side assembler parses these bytes, so this subcommand's ONLY contract
+/// is that stream, its refusals and their exit statuses.
+///
+/// THE REFUSALS ARE THE SCRIPT'S, INCLUDING THEIR DIAGNOSTIC BYTES AND STATUS:
+///
+/// * any failing `stat` on the ROOT is `absent: <root>` — the script's `-e`
+///   test cannot distinguish ENOENT from EACCES — exiting with that errno;
+/// * a root that exists but is not a directory is `not a directory: <root>`,
+///   exiting 2 (perl's module loading leaves `$!` = ENOENT, which is what the
+///   script's `die` exits with);
+/// * an unreadable directory is `opendir <dir>: <err>`, a failed `readdir` is
+///   `readdir <dir>: <err>`, and a failed `lstat`/`readlink` likewise `<syscall>
+///   <path>: <err>`, each exiting with that errno;
+/// * a file whose `lstat` succeeds but whose `open` fails is the script's ONE
+///   `die` without a trailing newline, so perl appends its location:
+///   `open <path>: <err> at -e line 20.`;
+/// * a name that contains NUL/LF/CR/TAB is refused with its hex, a name that is
+///   not valid UTF-8 likewise, and a name that is not NFC with the name itself;
+///   a symlink TARGET is refused for NUL/LF/CR/TAB or invalid UTF-8 (a target
+///   need not be NFC). These are shell-free copies of the script's checks; each
+///   exits with perl's `die` rule — 255 when no earlier failed syscall left an
+///   errno, which is the normal case, because the walk tracks the `$!` a failed
+///   read or filetest would leave, exactly as the script's `$!` carries it.
+///
+/// `utf8::decode` is NOT `std::str::from_utf8`: Perl accepts its EXTENDED UTF-8
+/// (surrogates, code points above U+10FFFF, 5/6/7-byte forms), so
+/// [`perl_utf8_valid`] accepts exactly what Perl accepts and the name check
+/// reproduces Perl's verdict for those byte sequences.
+///
+/// There is NO hard-link refusal: the script prints `nlink` and never dies on
+/// it. The near-side assembler refuses `nlink > 1`, which is where that rule
+/// lives; adding it here would make this form observably differ from the
+/// script it replaces.
+///
+/// The walk holds no descriptor per level beyond the directory it is reading:
+/// `read_dir`'s iterator is consumed into a complete name list (as the script's
+/// `my @names=readdir($dh)` does) and dropped before any entry is emitted, so
+/// the depth bound is the process stack rather than the descriptor limit.
+#[cfg(unix)]
+fn manifest(root: &std::ffi::OsStr) -> std::process::ExitCode {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = root.as_bytes().to_vec();
+    // Perl's `$!` is ENOENT once the script's two `use` lines have loaded, and a
+    // successful filetest does not clear it: that is why the `not a directory:`
+    // `die` exits 2. A failed root `stat` overwrites it with its own errno, which
+    // is the script's `absent:` status.
+    let mut state = ManifestWalkState {
+        errno: Some(MANIFEST_PRELUDE_ERRNO),
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let outcome = manifest_root_checks(&root, &mut state)
+        .and_then(|()| manifest_walk(&mut out, &root, b"", &mut state));
+    // The script's stdout is buffered and flushed at exit, INCLUDING on a `die`,
+    // so a refusal after some records keeps those bytes on stdout.
+    let flushed = out.flush();
+    match outcome {
+        Ok(()) => match flushed {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => fail(&format!("writing the manifest failed: {error}")),
+        },
+        Err(ManifestFailure::Die { message, errno }) => script_die(&message, errno),
+        Err(ManifestFailure::Io(message)) => fail(&message),
+    }
+}
+
+/// The `$!` the script's `die` exits with when no syscall the walk made has set
+/// it: perl's own module loading leaves ENOENT, so the `not a directory:`
+/// refusal exits 2. Measured on the script's one-line `-e` form (a script FILE
+/// form leaves a different `$!`), which is exactly how the transport runs it.
+#[cfg(unix)]
+const MANIFEST_PRELUDE_ERRNO: i32 = 2;
+
+/// The `$!` perl would hold at the next `die`. `None` is zero, which perl's
+/// `die` turns into exit status 255. Only a FAILED syscall sets it and only the
+/// script's `$! = 0` after `opendir` clears it — successful syscalls leave it
+/// alone, exactly as in perl.
+#[cfg(unix)]
+struct ManifestWalkState {
+    errno: Option<i32>,
+}
+
+/// Why the manifest walk stopped: a script `die` (diagnostic bytes and the
+/// `$!` that decides the status), or a failure writing stdout.
+#[cfg(unix)]
+enum ManifestFailure {
+    Die {
+        message: Vec<u8>,
+        errno: Option<i32>,
+    },
+    Io(String),
+}
+
+/// The script's `-e`/`-d` root tests, in its order, with its diagnostics.
+#[cfg(unix)]
+fn manifest_root_checks(root: &[u8], state: &mut ManifestWalkState) -> Result<(), ManifestFailure> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // `-e $root` is `stat`, following a symlink; ANY failure is the ABSENT arm.
+    match std::fs::metadata(std::ffi::OsStr::from_bytes(root)) {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(ManifestFailure::Die {
+                    message: manifest_message(&[b"not a directory: ", root], b"\n"),
+                    errno: state.errno,
+                });
+            }
+            Ok(())
+        }
+        Err(error) => {
+            state.errno = error.raw_os_error();
+            Err(ManifestFailure::Die {
+                message: manifest_message(&[b"absent: ", root], b"\n"),
+                errno: state.errno,
+            })
+        }
+    }
+}
+
+/// One directory of the walk: `opendir`, read EVERY name (as the script's list
+/// context `readdir` does, so a read error is a `die` before any record from
+/// this directory), then emit and recurse.
+#[cfg(unix)]
+fn manifest_walk<W: std::io::Write>(
+    out: &mut W,
+    dir: &[u8],
+    prefix: &[u8],
+    state: &mut ManifestWalkState,
+) -> Result<(), ManifestFailure> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let reader = match std::fs::read_dir(std::ffi::OsStr::from_bytes(dir)) {
+        Ok(reader) => reader,
+        Err(error) => {
+            state.errno = error.raw_os_error();
+            return Err(ManifestFailure::Die {
+                message: manifest_errno_message(b"opendir ", dir, state.errno),
+                errno: state.errno,
+            });
+        }
+    };
+    // The script's `$! = 0` sits between `opendir` and `readdir`; everything
+    // before the next failing syscall therefore exits 255 on a validation `die`.
+    state.errno = None;
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for entry in reader {
+        match entry {
+            Ok(entry) => names.push(entry.file_name()),
+            Err(error) => {
+                state.errno = error.raw_os_error();
+                return Err(ManifestFailure::Die {
+                    message: manifest_errno_message(b"readdir ", dir, state.errno),
+                    errno: state.errno,
+                });
+            }
+        }
+    }
+    // `read_dir` omits `.` and `..` itself; the script skips them explicitly.
+    for name in names {
+        let name = name.as_bytes();
+        manifest_check_name(name, dir, state)?;
+        // `"$dir/$n"`, built UNCONDITIONALLY so a root ending in `/` yields
+        // `//` in both the syscall path and the diagnostics, as the script does.
+        let mut path = Vec::with_capacity(dir.len() + 1 + name.len());
+        path.extend_from_slice(dir);
+        path.push(b'/');
+        path.extend_from_slice(name);
+        // `length($prefix) ? "$prefix/$name" : $name`
+        let mut rel = Vec::with_capacity(prefix.len() + 1 + name.len());
+        if !prefix.is_empty() {
+            rel.extend_from_slice(prefix);
+            rel.push(b'/');
+        }
+        rel.extend_from_slice(name);
+        manifest_emit(out, &rel, &path, state)?;
+        // `-d $p && !-l $p`: recurse into a real directory, never a symlink.
+        // The two filetests are re-run exactly as the script runs them, ERRNO
+        // EFFECT INCLUDED: a failed one does not stop the walk, but its errno
+        // becomes the status of a later validation `die`, as perl's `$!` would.
+        let is_dir = match std::fs::metadata(std::ffi::OsStr::from_bytes(&path)) {
+            Ok(meta) => meta.is_dir(),
+            Err(error) => {
+                state.errno = error.raw_os_error();
+                false
+            }
+        };
+        if is_dir {
+            let is_link = match std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(&path)) {
+                Ok(meta) => meta.file_type().is_symlink(),
+                Err(error) => {
+                    state.errno = error.raw_os_error();
+                    false
+                }
+            };
+            if !is_link {
+                manifest_walk(out, &path, &rel, state)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The script's `$check_name` closure: NUL/LF/CR/TAB (by raw byte), then Perl's
+/// UTF-8 validity, then NFC — in that order, with the same diagnostic bytes.
+#[cfg(unix)]
+fn manifest_check_name(
+    name: &[u8],
+    dir: &[u8],
+    state: &ManifestWalkState,
+) -> Result<(), ManifestFailure> {
+    if manifest_wire_unrepresentable(name) {
+        let hex = hex::encode(name);
+        return Err(ManifestFailure::Die {
+            message: manifest_message(
+                &[
+                    b"entry name under ",
+                    dir,
+                    b" contains a tab, newline, carriage return, or NUL (the manifest wire refuses NUL/LF/CR/TAB): ",
+                    hex.as_bytes(),
+                ],
+                b"\n",
+            ),
+            errno: state.errno,
+        });
+    }
+    if !perl_utf8_valid(name) {
+        let hex = hex::encode(name);
+        return Err(ManifestFailure::Die {
+            message: manifest_message(
+                &[
+                    b"entry name under ",
+                    dir,
+                    b" is not valid UTF-8: ",
+                    hex.as_bytes(),
+                ],
+                b"\n",
+            ),
+            errno: state.errno,
+        });
+    }
+    if !perl_nfc(name) {
+        return Err(ManifestFailure::Die {
+            message: manifest_message(
+                &[b"entry name under ", dir, b" is not NFC-normalized: ", name],
+                b"\n",
+            ),
+            errno: state.errno,
+        });
+    }
+    Ok(())
+}
+
+/// The script's `$check_target` closure: NUL/LF/CR/TAB, then Perl's UTF-8
+/// validity. NFC is deliberately NOT required of a target: it is link data the
+/// kernel dereferences verbatim, not an addressable name.
+#[cfg(unix)]
+fn manifest_check_target(
+    target: &[u8],
+    rel: &[u8],
+    state: &ManifestWalkState,
+) -> Result<(), ManifestFailure> {
+    if manifest_wire_unrepresentable(target) {
+        let hex = hex::encode(target);
+        return Err(ManifestFailure::Die {
+            message: manifest_message(
+                &[
+                    b"symlink target of ",
+                    rel,
+                    b" contains a tab, newline, carriage return, or NUL (the manifest wire refuses NUL/LF/CR/TAB): ",
+                    hex.as_bytes(),
+                ],
+                b"\n",
+            ),
+            errno: state.errno,
+        });
+    }
+    if !perl_utf8_valid(target) {
+        let hex = hex::encode(target);
+        return Err(ManifestFailure::Die {
+            message: manifest_message(
+                &[
+                    b"symlink target of ",
+                    rel,
+                    b" is not valid UTF-8: ",
+                    hex.as_bytes(),
+                ],
+                b"\n",
+            ),
+            errno: state.errno,
+        });
+    }
+    Ok(())
+}
+
+/// One entry's record, from `lstat` to the printed line, exactly as the
+/// script's `$emit` closure does it.
+#[cfg(unix)]
+fn manifest_emit<W: std::io::Write>(
+    out: &mut W,
+    rel: &[u8],
+    path: &[u8],
+    state: &mut ManifestWalkState,
+) -> Result<(), ManifestFailure> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path)) {
+        Ok(meta) => meta,
+        Err(error) => {
+            state.errno = error.raw_os_error();
+            return Err(ManifestFailure::Die {
+                message: manifest_errno_message(b"lstat ", path, state.errno),
+                errno: state.errno,
+            });
+        }
+    };
+    // `-l $p ? l : (-d $p ? d : (-f $p ? f : o))`: the symlink test FIRST, so a
+    // symlink to a directory is `l` and is never walked into.
+    let file_type = meta.file_type();
+    let tag = if file_type.is_symlink() {
+        b'l'
+    } else if meta.is_dir() {
+        b'd'
+    } else if meta.is_file() {
+        b'f'
+    } else {
+        b'o'
+    };
+    let mode = meta.mode() & 0o7777;
+    let nlink = meta.nlink();
+    let mut hash = String::new();
+    let mut target: Vec<u8> = Vec::new();
+    if tag == b'f' {
+        let mut file = match std::fs::File::open(std::ffi::OsStr::from_bytes(path)) {
+            Ok(file) => file,
+            Err(error) => {
+                state.errno = error.raw_os_error();
+                let errno = errno_text(state.errno);
+                return Err(ManifestFailure::Die {
+                    message: manifest_message(
+                        &[
+                            b"open ",
+                            path,
+                            b": ",
+                            &errno,
+                            // No trailing newline in the script: perl appends
+                            // its location, and the one-line program makes the
+                            // location `-e line 20`.
+                            b" at -e line 20.\n",
+                        ],
+                        b"",
+                    ),
+                    errno: state.errno,
+                });
+            }
+        };
+        let mut data = Vec::new();
+        if let Err(error) = std::io::Read::read_to_end(&mut file, &mut data) {
+            // The script's slurp leaves `$d` undef and `sha256_hex(undef)` hashes
+            // the EMPTY string; warnings are off in the one-line program, so
+            // nothing is printed. The failed read's errno stays in `$!`.
+            state.errno = error.raw_os_error();
+            data.clear();
+        }
+        hash = storekit::digest::sha256_bytes(&data);
+    } else if tag == b'l' {
+        let link = match std::fs::read_link(std::ffi::OsStr::from_bytes(path)) {
+            Ok(link) => link,
+            Err(error) => {
+                state.errno = error.raw_os_error();
+                return Err(ManifestFailure::Die {
+                    message: manifest_errno_message(b"readlink ", path, state.errno),
+                    errno: state.errno,
+                });
+            }
+        };
+        target = link.as_os_str().as_bytes().to_vec();
+        manifest_check_target(&target, rel, state)?;
+        hash = storekit::digest::sha256_bytes(&target);
+    }
+    let mut record = Vec::with_capacity(rel.len() + path.len() + 96);
+    record.extend_from_slice(rel);
+    record.push(b'\t');
+    record.push(tag);
+    record.push(b'\t');
+    record.extend_from_slice(format!("{mode:x}").as_bytes());
+    record.push(b'\t');
+    record.extend_from_slice(nlink.to_string().as_bytes());
+    record.push(b'\t');
+    record.extend_from_slice(hash.as_bytes());
+    record.push(b'\t');
+    record.extend_from_slice(&target);
+    record.push(b'\n');
+    out.write_all(&record)
+        .map_err(|error| ManifestFailure::Io(format!("writing the manifest failed: {error}")))
+}
+
+/// Concatenate byte fragments (the script interpolates raw bytes into its
+/// diagnostics, so these are never built through a lossy string).
+#[cfg(unix)]
+fn manifest_message(parts: &[&[u8]], tail: &[u8]) -> Vec<u8> {
+    let mut message = Vec::new();
+    for part in parts {
+        message.extend_from_slice(part);
+    }
+    message.extend_from_slice(tail);
+    message
+}
+
+/// `<what><path>: <strerror>\n` — the script's `die qq{...: $!\n}` shape for a
+/// failing syscall (`what` carries its own trailing space).
+#[cfg(unix)]
+fn manifest_errno_message(what: &[u8], path: &[u8], errno: Option<i32>) -> Vec<u8> {
+    let errno = errno_text(errno);
+    manifest_message(&[what, path, b": ", &errno], b"\n")
+}
+
+/// Whether `bytes` holds one of the four characters the wire cannot carry:
+/// NUL, LF, CR, or TAB.
+#[cfg(unix)]
+fn manifest_wire_unrepresentable(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&byte| matches!(byte, 0 | b'\n' | b'\r' | b'\t'))
+}
+
+/// Whether Perl's `utf8::decode` accepts `bytes`.
+///
+/// NOT `std::str::from_utf8`: Perl's decoder accepts its EXTENDED UTF-8, which
+/// additionally encodes SURROGATES (a lone `ED A0 80` is U+D800), code points
+/// above U+10FFFF, and 5-, 6- and 7-byte forms. The script validates names and
+/// targets with `utf8::decode`, so a sequence Perl accepts must not be reported
+/// here as "not valid UTF-8". The per-length minimum rejects exactly the
+/// OVERLONG forms Perl rejects, and a `0xFF` lead is refused outright.
+///
+/// The boundaries are the measured ones: `C2 80` accepted, `C1 BF` refused;
+/// `E0 A0 80` accepted, `E0 9F BF` refused; `F0 90 80 80` accepted, `F0 8F BF
+/// BF` refused; `F8 88 80 80 80` accepted, `F8 87 BF BF BF` refused; `FC 84 80
+/// 80 80 80` accepted, `FC 83 …` refused; `FE 82 …` accepted, `FE 81 …`
+/// refused, `FF …` refused.
+#[cfg(unix)]
+fn perl_utf8_valid(bytes: &[u8]) -> bool {
+    perl_utf8_decode(bytes).is_some()
+}
+
+/// Decode `bytes` as Perl's extended UTF-8 — the decoder behind
+/// [`perl_utf8_valid`] — one code point per element, or `None` for exactly the
+/// byte strings Perl refuses. The elements are `u64` because the 7-byte form
+/// carries 36 value bits, past `u32`; every such value is invalid Unicode and
+/// is used only as a BOUNDARY by [`perl_nfc`].
+#[cfg(unix)]
+fn perl_utf8_decode(bytes: &[u8]) -> Option<Vec<u64>> {
+    let mut code_points = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let lead = bytes[index];
+        // (total length, smallest code point that needs that length)
+        let (len, minimum): (usize, u64) = match lead {
+            0x00..=0x7F => {
+                code_points.push(u64::from(lead));
+                index += 1;
+                continue;
+            }
+            0xC0..=0xDF => (2, 0x80),
+            0xE0..=0xEF => (3, 0x800),
+            0xF0..=0xF7 => (4, 0x1_0000),
+            0xF8..=0xFB => (5, 0x20_0000),
+            0xFC..=0xFD => (6, 0x400_0000),
+            0xFE => (7, 0x8000_0000),
+            // A continuation byte with no lead, and 0xFF, are never a start.
+            _ => return None,
+        };
+        if index + len > bytes.len() {
+            return None;
+        }
+        // The lead contributes the low (7 - len) bits of the first byte.
+        let mut value = u64::from(lead & ((1u16 << (7 - len)) - 1) as u8);
+        for continuation in &bytes[index + 1..index + len] {
+            if !(0x80..=0xBF).contains(continuation) {
+                return None;
+            }
+            value = (value << 6) | u64::from(continuation & 0x3F);
+        }
+        if value < minimum {
+            return None;
+        }
+        code_points.push(value);
+        index += len;
+    }
+    Some(code_points)
+}
+
+/// The script's NFC check (`NFC($c) ne $c`) for a name that
+/// [`perl_utf8_valid`] accepted.
+///
+/// A code point valid in Perl's EXTENDED UTF-8 but not in Unicode (a
+/// surrogate, a code point above U+10FFFF, or a 5/6/7-byte form) is PASSED
+/// THROUGH by Perl's normalizer: `Unicode::Normalize` normalizes the runs of
+/// valid scalars and leaves each such code point untouched, so those code
+/// points are BOUNDARIES and the check is per RUN. A name that mixes an
+/// extended code point with a decomposable valid run (`65 CC 81 ED A0 80` is
+/// `e`, U+0301, U+D800: the `e`+U+0301 run becomes U+00E9) therefore STILL
+/// fails and the script refuses it, while a name with no decomposable run is
+/// printed. Measured on perl 5.34/5.42.
+#[cfg(unix)]
+fn perl_nfc(bytes: &[u8]) -> bool {
+    // The caller refuses Perl-invalid bytes with the hex diagnostic BEFORE this
+    // check, so `None` is unreachable; it is not an NFC change either way.
+    let Some(code_points) = perl_utf8_decode(bytes) else {
+        return true;
+    };
+    let mut run: Vec<char> = Vec::new();
+    for code_point in code_points {
+        // `char::from_u32` is exactly the VALID scalar test: `None` for a
+        // surrogate and for anything above U+10FFFF.
+        match u32::try_from(code_point).ok().and_then(char::from_u32) {
+            Some(scalar) => run.push(scalar),
+            None => {
+                if !nfc_preserved(&run) {
+                    return false;
+                }
+                run.clear();
+            }
+        }
+    }
+    nfc_preserved(&run)
+}
+
+/// Whether `run` equals its own NFC form — the script's `NFC($c) ne $c`.
+#[cfg(unix)]
+fn nfc_preserved(run: &[char]) -> bool {
+    use unicode_normalization::UnicodeNormalization;
+
+    run.iter().copied().nfc().eq(run.iter().copied())
 }
 
 /// Reproduce perl's `die`: write `message` (the exact bytes, location suffix
@@ -1765,7 +2321,7 @@ fn flock_exclusive(fd: std::os::unix::io::RawFd) -> Result<(), FlockFailure> {
 #[cfg(unix)]
 fn usage(problem: &str) -> std::process::ExitCode {
     fail(&format!(
-        "{problem}\nusage: storekit-remote protocol\n       storekit-remote lstat <path>\n       storekit-remote list <path>\n       storekit-remote verify-open <path>\n       storekit-remote publish <path> <mode> <len>\n       storekit-remote write-new <path> <mode> <len>\n       storekit-remote sidecar-publish <sidecar> <lock> <mode> <len>\n       storekit-remote fsync-file <path>\n       storekit-remote fsync-dir <path>\n       storekit-remote fsync-tree <path>\n       storekit-remote rename <from> <to>\n       storekit-remote remove-file-if <path> <expected>\n       storekit-remote remove-file-if-sidecar <sidecar> <lock> <expected>\n       storekit-remote lock <record> <op_id>"
+        "{problem}\nusage: storekit-remote protocol\n       storekit-remote lstat <path>\n       storekit-remote list <path>\n       storekit-remote manifest <root>\n       storekit-remote verify-open <path>\n       storekit-remote publish <path> <mode> <len>\n       storekit-remote write-new <path> <mode> <len>\n       storekit-remote sidecar-publish <sidecar> <lock> <mode> <len>\n       storekit-remote fsync-file <path>\n       storekit-remote fsync-dir <path>\n       storekit-remote fsync-tree <path>\n       storekit-remote rename <from> <to>\n       storekit-remote remove-file-if <path> <expected>\n       storekit-remote remove-file-if-sidecar <sidecar> <lock> <expected>\n       storekit-remote lock <record> <op_id>"
     ))
 }
 

@@ -3060,6 +3060,29 @@ impl Remote for SshTransport {
         false
     }
 
+    /// The far-side manifest walk, in the dialect the ONE probe chose:
+    /// `storekit-remote manifest <root>` when the far side has a compatible
+    /// CLI, and otherwise the crate's existing `perl -e <script> <root>` form,
+    /// VERBATIM. Both forms are handed to [`Remote::exec`], so they share its
+    /// quoting; the CLI reproduces the script's stdout bytes, stderr and exit
+    /// status (the near-side assembler parses the identical stream).
+    fn manifest_argv(&self, root: &Path) -> Result<Vec<String>> {
+        let root = root.to_string_lossy().into_owned();
+        match self.far_side()? {
+            FarSide::Cli => Ok(vec![
+                STOREKIT_REMOTE_PROGRAM.to_string(),
+                "manifest".to_string(),
+                root,
+            ]),
+            FarSide::Scripts => Ok(vec![
+                "perl".to_string(),
+                "-e".to_string(),
+                crate::manifest::remote_tree_verify_script().to_string(),
+                root,
+            ]),
+        }
+    }
+
     fn endpoint_identity(&self) -> Option<String> {
         // The CONNECTION TARGET and port: `user@address` is what `ssh` dials,
         // so two transports that reach different hosts (or different ports on

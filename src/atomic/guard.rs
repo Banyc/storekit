@@ -5122,6 +5122,11 @@ impl S {
             "read-only walk/hash of a source root",
         ),
         (
+            "transport::Remote::manifest_argv",
+            "SELECTS the far-side manifest command's argv; issues no syscall, and the \
+             `&Path` is only spelled into the returned argv",
+        ),
+        (
             "sync::Residue::detect",
             "read-only detection of a stranded residue",
         ),
