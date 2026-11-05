@@ -28,7 +28,7 @@ requirement of the CLI path), and no removal of any script.
 | `remote-cli-read-ops` | DONE — change `zwwtxknu` (`e5c7a45f`) |
 | `remote-cli-write-ops` | DONE — change `tkkvxwnw` (`ec33f629`) |
 | `remote-cli-fsync-ops` | DONE — change `vwurprlv` (`1ace948a`) |
-| `remote-cli-lock` | OPEN |
+| `remote-cli-lock` | DONE — change `ksltvpwu` (`055a3313`) |
 | `remote-cli-manifest` | OPEN |
 
 ## remote-cli-probe
