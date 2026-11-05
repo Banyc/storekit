@@ -27,7 +27,14 @@
 //! `fsync-tree` (the `find -depth` walk), `rename` (parent + `rename(2)`), and
 //! `remove-file-if`/`remove-file-if-sidecar` (compare-and-delete, the second
 //! under the sidecar's `flock`), whose one-byte `R`/`M`/`A` frame is match,
-//! mismatch and absent.
+//! mismatch and absent, and `lock` (the long-lived far-side operation-lock
+//! HOLDER), whose `LOCKOK` readiness line, reserved exit codes and anchored
+//! diagnostics are the transport's.
+//!
+//! `lock` is the ONE long-lived subcommand: it prints its readiness line, then
+//! blocks reading STDIN until EOF while it KEEPS the `flock`, exactly as the
+//! perl holder does — the lock is held for the caller's SESSION, not for one
+//! command, and process death (a dropped connection) releases it.
 //!
 //! The payload is NEVER an argv token: every writer reads its raw bytes from
 //! STDIN, exactly as the transport pipes them, so arbitrary bytes round-trip.
@@ -141,6 +148,12 @@ fn main() -> std::process::ExitCode {
     if subcommand == OsStr::new("remove-file-if-sidecar") {
         return match three_operands_raw("remove-file-if-sidecar", &mut args) {
             Ok((sidecar, lock, expected)) => remove_file_if_sidecar(&sidecar, &lock, &expected),
+            Err(code) => code,
+        };
+    }
+    if subcommand == OsStr::new("lock") {
+        return match two_operands("lock", &mut args) {
+            Ok((record, op_id)) => lock_holder(&record, &op_id),
             Err(code) => code,
         };
     }
@@ -1229,6 +1242,249 @@ fn remove_file_if_sidecar(
     verdict_frame(b"R")
 }
 
+/// The far-side lock protocol's markers and reserved exit codes, re-spelled
+/// from `SshTransport`'s private `holder` module: that module is inside the
+/// library crate and a separate binary crate cannot reach it. The near side
+/// classifies this program by these EXACT values (`far_side_lock_refusal`), and
+/// `tests/remote_cli_lock.rs` drives the readiness line and the contention and
+/// record refusals through the REAL transport, so a drift on either side fails
+/// there.
+#[cfg(unix)]
+mod holder {
+    /// A live holder owns the record (the single non-blocking `flock` reported
+    /// `EWOULDBLOCK`/`EAGAIN`).
+    pub(super) const CONTENDED: u8 = 3;
+    /// The record could not be MADE usable: the parent `make_path`, the
+    /// `O_NOFOLLOW` open, or the `chmod 0600` tightening failed.
+    pub(super) const RECORD_UNUSABLE: u8 = 4;
+    /// `flock` failed for a reason OTHER than contention.
+    pub(super) const FLOCK_FAILED: u8 = 5;
+    /// The entry is NON-EMPTY and does not begin with
+    /// [`storekit::lock::RECORD_HEADER`] — not a record this crate wrote.
+    pub(super) const RECORD_NOT_RECOGNIZED: u8 = 6;
+    /// The readiness line's leading token, followed by the holder's pid.
+    pub(super) const READY: &str = "LOCKOK";
+    /// Leading token of the contention diagnostic (exit [`CONTENDED`]).
+    pub(super) const MARK_CONTENDED: &str = "LOCKCONTENDED";
+    /// Leading token of an unusable-record / failed-flock diagnostic (exit
+    /// [`RECORD_UNUSABLE`] or [`FLOCK_FAILED`]).
+    pub(super) const MARK_ERR: &str = "LOCKERR";
+    /// Leading token of the "not a record this crate wrote" refusal (exit
+    /// [`RECORD_NOT_RECOGNIZED`]).
+    pub(super) const MARK_NOT_RECOGNIZED: &str = "LOCKRECORDNOTRECOGNIZED";
+}
+
+/// The `lock` subcommand: the far-side operation-lock HOLDER, the CLI form of
+/// the transport's `PERL_HOLD_LOCK_TEMPLATE` (`perl_hold_lock`). Whatever this
+/// program makes visible — stdout bytes, stderr bytes, the exit status, and the
+/// record's bytes and mode on disk — is the contract the transport's near side
+/// already reads, so the two forms must be indistinguishable:
+///
+/// 1. the record's PARENT chain is created when `dirname(record)` is not
+///    already a directory (`File::Path::make_path`); a failure is
+///    `LOCKERR mkdir <dir>: <strerror>`, exit 4;
+/// 2. the record is opened `O_RDWR | O_CREAT | O_NOFOLLOW` at `0600`, so a
+///    symlink planted at the record fails CLOSED (`ELOOP`) instead of
+///    redirecting the write into a victim; a failure is `LOCKERR open <path>:
+///    <strerror>`, exit 4;
+/// 3. ONE non-blocking `flock(LOCK_EX | LOCK_NB)`: `EWOULDBLOCK`/`EAGAIN` is
+///    `LOCKCONTENDED <path>: <strerror>`, exit 3; any other failure is
+///    `LOCKERR flock <path>: <strerror>`, exit 5. No case ever waits;
+/// 4. AFTER the flock is held — the same order the local `FileLock::acquire`
+///    uses — the entry is read to the length of
+///    [`storekit::lock::RECORD_HEADER`]: a NON-EMPTY entry that does not begin
+///    with that header is not a record this crate wrote, so it is REFUSED
+///    (`LOCKRECORDNOTRECOGNIZED <path>: the entry is not a lock record this
+///    crate wrote; refusing to truncate it`, exit 6) and left byte-for-byte
+///    and mode-for-mode untouched;
+/// 5. the record is chmodded `0600` (`fchmod` on the open descriptor); a
+///    failure is `LOCKERR chmod <path>: <strerror>`, exit 4;
+/// 6. the header followed by `op_id` is written over the record from offset 0;
+/// 7. `LOCKOK <pid>` is printed and flushed;
+/// 8. the process BLOCKS reading STDIN until EOF, then `flock(LOCK_UN)`s and
+///    closes. Holding the flock for the caller's SESSION is the contract, not
+///    for one command; a dropped connection EOFs this stdin and process death
+///    releases the lock regardless.
+///
+/// The diagnostics are `print STDERR`, NOT `die`: they carry no perl
+/// ` at -e line N.` location suffix.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn lock_holder(record: &std::ffi::OsStr, op_id: &std::ffi::OsStr) -> std::process::ExitCode {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+
+    let path = std::path::Path::new(record);
+    let dir = dirname_of(record);
+    if !dir.is_dir()
+        && let Err(error) = std::fs::create_dir_all(&dir)
+    {
+        return holder_error(
+            holder::MARK_ERR,
+            Some("mkdir"),
+            dir.as_os_str().as_bytes(),
+            error.raw_os_error(),
+            holder::RECORD_UNUSABLE,
+        );
+    }
+    // The `0600` is a REQUEST subject to the umask, exactly like perl's
+    // `sysopen` mode (the umask can only remove bits) — and the chmod below
+    // re-applies it unconditionally, so the record ends up private either way.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return holder_error(
+                holder::MARK_ERR,
+                Some("open"),
+                path_bytes(path),
+                error.raw_os_error(),
+                holder::RECORD_UNUSABLE,
+            );
+        }
+    };
+    // ONE attempt: a live holder is a refusal, never a wait.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        let errno = error.raw_os_error();
+        if errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN) {
+            return holder_error(
+                holder::MARK_CONTENDED,
+                None,
+                path_bytes(path),
+                errno,
+                holder::CONTENDED,
+            );
+        }
+        return holder_error(
+            holder::MARK_ERR,
+            Some("flock"),
+            path_bytes(path),
+            errno,
+            holder::FLOCK_FAILED,
+        );
+    }
+    // Read at most the header's length. The script leaves its read loop on EOF
+    // OR on a read error and then compares whatever it accumulated, so a failed
+    // read is not its own failure arm; `read_to_end` keeps the bytes read
+    // before the error, which is exactly that accumulated `$head`.
+    let header = storekit::lock::RECORD_HEADER.as_bytes();
+    let mut head = Vec::with_capacity(header.len());
+    let _ = (&file).take(header.len() as u64).read_to_end(&mut head);
+    if !head.is_empty() && !head.starts_with(header) {
+        let mut message = format!("{} ", holder::MARK_NOT_RECOGNIZED).into_bytes();
+        message.extend_from_slice(path_bytes(path));
+        message.extend_from_slice(
+            b": the entry is not a lock record this crate wrote; refusing to truncate it\n",
+        );
+        let _ = std::io::stderr().lock().write_all(&message);
+        return std::process::ExitCode::from(holder::RECORD_NOT_RECOGNIZED);
+    }
+    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        return holder_error(
+            holder::MARK_ERR,
+            Some("chmod"),
+            path_bytes(path),
+            error.raw_os_error(),
+            holder::RECORD_UNUSABLE,
+        );
+    }
+    // The script does NOT check these four calls (there is no `or die`), so the
+    // CLI must not invent a failure arm it does not have: it proceeds to the
+    // ready line exactly as the script does. `set_len` does not move the
+    // offset; the seek does.
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.set_len(0);
+    let _ = file.write_all(header);
+    let _ = file.write_all(op_id.as_bytes());
+    let _ = file.flush();
+    let mut out = std::io::stdout().lock();
+    let ready = format!("{} {}\n", holder::READY, std::process::id());
+    if let Err(error) = out.write_all(ready.as_bytes()).and_then(|()| out.flush()) {
+        return fail(&format!("writing the lock ready line failed: {error}"));
+    }
+    // The stdout lock must not be held across the (unbounded) stdin wait.
+    drop(out);
+    // BLOCK until EOF. The bytes are discarded: EOF is the whole signal.
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    // The explicit release, then close. Best-effort exactly as the script's
+    // unchecked `flock($fh, LOCK_UN); close($fh);` is: process death has
+    // already released the flock if either call is skipped.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    drop(file);
+    std::process::ExitCode::SUCCESS
+}
+
+/// `File::Basename::dirname` for a Unix path — the semantics the holder script
+/// uses (`use File::Basename qw(dirname)`) — rather than `Path::parent`'s:
+/// trailing slashes are removed (`a/` is `a`), repeated separators are
+/// collapsed (`a//b` is `a`), a path with no directory component is `.`, and
+/// the filesystem root is `/`.
+#[cfg(unix)]
+fn dirname_of(path: &std::ffi::OsStr) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return std::path::PathBuf::from(".");
+    }
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 1 && bytes[0] == b'/' {
+        return std::path::PathBuf::from("/");
+    }
+    match bytes[..end].iter().rposition(|&b| b == b'/') {
+        None => std::path::PathBuf::from("."),
+        Some(0) => std::path::PathBuf::from("/"),
+        Some(separator) => {
+            let mut cut = separator;
+            while cut > 1 && bytes[cut - 1] == b'/' {
+                cut -= 1;
+            }
+            std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..cut]))
+        }
+    }
+}
+
+/// Print ONE anchored holder diagnostic to STDERR — `<marker>[ <what>] <path>:
+/// <strerror>` plus one LF — and return the arm's reserved exit code. It is a
+/// `print STDERR`, never a `die`: no ` at -e line N.` suffix is appended, and
+/// the errno text is the C library's (`$!`'s), not `std`'s rendering.
+#[cfg(unix)]
+fn holder_error(
+    marker: &str,
+    what: Option<&str>,
+    path: &[u8],
+    errno: Option<i32>,
+    code: u8,
+) -> std::process::ExitCode {
+    use std::io::Write;
+
+    let mut message = marker.as_bytes().to_vec();
+    message.push(b' ');
+    if let Some(what) = what {
+        message.extend_from_slice(what.as_bytes());
+        message.push(b' ');
+    }
+    message.extend_from_slice(path);
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(&errno_text(errno));
+    message.push(b'\n');
+    let _ = std::io::stderr().lock().write_all(&message);
+    std::process::ExitCode::from(code)
+}
+
 /// Print the ONE verdict frame the transport's parser reads. It is the script's
 /// `printf 'R'` / perl `print "M"`: the byte alone, no newline, flushed before
 /// exit.
@@ -1509,7 +1765,7 @@ fn flock_exclusive(fd: std::os::unix::io::RawFd) -> Result<(), FlockFailure> {
 #[cfg(unix)]
 fn usage(problem: &str) -> std::process::ExitCode {
     fail(&format!(
-        "{problem}\nusage: storekit-remote protocol\n       storekit-remote lstat <path>\n       storekit-remote list <path>\n       storekit-remote verify-open <path>\n       storekit-remote publish <path> <mode> <len>\n       storekit-remote write-new <path> <mode> <len>\n       storekit-remote sidecar-publish <sidecar> <lock> <mode> <len>\n       storekit-remote fsync-file <path>\n       storekit-remote fsync-dir <path>\n       storekit-remote fsync-tree <path>\n       storekit-remote rename <from> <to>\n       storekit-remote remove-file-if <path> <expected>\n       storekit-remote remove-file-if-sidecar <sidecar> <lock> <expected>"
+        "{problem}\nusage: storekit-remote protocol\n       storekit-remote lstat <path>\n       storekit-remote list <path>\n       storekit-remote verify-open <path>\n       storekit-remote publish <path> <mode> <len>\n       storekit-remote write-new <path> <mode> <len>\n       storekit-remote sidecar-publish <sidecar> <lock> <mode> <len>\n       storekit-remote fsync-file <path>\n       storekit-remote fsync-dir <path>\n       storekit-remote fsync-tree <path>\n       storekit-remote rename <from> <to>\n       storekit-remote remove-file-if <path> <expected>\n       storekit-remote remove-file-if-sidecar <sidecar> <lock> <expected>\n       storekit-remote lock <record> <op_id>"
     ))
 }
 

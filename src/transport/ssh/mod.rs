@@ -3551,13 +3551,14 @@ impl Remote for SshTransport {
     }
 
     /// Acquire a REAL far-side operation-lock session (the [`FarSideLockSession`]
-    /// contract): spawn a long-lived local `ssh` client whose remote `perl`
-    /// ([`perl_hold_lock`]) takes the record's `flock` non-blocking and then
-    /// blocks on stdin. The guard owns the child; dropping it closes stdin,
-    /// waits for the holder to exit, then kills and reaps the client if it did
-    /// not, so the record is released on every path. A connection that dies
-    /// drops the child too (the far side sees EOF), which is the documented
-    /// "a lost connection releases it" property.
+    /// contract): spawn a long-lived local `ssh` client whose remote holder —
+    /// the `storekit-remote lock` subcommand when the far side has a compatible
+    /// CLI, the perl program ([`perl_hold_lock`]) otherwise — takes the record's
+    /// `flock` non-blocking and then blocks on stdin. The guard owns the child;
+    /// dropping it closes stdin, waits for the holder to exit, then kills and
+    /// reaps the client if it did not, so the record is released on every path.
+    /// A connection that dies drops the child too (the far side sees EOF), which
+    /// is the documented "a lost connection releases it" property.
     fn lock_far_side(&self, record: &Path, op_id: &str) -> Result<Box<dyn FarSideLockSession>> {
         Ok(Box::new(self.spawn_far_side_lock(record, op_id)?))
     }
@@ -3930,16 +3931,37 @@ fn reap_bounded(
 }
 
 impl SshTransport {
+    /// The CLI form of [`perl_hold_lock`]: `storekit-remote lock <record>
+    /// <op_id>`. Both operands are the SAME absolute record path and op id the
+    /// script is given, so the two forms contend on the same inode and write
+    /// the same record bytes.
+    fn lock_cli_argv(record: &Path, op_id: &str) -> Vec<String> {
+        vec![
+            STOREKIT_REMOTE_PROGRAM.to_string(),
+            "lock".to_string(),
+            record.to_string_lossy().into_owned(),
+            op_id.to_string(),
+        ]
+    }
+
     /// Spawn the long-lived far-side lock holder and wait (bounded) for its
     /// `LOCKOK` readiness line. See [`perl_hold_lock`] for the script and
     /// [`SshFarSideLock`] for the lifetime.
+    ///
+    /// The holder runs the CLI `lock` subcommand when the far side has a
+    /// compatible `storekit-remote` and the perl script otherwise; the choice
+    /// is [`Self::far_command`]'s, exactly as for every other operation, so a
+    /// transport still probes once and never per call. Both forms implement the
+    /// same protocol (markers, reserved exit codes, `LOCKOK <pid>` readiness,
+    /// a `flock` held until stdin closes), so the readiness read and the
+    /// refusal classification below are unchanged by the choice.
     fn spawn_far_side_lock(&self, record: &Path, op_id: &str) -> Result<SshFarSideLock> {
         // The mux dir must exist before the `ControlPath` option is used, and a
         // fingerprint-only identity must be pinned first — the self-preparing
         // step `prepare_for_request` performs (not every request takes it;
         // `try_write_new` is the only one that does not).
         self.prepare_for_request()?;
-        let inner = Self::argv_cmd(&[
+        let script = Self::argv_cmd(&[
             "perl".into(),
             "-e".into(),
             perl_hold_lock(),
@@ -3947,6 +3969,7 @@ impl SshTransport {
             record.to_string_lossy().into_owned(),
             op_id.to_string(),
         ]);
+        let inner = self.far_command(script, &Self::lock_cli_argv(record, op_id))?;
         // Wrap in `bash -c` exactly like every other far-side command, so the
         // remote login shell only parses a trivial single-quoted invocation and
         // the script runs under POSIX/bash semantics.

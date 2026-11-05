@@ -88,7 +88,14 @@ pub(crate) use platform::{contended_errno, try_lock, unlock};
 /// a record RECOGNIZABLE: [`FileLock::acquire`] adopts a pre-existing entry
 /// only when it is empty or begins with this header, so a caller-supplied path
 /// that names ordinary content is refused instead of truncated.
-pub(crate) const RECORD_HEADER: &str = "storekit lock record v1\n";
+///
+/// Public (hidden from the rendered docs: it is not part of the supported API
+/// surface) because the far-side `storekit-remote` binary is a SEPARATE crate
+/// and its `lock` holder must write and recognise the SAME bytes. This constant
+/// is that one authority: the transport's perl template, the local
+/// [`FileLock`], and the CLI are all generated from or compare against it.
+#[doc(hidden)]
+pub const RECORD_HEADER: &str = "storekit lock record v1\n";
 
 /// Read at most [`RECORD_HEADER`]'s length from the start of `file` — just
 /// enough to decide whether the entry is a record this crate wrote, so a large

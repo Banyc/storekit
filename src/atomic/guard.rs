@@ -2651,12 +2651,23 @@ mod tests {
             // non-mutating probes `perl_handle_setup_errno` runs on an ALREADY
             // OPENED, read-only descriptor to reproduce the `$!` perl's own
             // `sysopen` leaves for the fsync primitive's refusal `die`.
-            ("src/bin/storekit-remote.rs", "libc::O_NOFOLLOW", 1),
+            //
+            // The `lock` HOLDER adds the perl holder's own descriptor-bound
+            // protocol: the second `O_NOFOLLOW` open (the record), the ONE
+            // non-blocking `flock(LOCK_EX | LOCK_NB)` it tries and the
+            // `flock(LOCK_UN)` release, and the `EWOULDBLOCK`/`EAGAIN` pair
+            // that classifies contention. None of these can ADOPT a name;
+            // `flock` is reviewed on `FUNNEL_SYMBOLS_NOT_DENIED` as
+            // descriptor-bound, exactly as `fcntl` is.
+            ("src/bin/storekit-remote.rs", "libc::O_NOFOLLOW", 2),
             ("src/bin/storekit-remote.rs", "libc::O_NONBLOCK", 2),
             ("src/bin/storekit-remote.rs", "libc::strerror", 1),
-            ("src/bin/storekit-remote.rs", "libc::flock", 1),
-            ("src/bin/storekit-remote.rs", "libc::LOCK_EX", 1),
-            ("src/bin/storekit-remote.rs", "libc::LOCK_NB", 1),
+            ("src/bin/storekit-remote.rs", "libc::flock", 3),
+            ("src/bin/storekit-remote.rs", "libc::LOCK_EX", 2),
+            ("src/bin/storekit-remote.rs", "libc::LOCK_NB", 2),
+            ("src/bin/storekit-remote.rs", "libc::LOCK_UN", 1),
+            ("src/bin/storekit-remote.rs", "libc::EWOULDBLOCK", 1),
+            ("src/bin/storekit-remote.rs", "libc::EAGAIN", 1),
             ("src/bin/storekit-remote.rs", "libc::isatty", 1),
             ("src/bin/storekit-remote.rs", "libc::lseek", 1),
             ("src/bin/storekit-remote.rs", "libc::SEEK_CUR", 1),
@@ -2903,18 +2914,22 @@ mod tests {
             ("src/atomic/guard.rs", "OpenOptions::custom_flags", 1),
             ("src/atomic/mod.rs", "OpenOptions::custom_flags", 1),
             // The far-side executable's `verify-open`: a READ-ONLY open
-            // forwarding `O_NOFOLLOW | O_NONBLOCK` only.
-            ("src/bin/storekit-remote.rs", "OpenOptions::custom_flags", 2),
+            // forwarding `O_NOFOLLOW | O_NONBLOCK` only, and the `lock` holder's
+            // record open: `O_NOFOLLOW` plus the `create` flag (0600, never
+            // truncating). Both are the guarded `O_NOFOLLOW` protocol open the
+            // perl holder performs — a symlink at the spelling fails ELOOP
+            // before any chmod/write — never a caller's store-relative name.
+            ("src/bin/storekit-remote.rs", "OpenOptions::custom_flags", 3),
             // The far-side payload writers AND the fsync/rename/compare-and-
             // delete operations: the same temp/mode/fsync/rename/link sequence
             // the perl scripts perform, on the far-side paths the transport
             // hands them (the temp name comes from
             // `atomic::temp_name_for`). The claim's `mktemp`+`rm -f` reserve-\n            // and-release is one `OpenOptions::create_new` plus one
             // `remove_file`; the restore is the no-replace `hard_link`.
-            ("src/bin/storekit-remote.rs", "create_dir_all", 6),
+            ("src/bin/storekit-remote.rs", "create_dir_all", 7),
             ("src/bin/storekit-remote.rs", "set_permissions", 5),
             ("src/bin/storekit-remote.rs", "OpenOptions::create_new", 1),
-            ("src/bin/storekit-remote.rs", "OpenOptions::create", 2),
+            ("src/bin/storekit-remote.rs", "OpenOptions::create", 3),
             ("src/bin/storekit-remote.rs", "remove_file", 2),
             ("src/bin/storekit-remote.rs", "rename", 3),
             ("src/bin/storekit-remote.rs", "hard_link", 3),
@@ -3760,6 +3775,13 @@ mod tests {
         "libc::fdopendir",
         "libc::closedir",
         "libc::fcntl",
+        // The advisory-lock call the lock protocol takes on an ALREADY OPENED
+        // descriptor: it sets no mode bits and touches no name, so it cannot
+        // adopt a reserved spelling. Reviewed here rather than denied, exactly
+        // as `fcntl` is; the record's `O_NOFOLLOW` open — the adoption-capable
+        // half of the protocol — IS denied and carries an item-level allow at
+        // its one reviewed site.
+        "libc::flock",
     ];
 
     /// The canonical `std`/`libc` path a resolved path names, if it is a CALL
