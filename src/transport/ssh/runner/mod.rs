@@ -192,27 +192,29 @@ fn record_reap(status: &WaitStatusCell) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = WaitStatus::Reaped;
 }
 
-/// A spawned child owned by one supervisor. The runner keeps the EXCLUSIVE
-/// handle to the live child, and its `kill` terminates that child through it
-/// — never a detached pid: on Unix the whole process group, by the owned
-/// child's pgid (TERM, grace, KILL), reaching the owned
-/// [`std::process::Child::kill`] only as the fallback for a group kill that
-/// reports ESRCH or another error; on Windows the direct child
-/// (`TerminateProcess`). The wait thread runs a reaping closure. The closure
-/// records [`WaitStatus::Reaped`] as soon as the child's exit status is
-/// consumed and delivers its single result when it returns, so the runner's
-/// join is a deterministic reap. Once the wait thread has reaped the child the
-/// handle is CONSUMED: a kill on it is a no-op by construction, so a pid the
-/// OS recycled to an unrelated process can never be signalled.
+/// A spawned child owned by one supervisor. The runner holds the child's
+/// [`crate::transport::runner::ProcessGroup`] capability through the seam,
+/// and its `kill` terminates the group the capability names — never a
+/// detached pid inherited from beside the slot. On Unix that is the whole
+/// process group (TERM, grace, KILL), reaching the owned leader only as the
+/// fallback for a group signal that reports ESRCH or another error; on
+/// Windows it is the direct child (`TerminateProcess`). The wait thread runs a
+/// reaping closure. The closure records [`WaitStatus::Reaped`] as soon as the
+/// child's exit status is consumed and delivers its single result when it
+/// returns, so the runner's join is a deterministic reap. Once the wait thread
+/// has TAKEN the capability the slot is empty and every later signal is a
+/// no-op by construction, so a pid the OS recycled to an unrelated process can
+/// never be signalled.
 struct SpawnedChild {
     /// The child's pid, known to the PARENT synchronously at spawn time: the
-    /// real seam reads it off the owned [`std::process::Child`] immediately
-    /// after spawn (the fake generates its own), and the runner surfaces it
-    /// through the test-only spawn observer — so a test asserts the pid is
-    /// gone after the deadline kill WITHOUT the child ever writing its own
-    /// pid to a file (a child-written pidfile races the kill: the child can
+    /// real seam reads it off the owned [`crate::transport::runner::ProcessGroup`]
+    /// immediately after spawn (the fake generates its own), and the runner
+    /// surfaces it through the test-only spawn observer — so a test asserts the
+    /// pid is gone after the deadline kill WITHOUT the child ever writing its
+    /// own pid to a file (a child-written pidfile races the kill: the child can
     /// be killed before it writes).
     pid: u32,
+
     /// The deadline-visible fact, updated by the wait closure the instant the
     /// exit status is consumed, BEFORE the bounded drain. The fake seam sets
     /// it synchronously in `spawn`, so the test premise stays deterministic: a
@@ -221,16 +223,17 @@ struct SpawnedChild {
     /// sometimes observing a still-running child and fabricating a `Timeout`
     /// for a command that had already exited.
     status: Arc<WaitStatusCell>,
+
     /// Request the force-kill of the live child. A no-op once the wait thread
-    /// has reaped the child: the shared slot then holds no handle. The real
-    /// seam's closure locks the child slot shared with the wait thread and is
-    /// per-platform. On Unix the child leads its own process group, so the
-    /// closure signals the WHOLE group — SIGTERM to the group, sleep
-    /// [`crate::transport::runner::TERM_TO_KILL_GRACE`], then SIGKILL to the
-    /// group — and reaches the owned [`std::process::Child::kill`] only as the
-    /// fallback for a group kill that reports ESRCH or another error. On
-    /// Windows there is no process group, so the closure calls `kill` on the
-    /// owned child (`TerminateProcess`). The fake seam records the Kill event
+    /// has consumed the capability: the shared slot then holds no group, so a
+    /// signal has no pgid to address. The real seam's closure locks the SAME
+    /// slot the wait thread takes and is per-platform. On Unix the child leads
+    /// its own process group, so the closure signals the WHOLE group — SIGTERM
+    /// to the group, sleep [`crate::transport::runner::TERM_TO_KILL_GRACE`],
+    /// then SIGKILL to the group — and reaches the owned leader only as the
+    /// fallback for a group signal that reports ESRCH or another error. On
+    /// Windows there is no process group, so the closure signals the owned
+    /// child alone (`TerminateProcess`). The fake seam records the Kill event
     /// against its own per-child control block.
     kill: Box<dyn Fn() -> std::io::Result<()> + Send>,
     /// Drain stdout/stderr and wait for the child; must return promptly once
@@ -421,12 +424,12 @@ impl SshRunner {
             .seam
             .spawn(op, argv, stdin.map(<[u8]>::to_vec))
             .map_err(|e| RunError::Spawn(format!("spawn {:?}: {e}", argv)))?;
-        // Split the owned handle into the kill request (the deadline path)
-        // and the wait closure (the wait thread), plus the shared status the
-        // closure flips when it consumes the exit status. The kill and the
-        // wait share the child EXCLUSIVELY through the seam's handle, so the
-        // deadline path can kill while the wait thread is mid-wait and a kill
-        // after the wait has reaped the child is a no-op by construction.
+        // Split the owned capability into the kill request (the deadline
+        // path) and the wait closure (the wait thread), plus the shared status
+        // the closure flips when it consumes the exit status. The kill and the
+        // wait share the group EXCLUSIVELY through the seam's ONE slot, so the
+        // deadline path can signal while the wait thread is mid-wait and a
+        // signal after the wait has taken the capability finds it absent.
         let SpawnedChild {
             pid,
             status,
@@ -483,15 +486,16 @@ impl SshRunner {
                     return res;
                 }
                 // The child was still RUNNING at the deadline: request the
-                // kill on the owned child's slot (the WHOLE process group on
-                // Unix, the direct child on Windows) — never a libc::kill of a
-                // detached pid — then reap by joining the wait thread that
-                // owns the child (its `wait` returns promptly after the kill).
-                // Both complete before this function returns, so the child is
-                // deterministically collected — no zombie, no kill-vs-wait
-                // race, no return-before-reap — and a pid the OS recycled
-                // after the reap can never be signalled: a kill on a consumed
-                // handle is a no-op by construction.
+                // signal on the group the seam's slot holds (the WHOLE process
+                // group on Unix, the direct child on Windows) — never a
+                // libc::kill of a detached pid — then collect by joining the
+                // wait thread that owns the capability (its `wait` returns
+                // promptly after the signal). Both complete before this
+                // function returns, so the child is deterministically
+                // collected — no zombie, no signal-vs-wait race, no
+                // return-before-reap — and a pid the OS recycled after the
+                // collect can never be signalled: the slot is empty, so a
+                // signal has no group to name.
                 let _ = kill();
                 let _ = handle.join();
                 // The wait thread has now finished and delivered its result:
@@ -2101,12 +2105,12 @@ mod runner_property_tests {
     }
 
     /// The SSH runner's Unix seam reuses the LOCAL runner's
-    /// [`crate::transport::runner::OwnedChild`] drop backstop (ONE authority
-    /// for "every error path leaves no uncollected child"). If a
-    /// `drain_available`/`try_wait` error makes the wait closure return while
-    /// the child is still live and uncollected, the shared slot is dropped and
-    /// `OwnedChild::drop` kills the group and reaps it; a bare
-    /// [`std::process::Child`]'s own `Drop` neither waits nor kills.
+    /// [`crate::transport::runner::ProcessGroup`] capability and its drop
+    /// backstop (ONE authority for "every error path leaves no uncollected
+    /// child"). If a `drain_available`/`try_wait` error makes the wait closure
+    /// return while the child is still live and uncollected, the shared slot is
+    /// dropped and `ProcessGroup::drop` signals the group and collects it; a
+    /// bare [`std::process::Child`]'s own `Drop` neither waits nor signals.
     ///
     /// The error itself cannot be injected through the public seam (there is
     /// no fault seam between `drain_available` and the child slot), so this
@@ -2129,7 +2133,7 @@ mod runner_property_tests {
         } = child;
         // Abandon the handle: drop both Arcs without ever invoking the wait
         // closure, exactly as an early `?`-return inside the wait closure
-        // does. The LAST drop runs the shared `OwnedChild::drop` backstop.
+        // does. The LAST drop runs the shared [`ProcessGroup::drop`] backstop.
         drop(wait);
         drop(kill);
         let budget = Instant::now() + Duration::from_secs(5);

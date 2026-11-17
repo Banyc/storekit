@@ -78,7 +78,9 @@ pub(crate) mod scripted;
 mod ssh;
 
 pub use crate::relpath::RootedRelativePath;
-pub use runner::{ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig};
+pub use runner::{
+    ChildRunner, GroupSignal, KillSeam, ProcessGroup, RealKill, RunError, RunOutcome, RunnerConfig,
+};
 pub use ssh::SshTransport;
 /// The far-side payload-writer protocol's reserved statuses, re-exported for
 /// the `storekit-remote` binary: the no-clobber conflict verdict, the

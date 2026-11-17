@@ -4,10 +4,9 @@
 
 use super::*;
 use crate::transport::runner::{
-    DrainState, KILL_REAP_BOUND, OwnedChild, RealKill, TERM_TO_KILL_GRACE, drain_available,
-    drain_to_eof, kill_process_group, set_nonblocking,
+    DrainState, GroupSignal, KILL_REAP_BOUND, ProcessGroup, RealKill, TERM_TO_KILL_GRACE,
+    drain_available, drain_to_eof, set_nonblocking,
 };
-use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -31,96 +30,84 @@ pub(crate) fn spawn(
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
-    // The child becomes its OWN process-group leader (pgid == pid) — the
-    // shared bounded child-runner's spawn rule — so the deadline kill
-    // terminates the WHOLE group (killpg), and any local helper process
-    // the child spawned dies with it.
-    cmd.process_group(0);
-    let mut child = cmd.spawn()?;
+    // The group rule (own group leader, pgid == pid) is applied BY the
+    // capability: a child cannot be spawned outside a group whose authority the
+    // runner holds. The deadline signal then terminates the WHOLE group
+    // (`killpg`), so any local helper process the child spawned dies with it.
+    let mut group = ProcessGroup::spawn_configured(cmd, Arc::new(RealKill))?;
     // The parent reads the pid synchronously at spawn time and surfaces it
     // through the runner's spawn observer: the child never needs to write
     // its own pid to a file.
-    let pid = child.id();
+    let pid = group.pid();
     // Non-blocking pipe read ends, exactly as the shared local runner does
     // (the helpers are shared, not copied): the wait loop drains without
     // blocking, and — the reason this matters — the post-exit drain can give
     // up on schedule instead of parking on a pipe another process still
     // holds open. Done here, before the wait thread exists, so a setup
-    // failure is handled while the child is still OURS: it is killed and
-    // reaped first, so even this path cannot leave a live, un-reaped child.
+    // failure is handled while the group is still OURS: it is signalled and
+    // collected first, so even this path cannot leave a live, un-collected
+    // child.
     if let Err(e) =
-        set_nonblocking(&mut child.stdout).and_then(|()| set_nonblocking(&mut child.stderr))
+        set_nonblocking(group.stdout_mut()).and_then(|()| set_nonblocking(group.stderr_mut()))
     {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = group.signal_leader();
+        let _ = group.wait();
         return Err(e);
     }
-    // The child is shared EXCLUSIVELY between the runner's deadline path
-    // and the wait thread through this slot: the wait thread polls the
-    // child (`try_wait`) with the slot locked and CONSUMES it on exit
-    // (the slot becomes None), the deadline path locks the same slot and
-    // terminates the WHOLE process group (`killpg` TERM then KILL, with a
-    // fallback to `Child::kill` on the OWNED handle) — never a detached
-    // pid. A kill on a slot the wait thread already reaped (None) is a
-    // no-op by construction: a consumed handle cannot signal anything, so
-    // a pid the OS recycled to an unrelated process can never be hit.
+    // The group is shared EXCLUSIVELY between the runner's deadline path and
+    // the wait thread through this ONE slot: whoever TAKEs the capability
+    // consumes it, so the wait path's collect and the deadline path's signal
+    // cannot both own the group and cannot both act on it. A signal after the
+    // collect finds `None` and is a no-op by construction — a pid the OS
+    // recycled to an unrelated process can never be signalled. No separate
+    // pgid is held beside the slot: a number outside the capability would not
+    // be covered by that guarantee.
     //
-    // The slot holds the SAME [`OwnedChild`] the local runner owns, so the
-    // SSH runner inherits the local runner's drop backstop (ONE authority
-    // for "every error path leaves no uncollected child"): a `drain_available`
-    // or `try_wait` error that returns early from the wait closure drops the
-    // slot — and the owned child with it — kills the group, and reaps, where
-    // a bare `Child`'s own `Drop` would neither wait nor kill.
-    let child: Arc<Mutex<Option<OwnedChild>>> =
-        Arc::new(Mutex::new(Some(OwnedChild::new(child, Arc::new(RealKill)))));
-    let kill_child = child.clone();
+    // The slot holds the SAME [`ProcessGroup`] the local runner owns, so the
+    // SSH runner inherits the local runner's drop backstop (ONE authority for
+    // "every error path leaves no uncollected child"): a `drain_available` or
+    // `try_wait` error that returns early from the wait closure drops the
+    // slot — and the capability with it — signals the group, and collects,
+    // where a bare `Child`'s own `Drop` would neither wait nor signal.
+    let group: Arc<Mutex<Option<ProcessGroup>>> = Arc::new(Mutex::new(Some(group)));
+    let kill_group_cap = group.clone();
     let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
-        let mut guard = kill_child.lock().unwrap();
-        let Some(owned) = guard.as_mut() else {
-            // The wait thread already reaped the child: a kill on the
-            // consumed handle is a NO-OP by construction — a pid the OS
-            // recycled to an unrelated process can never be signalled.
+        let mut guard = kill_group_cap.lock().unwrap();
+        let Some(group) = guard.as_mut() else {
+            // The wait thread already consumed the capability: a signal on it
+            // is a NO-OP by construction — a pid the OS recycled to an
+            // unrelated process can never be signalled.
             return Ok(());
         };
         // Terminate the WHOLE process group (shared with the local
         // child-runner): graceful TERM first, then — after the shared
         // grace — an escalated KILL, so a child that ignores TERM (and
         // any grandchild in the group) still dies.
-        //
-        // The direct-child fallback goes through `live_child()`: once the
-        // wait thread has consumed the exit status the handle is
-        // unreachable, so a pid the OS recycled after the reap can never
-        // be signalled.
-        let direct = |owned: &mut OwnedChild| match owned.live_child() {
-            Some(child) => child.kill(),
-            None => Ok(()),
-        };
-        let pgid = owned.pid() as i32;
-        match kill_process_group(pgid, libc::SIGTERM) {
+        match group.signal(GroupSignal::Term) {
             Ok(()) => {
                 std::thread::sleep(TERM_TO_KILL_GRACE);
-                match kill_process_group(pgid, libc::SIGKILL) {
+                match group.signal(GroupSignal::Kill) {
                     Ok(()) => Ok(()),
                     // The group already died on TERM (the wait thread
-                    // reaps the child): nothing left to kill.
+                    // collects the child): nothing left to signal.
                     Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-                    // The escalated group kill failed: fall back to the
-                    // OWNED handle so the direct child still dies and the
-                    // join reaps it; the failure is surfaced.
-                    Err(e) => direct(owned).or(Err(e)),
+                    // The escalated group signal failed: fall back to the
+                    // OWNED leader so the direct child still dies and the
+                    // join collects it; the failure is surfaced.
+                    Err(e) => group.signal_leader().or(Err(e)),
                 }
             }
             // The group is already gone (the child exited, or escaped via
-            // setsid): fall back to the OWNED handle so a live direct
+            // setsid): fall back to the OWNED leader so a live direct
             // child is still terminated.
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => direct(owned),
-            // A real group-kill failure: fall back to the owned handle so
-            // the direct child still dies (the join then reaps it), and
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => group.signal_leader(),
+            // A real group-signal failure: fall back to the owned leader so
+            // the direct child still dies (the join then collects it), and
             // surface the failure.
-            Err(e) => direct(owned).or(Err(e)),
+            Err(e) => group.signal_leader().or(Err(e)),
         }
     });
-    let wait_child = child.clone();
+    let wait_group = group.clone();
     // The deadline fact: the wait closure flips it to `Reaped` the instant it
     // consumes the exit status — BEFORE the bounded drain — so a deadline that
     // fires during the drain finds a child that had already exited and returns
@@ -145,15 +132,15 @@ pub(crate) fn spawn(
         // result delivery.
         let body = move || -> WaitResult {
             use std::io::Write;
-            let mut stdin_pipe = wait_child
+            let mut stdin_pipe = wait_group
                 .lock()
                 .unwrap()
                 .as_mut()
-                .and_then(|c| c.take_stdin());
+                .and_then(|g| g.take_stdin());
             // Write the payload FIRST, saving any error: `?` here would
             // return BEFORE the child is collected — a write error (EPIPE
-            // after the deadline kill, or a hung-remote pipe) would leave
-            // an un-reaped child. The error is therefore saved, and the
+            // after the deadline signal, or a hung-remote pipe) would leave
+            // the capability unconsumed. The error is therefore saved, and the
             // poll loop below ALWAYS collects the child before the saved
             // write error is surfaced.
             let write_res = match (&stdin, stdin_pipe.as_mut()) {
@@ -161,33 +148,33 @@ pub(crate) fn spawn(
                 _ => Ok(()),
             };
             drop(stdin_pipe);
-            // Poll loop: the child lives in the shared slot; every pass
+            // Poll loop: the group lives in the shared slot; every pass
             // drains its pipes (non-blocking) so a large output can never
             // fill a pipe and stall the child, then `try_wait`. Between
-            // passes the slot is released so the runner's deadline kill
-            // can grab it — each pass is short, so a kill never blocks
+            // passes the slot is released so the runner's deadline signal
+            // can grab it — each pass is short, so a signal never blocks
             // long. When the child exits the slot is consumed (reaped)
             // and the remaining output drained to EOF.
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let wait_res = loop {
-                let mut exited: Option<(OwnedChild, std::process::ExitStatus)> = None;
+                let mut exited: Option<ProcessGroup> = None;
                 // Bytes drained THIS pass. A pass that moved data must not
                 // sleep before the next one. Progress means no sleep; a silent
                 // running child yields so the loop does not busy-spin and the
-                // deadline path can still take the child slot.
+                // deadline path can still take the group slot.
                 let mut drained = 0usize;
                 {
-                    let mut guard = wait_child.lock().unwrap();
-                    let owned = guard
+                    let mut guard = wait_group.lock().unwrap();
+                    let group = guard
                         .as_mut()
-                        .expect("the wait thread is the sole consumer of the child slot");
-                    drained += drain_available(owned.stdout_mut(), &mut stdout)
+                        .expect("the wait thread is the sole consumer of the group slot");
+                    drained += drain_available(group.stdout_mut(), &mut stdout)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    drained += drain_available(owned.stderr_mut(), &mut stderr)
+                    drained += drain_available(group.stderr_mut(), &mut stderr)
                         .map_err(|e| RunError::Wait(format!("read: {e}")))?;
-                    match owned.try_wait() {
-                        Ok(Some(status)) => {
+                    match group.try_wait() {
+                        Ok(Some(_)) => {
                             // `try_wait` consumed the exit status: the child is
                             // REAPED and the handle's lifecycle is `Reaped`, so
                             // nothing can signal the released pid. Record that in
@@ -197,13 +184,18 @@ pub(crate) fn spawn(
                             // was still running at the deadline".
                             record_reap(&wait_status_cell);
                             let taken = guard.take().expect("the slot was occupied a moment ago");
-                            exited = Some((taken, status));
+                            exited = Some(taken);
                         }
                         Ok(None) => {}
                         Err(e) => return Err(RunError::Wait(format!("wait: {e}"))),
                     }
                 }
-                if let Some((mut owned, status)) = exited {
+                if let Some(group) = exited {
+                    // Collect the leader: the SINGLE reap, CONSUMING the
+                    // capability, so nothing can signal the released pid.
+                    let mut reaped = group
+                        .reap()
+                        .map_err(|e| RunError::Wait(format!("wait: {e}")))?;
                     // BOUNDED drain (the same helper, and the same bound, the
                     // shared local runner uses): the child is reaped and its
                     // pipes hold the remaining output. A process that outlived
@@ -213,7 +205,7 @@ pub(crate) fn spawn(
                     // [`KILL_REAP_BOUND`] and the violation is reported, never a
                     // silent clean outcome.
                     let stdout_drain =
-                        drain_to_eof(owned.stdout_mut(), &mut stdout, KILL_REAP_BOUND)
+                        drain_to_eof(reaped.stdout_mut(), &mut stdout, KILL_REAP_BOUND)
                             .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     if matches!(stdout_drain, DrainState::BoundExpired) {
                         return Err(RunError::Background(format!(
@@ -221,7 +213,7 @@ pub(crate) fn spawn(
                         )));
                     }
                     let stderr_drain =
-                        drain_to_eof(owned.stderr_mut(), &mut stderr, KILL_REAP_BOUND)
+                        drain_to_eof(reaped.stderr_mut(), &mut stderr, KILL_REAP_BOUND)
                             .map_err(|e| RunError::Wait(format!("read: {e}")))?;
                     if matches!(stderr_drain, DrainState::BoundExpired) {
                         return Err(RunError::Background(format!(
@@ -229,7 +221,7 @@ pub(crate) fn spawn(
                         )));
                     }
                     break Ok(std::process::Output {
-                        status,
+                        status: reaped.status(),
                         stdout,
                         stderr,
                     });

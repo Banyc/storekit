@@ -13,23 +13,38 @@
 use super::*;
 use std::io::Read;
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Instant;
 
-/// Production seam: Windows has no process groups — the group kill is a
-/// no-op (the owned-child kill is the termination path).
+/// Production seam: Windows has no process groups — the group signal is a
+/// no-op (the owned-child signal is the termination path).
 pub struct RealKill;
 
 impl KillSeam for RealKill {
-    fn kill_group(&self, _pgid: i32, _sig: i32) -> std::io::Result<()> {
-        // No process groups on Windows: the group kill is a no-op (the
-        // owned-child kill is the termination path).
+    fn kill_group(&self, _group: &ProcessGroup, _sig: GroupSignal) -> std::io::Result<()> {
+        // No process groups on Windows: the group signal is a no-op (the
+        // owned-child signal is the termination path).
         Ok(())
     }
-    fn kill_owned(&self, child: &mut Child) -> std::io::Result<()> {
-        child.kill()
+    fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()> {
+        match group.live_child() {
+            Some(child) => child.kill(),
+            None => Ok(()),
+        }
     }
+}
+
+/// Spawn rule for Windows: NO process group. The owned handle
+/// (`TerminateProcess`) is the whole termination path, so `live_members`
+/// reports nothing and [`ProcessGroup::settle`] settles at once — the
+/// documented weaker guarantee of this port.
+pub(crate) fn own_process_group(_cmd: &mut std::process::Command) {}
+
+/// Windows has no process-group enumeration: no member is ever reported, so the
+/// foreground-only check never fires and the owned handle remains the whole
+/// termination path.
+pub(crate) fn live_group_members(_pgid: i32, _exclude_pid: u32) -> Vec<i32> {
+    Vec::new()
 }
 
 /// The Windows termination ladder's ONE transition. Windows has no process
@@ -66,23 +81,9 @@ pub(crate) fn exec(
     argv: &[String],
     timeout: Duration,
 ) -> std::result::Result<RunOutcome, RunError> {
-    let mut cmd = std::process::Command::new(&argv[0]);
-    env.apply_to_command(&mut cmd);
-    cmd.args(&argv[1..]);
-    cmd.current_dir(cwd);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let child = cmd
-        .spawn()
+    let mut group = ProcessGroup::spawn(argv, cwd, env, config.kill.clone())
         .map_err(|e| RunError::Spawn(format!("spawn {argv:?}: {e}")))?;
-    // The platform-neutral [`OwnedChild`] backstop: every early error return
-    // below drops this handle, whose `Drop` terminates and reaps the child.
-    // A bare `std::process::Child`'s own `Drop` neither waits nor kills, so
-    // without it a `try_wait` error (or a reap-bound expiry) would abandon a
-    // live child. On Windows the group kill is a no-op — only the DIRECT child
-    // is terminated, the documented weaker guarantee of this port.
-    let mut child = OwnedChild::new(child, config.kill.clone());
-    let pid = child.pid();
+    let pid = group.pid();
     // The parent records the pid synchronously at spawn time — before the
     // timeout clock starts — so tests can assert the pid is gone after the
     // outcome without a child-written pidfile (which would race the
@@ -93,8 +94,8 @@ pub(crate) fn exec(
     // Reader threads: drain stdout/stderr to EOF (the pipes EOF when the
     // child — and any descendant that kept them — dies). Each thread sends
     // its buffer on a channel; the main loop collects them bounded.
-    let stdout_rx = spawn_reader(child.stdout_mut().take());
-    let stderr_rx = spawn_reader(child.stderr_mut().take());
+    let stdout_rx = spawn_reader(group.stdout_mut().take());
+    let stderr_rx = spawn_reader(group.stderr_mut().take());
 
     let mut termination = Termination::armed(Instant::now() + timeout);
     // Wait loop: poll `try_wait` (no `waitid` WNOWAIT peek on Windows — the
@@ -103,7 +104,7 @@ pub(crate) fn exec(
     loop {
         // `try_wait` records the status it consumes: from the reap on the
         // lifecycle is `Reaped`, so nothing can reach the handle to signal it.
-        match child.try_wait() {
+        match group.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(e) => return Err(RunError::Wait(format!("wait {argv:?}: {e}"))),
@@ -119,14 +120,12 @@ pub(crate) fn exec(
         {
             // Terminate the OWNED child. No process group: a background
             // descendant survives. The handle is reachable only while the
-            // child is LIVE (a reaped child's pid may already be recycled).
-            termination = termination.child_killed(deadline, || match child.live_child() {
-                Some(live) => config
-                    .kill
-                    .kill_owned(live)
+            // leader is LIVE (a reaped child's pid may already be recycled).
+            termination = termination.child_killed(deadline, || {
+                group
+                    .signal_leader()
                     .err()
-                    .map(|e| KillFailure::new(format!("kill child {pid}: {e}"))),
-                None => None,
+                    .map(|e| KillFailure::new(format!("kill child {pid}: {e}")))
             });
         }
         if let Some(escalation_start) = termination.escalation_start()
@@ -142,14 +141,11 @@ pub(crate) fn exec(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    // Reap the child — the SINGLE reap, releasing the pid. From here on
-    // nothing signals anything.
-    let status = child
-        .wait()
-        .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?;
-    if let Some(observer) = &config.reap_observer {
-        observer(pid);
-    }
+    // The leader is the only collectable child on Windows (no process groups):
+    // collect it — the SINGLE reap, CONSUMING the capability, so nothing can
+    // signal the released pid. On Unix the foreground-only group check runs
+    // between the peek and this collect.
+    let mut reaped = collect(group, config.reap_observer.as_ref(), pid, argv)?;
     // Collect the reader buffers, BOUNDED: the pipes EOF when the last
     // holder dies. A channel still open at the bound proves a live
     // descendant HOLDS the pipe — the pipe-EOF containment signal (the
@@ -183,7 +179,7 @@ pub(crate) fn exec(
         });
     }
     Ok(RunOutcome::Exited {
-        exit_code: status.code().unwrap_or(-1),
+        exit_code: reaped.status().code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })

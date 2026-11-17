@@ -9,22 +9,16 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Stdio};
 use std::time::Instant;
 
-pub fn kill_process_group(pgid: i32, sig: i32) -> std::io::Result<()> {
-    // SAFETY: `killpg` on a process group this runner created for its own
-    // child; `pgid` is the child's pid (positive) and `sig` is a valid libc
-    // signal constant.
-    let rc = unsafe { libc::killpg(pgid, sig) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+/// Spawn rule for Unix: the child becomes its OWN process-group leader
+/// (`process_group(0)`, so pgid == pid), which is what makes
+/// [`ProcessGroup::signal`] terminate the WHOLE group — grandchildren included.
+pub(crate) fn own_process_group(cmd: &mut std::process::Command) {
+    cmd.process_group(0);
 }
 
-/// True when the direct child has EXITED but has NOT been reaped yet
+/// Whether the direct child has EXITED but has NOT been reaped yet
 /// (`waitid(2)` with `WNOHANG | WNOWAIT | WEXITED`): the child remains a
 /// ZOMBIE, and a zombie holds its pid — and therefore its process-group id
 /// (the child is the group leader, pgid == pid) — allocated until reaped.
@@ -33,7 +27,7 @@ pub fn kill_process_group(pgid: i32, sig: i32) -> std::io::Result<()> {
 /// for an unrelated process: the group being signalled is provably ours.
 /// ECHILD (the child is gone — reaped or never ours) is treated as exited so
 /// the caller proceeds to the reap instead of spinning.
-fn child_exited_unreaped(pid: u32) -> std::io::Result<bool> {
+pub(crate) fn leader_exited(pid: u32) -> std::io::Result<bool> {
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `waitid` on our own child (a positive pid, the direct child of
     // this process); `WNOWAIT` leaves it waitable for the subsequent reap;
@@ -83,7 +77,7 @@ fn siginfo_pid(si: &libc::siginfo_t) -> libc::pid_t {
 /// "leftover". A scan error (a vanished/EPERM process mid-scan) skips that
 /// entry; only a fully failed scan degrades to an empty list.
 #[cfg(target_os = "linux")]
-fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
+pub(crate) fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
     let mut members = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return members;
@@ -122,7 +116,7 @@ fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
 }
 
 #[cfg(target_os = "macos")]
-fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
+pub(crate) fn live_group_members(pgid: i32, exclude_pid: u32) -> Vec<i32> {
     // `proc_listpgrppids(3)`: the pids of every process in the group —
     // ZOMBIES INCLUDED (a killed descendant that launchd has not yet reaped
     // is still listed). A zombie is NOT live, so every member's state is
@@ -213,7 +207,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn live_group_members(_pgid: i32, _exclude_pid: u32) -> Vec<i32> {
+pub(crate) fn live_group_members(_pgid: i32, _exclude_pid: u32) -> Vec<i32> {
     compile_error!("live group-member enumeration is implemented for Linux and macOS only");
 }
 
@@ -229,12 +223,31 @@ fn live_group_members(_pgid: i32, _exclude_pid: u32) -> Vec<i32> {
 pub struct RealKill;
 
 impl KillSeam for RealKill {
-    fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()> {
-        kill_process_group(pgid, sig)
+    fn kill_group(&self, group: &ProcessGroup, sig: GroupSignal) -> std::io::Result<()> {
+        // SAFETY: `killpg` on the ONE group this capability owns. Its leader is
+        // un-reaped while the capability is live, so the pgid is still allocated
+        // to that group; `sig.raw()` is one of the two ladder constants.
+        let rc = unsafe { libc::killpg(group.pid() as i32, sig.raw()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
-    fn kill_owned(&self, child: &mut Child) -> std::io::Result<()> {
-        child.kill()
+    fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()> {
+        match group.live_child() {
+            Some(child) => child.kill(),
+            None => Ok(()),
+        }
     }
+}
+
+/// The pid list a violation error reports: the live leftovers as enumerated.
+fn join_pids(pids: &[i32]) -> String {
+    pids.iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The Unix termination ladder's transitions: the platform's three rungs, in
@@ -301,9 +314,9 @@ impl Termination {
 /// after the child was REAPED. A timeout-kill or reap failure is an ERROR,
 /// never a successful timeout outcome.
 ///
-/// The runner is per-exec and owns nothing between calls: the child lives in
-/// `OwnedChild` inside [`exec`] and is collected before the call returns, so
-/// no thread or handle outlives the call — the lifecycle is bounded.
+/// The runner is per-exec and owns nothing between calls: the child lives in a
+/// [`ProcessGroup`] capability inside [`exec`] and is collected before the call
+/// returns, so no thread or handle outlives the call — the lifecycle is bounded.
 ///
 /// Execute `argv` (no shell) bounded by `timeout` — the Unix lifecycle:
 /// spawn into an OWN process group, `waitid` WNOWAIT peek, `killpg`
@@ -317,21 +330,9 @@ pub(crate) fn exec(
     argv: &[String],
     timeout: Duration,
 ) -> std::result::Result<RunOutcome, RunError> {
-    let mut cmd = std::process::Command::new(&argv[0]);
-    env.apply_to_command(&mut cmd);
-    cmd.args(&argv[1..]);
-    cmd.current_dir(cwd);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    // The child becomes its OWN process-group leader (pgid == pid):
-    // timeout termination signals the WHOLE group, so grandchildren die
-    // with it. `process_group` is the std Unix API.
-    cmd.process_group(0);
-    let child = cmd
-        .spawn()
+    let mut group = ProcessGroup::spawn(argv, cwd, env, config.kill.clone())
         .map_err(|e| RunError::Spawn(format!("spawn {argv:?}: {e}")))?;
-    let mut owned = OwnedChild::new(child, config.kill.clone());
-    let pid = owned.pid();
+    let pid = group.pid();
     let pgid = pid as i32;
     // The parent records the pid synchronously at spawn time — before the
     // timeout clock starts — so tests can assert the pid is gone after
@@ -343,8 +344,8 @@ pub(crate) fn exec(
     // Non-blocking pipe read ends: the wait loop drains without blocking
     // and the post-reap EOF drain is bounded — a grandchild that keeps a
     // pipe open can never hang the outcome.
-    set_nonblocking(owned.stdout_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
-    set_nonblocking(owned.stderr_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
+    set_nonblocking(group.stdout_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
+    set_nonblocking(group.stderr_mut()).map_err(|e| RunError::Wait(e.to_string()))?;
 
     let mut termination = Termination::armed(Instant::now() + timeout);
     let mut stdout: Vec<u8> = Vec::new();
@@ -363,11 +364,14 @@ pub(crate) fn exec(
         // `chunk / 1 ms` no matter how fast the link is. A silent child (no
         // progress) yields to the scheduler so the loop does not busy-spin.
         let mut drained = 0usize;
-        drained += drain_available(owned.stdout_mut(), &mut stdout)
+        drained += drain_available(group.stdout_mut(), &mut stdout)
             .map_err(|e| RunError::Wait(e.to_string()))?;
-        drained += drain_available(owned.stderr_mut(), &mut stderr)
+        drained += drain_available(group.stderr_mut(), &mut stderr)
             .map_err(|e| RunError::Wait(e.to_string()))?;
-        if child_exited_unreaped(pid).map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))? {
+        if group
+            .leader_exited()
+            .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?
+        {
             break;
         }
         let now = Instant::now();
@@ -380,22 +384,19 @@ pub(crate) fn exec(
             && now >= deadline
         {
             // Graceful TERM of the WHOLE process group.
-            termination =
-                termination.termed(now, || match config.kill.kill_group(pgid, libc::SIGTERM) {
-                    Ok(()) => None,
-                    // ESRCH is benign only when the child itself is already
-                    // gone (it exited as the deadline fired — the peek
-                    // reports it next); a live child behind an unreachable
-                    // group is a real termination failure. The liveness
-                    // check must NOT reap: the child stays a zombie until
-                    // the post-loop foreground check.
-                    Err(e) => {
-                        let alive = child_exited_unreaped(pid)
-                            .map(|exited| !exited)
-                            .unwrap_or(false);
-                        alive.then(|| KillFailure::new(format!("TERM group {pgid}: {e}")))
-                    }
-                });
+            termination = termination.termed(now, || match group.signal(GroupSignal::Term) {
+                Ok(()) => None,
+                // ESRCH is benign only when the child itself is already
+                // gone (it exited as the deadline fired — the peek
+                // reports it next); a live child behind an unreachable
+                // group is a real termination failure. The liveness
+                // check must NOT reap: the child stays a zombie until
+                // the post-loop foreground check.
+                Err(e) => {
+                    let alive = group.leader_exited().map(|exited| !exited).unwrap_or(false);
+                    alive.then(|| KillFailure::new(format!("TERM group {pgid}: {e}")))
+                }
+            });
         }
         if let Some(escalation_start) = termination.escalation_start() {
             let since = now.duration_since(escalation_start);
@@ -405,12 +406,11 @@ pub(crate) fn exec(
             // cannot precede the TERM or repeat.
             if since >= config.term_to_kill_grace {
                 termination = termination.group_killed(escalation_start, || {
-                    match config.kill.kill_group(pgid, libc::SIGKILL) {
+                    match group.signal(GroupSignal::Kill) {
                         Ok(()) => None,
                         Err(e) => {
-                            let alive = child_exited_unreaped(pid)
-                                .map(|exited| !exited)
-                                .unwrap_or(false);
+                            let alive =
+                                group.leader_exited().map(|exited| !exited).unwrap_or(false);
                             alive.then(|| KillFailure::new(format!("KILL group {pgid}: {e}")))
                         }
                     }
@@ -422,15 +422,12 @@ pub(crate) fn exec(
             // child is LIVE, so a reaped child (whose pid the OS may have
             // recycled) is never signalled.
             if since >= config.term_to_kill_grace * 2 {
-                termination =
-                    termination.child_killed(escalation_start, || match owned.live_child() {
-                        Some(child) => config
-                            .kill
-                            .kill_owned(child)
-                            .err()
-                            .map(|e| KillFailure::new(format!("kill child {pid}: {e}"))),
-                        None => None,
-                    });
+                termination = termination.child_killed(escalation_start, || {
+                    group
+                        .signal_leader()
+                        .err()
+                        .map(|e| KillFailure::new(format!("kill child {pid}: {e}")))
+                });
             }
             if since >= config.reap_bound {
                 // The child is STILL alive after every termination
@@ -447,80 +444,81 @@ pub(crate) fn exec(
         }
     }
 
-    // The child has EXITED but is still a ZOMBIE: the `waitid` WNOWAIT
-    // peek above left it waitable, so its pid — and therefore its
-    // process-group id (the child is the group leader, pgid == pid) — is
-    // still allocated. Every foreground-only check and group termination
-    // below happens while the zombie holds the pgid, so a `killpg` can
-    // NEVER race a pid the OS recycled for an unrelated process.
+    // The leader has EXITED but is still a ZOMBIE: the `waitid` WNOWAIT
+    // peek above left it waitable, so its pid — hence the pgid (pgid == pid,
+    // the leader IS the group leader) — is still allocated. Every signal below
+    // happens while the zombie holds the pgid, so a `killpg` can NEVER race a
+    // pid the OS recycled for an unrelated process.
     //
-    // FOREGROUND-ONLY: enumerate the LIVE members of the child's process
-    // group (our zombie excluded). If any remain, the command left a
-    // background descendant: terminate the WHOLE group (TERM → grace →
-    // KILL, the timeout path's escalation) and report the violation as
-    // an ERROR, never a successful outcome; the check runs BEFORE the
-    // outcome escapes. A CLEAN command (no live members — the common
-    // case) pays one enumeration.
-    let live = live_group_members(pgid, pid);
+    // A TIMED-OUT group was already swept by the runner's OWN ladder, so its
+    // emptiness is PROVED by iteration here and never sampled once. A group
+    // still live at the bound is a termination that did not take effect: a
+    // `Kill` when a signal was refused, a `Reap` otherwise — NEVER a clean
+    // timeout. The leader is collected before that error escapes.
+    if termination.timed_out() {
+        let leftover = group.settle(config.reap_bound);
+        if !leftover.is_empty() {
+            let failed = match termination.failure() {
+                Some(failure) => RunError::Kill(format!(
+                    "timeout termination failed: {} (live group members: {})",
+                    failure.message(),
+                    join_pids(&leftover)
+                )),
+                None => RunError::Reap(format!(
+                    "process group {pgid} still has live members {} {:?} \
+                     after the timeout termination",
+                    join_pids(&leftover),
+                    config.reap_bound
+                )),
+            };
+            collect(group, config.reap_observer.as_ref(), pid, argv)?;
+            return Err(failed);
+        }
+    }
+
+    // FOREGROUND-ONLY: enumerate the LIVE members of the leader's process
+    // group (our zombie excluded; a settled group has none by its recorded
+    // fact). If any remain, the command left a background descendant:
+    // terminate the WHOLE group (TERM → grace → KILL, the timeout path's
+    // escalation) and report the violation as an ERROR, never a successful
+    // outcome; the check runs BEFORE the outcome escapes. A CLEAN command (no
+    // live members — the common case) pays one enumeration.
+    let live = group.live_members();
     if !live.is_empty() {
         // Terminate the whole group; a kill failure is surfaced inside
         // the violation error (the leftover member must not survive even
         // when a kill fails — the fault-injected paths that cannot land
         // a kill are covered by the caller's own cleanup, and the drop
-        // backstop remains the final resort for the owned child).
+        // backstop remains the final resort for the leader).
         let mut term_error: Option<String> = None;
-        if let Err(e) = config.kill.kill_group(pgid, libc::SIGTERM) {
+        if let Err(e) = group.signal(GroupSignal::Term) {
             term_error = Some(format!("TERM group {pgid}: {e}"));
         }
         std::thread::sleep(config.term_to_kill_grace);
-        if let Err(e) = config.kill.kill_group(pgid, libc::SIGKILL)
-            && term_error.is_none()
-        {
-            term_error = Some(format!("KILL group {pgid}: {e}"));
-        }
-        // Confirm the group is gone (bounded): a killed descendant is
-        // reparented to init and reaped there; the poll covers the
-        // transient zombie window. On expiry (an injected inert kill) the
-        // error still names the violation — the fault IS the kill not
-        // working.
-        let verify_deadline = Instant::now() + config.reap_bound;
-        while !live_group_members(pgid, pid).is_empty() && Instant::now() < verify_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // Reap the direct child (a zombie — the wait returns immediately,
-        // releasing the pid) BEFORE the error escapes.
-        owned
-            .wait()
-            .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?;
-        if let Some(observer) = &config.reap_observer {
-            observer(pid);
-        }
+        // The escalation and the proof that it took effect are ONE authority:
+        // `settle` re-signals and re-enumerates until the group is empty, so a
+        // descendant reparented to init and reaped there cannot be misread as a
+        // survivor of the sweep. On expiry (an injected inert signal) the error
+        // still names the violation — the fault IS the signal not working.
+        let _ = group.settle(config.reap_bound);
+        collect(group, config.reap_observer.as_ref(), pid, argv)?;
         let detail = term_error.map(|e| format!(" ({e})")).unwrap_or_default();
-        let leftover = live
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let leftover = join_pids(&live);
         return Err(RunError::Background(format!(
             "command {argv:?} left background processes in its process group \
                  (live members: {leftover}); commands are foreground-only{detail}"
         )));
     }
 
-    // The direct child is the only group member: reap it — the SINGLE
-    // reap, releasing the pid. From here on nothing signals anything.
-    let status = owned
-        .wait()
-        .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?;
-    if let Some(observer) = &config.reap_observer {
-        observer(pid);
-    }
-    // Bounded drain to EOF: the child is dead and its pipes hold the
+    // The leader is the only group member: collect it — the SINGLE reap,
+    // CONSUMING the capability, so nothing can signal the group again.
+    let mut reaped = collect(group, config.reap_observer.as_ref(), pid, argv)?;
+    // Bounded drain to EOF: the leader is dead and its pipes hold the
     // remaining output. A grandchild that keeps a pipe open cannot hang
     // the outcome — the drain gives up after the reap bound.
-    // PIPE-EOF CONTAINMENT: the direct child is reaped (its descriptors
+    // PIPE-EOF CONTAINMENT: the leader is collected (its descriptors
     // closed by the kernel); the inherited stdout/stderr write ends EOF
-    // exactly when the LAST holder — the child or any descendant that
+    // exactly when the LAST holder — the leader or any descendant that
     // kept the pipes — dies. EOF within the bound proves no pipe-holding
     // descendant lives (the clean path stays clean); a pipe still open
     // at the bound proves a live descendant HOLDS it — a descendant that
@@ -530,7 +528,7 @@ pub(crate) fn exec(
     // (`setsid` AND closed descriptors) is outside the contract (see the
     // module doc) — commands must not daemonize.
     let drain_bound = config.reap_bound;
-    let stdout_drain = drain_to_eof(owned.stdout_mut(), &mut stdout, drain_bound)
+    let stdout_drain = drain_to_eof(reaped.stdout_mut(), &mut stdout, drain_bound)
         .map_err(|e| RunError::Wait(e.to_string()))?;
     if matches!(stdout_drain, DrainState::BoundExpired) {
         return Err(RunError::Background(format!(
@@ -538,7 +536,7 @@ pub(crate) fn exec(
                  commands are foreground-only"
         )));
     }
-    let stderr_drain = drain_to_eof(owned.stderr_mut(), &mut stderr, drain_bound)
+    let stderr_drain = drain_to_eof(reaped.stderr_mut(), &mut stderr, drain_bound)
         .map_err(|e| RunError::Wait(e.to_string()))?;
     if matches!(stderr_drain, DrainState::BoundExpired) {
         return Err(RunError::Background(format!(
@@ -561,7 +559,7 @@ pub(crate) fn exec(
         });
     }
     Ok(RunOutcome::Exited {
-        exit_code: status.code().unwrap_or(-1),
+        exit_code: reaped.status().code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })

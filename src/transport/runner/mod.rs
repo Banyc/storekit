@@ -3,11 +3,18 @@
 //!
 //! # The lifecycle contract
 //!
-//! * **Synchronized child ownership** — the runner owns the `Child` handle
-//!   exclusively from spawn until the single reap. The wait runs inline on the
-//!   calling thread (no wait is delegated to a spawned thread), and a handle
+//! * **One authority per spawned child** — the child is held as a
+//!   [`ProcessGroup`] capability, minted only by spawning and never from a
+//!   pid: every signal, every enumeration and the single reap go through that
+//!   ONE value, and [`ProcessGroup::reap`] CONSUMES it. A pgid is a pid, and
+//!   the kernel recycles a pid the instant its child is reaped, so a
+//!   remembered number is not an authority: a `killpg` on it can reach
+//!   whatever process later inherited the id.
+//! * **Synchronized child ownership** — the wait runs inline on the calling
+//!   thread (no wait is delegated to a spawned thread), and a capability
 //!   dropped before it was reaped goes through the drop backstop, which kills
-//!   and waits (bounded) as a final resort.
+//!   and waits (bounded) as a final resort — and signals NOTHING once the
+//!   leader was collected.
 //! * **Process-group termination (Unix)** — the child is spawned into its
 //!   OWN process group (`process_group(0)` — the child becomes the group
 //!   leader, pgid == pid), so a timeout terminates the WHOLE group (`killpg`
@@ -19,8 +26,8 @@
 //!   synchronously on its owned handle and "proven dead" means the wait
 //!   returned. The CONSUMING call is per platform: Windows polls `try_wait`,
 //!   which consumes the exit status; Unix PEEKS with `waitid(2)`/`WNOWAIT`
-//!   (`child_exited_unreaped` — no status consumed) and consumes it once
-//!   through [`OwnedChild::wait`] → [`Child::wait`]. Both reap exactly once;
+//!   (`ProcessGroup::leader_exited` — no status consumed) and consumes it once
+//!   through [`ProcessGroup::wait`] → [`Child::wait`]. Both reap exactly once;
 //!   the drop backstop reaps through `try_wait`. An error path that cannot
 //!   reap drops the handle, and the drop backstop's bounded kill-and-wait is
 //!   the final resort.
@@ -48,6 +55,17 @@
 //!   members — the common case) pays one enumeration. On Windows the
 //!   foreground-only check is NOT performed (no process-group enumeration
 //!   exists).
+//! * **A timed-out group is SETTLED, never sampled once** — the runner's own
+//!   TERM→grace→KILL ladder already swept that group, so its emptiness is
+//!   proved by ITERATION ([`ProcessGroup::settle`]) and not by one
+//!   enumeration: `fork(2)` records the new child in its parent's process group
+//!   (`copy_process` in `kernel/fork.c`), so a descendant can join AFTER a
+//!   sweep has passed — it inherits the group but not the signal — and a
+//!   signalled process keeps a non-live-but-not-yet-`do_exit` state, so a
+//!   sample can still list the sweep's own victims mid-death. A group still
+//!   live at the bound is a termination that did not take effect: [`RunError::Kill`]
+//!   when a kill was refused, [`RunError::Reap`] otherwise — never a clean
+//!   timeout. The leader is reaped (once) before that error escapes.
 //! * **A timeout-kill failure is an ERROR** — if the group kill fails (a real
 //!   failure, not the benign ESRCH of a group that is already gone), or the
 //!   escalated kill fails, or the reap cannot be confirmed within the bound,
@@ -67,10 +85,11 @@
 //! The kill path is a [`KillSeam`] (a kill-function seam): production uses
 //! [`RealKill`] (Unix: `killpg(2)` — no shell, no external `kill` binary;
 //! Windows: the owned `Child::kill`), and the tests inject their own seam (an
-//! inert kill) without any subprocess fakery. The process group + escalation
-//! primitives are shared with the SSH runner's real seam
-//! ([`kill_process_group`], [`TERM_TO_KILL_GRACE`]), so on Unix both
-//! transports terminate process groups, not bare pids.
+//! inert kill) without any subprocess fakery. The seam takes the CAPABILITY,
+//! so its implementor can only signal a group it was handed; the SSH runner's
+//! real seam shares the same [`ProcessGroup`] and the same
+//! [`TERM_TO_KILL_GRACE`], so on Unix both transports terminate process
+//! groups, not bare pids.
 //!
 //! # The platform split (ONE cfg switch at the module boundary)
 //!
@@ -104,7 +123,7 @@
 
 use crate::env::SysEnv;
 use std::path::PathBuf;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -120,12 +139,10 @@ use windows as platform;
 
 #[cfg(unix)]
 pub use unix::RealKill;
-#[cfg(unix)]
-pub(crate) use unix::kill_process_group;
 // The bounded pipe-drain discipline (non-blocking setup, the running-drain
 // and the bounded post-exit drain) is re-exported so the SSH runner's Unix
 // seam reuses ONE implementation instead of keeping a divergent copy. The
-// [`OwnedChild`] drop backstop is NOT platform-specific (it is defined below,
+// [`ProcessGroup`] capability is NOT platform-specific (it is defined below,
 // in this module), so BOTH platforms' seams share it.
 #[cfg(unix)]
 pub(crate) use unix::{DrainState, drain_available, drain_to_eof, set_nonblocking};
@@ -175,46 +192,64 @@ pub(crate) fn is_live_state(state: &str) -> bool {
     !matches!(state, "X" | "Z" | "x" | "z")
 }
 
+/// The two rungs of a process group's termination ladder — the only signals
+/// this crate has business sending a group. The enum is the authority: a caller
+/// cannot express a signal outside these two rungs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupSignal {
+    /// Ask the members to terminate.
+    Term,
+    /// Force the members to terminate.
+    Kill,
+}
+
+impl GroupSignal {
+    /// The libc constant behind the rung. Unix only: Windows has no process
+    /// groups, so its [`KillSeam::kill_group`] is a no-op and never names one.
+    #[cfg(unix)]
+    fn raw(self) -> i32 {
+        match self {
+            GroupSignal::Term => libc::SIGTERM,
+            GroupSignal::Kill => libc::SIGKILL,
+        }
+    }
+}
+
 /// The kill seam behind [`ChildRunner`]: the syscall-level termination
 /// surface, injectable for tests (a kill-function pointer seam). The runner
 /// reports a kill failure as an error only when the seam says the signal
 /// could not be delivered; an inert seam (returns `Ok` without signalling) is
 /// caught by the reap bound instead.
 ///
+/// Both methods take the [`ProcessGroup`] CAPABILITY, never a pid: a pgid is a
+/// pid, and the kernel recycles it the instant its child is reaped, so the seam
+/// can only signal a group whose leader is still un-reaped.
+///
 /// Public because [`RunnerConfig`] is public and takes an `Arc<dyn KillSeam>`:
 /// a caller building its own [`RunnerConfig`] (and a test injecting a
 /// syscall-level fault) needs the trait to name its seam. The crate's own
 /// tests drive the runner under an injected kill seam through it.
 pub trait KillSeam: Send + Sync {
-    /// Signal the whole process group `pgid`. Windows has no process groups:
-    /// there the group kill is a no-op and the owned-handle kill is the
-    /// termination path.
-    fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()>;
-    /// Signal the OWNED child directly (`Child::kill`): the last-resort rung
-    /// that catches a child which escaped its group (e.g. `setsid`), where
-    /// the group kill reports the group unreachable. A kill through the owned
-    /// handle can never hit a pid the OS recycled: the handle is consumed by
-    /// the single reap and nothing is signalled after it.
-    fn kill_owned(&self, child: &mut Child) -> std::io::Result<()>;
+    /// Signal the WHOLE group. Windows has no process groups: there the group
+    /// signal is a no-op and the owned-handle signal is the termination path.
+    fn kill_group(&self, group: &ProcessGroup, sig: GroupSignal) -> std::io::Result<()>;
+    /// Signal the group's OWNED leader alone (`Child::kill`): the last-resort
+    /// rung that catches a leader which escaped its group (e.g. `setsid`),
+    /// where the group signal reports the group unreachable. The leader is
+    /// reachable only while it is un-reaped, so this cannot hit a recycled pid.
+    fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()>;
 }
 
-/// The [`OwnedChild::drop`] backstop's bounded wait: after killing the group
-/// and the owned child, drop waits this long for the reap before giving up.
+/// The [`ProcessGroup::drop`] backstop's bounded wait: after signalling the
+/// group and the owned leader, drop waits this long for the collection before
+/// giving up.
 const DROP_REAP_BOUND: Duration = Duration::from_millis(100);
-
-/// The signal [`OwnedChild::drop`] delivers to the child's process group.
-/// `SIGKILL` on Unix; unused on Windows, where [`KillSeam::kill_group`] is a
-/// no-op and the owned handle (`TerminateProcess`) is the termination path.
-#[cfg(unix)]
-const DROP_KILL_SIGNAL: i32 = libc::SIGKILL;
-#[cfg(windows)]
-const DROP_KILL_SIGNAL: i32 = 0;
 
 /// A child's lifecycle as a VALUE: `Live` until the single reap consumes its
 /// exit status, `Reaped(status)` from then on. The variant — not a bare
 /// boolean beside the handle — is what makes "signal after the reap"
 /// unrepresentable: the only way a caller outside this type reaches the
-/// [`Child`] is [`OwnedChild::live_child`], which is `None` in the `Reaped`
+/// [`Child`] is [`ProcessGroup::live_child`], which is `None` in the `Reaped`
 /// state, and the exit status is carried with the state instead of being
 /// discarded.
 #[derive(Debug)]
@@ -349,31 +384,32 @@ impl Termination {
     }
 }
 
-/// An owned child with a drop backstop, shared by BOTH real runners AND both
-/// platforms so the "every error path leaves no uncollected child" contract
-/// has ONE implementation. The local runner owns one directly; the SSH
-/// runner's seam owns one inside its shared slot (the same type, the same
-/// `Drop`), so a `drain_available`/`try_wait` error that returns early from
-/// the wait closure does not drop a live `Child` without the backstop's
-/// kill-and-wait (a bare `Child`'s own `Drop` neither waits nor kills — on
-/// Unix OR on Windows).
+/// The process group of ONE spawned child — the authority to signal it,
+/// enumerate it and collect it. A pgid is a pid, and the kernel recycles a pid
+/// the instant its child is reaped, so a remembered number is not an authority:
+/// a `killpg` on it can reach whatever unrelated process later inherited the id.
+/// This value IS that authority: its fields are private, it is minted only by
+/// spawning ([`ProcessGroup::spawn`], [`ProcessGroup::spawn_configured`],
+/// [`ProcessGroup::from_child`]) and never from a pid, and
+/// [`ProcessGroup::reap`] CONSUMES it, so nothing can signal the group once the
+/// kernel may have recycled its pgid.
 ///
-/// The handle is shared EXCLUSIVELY between a runner's deadline/kill path and
-/// its wait path. A child that exited is consumed by [`OwnedChild::wait`] (or
-/// by [`OwnedChild::try_wait`], which records the status it consumed), and the
-/// [`ChildLifecycle`] moves to `Reaped` — after which no caller can reach the
-/// handle at all (`live_child()` is `None`) and the drop backstop returns
-/// early, so a signal after the reap is unrepresentable (a pid the OS recycled
-/// after the reap can never be hit).
+/// Two parties that need the group at once (a wait path draining pipes and a
+/// deadline path signalling — the SSH runner's seam) share ONE
+/// `Arc<Mutex<Option<ProcessGroup>>>` and compete for the instance: whoever
+/// `take`s it consumes the capability, and every later signal finds `None` and
+/// is a no-op by construction.
 ///
-/// The backstop's GROUP kill is a no-op on Windows (no process groups), so
-/// there it terminates the direct child only and reaps it, with the SAME
-/// one-authority backstop shape.
-pub(crate) struct OwnedChild {
+/// A capability dropped before its reap goes through the drop backstop, which
+/// signals the group and the leader and waits (bounded) for the collection — the
+/// ONE "every error path leaves no uncollected child" implementation, shared by
+/// BOTH real runners and both platforms. Its group signal is a no-op on Windows
+/// (no process groups), so there it terminates the direct child only.
+pub struct ProcessGroup {
     /// The owned child, PRIVATE to this type: the seams drain its pipes and
     /// poll it through the accessors below, and reach the handle for a direct
-    /// signal only through [`OwnedChild::live_child`], so the handle of a
-    /// reaped child is unreachable. On Unix the group kill (`killpg`) is the
+    /// signal only through [`ProcessGroup::live_child`], so the handle of a
+    /// reaped child is unreachable. On Unix the group signal (`killpg`) is the
     /// primary termination path and this handle is the last-resort rung.
     child: Child,
     kill: Arc<dyn KillSeam>,
@@ -382,25 +418,67 @@ pub(crate) struct OwnedChild {
     /// OS recycled after the reap can never be hit — the drop backstop returns
     /// early).
     lifecycle: ChildLifecycle,
+    /// Set once [`ProcessGroup::settle`] iterated the enumeration to empty: the
+    /// group is then PROVEN empty, so [`ProcessGroup::live_members`] reports
+    /// nothing afterwards and a settled group can never be re-reported as a
+    /// foreground-only violation.
+    settled: bool,
 }
 
-impl OwnedChild {
-    /// Wrap a freshly spawned child with the drop backstop under the kill
-    /// `seam`. On Unix the child is assumed to be spawned into its OWN process
-    /// group (pgid == pid) by the caller, so the backstop's `kill_group`
-    /// terminates its whole group; on Windows `kill_group` is a no-op and the
-    /// owned handle is terminated.
-    pub(crate) fn new(child: Child, kill: Arc<dyn KillSeam>) -> Self {
-        OwnedChild {
+impl ProcessGroup {
+    /// Spawn `argv` (no shell) as its OWN group leader with piped stdout and
+    /// stderr, in `cwd` under the environment snapshot `env`.
+    pub(crate) fn spawn(
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &SysEnv,
+        kill: Arc<dyn KillSeam>,
+    ) -> std::io::Result<ProcessGroup> {
+        let mut cmd = Command::new(&argv[0]);
+        env.apply_to_command(&mut cmd);
+        cmd.args(&argv[1..]);
+        cmd.current_dir(cwd);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        ProcessGroup::spawn_configured(cmd, kill)
+    }
+
+    /// Adopt an already-configured `Command`, applying the platform's group rule
+    /// HERE so no caller can spawn a child outside a group whose authority it
+    /// holds.
+    pub(crate) fn spawn_configured(
+        mut cmd: Command,
+        kill: Arc<dyn KillSeam>,
+    ) -> std::io::Result<ProcessGroup> {
+        platform::own_process_group(&mut cmd);
+        let child = cmd.spawn()?;
+        Ok(ProcessGroup::from_child(child, kill))
+    }
+
+    /// Take authority over `child`. The caller MUST have spawned it as its own
+    /// group leader where the platform has process groups — the rule
+    /// [`ProcessGroup::spawn_configured`] applies — which is what makes
+    /// pgid == pid.
+    pub(crate) fn from_child(child: Child, kill: Arc<dyn KillSeam>) -> ProcessGroup {
+        ProcessGroup {
             child,
             kill,
             lifecycle: ChildLifecycle::Live,
+            settled: false,
         }
     }
 
+    /// The leader's pid, which is also the group id. A recorded number, not a
+    /// handle: it stays readable after the reap for error messages, and nothing
+    /// in this crate signals it — every signal is a [`KillSeam`] call handed
+    /// this capability.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The live child handle, or `None` once the exit status was consumed.
-    /// This is the ONLY route from outside this type to the [`Child`]: a
-    /// reaped child's handle cannot be reached, so it cannot be signalled.
+    /// This is the ONLY route to the [`Child`]: a reaped child's handle cannot
+    /// be reached, so it cannot be signalled.
     pub(crate) fn live_child(&mut self) -> Option<&mut Child> {
         match self.lifecycle {
             ChildLifecycle::Live => Some(&mut self.child),
@@ -408,17 +486,8 @@ impl OwnedChild {
         }
     }
 
-    /// The child's pid, known to the parent synchronously at spawn time. Still
-    /// readable after the reap: it is a recorded number, not a handle, and
-    /// nothing in this crate signals it (every kill goes through
-    /// [`KillSeam`] with either the group id of a LIVE child or
-    /// [`OwnedChild::live_child`]'s handle).
-    pub(crate) fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    /// Take the stdin write end (the wait closure writes the payload from
-    /// inside itself, without holding the child slot).
+    /// Take the stdin write end (the SSH wait closure writes the payload from
+    /// inside itself, without holding the group slot).
     pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin.take()
     }
@@ -431,9 +500,18 @@ impl OwnedChild {
     }
 
     /// The stderr read end, for the running-phase and bounded post-exit
-    /// drains (see [`OwnedChild::stdout_mut`]).
+    /// drains (see [`ProcessGroup::stdout_mut`]).
     pub(crate) fn stderr_mut(&mut self) -> &mut Option<ChildStderr> {
         &mut self.child.stderr
+    }
+
+    /// Whether the leader has exited but is not collected yet — a `waitid(2)`
+    /// `WNOWAIT` peek that leaves it a ZOMBIE: the pid, and therefore the pgid,
+    /// stays allocated, so every signal in this window is still addressed to
+    /// THIS group. Unix only; Windows polls [`ProcessGroup::try_wait`] instead.
+    #[cfg(unix)]
+    pub(crate) fn leader_exited(&self) -> std::io::Result<bool> {
+        platform::leader_exited(self.pid())
     }
 
     /// Poll the child WITHOUT blocking. A `Some(status)` consumes the exit
@@ -455,7 +533,7 @@ impl OwnedChild {
         }
     }
 
-    /// Reap the child — the SINGLE blocking reap (on an already-exited zombie
+    /// Reap the leader — the SINGLE blocking reap (on an already-exited zombie
     /// it returns immediately with its status) — and record the status in the
     /// lifecycle: from here on nothing may signal anything, because the pid is
     /// released by this call. On a handle that is already `Reaped`, the
@@ -473,30 +551,135 @@ impl OwnedChild {
     pub(crate) fn is_reaped(&self) -> bool {
         matches!(self.lifecycle, ChildLifecycle::Reaped(_))
     }
+
+    /// Signal the WHOLE group.
+    pub fn signal(&self, sig: GroupSignal) -> std::io::Result<()> {
+        self.kill.kill_group(self, sig)
+    }
+
+    /// Signal the OWNED leader alone — the last-resort rung, and the only signal
+    /// this type sends through the held handle. There is no TERM here: a leader
+    /// that escaped its group is signalled to die, not asked to.
+    pub fn signal_leader(&mut self) -> std::io::Result<()> {
+        let kill = self.kill.clone();
+        kill.kill_owned(self)
+    }
+
+    /// The LIVE members of the group, the un-reaped leader excluded (judged by
+    /// each platform's ONE liveness predicate, see the module docs). A settled
+    /// group has none by its own recorded fact.
+    pub fn live_members(&self) -> Vec<i32> {
+        if self.settled {
+            return Vec::new();
+        }
+        platform::live_group_members(self.pid() as i32, self.pid())
+    }
+
+    /// Sweep the group until it is PROVEN empty, bounded by `bound`; returns the
+    /// members still live at the bound (empty, and recorded, once settled).
+    ///
+    /// Iteration is what makes it a proof: `fork(2)` records a new child in its
+    /// parent's group (`copy_process` in `kernel/fork.c`), so a descendant can
+    /// join AFTER a sweep has passed — it inherits the group but not the signal
+    /// — and a signalled process keeps a non-live-but-not-yet-`do_exit` state,
+    /// so one enumeration can still list the sweep's own victims mid-death.
+    pub fn settle(&mut self, bound: Duration) -> Vec<i32> {
+        let deadline = Instant::now() + bound;
+        loop {
+            let live = self.live_members();
+            if live.is_empty() {
+                self.settled = true;
+                return live;
+            }
+            if Instant::now() >= deadline {
+                return live;
+            }
+            let _ = self.signal(GroupSignal::Kill);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Collect the leader — the SINGLE reap — CONSUMING the capability: the pgid
+    /// is released by this call, so nothing can signal it afterwards, not even
+    /// this value's own drop backstop.
+    pub(crate) fn reap(mut self) -> std::io::Result<ReapedGroup> {
+        let stdout = self.child.stdout.take();
+        let stderr = self.child.stderr.take();
+        let status = self.wait()?;
+        Ok(ReapedGroup {
+            status,
+            stdout,
+            stderr,
+        })
+    }
 }
 
-impl Drop for OwnedChild {
+impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if self.is_reaped() {
             return;
         }
-        // Final backstop: kill the whole group (a no-op on Windows), then the
-        // owned handle, then wait (bounded) for the reap. Under an injected
-        // inert kill the bound expires and the child is left to the caller's
-        // own cleanup (the fault is exactly the kill not working).
-        let pgid = self.child.id() as i32;
-        let _ = self.kill.kill_group(pgid, DROP_KILL_SIGNAL);
-        let _ = self.kill.kill_owned(&mut self.child);
+        // Final backstop: signal the whole group (a no-op on Windows), then the
+        // owned leader, then wait (bounded) for the collection. Under an
+        // injected inert signal the bound expires and the child is left to the
+        // caller's own cleanup (the fault is exactly the signal not working).
+        let _ = self.signal(GroupSignal::Kill);
+        let _ = self.signal_leader();
         let budget = Instant::now() + DROP_REAP_BOUND;
         while Instant::now() < budget {
             // `try_wait` records the status it consumes, so a successful
-            // backstop reap leaves the lifecycle `Reaped` as well.
+            // backstop collection leaves the lifecycle `Reaped` as well.
             if let Ok(Some(_)) = self.try_wait() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+}
+
+/// A collected group: the leader's exit status and the pipes it left behind. No
+/// longer the authority — its pgid is released, so this reports the outcome and
+/// drains the remaining output, but cannot signal anything.
+pub(crate) struct ReapedGroup {
+    status: ExitStatus,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+impl ReapedGroup {
+    /// The leader's exit status, consumed by the single reap.
+    pub(crate) fn status(&self) -> ExitStatus {
+        self.status
+    }
+
+    /// The stdout read end, for the bounded post-exit drain.
+    pub(crate) fn stdout_mut(&mut self) -> &mut Option<ChildStdout> {
+        &mut self.stdout
+    }
+
+    /// The stderr read end, for the bounded post-exit drain.
+    pub(crate) fn stderr_mut(&mut self) -> &mut Option<ChildStderr> {
+        &mut self.stderr
+    }
+}
+
+/// Collect the leader (the SINGLE reap) and notify the observer exactly once.
+/// Every path that escapes with a collected child goes through here, so no path
+/// reaps twice and none skips it. Consuming the capability is the point: the
+/// caller cannot signal the group after this call.
+fn collect(
+    group: ProcessGroup,
+    observer: Option<&Arc<dyn Fn(u32) + Send + Sync>>,
+    pid: u32,
+    argv: &[String],
+) -> std::result::Result<ReapedGroup, RunError> {
+    let reaped = group
+        .reap()
+        .map_err(|e| RunError::Wait(format!("wait {argv:?}: {e}")))?;
+    if let Some(observer) = observer {
+        observer(pid);
+    }
+    Ok(reaped)
 }
 
 /// The runner's policy knobs: termination timing, the reap bound, the kill
@@ -565,8 +748,9 @@ pub enum RunError {
     ///
     /// (1) A live member of the child's process group survives the child's
     /// exit. Unix only, where the runner enumerates the group: the group
-    /// termination is attempted (TERM → grace → KILL), the child is reaped,
-    /// and the violation is then reported.
+    /// termination is attempted (TERM → grace → KILL, then iterated to an
+    /// empty enumeration), the leader is collected, and the violation is then
+    /// reported.
     /// (2) A pipe is still open when the bounded post-exit drain expires.
     /// Unix and Windows: a descendant holds the inherited stdout, or the
     /// inherited stderr, write end. On Unix the group check has already
@@ -1019,6 +1203,176 @@ mod tests {
         }
     }
 
+    /// BUG 1 REGRESSION: a TIMED-OUT group is swept to a PROVEN-EMPTY
+    /// enumeration, never sampled once.
+    ///
+    /// The child exits on its own AFTER the deadline but WELL BEFORE the
+    /// ladder's escalated KILL is due, leaving one TERM-immune helper in its
+    /// group. That fixes the group's state by construction instead of by
+    /// kernel timing: at the moment the wait loop breaks, exactly one live
+    /// member exists and the ladder's TERM (which the helper ignores) has
+    /// already passed it, so
+    ///
+    /// * one enumeration reports a live member — the runner's own successful
+    ///   termination misread as a foreground-only violation;
+    /// * an iterated sweep re-signals and re-enumerates to empty — a clean
+    ///   timeout.
+    ///
+    /// The assertion is the CONSEQUENCE: `RunOutcome::TimedOut` (reachable only
+    /// through an empty enumeration) and the helper — which nothing but the
+    /// sweep could kill, since the ladder's KILL was never dispatched and the
+    /// leader exited without signalling it — is gone.
+    #[test]
+    fn a_timed_out_group_is_swept_to_a_proven_empty_group() {
+        let env = SysEnv::from_process();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(env.temp_dir())
+            .expect("tempdir");
+        let marker = dir.path().join("helper.pid");
+        let config = RunnerConfig {
+            term_to_kill_grace: Duration::from_millis(200),
+            reap_bound: Duration::from_secs(2),
+            ..RunnerConfig::production()
+        };
+        let runner = fixture_runner(dir.path(), config);
+        // `sleep 0.12` either finishes or is killed by the group TERM at the
+        // 100ms deadline; either way the leader exits inside the grace window,
+        // before the escalated KILL is due. The helper ignores TERM, so it is
+        // live and untouched when the leader goes.
+        let script = format!(
+            "trap '' TERM; ( trap '' TERM; sleep 30 ) & echo $! > {}; sleep 0.12; exit 0",
+            marker.display()
+        );
+        let captured = {
+            let marker = marker.clone();
+            let reader = std::thread::spawn(move || capture_grandchild(&marker, GONE_BUDGET));
+            let out = runner
+                .exec(
+                    &["sh".into(), "-c".into(), script],
+                    Duration::from_millis(100),
+                )
+                .expect(
+                    "a timed-out group swept to empty must return the timeout outcome, never \
+                     report its own termination as a foreground-only violation",
+                );
+            assert!(
+                matches!(out, RunOutcome::TimedOut { .. }),
+                "a swept-to-empty timed-out group must yield TimedOut, got {out:?}"
+            );
+            reader
+                .join()
+                .expect("the identity-capture thread must not panic")
+        };
+        let helper: u32 = std::fs::read_to_string(&marker)
+            .expect("the leader writes the helper pid immediately")
+            .trim()
+            .parse()
+            .expect("pid");
+        match captured {
+            Some(id) => assert!(
+                id.wait_until_gone(GONE_BUDGET),
+                "the TERM-immune helper {} must be terminated by the sweep, not left live",
+                id.pid
+            ),
+            None => assert!(
+                wait_until_not_live(helper, GONE_BUDGET),
+                "the TERM-immune helper {helper} must be terminated by the sweep"
+            ),
+        }
+    }
+
+    /// A timed-out group that is STILL live at the reap bound is a termination
+    /// that did not take effect — never a clean timeout. The seam's group signal
+    /// is RECORDED and never delivered, so every member survives the sweep by
+    /// construction and the verdict can be asserted without a race. The leader
+    /// exits on its own (well inside the ladder's own bound), so the loop
+    /// breaks with the leader a zombie while its helper is still live: the
+    /// `settle` arm — not the loop's "leader still alive" arm — is the one
+    /// under test.
+    #[test]
+    fn an_unsettled_timed_out_group_is_a_reap_failure() {
+        let env = SysEnv::from_process();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(env.temp_dir())
+            .expect("tempdir");
+        let reaped = Arc::new(AtomicUsize::new(0));
+        let config = RunnerConfig {
+            term_to_kill_grace: Duration::from_millis(20),
+            reap_bound: Duration::from_millis(300),
+            kill: RecordingKill::delivering(Delivery::Recorded),
+            reap_observer: Some({
+                let reaped = reaped.clone();
+                Arc::new(move |_pid: u32| {
+                    reaped.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+            ..RunnerConfig::production()
+        };
+        let runner = fixture_runner(dir.path(), config);
+        let script = "sleep 1 & sleep 0.2";
+        let err = runner
+            .exec(
+                &["sh".into(), "-c".into(), script.into()],
+                Duration::from_millis(100),
+            )
+            .expect_err("a group still live at the bound must not yield a timeout outcome");
+        assert!(
+            matches!(err, RunError::Reap(_)),
+            "an unsettled group with no refused signal must be a Reap failure, got {err:?}"
+        );
+        assert_eq!(
+            reaped.load(Ordering::SeqCst),
+            1,
+            "the leader must be reaped exactly once before the unsettled verdict escapes"
+        );
+    }
+
+    /// A group whose ladder recorded a REFUSED signal is a `RunError::Kill`,
+    /// never a clean `TimedOut` and never the `Reap` an unexplained leftover
+    /// would give.
+    ///
+    /// The seam delivers TERM and refuses the GROUP KILL; every member ignores
+    /// TERM, so the group cannot empty and only the last-resort owned-leader
+    /// signal ends the leader. The recorded refusal is what decides the
+    /// verdict: without it the same live group is a plain `Reap`.
+    #[test]
+    fn an_unsettled_group_with_a_refused_kill_is_a_kill_failure() {
+        let env = SysEnv::from_process();
+        let dir = tempfile::Builder::new()
+            .tempdir_in(env.temp_dir())
+            .expect("tempdir");
+        let reaped = Arc::new(AtomicUsize::new(0));
+        let config = RunnerConfig {
+            term_to_kill_grace: Duration::from_millis(20),
+            reap_bound: Duration::from_millis(500),
+            kill: RecordingKill::delivering(Delivery::RefuseKill),
+            reap_observer: Some({
+                let reaped = reaped.clone();
+                Arc::new(move |_pid: u32| {
+                    reaped.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+            ..RunnerConfig::production()
+        };
+        let runner = fixture_runner(dir.path(), config);
+        let script = "trap '' TERM; ( trap '' TERM; sleep 30 ) & sleep 0.2; exit 0";
+        let err = runner
+            .exec(
+                &["sh".into(), "-c".into(), script.into()],
+                Duration::from_millis(100),
+            )
+            .expect_err("a refused termination signal must not yield a timeout outcome");
+        assert!(
+            matches!(err, RunError::Kill(_)),
+            "a group whose KILL was refused must be a Kill failure, got {err:?}"
+        );
+        assert_eq!(
+            reaped.load(Ordering::SeqCst),
+            1,
+            "the leader must be reaped exactly once before the Kill verdict escapes"
+        );
+    }
+
     /// On the paths where the reap succeeds, every returned outcome happens
     /// only after the child was reaped: a timeout kill failure is an error.
     /// An error path that CANNOT reap drops the handle, and the drop
@@ -1185,28 +1539,45 @@ mod tests {
         );
     }
 
+    /// How the recording seam DELIVERS a signal — the state of the group is then
+    /// known BY CONSTRUCTION rather than by winning a race against the kernel.
+    enum Delivery {
+        /// Really signal, the production behaviour.
+        Real,
+        /// Record and report success WITHOUT signalling anything.
+        Recorded,
+        /// Deliver TERM, refuse the GROUP KILL with a permission error (the fault
+        /// a group that may not be signalled reports).
+        RefuseKill,
+    }
+
     /// A [`KillSeam`] that RECORDS every call, so a test can assert DIRECTLY
-    /// whether the drop backstop fired. With `terminate` set it delegates to
-    /// [`RealKill`] (so a test that relies on the backstop to collect a real
-    /// child really collects it); with it clear the seam is INERT, so the
-    /// guard-removal witness below cannot signal a pid the OS may already have
-    /// recycled.
+    /// whether the drop backstop fired, and injects a delivery fault where a
+    /// verdict needs the group's state fixed.
     struct RecordingKill {
-        terminate: bool,
-        group_calls: Mutex<Vec<(i32, i32)>>,
+        delivery: Delivery,
+        group_calls: Mutex<Vec<(i32, GroupSignal)>>,
         owned_calls: AtomicUsize,
     }
 
     impl RecordingKill {
         fn recording(terminate: bool) -> Arc<Self> {
+            Self::delivering(if terminate {
+                Delivery::Real
+            } else {
+                Delivery::Recorded
+            })
+        }
+
+        fn delivering(delivery: Delivery) -> Arc<Self> {
             Arc::new(RecordingKill {
-                terminate,
+                delivery,
                 group_calls: Mutex::new(Vec::new()),
                 owned_calls: AtomicUsize::new(0),
             })
         }
 
-        fn group_calls(&self) -> Vec<(i32, i32)> {
+        fn group_calls(&self) -> Vec<(i32, GroupSignal)> {
             self.group_calls.lock().unwrap().clone()
         }
 
@@ -1216,58 +1587,56 @@ mod tests {
     }
 
     impl KillSeam for RecordingKill {
-        fn kill_group(&self, pgid: i32, sig: i32) -> std::io::Result<()> {
-            self.group_calls.lock().unwrap().push((pgid, sig));
-            if self.terminate {
-                RealKill.kill_group(pgid, sig)
-            } else {
-                Ok(())
+        fn kill_group(&self, group: &ProcessGroup, sig: GroupSignal) -> std::io::Result<()> {
+            self.group_calls
+                .lock()
+                .unwrap()
+                .push((group.pid() as i32, sig));
+            match self.delivery {
+                Delivery::Real => RealKill.kill_group(group, sig),
+                Delivery::Recorded => Ok(()),
+                Delivery::RefuseKill if sig == GroupSignal::Kill => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated refusal to signal the group",
+                )),
+                Delivery::RefuseKill => RealKill.kill_group(group, sig),
             }
         }
 
-        fn kill_owned(&self, child: &mut Child) -> std::io::Result<()> {
+        fn kill_owned(&self, group: &mut ProcessGroup) -> std::io::Result<()> {
             self.owned_calls.fetch_add(1, Ordering::SeqCst);
-            if self.terminate {
-                RealKill.kill_owned(child)
-            } else {
-                Ok(())
+            match self.delivery {
+                Delivery::Real | Delivery::RefuseKill => RealKill.kill_owned(group),
+                Delivery::Recorded => Ok(()),
             }
         }
     }
 
-    /// Spawn `sh -c script` in its OWN process group (as production does) with
-    /// stdio nulled, so the backstop's group kill targets the child's group and
-    /// never the test process's.
-    fn spawn_grouped(script: &str) -> Child {
-        use std::os::unix::process::CommandExt;
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn()
-            .expect("spawn a child in its own process group")
+    /// The bare `sh -c script` command the capability tests spawn.
+    fn group_command(script: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(script);
+        cmd
     }
 
     /// WITNESS for the `if self.is_reaped() { return; }` guard in
-    /// [`OwnedChild::drop`].
+    /// [`ProcessGroup::drop`].
     ///
     /// The guard protects against signalling a pid the OS RECYCLED after the
-    /// reap: [`OwnedChild::wait`] (like [`OwnedChild::try_wait`]) moves the
+    /// reap: [`ProcessGroup::wait`] (like [`ProcessGroup::try_wait`]) moves the
     /// lifecycle to [`ChildLifecycle::Reaped`] and releases the pid, and a
     /// `killpg`/`kill` on the released number could land on an unrelated
     /// process; this test pins the guard DIRECTLY, through the module's own
     /// reap path, and asserts the drop backstop does NOT signal.
     ///
-    /// The REAPED arm calls [`OwnedChild::wait`] (it consumes the exit status,
-    /// so the pid is really reaped, not merely declared so) and drops the
-    /// handle: the recording seam must record NO group kill and NO direct
-    /// kill. The CONTROL arm drops an UN-REAPED handle with the same fixture:
-    /// it must record exactly one group kill (the drop signal) and one direct
-    /// kill, proving the silence above is the guard's doing and not the seam's.
-    /// Deleting the guard makes the REAPED arm's assertions fail.
+    /// The REAPED arm calls [`ProcessGroup::wait`] (it consumes the exit
+    /// status, so the pid is really reaped, not merely declared so) and drops
+    /// the capability: the recording seam must record NO group signal and NO
+    /// direct signal. The CONTROL arm drops an UN-REAPED capability with the
+    /// same fixture: it must record exactly one group signal (`Kill`, the drop
+    /// signal) and one direct signal, proving the silence above is the guard's
+    /// doing and not the seam's. Deleting the guard makes the REAPED arm's
+    /// assertions fail.
     #[test]
     fn a_reaped_owned_child_is_never_signalled_by_the_drop_backstop() {
         // REAPED: `wait` consumes the exit status and moves the lifecycle to
@@ -1277,8 +1646,10 @@ mod tests {
         // this witness cannot signal a recycled pid.
         let reaped_seam = RecordingKill::recording(false);
         {
-            let mut owned = OwnedChild::new(spawn_grouped("exit 0"), reaped_seam.clone());
-            owned.wait().expect("a promptly-exiting child must reap");
+            let mut group =
+                ProcessGroup::spawn_configured(group_command("exit 0"), reaped_seam.clone())
+                    .expect("spawn a promptly-exiting child");
+            group.wait().expect("a promptly-exiting child must reap");
         }
         assert_eq!(
             reaped_seam.group_calls(),
@@ -1294,23 +1665,27 @@ mod tests {
         // CONTROL: the same fixture, but the child is NOT reaped, so the drop
         // backstop must fire. The seam TERMINATES (delegates to `RealKill`) so
         // the control's child is really collected by the backstop's own bounded
-        // reap — no child is left behind.
+        // collection — no child is left behind.
         let control_seam = RecordingKill::recording(true);
         let pid = {
-            let owned = OwnedChild::new(spawn_grouped("exec sleep 30"), control_seam.clone());
-            let pid = owned.pid();
-            drop(owned);
+            let group = ProcessGroup::spawn_configured(
+                group_command("exec sleep 30"),
+                control_seam.clone(),
+            )
+            .expect("spawn a long-lived child");
+            let pid = group.pid();
+            drop(group);
             pid
         };
         assert_eq!(
             control_seam.group_calls(),
-            vec![(pid as i32, DROP_KILL_SIGNAL)],
-            "the control's un-reaped child must be killed as a group by the drop backstop"
+            vec![(pid as i32, GroupSignal::Kill)],
+            "the control's un-reaped child must be signalled as a group by the drop backstop"
         );
         assert_eq!(
             control_seam.owned_calls(),
             1,
-            "the control's un-reaped child must also be killed through the owned handle"
+            "the control's un-reaped child must also be signalled through the owned leader"
         );
         assert!(
             wait_until_not_live(pid, GONE_BUDGET),
@@ -1320,8 +1695,8 @@ mod tests {
 
     /// The lifecycle as a VALUE: the handle is reachable only while the child
     /// is LIVE, the single reap records the exit status it consumed, and the
-    /// drop backstop of a reaped handle signals nothing (the pid was released
-    /// by the reap, so a signal could land on a recycled pid).
+    /// drop backstop of a reaped capability signals nothing (the pid was
+    /// released by the reap, so a signal could land on a recycled pid).
     ///
     /// The seam is INERT (records without signalling) for the same reason as
     /// the control-arm witness above: the child under test is already reaped,
@@ -1329,34 +1704,35 @@ mod tests {
     #[test]
     fn a_reaped_child_has_no_live_handle_and_is_never_signalled() {
         let seam = RecordingKill::recording(false);
-        let mut owned = OwnedChild::new(spawn_grouped("exit 0"), seam.clone());
-        assert!(!owned.is_reaped(), "a freshly spawned child is live");
+        let mut group = ProcessGroup::spawn_configured(group_command("exit 0"), seam.clone())
+            .expect("spawn a promptly-exiting child");
+        assert!(!group.is_reaped(), "a freshly spawned child is live");
         assert!(
-            owned.live_child().is_some(),
+            group.live_child().is_some(),
             "a live child must expose its handle"
         );
 
-        let status = owned.wait().expect("a promptly-exiting child must reap");
+        let status = group.wait().expect("a promptly-exiting child must reap");
         assert_eq!(status.code(), Some(0), "the exit status must be preserved");
         assert!(
-            owned.is_reaped(),
+            group.is_reaped(),
             "the reap must move the lifecycle to Reaped"
         );
         assert!(
-            owned.live_child().is_none(),
+            group.live_child().is_none(),
             "a reaped child must not expose its handle: a signal on the released pid is unrepresentable"
         );
         // The reap is SINGLE: `try_wait` reports the status it already
         // consumed instead of polling the released pid again.
         assert_eq!(
-            owned
+            group
                 .try_wait()
                 .expect("a reaped child still reports its status"),
             Some(status),
             "the consumed exit status must be the recorded one"
         );
 
-        drop(owned);
+        drop(group);
         assert_eq!(
             seam.group_calls(),
             Vec::new(),

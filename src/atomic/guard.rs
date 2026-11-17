@@ -2702,7 +2702,11 @@ mod tests {
             ("src/transport/runner/mod.rs", "libc::CTL_KERN", 1),
             ("src/transport/runner/mod.rs", "libc::KERN_PROC", 1),
             ("src/transport/runner/mod.rs", "libc::KERN_PROC_PID", 1),
+            // The two rungs of `GroupSignal::raw`, the ONLY signal constants the
+            // crate sends a group: they live on the capability's signal type, so
+            // the platform's `KillSeam` holds no number of its own.
             ("src/transport/runner/mod.rs", "libc::SIGKILL", 1),
+            ("src/transport/runner/mod.rs", "libc::SIGTERM", 1),
             ("src/transport/runner/mod.rs", "libc::sysctl", 1),
             ("src/transport/runner/unix.rs", "libc::ECHILD", 1),
             ("src/transport/runner/unix.rs", "libc::F_GETFL", 1),
@@ -2710,8 +2714,6 @@ mod tests {
             ("src/transport/runner/unix.rs", "libc::O_NONBLOCK", 1),
             ("src/transport/runner/unix.rs", "libc::POLLIN", 2),
             ("src/transport/runner/unix.rs", "libc::P_PID", 1),
-            ("src/transport/runner/unix.rs", "libc::SIGKILL", 2),
-            ("src/transport/runner/unix.rs", "libc::SIGTERM", 2),
             ("src/transport/runner/unix.rs", "libc::WEXITED", 1),
             ("src/transport/runner/unix.rs", "libc::WNOHANG", 1),
             ("src/transport/runner/unix.rs", "libc::WNOWAIT", 1),
@@ -2724,8 +2726,6 @@ mod tests {
             ("src/transport/runner/unix.rs", "libc::waitid", 1),
             ("src/transport/ssh/mod.rs", "libc::sockaddr_un", 2),
             ("src/transport/ssh/runner/unix.rs", "libc::ESRCH", 2),
-            ("src/transport/ssh/runner/unix.rs", "libc::SIGKILL", 1),
-            ("src/transport/ssh/runner/unix.rs", "libc::SIGTERM", 1),
         ];
         let expected: BTreeMap<(String, String), usize> = expected
             .iter()
