@@ -136,6 +136,10 @@ impl Harness {
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).expect("create the shim bin dir");
         write_executable(&bin.join("ssh"), SHIM_SCRIPT.as_bytes());
+        // The shim runs remote commands locally, so this host's `storekit-remote`
+        // would answer the far-side probe as the CLI; 127 is its absence code.
+        // A test that wants a CLI overwrites this entry (expose_real_cli, or a stub).
+        write_executable(&bin.join("storekit-remote"), b"#!/bin/sh\nexit 127\n");
         let root = work.join("remote");
         Harness {
             log_path: tmp.path().join("ssh.log"),
@@ -149,6 +153,9 @@ impl Harness {
     /// Put the REAL `storekit-remote` on the shim's `PATH` (a symlink, so no
     /// bytes are written from the test process and the binary is never stale).
     fn expose_real_cli(&self) {
+        // The harness pins an ABSENT `storekit-remote` (exit 127); the symlink
+        // replaces that entry, so remove it first.
+        let _ = std::fs::remove_file(self.bin.join("storekit-remote"));
         std::os::unix::fs::symlink(
             env!("CARGO_BIN_EXE_storekit-remote"),
             self.bin.join("storekit-remote"),

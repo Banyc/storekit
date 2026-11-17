@@ -705,7 +705,18 @@ fn connection_loss_releases_the_far_side_lock_and_is_reported() {
         !pids_matching("ssh ", &fragment).is_empty(),
         "premise: the lock session's local ssh client is running"
     );
-    let killed = kill_matching("perl ", &fragment);
+    // The holder is the SCRIPT form (`perl -e ...`) when the far side has no
+    // compatible `storekit-remote`, and the CLI form otherwise. This host may
+    // have one installed, so match whichever form the far side actually ran —
+    // the record path in argv identifies it either way.
+    let killed = {
+        let script = kill_matching("perl ", &fragment);
+        if script.is_empty() {
+            kill_matching("storekit-remote ", &fragment)
+        } else {
+            script
+        }
+    };
     assert!(
         !killed.is_empty(),
         "the far-side lock holder (argv carries {record:?}) must be found and killed"

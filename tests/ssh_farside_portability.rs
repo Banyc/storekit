@@ -114,6 +114,9 @@ fn write_executable(path: &Path, body: &[u8]) {
 fn install_shim_ssh(bin: &Path) {
     std::fs::create_dir_all(bin).expect("create shim bin dir");
     write_executable(&bin.join("ssh"), SHIM_SCRIPT.as_bytes());
+    // The shim runs remote commands locally, so this host's `storekit-remote`
+    // would answer the far-side probe as the CLI. 127 is the absence code.
+    write_executable(&bin.join("storekit-remote"), b"#!/bin/sh\nexit 127\n");
 }
 
 /// Install a far-side `perl` on `bin` that (a) records the path operand of any
