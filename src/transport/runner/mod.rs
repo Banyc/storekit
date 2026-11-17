@@ -641,9 +641,10 @@ impl Drop for ProcessGroup {
     }
 }
 
-/// A collected group: the leader's exit status and the pipes it left behind. No
-/// longer the authority — its pgid is released, so this reports the outcome and
-/// drains the remaining output, but cannot signal anything.
+/// A collected group: the leader's exit status and — on Unix, where the drain
+/// reads the pipe ends directly — those it left behind. No longer the authority:
+/// its pgid is released, so this reports the outcome and drains the remaining
+/// output, but cannot signal anything.
 pub(crate) struct ReapedGroup {
     status: ExitStatus,
     /// Present on Unix only: Windows drains through reader threads handed the
@@ -660,7 +661,8 @@ impl ReapedGroup {
         self.status
     }
 
-    /// The stdout read end, for the bounded post-exit drain.
+    /// The stdout read end, for the bounded post-exit drain (Unix: Windows
+    /// collects the reader buffers on its own channels).
     #[cfg(unix)]
     pub(crate) fn stdout_mut(&mut self) -> &mut Option<ChildStdout> {
         &mut self.stdout
