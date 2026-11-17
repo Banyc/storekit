@@ -1311,8 +1311,11 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
             std::io::Error::last_os_error()
         )));
     }
-    // btrfs leaves the description an `open(O_DIRECTORY)` returns at LLONG_MAX,
-    // where `getdents64` yields only `.`/`..`; `rewinddir` restarts the stream.
+    // The stream begins wherever the SHARED description stands, so a second
+    // enumeration of one root would list nothing. A btrfs stream opened before
+    // its directory's entries existed lists only `.`/`..` until it is rewound.
+    // `rewinddir` restarts both; `lseek(0)` alone replays the stream's own
+    // cached block instead.
     unsafe { libc::rewinddir(dir) };
     loop {
         let entry = unsafe { libc::readdir(dir) };
