@@ -1311,6 +1311,9 @@ fn for_each_dir_entry(dir_fd: &OwnedFd, mut f: impl FnMut(&[u8]) -> Result<()>) 
             std::io::Error::last_os_error()
         )));
     }
+    // btrfs leaves the description an `open(O_DIRECTORY)` returns at LLONG_MAX,
+    // where `getdents64` yields only `.`/`..`; `rewinddir` restarts the stream.
+    unsafe { libc::rewinddir(dir) };
     loop {
         let entry = unsafe { libc::readdir(dir) };
         if entry.is_null() {
@@ -5022,6 +5025,26 @@ mod tests {
             RootedRelativePath::parse(Path::new(".")).is_err(),
             "the `.` spelling names the root, not an entry under it"
         );
+        let mut names: Vec<String> = read_root_dir_fd(&root)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["root-residue".to_string(), "sub".to_string()]);
+    }
+
+    /// The clone behind `fdopendir` shares the root's description, so draining it
+    /// once must not hide the entries from a SECOND enumeration of one [`RootDir`].
+    #[test]
+    fn a_second_enumeration_of_one_root_still_lists_its_entries() {
+        let (dir, root) = owned_root();
+        std::fs::write(dir.path().join("root-residue"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // The root is opened BEFORE its entries exist, and the FIRST pass is left
+        // unasserted: only the second distinguishes a restarted stream from one
+        // that merely began at the start.
+        read_root_dir_fd(&root).unwrap();
         let mut names: Vec<String> = read_root_dir_fd(&root)
             .unwrap()
             .into_iter()

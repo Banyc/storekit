@@ -2636,6 +2636,7 @@ mod tests {
             ("src/atomic/unix.rs", "libc::openat", 7),
             ("src/atomic/unix.rs", "libc::readdir", 1),
             ("src/atomic/unix.rs", "libc::readlinkat", 2),
+            ("src/atomic/unix.rs", "libc::rewinddir", 1),
             ("src/atomic/unix.rs", "libc::renameat", 1),
             ("src/atomic/unix.rs", "libc::stat", 8),
             ("src/atomic/unix.rs", "libc::symlinkat", 1),
@@ -3718,8 +3719,8 @@ mod tests {
     /// `std::fs::read`/`read_to_string`/`metadata`/`symlink_metadata`/
     /// `read_dir`/`read_link`/`canonicalize` act on an entry the funnel already
     /// created or resolved; the `libc` entries (`fstatat`, `fstat`, `readlinkat`,
-    /// `readdir`, `fdopendir`, `closedir`, `fcntl`) read or manage an open
-    /// descriptor. `std::fs::write` is deliberately NOT here: it CREATES on an
+    /// `readdir`, `fdopendir`, `rewinddir`, `closedir`, `fcntl`) read or manage an
+    /// open descriptor. `std::fs::write` is deliberately NOT here: it CREATES on an
     /// absent path, so it can ADOPT a name and is on `clippy.toml`'s deny list.
     ///
     /// `libc::openat` is deliberately NOT here: it CAN adopt a name (with
@@ -3773,6 +3774,7 @@ mod tests {
         "libc::readlinkat",
         "libc::readdir",
         "libc::fdopendir",
+        "libc::rewinddir",
         "libc::closedir",
         "libc::fcntl",
         // The advisory-lock call the lock protocol takes on an ALREADY OPENED
