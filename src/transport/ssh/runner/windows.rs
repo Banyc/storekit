@@ -136,7 +136,7 @@ pub(crate) fn spawn(
                     // the reader threads EOF and send their buffers. The collect
                     // CONSUMES the capability, so nothing can signal the
                     // released pid.
-                    let mut reaped = group
+                    let reaped = group
                         .reap()
                         .map_err(|e| RunError::Wait(format!("wait: {e}")))?;
                     debug_assert_eq!(reaped.status(), status);

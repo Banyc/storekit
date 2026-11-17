@@ -145,7 +145,7 @@ pub(crate) fn exec(
     // collect it — the SINGLE reap, CONSUMING the capability, so nothing can
     // signal the released pid. On Unix the foreground-only group check runs
     // between the peek and this collect.
-    let mut reaped = collect(group, config.reap_observer.as_ref(), pid, argv)?;
+    let reaped = collect(group, config.reap_observer.as_ref(), pid, argv)?;
     // Collect the reader buffers, BOUNDED: the pipes EOF when the last
     // holder dies. A channel still open at the bound proves a live
     // descendant HOLDS the pipe — the pipe-EOF containment signal (the

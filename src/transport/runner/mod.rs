@@ -603,12 +603,16 @@ impl ProcessGroup {
     /// is released by this call, so nothing can signal it afterwards, not even
     /// this value's own drop backstop.
     pub(crate) fn reap(mut self) -> std::io::Result<ReapedGroup> {
+        #[cfg(unix)]
         let stdout = self.child.stdout.take();
+        #[cfg(unix)]
         let stderr = self.child.stderr.take();
         let status = self.wait()?;
         Ok(ReapedGroup {
             status,
+            #[cfg(unix)]
             stdout,
+            #[cfg(unix)]
             stderr,
         })
     }
@@ -642,7 +646,11 @@ impl Drop for ProcessGroup {
 /// drains the remaining output, but cannot signal anything.
 pub(crate) struct ReapedGroup {
     status: ExitStatus,
+    /// Present on Unix only: Windows drains through reader threads handed the
+    /// pipes BEFORE the collect, so a collected group there holds none.
+    #[cfg(unix)]
     stdout: Option<ChildStdout>,
+    #[cfg(unix)]
     stderr: Option<ChildStderr>,
 }
 
@@ -653,11 +661,13 @@ impl ReapedGroup {
     }
 
     /// The stdout read end, for the bounded post-exit drain.
+    #[cfg(unix)]
     pub(crate) fn stdout_mut(&mut self) -> &mut Option<ChildStdout> {
         &mut self.stdout
     }
 
     /// The stderr read end, for the bounded post-exit drain.
+    #[cfg(unix)]
     pub(crate) fn stderr_mut(&mut self) -> &mut Option<ChildStderr> {
         &mut self.stderr
     }
@@ -848,7 +858,7 @@ impl ChildRunner {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     /// How long the oracle polls for a process to disappear. The runner's own
@@ -1052,7 +1062,7 @@ mod tests {
     #[test]
     fn quick_child_is_reaped_and_output_captured() {
         let pid_slot: Arc<Mutex<Option<ProcessId>>> = Arc::new(Mutex::new(None));
-        let reaped = Arc::new(AtomicBool::new(false));
+        let reaped = Arc::new(AtomicUsize::new(0));
         let config = RunnerConfig {
             spawn_observer: Some({
                 let slot = pid_slot.clone();
@@ -1060,7 +1070,9 @@ mod tests {
             }),
             reap_observer: Some({
                 let reaped = reaped.clone();
-                Arc::new(move |_pid: u32| reaped.store(true, Ordering::SeqCst))
+                Arc::new(move |_pid: u32| {
+                    reaped.fetch_add(1, Ordering::SeqCst);
+                })
             }),
             ..RunnerConfig::production()
         };
@@ -1090,8 +1102,9 @@ mod tests {
             "child {} must be reaped, not signalled-and-left",
             pid.pid
         );
-        assert!(
+        assert_eq!(
             reaped.load(Ordering::SeqCst),
+            1,
             "the reap observer must fire exactly once"
         );
     }
@@ -1206,12 +1219,12 @@ mod tests {
     /// BUG 1 REGRESSION: a TIMED-OUT group is swept to a PROVEN-EMPTY
     /// enumeration, never sampled once.
     ///
-    /// The child exits on its own AFTER the deadline but WELL BEFORE the
-    /// ladder's escalated KILL is due, leaving one TERM-immune helper in its
-    /// group. That fixes the group's state by construction instead of by
-    /// kernel timing: at the moment the wait loop breaks, exactly one live
-    /// member exists and the ladder's TERM (which the helper ignores) has
-    /// already passed it, so
+    /// The leader ends ONLY on the ladder's group TERM (`wait` interrupted by
+    /// it, then `exit 0`), so the deadline has necessarily fired before the wait
+    /// loop breaks — the premise is fixed by construction, never by a timing
+    /// margin. Its group then holds exactly one live TERM-immune helper, which
+    /// the ladder's TERM could not kill and the escalated KILL (due only after
+    /// the grace) has not been dispatched to yet, so
     ///
     /// * one enumeration reports a live member — the runner's own successful
     ///   termination misread as a foreground-only violation;
@@ -1221,7 +1234,7 @@ mod tests {
     /// The assertion is the CONSEQUENCE: `RunOutcome::TimedOut` (reachable only
     /// through an empty enumeration) and the helper — which nothing but the
     /// sweep could kill, since the ladder's KILL was never dispatched and the
-    /// leader exited without signalling it — is gone.
+    /// leader never signalled it — is gone.
     #[test]
     fn a_timed_out_group_is_swept_to_a_proven_empty_group() {
         let env = SysEnv::from_process();
@@ -1235,12 +1248,8 @@ mod tests {
             ..RunnerConfig::production()
         };
         let runner = fixture_runner(dir.path(), config);
-        // `sleep 0.12` either finishes or is killed by the group TERM at the
-        // 100ms deadline; either way the leader exits inside the grace window,
-        // before the escalated KILL is due. The helper ignores TERM, so it is
-        // live and untouched when the leader goes.
         let script = format!(
-            "trap '' TERM; ( trap '' TERM; sleep 30 ) & echo $! > {}; sleep 0.12; exit 0",
+            "trap 'exit 0' TERM; ( trap '' TERM; sleep 30 ) & echo $! > {}; wait",
             marker.display()
         );
         let captured = {
