@@ -109,14 +109,14 @@ pub(crate) fn spawn(
             // exits the slot is consumed (reaped) and the reader buffers
             // collected.
             let wait_res = loop {
-                let mut exited: Option<(ProcessGroup, std::process::ExitStatus)> = None;
+                let mut exited: Option<ProcessGroup> = None;
                 {
                     let mut guard = wait_group.lock().unwrap();
                     let g = guard
                         .as_mut()
                         .expect("the wait thread is the sole consumer of the group slot");
                     match g.try_wait() {
-                        Ok(Some(status)) => {
+                        Ok(Some(_)) => {
                             // `try_wait` consumed the exit status and moved the
                             // handle to `Reaped`: record that in the shared
                             // deadline fact BEFORE the reader buffers are
@@ -124,22 +124,22 @@ pub(crate) fn spawn(
                             // tell "the child exited" from "the child was still
                             // running at the deadline".
                             record_reap(&wait_status_cell);
-                            exited = guard.take().map(|g| (g, status));
+                            exited = guard.take();
                         }
                         Ok(None) => {}
                         Err(e) => return Err(RunError::Wait(format!("wait: {e}"))),
                     }
                 }
-                if let Some((group, status)) = exited {
+                if let Some(group) = exited {
                     // The child is REAPED and the capability cannot signal it;
                     // `Reaped` was announced above. Its handles are closed, so
                     // the reader threads EOF and send their buffers. The collect
-                    // CONSUMES the capability, so nothing can signal the
-                    // released pid.
+                    // CONSUMES the capability and reports the exit status it
+                    // consumed (`ProcessGroup::wait` on a `Reaped` lifecycle), so
+                    // nothing can signal the released pid.
                     let reaped = group
                         .reap()
                         .map_err(|e| RunError::Wait(format!("wait: {e}")))?;
-                    debug_assert_eq!(reaped.status(), status);
                     let stdout = stdout_rx
                         .recv()
                         .map_err(|_| RunError::Wait("stdout reader failed".into()))?;
