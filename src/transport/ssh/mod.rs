@@ -7658,7 +7658,8 @@ mod fingerprint_ssh_tests {
     use std::path::{Path, PathBuf};
 
     // HERMETIC SNAPSHOT: every fake-ssh test builds ONE `SysEnv::from_map`
-    // carrying the fake bin dir first in `PATH` plus the fake-ssh variables
+    // carrying the fake bin dir (which also pins an ABSENT `storekit-remote`, see
+    // `FakeSsh::new`) first in `PATH` plus the fake-ssh variables
     // (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`) and the per-test pin
     // cache (`STOREKIT_TEST_SSH_KNOWNHOSTS_DIR`). The transport spawns its children
     // (ssh / ssh-keyscan / ssh-keygen / perl) with that snapshot's variables
@@ -7847,6 +7848,14 @@ exec /bin/mv "$@"
                 .as_bytes(),
             );
 
+            // No `storekit-remote` here: exit 127 (`FAR_SIDE_ABSENT_EXITS`) because the
+            // fake `ssh` runs remote commands locally, so a host binary would answer the
+            // probe. `write_fake_bin` rewrites this entry, so a test's own CLI wins.
+            crate::test_support::write_executable(
+                &bin.join("storekit-remote"),
+                b"#!/bin/sh\nexit 127\n",
+            );
+
             // The shims are installed 0o755 by `write_executable`'s helper.
 
             FakeSsh {
@@ -8015,6 +8024,57 @@ exec /bin/mv "$@"
             invocations.push(current);
         }
         invocations
+    }
+
+    /// The emulated far side is the SCRIPT form whatever the host installs: the
+    /// read after the probe is the perl frame helper, so an injected frame
+    /// reaches the parser instead of a host `storekit-remote` doing the read.
+    #[test]
+    fn the_emulated_far_side_is_the_scripts_form_whatever_the_host_installs() {
+        let tmp = crate::test_support::fixture_tmpdir(&crate::test_support::fixture_env()).unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "far-side-form.test",
+            Path::new("/srv/deploy/far-side-form"),
+        );
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/far-side-form",
+        );
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+        assert!(
+            t.metadata_opt(&RootedRelativePath::parse(Path::new("absent.json")).unwrap())
+                .unwrap()
+                .is_none()
+        );
+
+        let invocations = read_ssh_argv_log(&fake.argv_log);
+        assert_eq!(
+            invocations.len(),
+            2,
+            "one probe plus one metadata read, got {invocations:?}"
+        );
+        let command = |n: usize| invocations[n].last().cloned().unwrap_or_default();
+        assert!(
+            command(0).contains("storekit-remote protocol"),
+            "the first remote command is the far-side probe, got {:?}",
+            command(0)
+        );
+        assert!(
+            command(1).contains("perl -e"),
+            "the metadata read must run the perl frame helper, got {:?}",
+            command(1)
+        );
+        assert!(
+            !command(1).contains("storekit-remote"),
+            "the far side is absent, so no CLI subcommand may run, got {:?}",
+            command(1)
+        );
     }
 
     // Scenario (a): a fingerprint-only configuration can make a STATUS request
